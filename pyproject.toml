@@ -1,0 +1,50 @@
+[project]
+name = "torch-offload"
+version = "0.1.0"
+description = "Model-agnostic GPU/CPU memory management for PyTorch — pinned-host offloading, block streaming, and LRU model caching."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.7",
+]
+
+[project.optional-dependencies]
+gguf = ["gguf"]
+quanto = ["optimum-quanto"]
+all = ["gguf", "optimum-quanto"]
+
+[build-system]
+requires = ["uv_build>=0.9.8,<0.10.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest~=9.0",
+    "ruff>=0.14.3",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = [
+    "E", "F", "W", "I", "N", "ANN", "B", "A", "COM", "C4",
+    "DTZ", "EXE", "PIE", "T20", "PT", "SIM", "ARG", "PTH",
+    "ERA", "RUF", "PL",
+]
+ignore = [
+    "ANN002",
+    "ANN003",
+    "ANN204",
+    "COM812",
+    "PTH123",
+    "PLR2004",
+    "N812",
+]
+
+[tool.ruff.lint.pylint]
+max-args = 10
+
+[tool.ruff.lint.isort]
+known-first-party = ["torch_offload"]
