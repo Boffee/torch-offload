@@ -147,7 +147,12 @@ class ModelOffloader:
     # ------------------------------------------------------------------ API
 
     def set_loras(self, loras: Sequence[tuple[LoRA, float]]) -> None:
-        """Replace all LoRAs. Must be called while deactivated.
+        """Attach LoRAs for the next activation cycle.
+
+        Must be called while deactivated.  Transforms are cleared
+        automatically on :meth:`deactivate`, so callers must call
+        ``set_loras`` before each :meth:`activate` if they want
+        LoRA-merged inference.
 
         Each entry is a ``(lora, strength)`` tuple. Matches each
         :class:`LoRA`'s pre-pinned factors against model parameters via
@@ -218,21 +223,34 @@ class ModelOffloader:
         return self._model
 
     @property
+    def value(self) -> nn.Module:
+        return self._model
+
+    @property
     def cache_bytes(self) -> int:
         return sum(c.cache_bytes for c in self._components)
 
     def activate(self) -> None:
-        with contextlib.ExitStack() as stack:
-            for component in self._components:
-                stack.callback(component.deactivate)
-                component.activate()
-            self._teardown_stack = stack.pop_all()
+        try:
+            with contextlib.ExitStack() as stack:
+                for component in self._components:
+                    stack.callback(component.deactivate)
+                    component.activate()
+                self._teardown_stack = stack.pop_all()
+        except BaseException:
+            for buf in self._reverse_index.values():
+                buf.transform = None
+            raise
 
     def deactivate(self) -> None:
         stack = self._teardown_stack
         self._teardown_stack = None
-        if stack is not None:
-            stack.close()
+        try:
+            if stack is not None:
+                stack.close()
+        finally:
+            for buf in self._reverse_index.values():
+                buf.transform = None
 
     def __enter__(self) -> nn.Module:
         self.activate()

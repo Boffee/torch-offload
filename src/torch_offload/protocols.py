@@ -1,23 +1,28 @@
-"""Public protocols for model storage/placement strategies.
+"""Public protocols for cached resources and model strategies.
 
-Two related Protocols form the contract:
+Three Protocols form the contract:
 
 - :class:`ModelStrategyComponent` — pure lifecycle. A piece composable
   inside a top-level strategy (see :class:`ModelOffloader`).
   Just ``cache_bytes`` + ``activate()`` + ``deactivate()``. Components
-  don't expose a model because their parent composite owns it.
+  don't expose a value because their parent composite owns it.
 
-- :class:`ModelStrategy` — top-level. Extends the component contract
-  with model exposure (``model`` property) and context-manager methods
-  for the ``with strategy as model:`` pattern. This is what
+- :class:`CachedResource` — generic top-level cache contract.
+  Extends the component lifecycle with a typed :attr:`value` accessor
+  and context-manager methods. This is what
   :class:`~torch_offload.model_cache.ModelCache` registers and
-  manages.
+  manages.  ``T`` is the type yielded by :meth:`~ModelCache.use`.
 
-Top-level implementations in this package:
+- :class:`ModelStrategy` — model-specific specialization of
+  :class:`CachedResource[nn.Module]`.  Adds a ``model`` convenience
+  property for code that works specifically with model strategies.
+
+Top-level :class:`CachedResource` implementations in this package:
 :class:`~torch_offload.PinnedWeights` (whole-model bulk DMA between
-pinned CPU and GPU) and :class:`ModelOffloader` (composite of
-streamers + pinning + trainable handling). Future strategies (disk-mmap,
-NVMe-paged, multi-GPU shard) just satisfy :class:`ModelStrategy`.
+pinned CPU and GPU), :class:`ModelOffloader` (composite of
+streamers + pinning + trainable handling), and :class:`~torch_offload.LoRA`
+(pinned LoRA factor storage). Future resources (disk-mmap, NVMe-paged,
+multi-GPU shard) just satisfy :class:`CachedResource`.
 
 Component implementations: :class:`~torch_offload.StreamedWeights`,
 :class:`~torch_offload.TrainableWeights`. (And :class:`PinnedWeights`
@@ -26,20 +31,19 @@ also satisfies the component shape — composites use it inline.)
 Lifecycle
 ---------
 ``__init__`` sets up backing storage (pinning, etc.) so
-``cache_bytes`` is final immediately and a top-level strategy is ready
+``cache_bytes`` is final immediately and a top-level resource is ready
 for :class:`~torch_offload.model_cache.ModelCache` admission →
-``activate()`` (make model usable) → ``deactivate()`` (release transient
-compute resources, keep ``cache_bytes`` resident).
+``activate()`` (make resource usable) → ``deactivate()`` (release
+transient compute resources, keep ``cache_bytes`` resident).
 
 ``activate()/deactivate()`` may be repeated as many times as you
-want. Top-level strategies are also context managers:
-``with strategy as model: ...`` is equivalent to ``activate()`` then
-yielding ``strategy.model``.
+want. Top-level resources are also context managers:
+``with resource as value: ...`` is equivalent to ``activate()`` then
+yielding ``resource.value``.
 
 There is no ``close()``. To release ``cache_bytes`` (typically
-pinned host memory), drop the strategy reference (and the model
-reference if you don't need it anymore). Python's refcount-based
-GC frees pinned tensors immediately. Strategies release what they
+pinned host memory), drop the resource reference. Python's refcount-based
+GC frees pinned tensors immediately. Resources release what they
 own; ownership of the user's model is the user's concern.
 """
 
@@ -47,7 +51,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from types import TracebackType
-from typing import Literal, Protocol, runtime_checkable
+from typing import Literal, Protocol, TypeVar, runtime_checkable
 
 from torch import nn
 
@@ -127,37 +131,47 @@ class ModelStrategyComponent(Protocol):
         ...
 
 
+T_co = TypeVar("T_co", covariant=True)
+
+
 @runtime_checkable
-class ModelStrategy(ModelStrategyComponent, Protocol):
-    """Top-level strategy: a registerable, model-exposing variant of
-    :class:`ModelStrategyComponent`.
+class CachedResource(Protocol[T_co]):
+    """Top-level cache-managed resource.
 
-    Adds ``model`` (so callers can reach the wrapped module) plus
-    context-manager methods (so ``with strategy as model: ...`` works).
-    This is what :class:`~torch_offload.model_cache.ModelCache`
-    registers and manages.
+    Extends the component lifecycle with a typed :attr:`value`
+    accessor and context-manager methods.  This is the plug-in
+    contract that :class:`~torch_offload.model_cache.ModelCache`
+    consumes.
 
-    The ``@runtime_checkable`` decoration enables ``isinstance(x,
-    ModelStrategy)`` for sanity checks, but the check is structural
-    and only verifies attribute *presence*, not signatures or types.
-    Treat it as a weak guard, not a contract verifier.
+    ``T`` is the type yielded by :meth:`~ModelCache.use`:
+    ``nn.Module`` for model strategies, ``LoRA`` for standalone
+    LoRA factor storage, etc.
     """
 
     @property
-    def model(self) -> nn.Module:
-        """The wrapped model. Stable across activate/deactivate cycles
-        (the same Module is returned regardless of whether weights are
-        currently GPU-resident or pinned-CPU).
-
-        Must be available immediately after construction and must not
-        depend on activation state. ``ModelCache`` reads this getter
-        BEFORE calling :meth:`activate` to avoid a post-activation
-        exception window where a raising getter would skip the
-        deactivate path on an already-active strategy."""
+    def cache_bytes(self) -> int:
+        """Bytes charged against the cache budget."""
         ...
 
-    def __enter__(self) -> nn.Module:
-        """Calls :meth:`activate`, returns :attr:`model`."""
+    @property
+    def value(self) -> T_co:
+        """The cached payload, yielded by :meth:`~ModelCache.use`.
+
+        Must be available immediately after construction and must not
+        depend on activation state.
+        """
+        ...
+
+    def activate(self) -> None:
+        """Make the resource ready for compute."""
+        ...
+
+    def deactivate(self) -> None:
+        """Undo :meth:`activate`.  ``cache_bytes`` remains held."""
+        ...
+
+    def __enter__(self) -> T_co:
+        """Calls :meth:`activate`, returns :attr:`value`."""
         ...
 
     def __exit__(
@@ -167,4 +181,18 @@ class ModelStrategy(ModelStrategyComponent, Protocol):
         tb: TracebackType | None,
     ) -> bool | None:
         """Equivalent to :meth:`deactivate`."""
+        ...
+
+
+@runtime_checkable
+class ModelStrategy(CachedResource[nn.Module], Protocol):
+    """Model-specific cached resource.
+
+    Adds a ``model`` convenience property (equivalent to :attr:`value`)
+    for code that works specifically with model strategies.
+    """
+
+    @property
+    def model(self) -> nn.Module:
+        """The wrapped model.  Stable across activate/deactivate cycles."""
         ...

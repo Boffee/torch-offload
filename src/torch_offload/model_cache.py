@@ -1,18 +1,18 @@
-"""LRU model cache over :class:`ModelStrategy` plug-ins.
+"""LRU resource cache over :class:`CachedResource` plug-ins.
 
-Manages cached pinned-CPU (or other strategy-owned) backing storage for
-multiple independent models. When a new model needs more cache than is
-free, the least-recently-used inactive entries are evicted until room is
-available. Active entries (currently inside an ``acquire()`` /
-``use()`` context) are never evicted.
+Manages cached pinned-CPU (or other resource-owned) backing storage for
+multiple independent resources (models, LoRA adapters, etc.). When a new
+resource needs more cache than is free, the least-recently-used inactive
+entries are evicted until room is available. Active entries (currently
+inside a ``use()`` context) are never evicted.
 
 Design highlights
 -----------------
-- **Strategy-agnostic.** The cache only talks to the
-  :class:`ModelStrategy` protocol — three lifecycle methods plus
-  ``cache_bytes`` accounting. Pluggable: today :class:`PinnedWeights`
-  and :func:`ModelOffloader`; future strategies (disk-mmap, NVMe-paged,
-  multi-GPU shard) just satisfy the protocol.
+- **Resource-agnostic.** The cache only talks to the
+  :class:`CachedResource` protocol — lifecycle methods plus
+  ``cache_bytes`` accounting. Pluggable: today :class:`PinnedWeights`,
+  :class:`ModelOffloader`, and :class:`LoRA`; future resources
+  (disk-mmap, NVMe-paged, multi-GPU shard) just satisfy the protocol.
 - **Active-set with refcount.** Multiple keys can be active
   simultaneously (e.g. text encoder and embedding processor in the
   same call), and the same key can be acquired re-entrantly (refcount
@@ -44,12 +44,11 @@ import logging
 from collections import OrderedDict
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Generic, TypeVar, overload
 
 import torch
-from torch import nn
 
-from .protocols import ModelStrategy
+from .protocols import CachedResource
 
 logger = logging.getLogger(__name__)
 
@@ -59,9 +58,12 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-@dataclass(frozen=True, slots=True)
-class ModelSpec:
-    """Registration spec for a cached model.
+T = TypeVar("T")
+
+
+@dataclass(frozen=True)
+class ResourceSpec(Generic[T]):
+    """Registration spec for a cached resource.
 
     ``key`` is the cache identity — caller-chosen and must include any
     construction inputs that affect the resulting weights or structure
@@ -70,7 +72,7 @@ class ModelSpec:
     same key but a different factory silently returns the cached entry.
 
     ``estimated_cache_bytes`` is used to evict before building. The
-    cache reconciles against the actual ``strategy.cache_bytes`` after
+    cache reconciles against the actual ``resource.cache_bytes`` after
     construction; if the actual exceeds the estimate enough to overflow
     the budget, the cache evicts more or rejects the admission.
 
@@ -79,22 +81,19 @@ class ModelSpec:
     fall back to ``key``).
 
     .. note::
-       The ``factory`` should build a *fresh* model that the cache
-       solely owns. Eviction releases pinned host memory only when
-       the strategy (and the model it wraps) becomes unreachable —
-       Python's refcount-based GC handles this when the cache is the
-       sole owner. If the factory captures an externally-held model
-       in its closure (e.g., ``factory=lambda: PinnedWeights(my_model,
-       device)`` where ``my_model`` is alive elsewhere), eviction
-       drops the strategy but the model — with its pinned slots —
-       stays alive. ``used_cache_bytes`` will drop to reflect the
-       eviction, but the actual host memory won't be freed.
+       The ``factory`` should build a *fresh* resource that the cache
+       solely owns. Eviction releases backing storage only when
+       the resource becomes unreachable — Python's refcount-based GC
+       handles this when the cache is the sole owner.
     """
 
     key: str
     estimated_cache_bytes: int
-    factory: Callable[[], ModelStrategy]
+    factory: Callable[[], CachedResource[T]]
     label: str | None = None
+
+
+ModelSpec: type[ResourceSpec] = ResourceSpec
 
 
 @dataclass(frozen=True, slots=True)
@@ -210,11 +209,11 @@ class ActivationError(ModelCacheError):
 
 @dataclass
 class _Entry:
-    spec: ModelSpec
-    strategy: ModelStrategy | None = None
+    spec: ResourceSpec
+    strategy: CachedResource | None = None
     cache_bytes: int = 0           # actual, post-build
     active_count: int = 0
-    active_module: nn.Module | None = None  # cached for re-entrant acquire
+    active_value: Any = None  # cached for re-entrant acquire
 
 
 # ---------------------------------------------------------------------------
@@ -223,7 +222,7 @@ class _Entry:
 
 
 class ModelCache:
-    """LRU pool over :class:`ModelStrategy` instances.
+    """LRU pool over :class:`CachedResource` instances.
 
     Parameters
     ----------
@@ -280,7 +279,7 @@ class ModelCache:
     def used_cache_bytes(self) -> int:
         return self._used_bytes
 
-    def register(self, spec: ModelSpec, *, replace: bool = False) -> None:
+    def register(self, spec: ResourceSpec, *, replace: bool = False) -> None:
         """Register a lazy model factory without building it.
 
         Idempotent only with ``replace=True``: re-registering an
@@ -318,19 +317,25 @@ class ModelCache:
             self._evict_inactive(key)
         del self._entries[key]
 
-    @contextlib.contextmanager
-    def use(self, model: str | ModelSpec) -> Iterator[nn.Module]:
-        """Acquire an active lease on a cached model.
+    @overload
+    def use(self, model: ResourceSpec[T]) -> contextlib.AbstractContextManager[T]: ...
+    @overload
+    def use(self, model: str) -> contextlib.AbstractContextManager[Any]: ...
 
-        Accepts either a registered key (string) or a :class:`ModelSpec`
+    @contextlib.contextmanager
+    def use(self, model: str | ResourceSpec) -> Iterator[Any]:
+        """Acquire an active lease on a cached resource.
+
+        Accepts either a registered key (string) or a :class:`ResourceSpec`
         (auto-registers if its key isn't already known). Yields the
-        ``nn.Module`` for use; on context exit, releases the lease.
+        resource's :attr:`~CachedResource.value` for use; on context
+        exit, releases the lease.
 
         Re-entrant for the same key: nested ``use()`` calls bump a
-        per-key refcount and share the already-active module (the
-        underlying strategy is *not* activated again).
+        per-key refcount and share the already-active value (the
+        underlying resource is *not* activated again).
         """
-        spec = model if isinstance(model, ModelSpec) else None
+        spec = model if isinstance(model, ResourceSpec) else None
         key = spec.key if spec is not None else model
         assert isinstance(key, str)
 
@@ -338,14 +343,14 @@ class ModelCache:
         if entry is None:
             if spec is None:
                 raise ModelNotRegisteredError(
-                    f"{key!r} is not registered; pass a ModelSpec to use() or call register() first"
+                    f"{key!r} is not registered; pass a ResourceSpec to use() or call register() first"
                 )
             self.register(spec)
             entry = self._entries[key]
 
         with self._activate_entry(entry):
-            assert entry.active_module is not None
-            yield entry.active_module
+            assert entry.active_value is not None
+            yield entry.active_value
 
     def evict(self, key: str) -> None:
         """Manually evict one inactive cached entry. Raises
@@ -425,12 +430,12 @@ class ModelCache:
             self._lru.pop(key, None)  # leaving inactive set
 
         assert entry.strategy is not None
-        # Fetch model BEFORE activate. The Protocol contract says
-        # `strategy.model` is stable across cycles (available regardless
+        # Fetch value BEFORE activate. The Protocol contract says
+        # `strategy.value` is stable across cycles (available regardless
         # of activation state), and reading first eliminates a post-
-        # activate exception window where a raising `model` getter
+        # activate exception window where a raising `value` getter
         # would skip the deactivate path on the now-active strategy.
-        module = entry.strategy.model
+        value = entry.strategy.value
         try:
             entry.strategy.activate()
         except BaseException as exc:
@@ -489,7 +494,7 @@ class ModelCache:
                     self._used_bytes, self._max_cache_bytes,
                 )
 
-        entry.active_module = module
+        entry.active_value = value
         entry.active_count = 1
         try:
             yield
@@ -506,7 +511,7 @@ class ModelCache:
                 except BaseException:
                     self._discard_entry(entry, was_active=True)
                     raise
-                entry.active_module = None
+                entry.active_value = None
                 # Active → inactive: re-enter LRU at MRU position.
                 self._lru[key] = None
 
@@ -625,7 +630,7 @@ class ModelCache:
         entry.strategy = None
         entry.cache_bytes = 0
         if was_active:
-            entry.active_module = None
+            entry.active_value = None
             entry.active_count = 0
         self._lru.pop(key, None)
         self._used_bytes -= bytes_to_free

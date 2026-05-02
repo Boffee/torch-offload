@@ -15,10 +15,13 @@ import torch
 from torch import nn
 
 from torch_offload import (
-    ModelOffloader,
     LoRA,
+    ModelCache,
+    ModelOffloader,
+    ResourceSpec,
 )
 from torch_offload.lora import KeyTransformT
+from torch_offload.protocols import CachedResource
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -519,3 +522,33 @@ class TestCacheBytes:
         assert s.cache_bytes == baseline
         s.set_loras([])
         assert s.cache_bytes == baseline
+
+
+# ---------------------------------------------------------------------------
+# LoRA as CachedResource (ModelCache integration)
+# ---------------------------------------------------------------------------
+
+
+class TestLoRACachedResource:
+    def test_lora_satisfies_cached_resource(self) -> None:
+        lora = _make_lora(num_blocks=2, dim=8, rank=2)
+        assert isinstance(lora, CachedResource)
+        assert not isinstance(lora, nn.Module)
+
+    def test_lora_through_model_cache(self) -> None:
+        sd = _make_lora_sd(num_blocks=2, dim=8, rank=2)
+        cache = ModelCache(10**9)
+        spec = ResourceSpec(
+            key="lora:test",
+            estimated_cache_bytes=1000,
+            factory=lambda: LoRA(sd),
+        )
+        with cache.use(spec) as lora:
+            assert isinstance(lora, LoRA)
+            assert lora.cache_bytes > 0
+            assert len(lora.targets) == 2
+        with cache.use("lora:test") as lora2:
+            assert lora2 is lora
+        snap = cache.snapshot()
+        assert snap.stats.builds == 1
+        assert snap.stats.hits == 1

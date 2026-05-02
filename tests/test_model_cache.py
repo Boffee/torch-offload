@@ -59,6 +59,10 @@ class FakeStrategy:
     def model(self) -> nn.Module:
         return self.module
 
+    @property
+    def value(self) -> nn.Module:
+        return self.module
+
     def activate(self) -> None:
         self.events.append("activate")
         if self._activate_raises is not None:

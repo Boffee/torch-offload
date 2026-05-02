@@ -16,6 +16,7 @@ fires automatically when the buffer copies to GPU.
 from __future__ import annotations
 
 from collections.abc import Callable
+from types import TracebackType
 
 import torch
 
@@ -42,6 +43,12 @@ class LoRA:
     Factors are paired, validated, and pinned to host memory at
     construction.  The raw ``state_dict`` is not retained.
 
+    Implements :class:`~torch_offload.protocols.CachedResource` so it
+    can be registered in :class:`~torch_offload.ModelCache` for budget
+    tracking and LRU eviction.  ``activate``/``deactivate`` are no-ops
+    — factors stay on pinned CPU and are copied to GPU per-parameter
+    by :class:`LoRATransform` during the merge-on-DMA callback.
+
     Strength is extrinsic — specify it when passing the adapter to
     :meth:`ModelOffloader.set_loras` as a ``(LoRA, strength)`` tuple.
 
@@ -49,8 +56,6 @@ class LoRA:
     Defaults to stripping the ``diffusion_model.`` prefix common in
     ComfyUI LoRA files.  Pass ``None`` to disable.
     """
-
-    __slots__ = ("_factors",)
 
     def __init__(
         self,
@@ -67,6 +72,28 @@ class LoRA:
     @property
     def cache_bytes(self) -> int:
         return sum(a.nbytes + b.nbytes for a, b in self._factors.values())
+
+    @property
+    def value(self) -> LoRA:
+        return self
+
+    def activate(self) -> None:
+        pass
+
+    def deactivate(self) -> None:
+        pass
+
+    def __enter__(self) -> LoRA:
+        self.activate()
+        return self.value
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        self.deactivate()
 
 
 class LoRATransform:

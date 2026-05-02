@@ -70,15 +70,17 @@ from .model_cache import (
     ModelNotRegisteredError,
     ModelSpec,
     ModelTooLargeError,
+    ResourceSpec,
 )
 from .model_offloader import ModelOffloader, detect_streaming_region_ties
 from .pinned_weights import PinnedWeights
-from .protocols import ModelStrategy, ModelStrategyComponent, SlotOwnership
+from .protocols import CachedResource, ModelStrategy, ModelStrategyComponent, SlotOwnership
 from .streamed_weights import StreamedWeights
 from .trainable_weights import TrainableWeights
 
 __all__ = [
     "ActivationError",
+    "CachedResource",
     "DuplicateModelKeyError",
     "GGUFWeight",
     "LoRA",
@@ -93,6 +95,7 @@ __all__ = [
     "ModelStrategyComponent",
     "ModelTooLargeError",
     "PinnedWeights",
+    "ResourceSpec",
     "SlotOwnership",
     "StreamedWeights",
     "TrainableWeights",

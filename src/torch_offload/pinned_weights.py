@@ -304,6 +304,10 @@ class PinnedWeights:
         assert self._model is not None
         return self._model
 
+    @property
+    def value(self) -> nn.Module:
+        return self.model
+
     def activate(self) -> None:
         """Bulk-DMA pinned weights to GPU.
 
