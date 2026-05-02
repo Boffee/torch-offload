@@ -527,6 +527,28 @@ class TestCacheBytesValidation:
         assert snap.used_cache_bytes == 0
         # Strategy was constructed and then released.
 
+    def test_negative_post_activate_rejected(self) -> None:
+        # A strategy that reports a sane cache_bytes pre-activate but
+        # mutates to negative during activate must be rejected — silently
+        # admitting it would corrupt _used_bytes accounting.
+        class PostActivateNegative(FakeStrategy):
+            def activate(self) -> None:
+                super().activate()
+                self._cache_bytes = -1
+
+        def factory():
+            return PostActivateNegative(100)
+
+        cache = ModelCache(200)
+        spec = ModelSpec(key="bad", estimated_cache_bytes=100, factory=factory)
+        with pytest.raises(Exception, match="cache_bytes"):
+            with cache.use(spec):
+                pass
+        snap = cache.snapshot()
+        assert snap.used_cache_bytes == 0
+        assert snap.stats.activation_errors == 1
+        assert "bad" not in snap.cached_keys_lru_to_mru
+
 
 # ---------------------------------------------------------------------------
 # Snapshot is immutable

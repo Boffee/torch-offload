@@ -211,9 +211,8 @@ class ActivationError(ModelCacheError):
 class _Entry:
     spec: ResourceSpec
     strategy: CachedResource | None = None
-    cache_bytes: int = 0           # actual, post-build
+    cache_bytes: int = 0  # actual, post-build
     active_count: int = 0
-    active_value: Any = None  # cached for re-entrant acquire
 
 
 # ---------------------------------------------------------------------------
@@ -230,12 +229,15 @@ class ModelCache:
         Total budget for cached strategy backing storage (typically
         pinned host memory). Must be ≥ 0.
     empty_host_cache:
-        Optional callback invoked after every successful eviction (and
-        after dropping a rejected newly-built strategy) to flush PyTorch's
-        ``CachingHostAllocator`` so freed pinned pages return to the OS.
-        If ``None`` and CUDA is available, defaults to
-        ``torch._C._host_emptyCache`` when present. Pass a no-op
-        callable to disable.
+        Optional callback invoked after any path that releases a
+        cache-held strategy reference — eviction, admission rejection
+        (negative or oversized post-build ``cache_bytes``), activation
+        failure on freshly-built or previously-cached entries,
+        post-activate contract violations, and deactivate poisoning.
+        Flushes PyTorch's ``CachingHostAllocator`` so freed pinned
+        pages return to the OS. If ``None`` and CUDA is available,
+        defaults to ``torch._C._host_emptyCache`` when present. Pass
+        a no-op callable to disable.
     """
 
     def __init__(
@@ -292,10 +294,17 @@ class ModelCache:
             raise ValueError(
                 f"spec.estimated_cache_bytes must be >= 0, got {spec.estimated_cache_bytes}"
             )
-        if spec.key in self._entries:
+        existing = self._entries.get(spec.key)
+        if existing is not None:
             if not replace:
                 raise DuplicateModelKeyError(f"{spec.key!r} is already registered")
-            self._evict_for_replace(spec.key)
+            if existing.active_count > 0:
+                raise ModelInUseError(
+                    f"cannot replace active registration {spec.key!r} "
+                    f"(refcount={existing.active_count})"
+                )
+            if existing.strategy is not None:
+                self._evict_inactive(spec.key)
         self._entries[spec.key] = _Entry(spec=spec)
 
     def unregister(self, key: str, *, evict: bool = True) -> None:
@@ -348,9 +357,11 @@ class ModelCache:
             self.register(spec)
             entry = self._entries[key]
 
-        with self._activate_entry(entry):
-            assert entry.active_value is not None
-            yield entry.active_value
+        value = self._acquire(entry)
+        try:
+            yield value
+        finally:
+            self._release(entry)
 
     def evict(self, key: str) -> None:
         """Manually evict one inactive cached entry. Raises
@@ -406,234 +417,213 @@ class ModelCache:
         )
 
     # ------------------------------------------------------------------
-    # Internals
+    # Lease lifecycle
     # ------------------------------------------------------------------
 
-    @contextlib.contextmanager
-    def _activate_entry(self, entry: _Entry) -> Iterator[None]:
-        key = entry.spec.key
-        # Re-entrant case: already active for this key. Bump refcount,
-        # share the active module, do not re-activate the strategy.
-        if entry.active_count > 0:
-            entry.active_count += 1
-            try:
-                yield
-            finally:
-                entry.active_count -= 1
-            return
+    def _acquire(self, entry: _Entry) -> Any:
+        """Build (if needed), activate, and return the resource value.
 
-        # First lease: ensure built, then activate.
+        Re-entrant: if the entry is already active, bump the refcount
+        and share the value without re-activating. On activate or
+        post-activate-reconcile failure, the entry is discarded and
+        an exception propagates."""
+        # Re-entrant lease: strategy is already active. The protocol
+        # contract guarantees `value` is stable across activation
+        # cycles, so re-reading it is safe.
+        if entry.active_count > 0:
+            value = entry.strategy.value
+            entry.active_count += 1
+            return value
+
+        key = entry.spec.key
         if entry.strategy is None:
             self._build_into_entry(entry)
         else:
             self._stats.hits += 1
-            self._lru.pop(key, None)  # leaving inactive set
+            self._lru.pop(key, None)  # leaving the inactive set
 
         assert entry.strategy is not None
-        # Fetch value BEFORE activate. The Protocol contract says
-        # `strategy.value` is stable across cycles (available regardless
-        # of activation state), and reading first eliminates a post-
-        # activate exception window where a raising `value` getter
-        # would skip the deactivate path on the now-active strategy.
+        # Read value BEFORE activate. The protocol says `value` is
+        # available regardless of activation state; reading first
+        # eliminates a post-activate exception window where a raising
+        # `value` getter would skip the deactivate path on the now-
+        # active strategy.
         value = entry.strategy.value
         try:
             entry.strategy.activate()
         except BaseException as exc:
             self._stats.activation_errors += 1
-            # Treat all activation failures as poisoned regardless of
-            # whether the entry was freshly built or previously cached.
-            # Block-streaming strategies can fail mid-way through
-            # activate after partially registering hooks / allocating
-            # GPU pool / activating composed PinnedWeights. Caching
-            # such an entry as "ready to retry" lies about its state
-            # and the next acquire would operate on partially-installed
-            # resources.
-            self._discard_entry(entry)
+            self._release_strategy(entry, evicted=False)
             raise ActivationError(f"activate() failed for {key!r}") from exc
 
-        # Reconcile cache_bytes after a successful activate. Most
-        # strategies pin in __init__ so cache_bytes is final at
-        # admission, but a strategy that defers pinning (e.g., a custom
-        # one) might report 0 at admission and pin during activate.
-        # Without this update _used_bytes would lag reality and future
-        # admissions would over-commit. If the actual now exceeds
-        # max_cache_bytes we can't unwind mid-context (the strategy is
-        # active and being
-        # yielded), so we log and continue — the user is over budget
-        # but at least the accounting reflects it.
-        post_activate_bytes = entry.strategy.cache_bytes
-        if post_activate_bytes < 0:
-            # Same guard as the factory-admission path. A misbehaving
-            # strategy returning negative cache_bytes after activate
-            # would corrupt _used_bytes accounting just as it would
-            # at admission. Treat the activation as failed and discard.
+        try:
+            self._reconcile_bytes(entry, entry.strategy.cache_bytes, phase="activate")
+        except BaseException:
             with contextlib.suppress(BaseException):
                 entry.strategy.deactivate()
             self._stats.activation_errors += 1
-            self._discard_entry(entry)
-            raise ModelCacheError(
-                f"strategy.cache_bytes for {key!r} returned "
-                f"{post_activate_bytes} (must be >= 0) after activate"
-            )
-        if post_activate_bytes != entry.cache_bytes:
-            delta = post_activate_bytes - entry.cache_bytes
-            entry.cache_bytes = post_activate_bytes
-            self._used_bytes += delta
-            self._stats.peak_cache_bytes = max(
-                self._stats.peak_cache_bytes, self._used_bytes
-            )
-            if self._used_bytes > self._max_cache_bytes:
-                logger.warning(
-                    "ModelCache over budget after activate(): %r grew from "
-                    "%d to %d bytes; total %d/%d. The strategy reported a "
-                    "smaller cache_bytes at construction than after "
-                    "activate() — usually means a custom strategy that "
-                    "defers pinning. Pin in __init__ so cache_bytes is "
-                    "final at admission.",
-                    key, entry.cache_bytes - delta, post_activate_bytes,
-                    self._used_bytes, self._max_cache_bytes,
-                )
+            self._release_strategy(entry, evicted=False)
+            raise
 
-        entry.active_value = value
         entry.active_count = 1
+        return value
+
+    def _release(self, entry: _Entry) -> None:
+        """End a lease. On the final release, deactivate and re-enter
+        the entry into the LRU at MRU. A raising deactivate poisons
+        the entry — discard and propagate so the caller sees the
+        strategy's failure."""
+        entry.active_count -= 1
+        if entry.active_count > 0:
+            return
         try:
-            yield
-        finally:
-            entry.active_count -= 1
-            if entry.active_count == 0:
-                # Strategy contract: deactivate is expected to leave
-                # the strategy in a clean inactive state and not raise
-                # under normal use. If it does raise, the strategy's
-                # internal state is unknown — don't risk reusing it.
-                # Discard so a subsequent acquire rebuilds.
-                try:
-                    entry.strategy.deactivate()
-                except BaseException:
-                    self._discard_entry(entry, was_active=True)
-                    raise
-                entry.active_value = None
-                # Active → inactive: re-enter LRU at MRU position.
-                self._lru[key] = None
+            entry.strategy.deactivate()
+        except BaseException:
+            self._release_strategy(entry, evicted=False)
+            raise
+        self._lru[entry.spec.key] = None
+
+    # ------------------------------------------------------------------
+    # Build & accounting
+    # ------------------------------------------------------------------
 
     def _build_into_entry(self, entry: _Entry) -> None:
-        """Cache miss: evict to make room, build, reconcile actuals."""
+        """Cache miss: pre-evict, build, validate, commit accounting.
+
+        Pre-build eviction trusts the estimate. After construction,
+        a negative ``cache_bytes`` is rejected and an over-estimate
+        triggers further eviction (which can fail with
+        :class:`ModelTooLargeError`). All post-factory failure paths
+        drop the local strategy ref BEFORE the host-cache flush so
+        refcount-GC frees pinned tensors in time for the flush to
+        actually reclaim them.
+        """
         key = entry.spec.key
         self._stats.misses += 1
         estimate = entry.spec.estimated_cache_bytes
-        # Pre-build eviction: trust the estimate.
         self._evict_until_room(key, estimate)
         try:
             strategy = entry.spec.factory()
         except BaseException:
             self._stats.factory_errors += 1
             raise
-        actual = strategy.cache_bytes
-        if actual < 0:
-            # Misbehaving strategy. Don't admit it (would corrupt
-            # _used_bytes accounting). Drop the local ref BEFORE the
-            # host-cache flush so refcount-GC frees the strategy's
-            # pinned tensors in time for empty_host_cache to actually
-            # reclaim them.
+
+        try:
+            actual = strategy.cache_bytes
+            if actual < 0:
+                raise ModelCacheError(
+                    f"strategy.cache_bytes for {key!r} returned {actual} (must be >= 0)"
+                )
+            if actual > estimate:
+                self._evict_until_room(key, actual)
+        except BaseException:
             del strategy
             self._after_release()
-            raise ModelCacheError(
-                f"strategy.cache_bytes for {key!r} returned {actual} (must be >= 0)"
-            )
-        # Reconcile if actual overshot the estimate.
-        if actual > estimate:
-            try:
-                self._evict_until_room(key, actual)
-            except BaseException:
-                # Can't fit the actual size — drop the new strategy and
-                # re-raise. Don't mark as built. del-before-flush so
-                # refcount-GC frees the strategy before the host-cache
-                # flush runs.
-                del strategy
-                self._after_release()
-                raise
+            raise
+
         entry.strategy = strategy
-        entry.cache_bytes = actual
-        self._used_bytes += actual
+        # Initial commit: cache_bytes is currently 0; reconcile against
+        # actual to record the bytes and update peak. Build-path
+        # eviction already made room, so the over-budget warning path
+        # is unreachable from here.
+        self._reconcile_bytes(entry, actual, phase="build")
         self._stats.builds += 1
+        # Freshly-built entries are about to be activated; do NOT add
+        # to LRU yet. They'll be added on first deactivate.
+
+    def _reconcile_bytes(self, entry: _Entry, observed: int, *, phase: str) -> None:
+        """Apply ``observed`` to entry and global byte accounting.
+
+        Used on the build path (initial commit, 0 → actual) and on the
+        activate path (drift from a strategy that defers pinning).
+        Raises :class:`ModelCacheError` if ``observed < 0`` so a
+        misbehaving strategy can't corrupt ``_used_bytes`` (the build
+        path also pre-validates before attaching to keep refcount-GC
+        timing correct on the cleanup path). Logs a warning if the
+        update pushes total usage over budget — only reachable from
+        the activate path; build-path pre-eviction makes the budget
+        already satisfied at this call.
+        """
+        if observed < 0:
+            raise ModelCacheError(
+                f"strategy.cache_bytes for {entry.spec.key!r} returned "
+                f"{observed} (must be >= 0) after {phase}"
+            )
+        if observed == entry.cache_bytes:
+            return
+        delta = observed - entry.cache_bytes
+        entry.cache_bytes = observed
+        self._used_bytes += delta
         self._stats.peak_cache_bytes = max(self._stats.peak_cache_bytes, self._used_bytes)
-        # Freshly-built entries are about to be activated; do NOT add to
-        # LRU yet. They'll be added on first deactivate.
+        if self._used_bytes > self._max_cache_bytes:
+            logger.warning(
+                "ModelCache over budget after %s: %r grew to %d bytes; total %d/%d. "
+                "The strategy reported a smaller cache_bytes earlier than at this "
+                "point — usually a custom strategy that defers pinning. Pin in "
+                "__init__ so cache_bytes is final at admission.",
+                phase, entry.spec.key, observed,
+                self._used_bytes, self._max_cache_bytes,
+            )
+
+    # ------------------------------------------------------------------
+    # Eviction & release
+    # ------------------------------------------------------------------
 
     def _evict_until_room(self, incoming_key: str, required: int) -> None:
-        """Evict inactive LRU entries until ``required`` bytes fit. If
-        active entries block sufficient eviction, raise
-        :class:`ModelTooLargeError`."""
+        """Evict inactive LRU entries until ``required`` bytes fit.
+        Raises :class:`ModelTooLargeError` when active entries block
+        sufficient eviction."""
         if required > self._max_cache_bytes:
-            raise ModelTooLargeError(
-                key=incoming_key,
-                required=required,
-                used=self._used_bytes,
-                limit=self._max_cache_bytes,
-                active_refcounts={
-                    k: e.active_count for k, e in self._entries.items() if e.active_count > 0
-                },
-            )
+            raise self._too_large(incoming_key, required)
         while self._used_bytes + required > self._max_cache_bytes:
             try:
                 victim = next(iter(self._lru))
             except StopIteration:
-                raise ModelTooLargeError(
-                    key=incoming_key,
-                    required=required,
-                    used=self._used_bytes,
-                    limit=self._max_cache_bytes,
-                    active_refcounts={
-                        k: e.active_count for k, e in self._entries.items() if e.active_count > 0
-                    },
-                ) from None
+                raise self._too_large(incoming_key, required) from None
             self._evict_inactive(victim)
 
+    def _too_large(self, key: str, required: int) -> ModelTooLargeError:
+        return ModelTooLargeError(
+            key=key,
+            required=required,
+            used=self._used_bytes,
+            limit=self._max_cache_bytes,
+            active_refcounts={
+                k: e.active_count
+                for k, e in self._entries.items()
+                if e.active_count > 0
+            },
+        )
+
     def _evict_inactive(self, key: str) -> None:
+        """Release a cached, inactive entry as an eviction. Asserts the
+        precondition (built + inactive); :meth:`_release_strategy`
+        bumps eviction stats."""
         entry = self._entries[key]
-        assert entry.strategy is not None
-        assert entry.active_count == 0
+        assert entry.strategy is not None and entry.active_count == 0
+        self._release_strategy(entry, evicted=True)
+
+    def _release_strategy(self, entry: _Entry, *, evicted: bool) -> None:
+        """Drop the strategy reference and update accounting.
+
+        Used on three paths: LRU eviction (``evicted=True``), activation
+        or contract failure (``evicted=False``), and deactivate poisoning
+        (``evicted=False``). Dropping ``entry.strategy`` triggers
+        refcount-GC of pinned tensors when the cache was the sole
+        owner; the host-cache flush runs after so freed pages return
+        to the OS.
+        """
         bytes_freed = entry.cache_bytes
-        # Detach from cache state — dropping `entry.strategy` releases
-        # the cache's only reference to the strategy. If the entry's
-        # factory built a fresh model (the typical pattern), the
-        # strategy was the sole owner of the model and Python's
-        # refcount-based GC frees the pinned tensors immediately.
+        # Drop strategy ref BEFORE the host-cache flush so refcount-GC
+        # frees pinned tensors in time for empty_host_cache to reclaim
+        # them.
         entry.strategy = None
         entry.cache_bytes = 0
-        self._lru.pop(key, None)
+        self._lru.pop(entry.spec.key, None)
         self._used_bytes -= bytes_freed
-        self._stats.evictions += 1
-        self._stats.bytes_evicted += bytes_freed
-        self._after_release()
-
-    def _evict_for_replace(self, key: str) -> None:
-        """``register(replace=True)`` path. Refuses to clobber an active
-        entry."""
-        entry = self._entries[key]
-        if entry.active_count > 0:
-            raise ModelInUseError(
-                f"cannot replace active registration {key!r} (refcount={entry.active_count})"
-            )
-        if entry.strategy is not None:
-            self._evict_inactive(key)
-
-    def _discard_entry(self, entry: _Entry, *, was_active: bool = False) -> None:
-        """Detach an entry from cache state — for activation failures,
-        deactivate poisoning, and unregistration. Dropping the
-        ``entry.strategy`` reference triggers GC; if the cache was the
-        sole owner of the model, pinned tensors are freed immediately.
-        ``was_active=True`` also clears the active-module bookkeeping
-        (only relevant on the deactivate-poisoned path; active state
-        is otherwise managed by the use() context)."""
-        key = entry.spec.key
-        bytes_to_free = entry.cache_bytes
-        entry.strategy = None
-        entry.cache_bytes = 0
-        if was_active:
-            entry.active_value = None
-            entry.active_count = 0
-        self._lru.pop(key, None)
-        self._used_bytes -= bytes_to_free
+        if evicted:
+            self._stats.evictions += 1
+            self._stats.bytes_evicted += bytes_freed
         self._after_release()
 
     def _after_release(self) -> None:
