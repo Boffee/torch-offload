@@ -485,6 +485,389 @@ class TestMergeCorrectness:
 # ---------------------------------------------------------------------------
 
 
+class TestRoutedMode:
+    """Routed-mode LoRA: forward hook on the parent layer, base
+    weight untouched. Math: y = base(x) + α·B·A·x.
+    """
+
+    def _expected_routed_output(
+        self,
+        model: nn.Module,
+        x: torch.Tensor,
+        loras: list[tuple[LoRA, float]],
+    ) -> torch.Tensor:
+        """Manual baseline: walk the block list using F.linear so we
+        bypass any forward hooks installed on the layers (otherwise
+        the expected calculation would also include the hook output
+        and we'd be comparing the hook against itself)."""
+        import torch.nn.functional as F  # noqa: N812
+
+        h = F.linear(x, model.embed.weight)
+        for i, blk in enumerate(model.transformer_blocks):
+            base_attn = F.linear(h, blk.attn.weight)
+            extra = torch.zeros_like(base_attn)
+            target_name = f"transformer_blocks.{i}.attn.weight"
+            for lora, strength in loras:
+                factors = lora.targets.get(target_name)
+                if factors is None:
+                    continue
+                a, b = factors
+                a_dev = a.to(device=h.device, dtype=h.dtype)
+                b_dev = b.to(device=h.device, dtype=h.dtype)
+                extra = extra + strength * (h @ a_dev.T @ b_dev.T)
+            h = F.linear(base_attn + extra, blk.ff.weight)
+        return F.linear(h, model.head.weight)
+
+    @CUDA
+    def test_routed_forward_matches_manual_baseline(self) -> None:
+        # Routed mode: base weight stays exactly as constructed; the
+        # LoRA contribution rides as a forward-hook addition.
+        m = _make_bf16_model(num_blocks=3, dim=16)
+        loras = [
+            (_make_lora(num_blocks=3, dim=16, seed=11), 0.5),
+            (_make_lora(num_blocks=3, dim=16, seed=22), 0.25),
+        ]
+        base_snapshots = [
+            m.transformer_blocks[i].attn.weight.detach().clone()
+            for i in range(3)
+        ]
+
+        s = _make_strategy(m, device="cuda")
+        s.set_loras(loras, mode="routed")
+        s.activate()
+        try:
+            x = torch.randn(2, 16, dtype=torch.bfloat16, device="cuda")
+            actual = m(x)
+            torch.cuda.synchronize()
+            expected = self._expected_routed_output(m, x, loras)
+            # Tolerance accounts for bf16 rounding noise accumulating
+            # across 3 blocks of GEMMs + LoRA contributions; the hook's
+            # sequential `output + strength * (...)` adds round
+            # differently than the F.linear baseline's single
+            # accumulator path.
+            assert torch.allclose(actual, expected, rtol=0.1, atol=0.1), (
+                f"routed forward mismatch:\n"
+                f"  expected: {expected.flatten()[:4]}\n"
+                f"  actual:   {actual.flatten()[:4]}"
+            )
+        finally:
+            s.deactivate()
+
+        # Base weights on CPU snapshots must equal the model's current
+        # (post-deactivate) base weights — routed mode didn't mutate.
+        for i in range(3):
+            assert torch.equal(
+                m.transformer_blocks[i].attn.weight.detach(),
+                base_snapshots[i],
+            ), f"routed mode mutated block {i} base weight"
+
+    @CUDA
+    def test_routed_clears_on_deactivate(self) -> None:
+        # Hooks installed on activate must be removed on deactivate so
+        # subsequent base-only forward sees the unaugmented model.
+        m = _make_bf16_model(num_blocks=3, dim=16)
+        s = _make_strategy(m, device="cuda")
+        s.set_loras([(_make_lora(3, 16, seed=7), 1.0)], mode="routed")
+        s.activate()
+        x = torch.randn(2, 16, dtype=torch.bfloat16, device="cuda")
+        with_lora = m(x).detach().clone()
+        torch.cuda.synchronize()
+        s.deactivate()
+
+        # Re-activate without LoRAs; output should differ from with_lora
+        # (the hooks should be gone).
+        s.set_loras([], mode="routed")
+        s.activate()
+        try:
+            base_only = m(x)
+            torch.cuda.synchronize()
+            assert not torch.allclose(with_lora, base_only, rtol=0.001, atol=0.001), (
+                "deactivate did not remove routed hooks; base-only output "
+                "still reflects LoRA contribution"
+            )
+        finally:
+            s.deactivate()
+
+    @CUDA
+    def test_routed_concat_handles_mixed_ranks(self) -> None:
+        # Multiple LoRAs targeting the same weight at different ranks
+        # must produce the same forward output as the un-fused loop.
+        # Validates the concat math: fused rank = r1 + r2 + ..., and
+        # B_fused @ A_fused == sum_i strength_i * B_i @ A_i.
+        m = _make_bf16_model(num_blocks=2, dim=16)
+        # Two LoRAs targeting the same blocks with different ranks.
+        lora_r4 = _make_lora(num_blocks=2, dim=16, rank=4, seed=101)
+        lora_r8 = _make_lora(num_blocks=2, dim=16, rank=8, seed=202)
+        loras = [(lora_r4, 0.6), (lora_r8, 0.3)]
+
+        s = _make_strategy(m, device="cuda")
+        s.set_loras(loras, mode="routed")
+        s.activate()
+        try:
+            x = torch.randn(2, 16, dtype=torch.bfloat16, device="cuda")
+            actual = m(x)
+            torch.cuda.synchronize()
+            expected = self._expected_routed_output(m, x, loras)
+            assert torch.allclose(actual, expected, rtol=0.1, atol=0.1), (
+                f"mixed-rank concat output mismatch:\n"
+                f"  expected: {expected.flatten()[:4]}\n"
+                f"  actual:   {actual.flatten()[:4]}"
+            )
+        finally:
+            s.deactivate()
+
+    def test_routed_with_non_linear_target_raises(self) -> None:
+        # Routed math assumes y = x @ W.T + bias. If a target's parent
+        # is not nn.Linear, set_loras(mode="routed") must reject so we
+        # don't silently install a hook against an incompatible forward.
+        class LinearLike(nn.Module):
+            """nn.Linear-shaped weight but not an nn.Linear instance."""
+
+            def __init__(self, dim: int) -> None:
+                super().__init__()
+                self.weight = nn.Parameter(
+                    torch.randn(dim, dim, dtype=torch.bfloat16),
+                    requires_grad=False,
+                )
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                return x @ self.weight.T
+
+        class Block(nn.Module):
+            def __init__(self, dim: int) -> None:
+                super().__init__()
+                self.attn = LinearLike(dim)
+                self.ff = nn.Linear(dim, dim, bias=False)
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                return self.ff(self.attn(x))
+
+        class M(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.transformer_blocks = nn.ModuleList(
+                    [Block(16) for _ in range(2)]
+                )
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                for blk in self.transformer_blocks:
+                    x = blk(x)
+                return x
+
+        model = M().to(torch.bfloat16)
+        for p in model.parameters():
+            p.requires_grad = False
+
+        s = ModelOffloader(
+            model, torch.device("cpu"),
+            layers_attr="transformer_blocks", blocks_to_swap=1,
+        )
+        # Build a LoRA targeting attn.weight (LinearLike, not nn.Linear).
+        lora = _make_lora(num_blocks=2, dim=16, seed=3)
+        with pytest.raises(ValueError, match="Routed LoRA mode requires nn.Linear"):
+            s.set_loras([(lora, 1.0)], mode="routed")
+        # Merge mode should still work — it doesn't care about parent type.
+        s.set_loras([(lora, 1.0)], mode="merge")
+
+    def test_routed_partial_failure_leaves_no_pending_state(self) -> None:
+        # Mid-loop rejection (e.g., one non-Linear target after some
+        # valid Linear targets) must NOT leave a half-built
+        # _pending_routes — the offloader has to roll back to the
+        # cleared state set at the top of set_loras.
+        class LinearLike(nn.Module):
+            def __init__(self, dim: int) -> None:
+                super().__init__()
+                self.weight = nn.Parameter(
+                    torch.randn(dim, dim, dtype=torch.bfloat16),
+                    requires_grad=False,
+                )
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                return x @ self.weight.T
+
+        class Block(nn.Module):
+            def __init__(self, dim: int, normal_attn: bool) -> None:
+                super().__init__()
+                self.attn = (
+                    nn.Linear(dim, dim, bias=False) if normal_attn
+                    else LinearLike(dim)
+                )
+                self.ff = nn.Linear(dim, dim, bias=False)
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                return self.ff(self.attn(x))
+
+        class M(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                # Block 0: normal Linear (passes routed validation).
+                # Block 1: LinearLike (fails routed validation).
+                self.transformer_blocks = nn.ModuleList(
+                    [Block(16, normal_attn=True), Block(16, normal_attn=False)]
+                )
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                for blk in self.transformer_blocks:
+                    x = blk(x)
+                return x
+
+        model = M().to(torch.bfloat16)
+        for p in model.parameters():
+            p.requires_grad = False
+
+        s = ModelOffloader(
+            model, torch.device("cpu"),
+            layers_attr="transformer_blocks", blocks_to_swap=1,
+        )
+        # Pre-populate _pending_routes with stale state to verify it
+        # gets cleared (set_loras top-of-method clear).
+        s._pending_routes = [(model.transformer_blocks[0].attn, [])]
+
+        lora = _make_lora(num_blocks=2, dim=16, seed=99)
+        with pytest.raises(ValueError, match="Routed LoRA mode requires nn.Linear"):
+            s.set_loras([(lora, 1.0)], mode="routed")
+        # No partial state survived the failed call.
+        assert s._pending_routes == [], (
+            f"set_loras failure left dangling _pending_routes "
+            f"with {len(s._pending_routes)} entries"
+        )
+
+    @CUDA
+    def test_routed_single_lora_skips_concat(self) -> None:
+        # Single-LoRA case takes the no-cat fast path. Forward output
+        # must still match the manual baseline.
+        m = _make_bf16_model(num_blocks=2, dim=16)
+        loras = [(_make_lora(num_blocks=2, dim=16, seed=33), 0.7)]
+
+        s = _make_strategy(m, device="cuda")
+        s.set_loras(loras, mode="routed")
+        s.activate()
+        try:
+            x = torch.randn(2, 16, dtype=torch.bfloat16, device="cuda")
+            actual = m(x)
+            torch.cuda.synchronize()
+            expected = self._expected_routed_output(m, x, loras)
+            assert torch.allclose(actual, expected, rtol=0.1, atol=0.1)
+        finally:
+            s.deactivate()
+
+    def test_routed_tied_weight_target_raises(self) -> None:
+        # Standard tied embed/head pattern: one Parameter aliased at
+        # multiple slots. PinnedWeights dedups them into one buffer
+        # with multiple parent locations. Routed mode would only hook
+        # one location and silently miss the others — reject explicitly.
+        class M(nn.Module):
+            def __init__(self, dim: int = 16, num_blocks: int = 2) -> None:
+                super().__init__()
+                self.embed = nn.Linear(dim, dim, bias=False)
+                self.transformer_blocks = nn.ModuleList(
+                    [
+                        type("B", (nn.Module,), {
+                            "__init__": lambda self, d=dim: (
+                                super(self.__class__, self).__init__(),
+                                setattr(self, "attn", nn.Linear(d, d, bias=False)),
+                            )[0],
+                            "forward": lambda self, x: self.attn(x),
+                        })()
+                        for _ in range(num_blocks)
+                    ]
+                )
+                self.head = nn.Linear(dim, dim, bias=False)
+                # Tie embed.weight to head.weight (standard pattern).
+                self.head.weight = self.embed.weight
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                x = self.embed(x)
+                for blk in self.transformer_blocks:
+                    x = blk(x)
+                return self.head(x)
+
+        model = M(dim=16, num_blocks=2).to(torch.bfloat16)
+        for p in model.parameters():
+            p.requires_grad = False
+
+        s = ModelOffloader(
+            model, torch.device("cpu"),
+            layers_attr="transformer_blocks", blocks_to_swap=1,
+        )
+        # Build a LoRA that targets embed.weight (the tied head shares it).
+        sd = {
+            "embed.lora_A.weight": torch.randn(4, 16),
+            "embed.lora_B.weight": torch.randn(16, 4),
+        }
+        lora = LoRA(state_dict=sd, key_transform=None)
+        with pytest.raises(ValueError, match="tied weights"):
+            s.set_loras([(lora, 1.0)], mode="routed")
+        # Merge mode handles tied weights via storage mutation.
+        s.set_loras([(lora, 1.0)], mode="merge")
+
+    @CUDA
+    def test_routed_with_bias_linear(self) -> None:
+        # Routed math: hook adds α·B·A·x to the layer's output, which
+        # already includes any bias from the base layer. Bias-having
+        # Linears must produce the same output as a manual baseline
+        # that goes through F.linear with the bias.
+        import torch.nn.functional as F  # noqa: N812
+
+        class Block(nn.Module):
+            def __init__(self, dim: int) -> None:
+                super().__init__()
+                self.attn = nn.Linear(dim, dim, bias=True)
+                self.ff = nn.Linear(dim, dim, bias=False)
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                return self.ff(self.attn(x))
+
+        class M(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.embed = nn.Linear(16, 16, bias=False)
+                self.transformer_blocks = nn.ModuleList(
+                    [Block(16) for _ in range(2)]
+                )
+                self.head = nn.Linear(16, 16, bias=False)
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                h = self.embed(x)
+                for blk in self.transformer_blocks:
+                    h = blk(h)
+                return self.head(h)
+
+        m = M().to(torch.bfloat16)
+        for p in m.parameters():
+            p.requires_grad = False
+
+        loras = [(_make_lora(num_blocks=2, dim=16, seed=55), 0.5)]
+        s = ModelOffloader(
+            m, torch.device("cuda"),
+            layers_attr="transformer_blocks", blocks_to_swap=1,
+        )
+        s.set_loras(loras, mode="routed")
+        s.activate()
+        try:
+            x = torch.randn(2, 16, dtype=torch.bfloat16, device="cuda")
+            actual = m(x)
+            torch.cuda.synchronize()
+            # Manual baseline: walk layers via F.linear (bypasses hooks)
+            # with bias included on attn.
+            h = F.linear(x, m.embed.weight)
+            for i, blk in enumerate(m.transformer_blocks):
+                base_attn = F.linear(h, blk.attn.weight, blk.attn.bias)
+                lora = loras[0][0]
+                strength = loras[0][1]
+                a, b = lora.targets[
+                    f"transformer_blocks.{i}.attn.weight"
+                ]
+                a_dev = a.to(device=h.device, dtype=h.dtype)
+                b_dev = b.to(device=h.device, dtype=h.dtype)
+                attn_out = base_attn + strength * (h @ a_dev.T @ b_dev.T)
+                h = F.linear(attn_out, blk.ff.weight)
+            expected = F.linear(h, m.head.weight)
+            assert torch.allclose(actual, expected, rtol=0.1, atol=0.1)
+        finally:
+            s.deactivate()
+
+
 class TestDeactivateCleanupInvariants:
     @CUDA
     def test_cleanup_runs_even_when_streamer_deactivate_raises(

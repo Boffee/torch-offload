@@ -15,12 +15,12 @@ import contextlib
 import logging
 from collections.abc import Sequence
 from types import TracebackType
-from typing import Any
+from typing import Any, Literal
 
 import torch
 from torch import nn
 
-from .lora import LoRA, LoRATransform
+from .lora import LoRA, LoRARouteHandle, LoRATransform
 from .pinned_buffer import PinnedParamBuffer, storage_key
 from .pinned_weights import PinnedWeights
 from .protocols import ModelStrategyComponent, SlotOwnership
@@ -140,25 +140,47 @@ class ModelOffloader:
         self._non_block = non_block
         self._teardown_stack: contextlib.ExitStack | None = None
 
-        self._reverse_index = self._build_reverse_index(
+        self._reverse_index, self._reverse_parents = self._build_reverse_index(
             streamers, layer_paths, non_block,
         )
+        # Pending routed-mode LoRAs: list of (parent_module, refs).
+        # Populated by set_loras(mode="routed"); the actual hooks are
+        # installed on activate() and removed on deactivate(). Cleared
+        # on every set_loras() call (including merge mode and clears).
+        self._pending_routes: list[
+            tuple[nn.Module, list[tuple[torch.Tensor, torch.Tensor, float]]]
+        ] = []
 
     # ------------------------------------------------------------------ API
 
-    def set_loras(self, loras: Sequence[tuple[LoRA, float]]) -> None:
+    def set_loras(
+        self,
+        loras: Sequence[tuple[LoRA, float]],
+        *,
+        mode: Literal["merge", "routed"] = "merge",
+    ) -> None:
         """Attach LoRAs for the next activation cycle.
 
-        Must be called while deactivated.  Transforms are cleared
+        Must be called while deactivated. Attachments are cleared
         automatically on :meth:`deactivate`, so callers must call
         ``set_loras`` before each :meth:`activate` if they want
-        LoRA-merged inference.
+        LoRA-augmented inference.
 
-        Each entry is a ``(lora, strength)`` tuple. Matches each
-        :class:`LoRA`'s pre-pinned factors against model parameters via
-        the reverse index and attaches a lightweight
-        :class:`LoRATransform` (references only, no pinning) to each
-        matched :class:`PinnedParamBuffer`.
+        ``mode``:
+
+        - ``"merge"`` (default): attaches a :class:`LoRATransform` per
+          matched :class:`PinnedParamBuffer`. The merge fires during
+          DMA via in-place ``addmm_``, so it rides along with the
+          streaming cycle. Requires base weight dtype to be bf16, fp16,
+          or fp32.
+        - ``"routed"``: registers a forward hook on each matched
+          parent module. Forward becomes ``y = base(x) + α·B·A·x``.
+          Doesn't touch the base weight in place. Restricted to
+          ``nn.Linear`` parents (the math assumes ``y = x @ W.T``);
+          tied targets and non-Linear parents raise. Quantized bases
+          (GGUF / quanto) are not exercised by the integration tests
+          here — for production quantized + LoRA workflows, prefer
+          PEFT's per-type LoraLayer subclasses.
 
         Pass an empty sequence to clear all LoRAs (base-only forward).
         """
@@ -167,16 +189,22 @@ class ModelOffloader:
                 "ModelOffloader.set_loras() requires the offloader "
                 "to be inactive. Call deactivate() first."
             )
+        if mode not in ("merge", "routed"):
+            raise ValueError(
+                f"set_loras mode must be 'merge' or 'routed', got {mode!r}"
+            )
+        # Clear any prior attachments from either mode.
         for buf in self._reverse_index.values():
             buf.transform = None
+        self._pending_routes = []
 
         if not loras:
             return
 
-        addmm_dtypes = (torch.bfloat16, torch.float16, torch.float32)
         per_target: dict[str, list[tuple[torch.Tensor, torch.Tensor, float]]] = {}
         total_targets = 0
         matched_targets = 0
+        addmm_dtypes = (torch.bfloat16, torch.float16, torch.float32)
         for lora, strength in loras:
             for target_key, (a, b) in lora.targets.items():
                 total_targets += 1
@@ -191,12 +219,12 @@ class ModelOffloader:
                         f"B@A produces ({b.shape[0]}, {a.shape[1]}), "
                         f"target shape is {expected}."
                     )
-                if buf.cpu_param.dtype not in addmm_dtypes:
+                if mode == "merge" and buf.cpu_param.dtype not in addmm_dtypes:
                     raise ValueError(
                         f"LoRA target {target_key!r} has dtype "
                         f"{buf.cpu_param.dtype}; addmm_ merge requires "
-                        f"bf16, fp16, or fp32. Use PEFT routed mode "
-                        f"for quantized params."
+                        f"bf16, fp16, or fp32. Use mode='routed' (or "
+                        f"PEFT routed mode) for quantized params."
                     )
                 per_target.setdefault(target_key, []).append(
                     (a, b, strength)
@@ -213,8 +241,41 @@ class ModelOffloader:
         else:
             logger.debug("set_loras matched %d/%d targets", matched_targets, total_targets)
 
-        for target_key, refs in per_target.items():
-            self._reverse_index[target_key].transform = LoRATransform(refs)
+        if mode == "merge":
+            for target_key, refs in per_target.items():
+                self._reverse_index[target_key].transform = LoRATransform(refs)
+        else:  # routed
+            # Two-pass: validate every parent before mutating state, so
+            # a mid-list rejection (non-Linear, tied weight) leaves the
+            # offloader in the cleared state set above instead of with
+            # a half-built _pending_routes the caller can't see.
+            new_routes: list[
+                tuple[nn.Module, list[tuple[torch.Tensor, torch.Tensor, float]]]
+            ] = []
+            for target_key, refs in per_target.items():
+                parents = self._reverse_parents[target_key]
+                if len(parents) > 1:
+                    raise ValueError(
+                        f"Routed LoRA mode does not support tied "
+                        f"weights; target {target_key!r} has "
+                        f"{len(parents)} parent locations (typically the "
+                        f"tied embed/head pattern). The hook would only "
+                        f"fire on one of them, silently missing the "
+                        f"others. Use mode='merge' for tied targets — "
+                        f"merge mutates the shared storage so all "
+                        f"locations see the LoRA contribution."
+                    )
+                parent = parents[0]
+                if not isinstance(parent, nn.Linear):
+                    raise ValueError(
+                        f"Routed LoRA mode requires nn.Linear targets; "
+                        f"target {target_key!r} has parent module of "
+                        f"type {type(parent).__name__}. Use mode='merge' "
+                        f"for non-Linear targets, or wrap the model with "
+                        f"PEFT for richer per-type routing."
+                    )
+                new_routes.append((parent, refs))
+            self._pending_routes = new_routes
 
     # ------------------------------------------------- ModelStrategy interface
 
@@ -236,10 +297,25 @@ class ModelOffloader:
                 for component in self._components:
                     stack.callback(component.deactivate)
                     component.activate()
+                # Install routed-mode hooks AFTER components activate
+                # so the LIFO ExitStack unwinds them FIRST on
+                # deactivate — routes come down before component
+                # teardown, which means the hook is gone by the time
+                # streamers reset slot Parameters. Cast factors to
+                # match the parent's weight dtype — LoRA state-dicts
+                # are typically fp32 while the base layer is bf16/fp16,
+                # and the hook math needs matching dtypes.
+                for parent, refs in self._pending_routes:
+                    handle = LoRARouteHandle(
+                        parent, refs, self._target_device,
+                        dtype=parent.weight.dtype,
+                    )
+                    stack.callback(handle.remove)
                 self._teardown_stack = stack.pop_all()
         except BaseException:
             for buf in self._reverse_index.values():
                 buf.transform = None
+            self._pending_routes = []
             raise
 
     def deactivate(self) -> None:
@@ -251,6 +327,7 @@ class ModelOffloader:
         finally:
             for buf in self._reverse_index.values():
                 buf.transform = None
+            self._pending_routes = []
 
     def __enter__(self) -> nn.Module:
         self.activate()
@@ -271,26 +348,53 @@ class ModelOffloader:
         streamers: list[StreamedWeights],
         layer_paths: list[str],
         non_block: PinnedWeights | None,
-    ) -> dict[str, PinnedParamBuffer]:
-        """Map canonical param names to their PinnedParamBuffer.
+    ) -> tuple[dict[str, PinnedParamBuffer], dict[str, tuple[nn.Module, ...]]]:
+        """Map canonical param names to their :class:`PinnedParamBuffer`
+        and to the tuple of parent modules where the param is installed.
+
+        Two parallel dicts: the buffer map drives merge-mode LoRA
+        (transform attached to the buffer), and the parents map drives
+        routed-mode LoRA (forward hook on the parent layer).
 
         Keys are normalized to strip PEFT's ``.base_layer.`` segments
         so that LoRA state-dict keys (which use the original model
         names) match regardless of whether the model is PEFT-wrapped.
+
+        Parents are stored as a tuple to preserve tied-weight
+        information. Streamed-block targets always have exactly one
+        parent (each ``(layer_path, block_idx, qual_name)`` is unique;
+        cross-region ties are rejected upstream by
+        :func:`detect_streaming_region_ties`). Non-block targets may
+        have more than one parent — e.g., the standard tied
+        embed/head pattern — which routed mode rejects (merge mode
+        handles tied storage uniformly because it mutates the shared
+        bytes).
         """
-        index: dict[str, PinnedParamBuffer] = {}
+        bufs: dict[str, PinnedParamBuffer] = {}
+        parents: dict[str, tuple[nn.Module, ...]] = {}
 
         for streamer, layer_path in zip(streamers, layer_paths, strict=True):
-            for block_idx, block_bufs in enumerate(streamer.param_bufs_per_block):
-                for buf in block_bufs:
-                    full_name = f"{layer_path}.{block_idx}.{buf.name}"
-                    index[_canonical_key(full_name)] = buf
+            block_bufs_per = streamer.param_bufs_per_block
+            block_locs_per = streamer.param_locs_per_block
+            for block_idx, (block_bufs, block_locs) in enumerate(
+                zip(block_bufs_per, block_locs_per, strict=True)
+            ):
+                for buf, (qual_name, parent, _leaf) in zip(
+                    block_bufs, block_locs, strict=True
+                ):
+                    full_name = f"{layer_path}.{block_idx}.{qual_name}"
+                    key = _canonical_key(full_name)
+                    bufs[key] = buf
+                    parents[key] = (parent,)
 
         if non_block is not None:
-            for buf, _locs in non_block.slots:
-                index[_canonical_key(buf.name)] = buf
+            for buf, locs in non_block.slots:
+                key = _canonical_key(buf.name)
+                bufs[key] = buf
+                if locs:
+                    parents[key] = tuple(p for p, _leaf in locs)
 
-        return index
+        return bufs, parents
 
 
 # ---------------------------------------------------------------------------

@@ -577,9 +577,31 @@ class StreamedWeights:
 
         Used by :class:`~torch_offload.ModelOffloader` to build a
         reverse index from parameter qualified names to their buffers.
+
+        .. warning::
+           Returned list aliases internal store state. Treat it as
+           read-only — mutating the outer list, inner lists, or
+           buffer objects will corrupt streaming bookkeeping.
         """
         assert self._store is not None
         return self._store._param_bufs
+
+    @property
+    def param_locs_per_block(self) -> list[list[tuple[str, nn.Module, str]]]:
+        """Per-block lists of ``(qualified_name, parent_module, leaf_name)``.
+
+        Parallel structure to :attr:`param_bufs_per_block`. Used by the
+        composer to build a reverse index from parameter names to
+        parent modules — needed by routed-mode LoRA (forward hooks) and
+        any future mechanism that has to act on the layer object rather
+        than the weight buffer.
+
+        .. warning::
+           Returned list aliases internal store state. Treat it as
+           read-only — mutating it will corrupt streaming bookkeeping.
+        """
+        assert self._store is not None
+        return self._store._param_locs
 
     @property
     def name(self) -> str:
