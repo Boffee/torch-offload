@@ -192,14 +192,16 @@ class ModelInUseError(ModelCacheError):
 
 
 class ActivationError(ModelCacheError):
-    """A strategy's ``activate()`` raised. The cache discards the entry
-    (drops the strategy reference, removes it from cache state) regardless
-    of whether the entry was freshly built or previously cached —
-    strategies with multi-step ``activate()`` (e.g.
+    """A strategy's ``activate()`` (or the ``pre_activate`` hook
+    passed to :meth:`ModelCache.use`) raised. The cache discards the
+    entry (drops the strategy reference, removes it from cache state)
+    regardless of whether the entry was freshly built or previously
+    cached — strategies with multi-step ``activate()`` (e.g.
     :func:`ModelOffloader`) can fail mid-way after partially
     installing hooks/pool/composed PinnedWeights, and caching such an
     entry as "ready to retry" lies about its state. The next acquire
-    rebuilds via the registered factory."""
+    rebuilds via the registered factory. The original exception is
+    chained via ``__cause__``."""
 
 
 # ---------------------------------------------------------------------------
@@ -213,6 +215,11 @@ class _Entry:
     strategy: CachedResource | None = None
     cache_bytes: int = 0  # actual, post-build
     active_count: int = 0
+    # True while `pre_activate` is running. Guards against same-key
+    # re-entry from inside the hook, which would otherwise activate
+    # the strategy while we're still in the deactivated-config phase
+    # and corrupt the LRU invariant (active entry ending up in LRU).
+    configuring: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -327,12 +334,27 @@ class ModelCache:
         del self._entries[key]
 
     @overload
-    def use(self, model: ResourceSpec[T]) -> contextlib.AbstractContextManager[T]: ...
+    def use(
+        self,
+        model: ResourceSpec[T],
+        *,
+        pre_activate: Callable[[CachedResource[T]], None] | None = None,
+    ) -> contextlib.AbstractContextManager[T]: ...
     @overload
-    def use(self, model: str) -> contextlib.AbstractContextManager[Any]: ...
+    def use(
+        self,
+        model: str,
+        *,
+        pre_activate: Callable[[CachedResource[Any]], None] | None = None,
+    ) -> contextlib.AbstractContextManager[Any]: ...
 
     @contextlib.contextmanager
-    def use(self, model: str | ResourceSpec) -> Iterator[Any]:
+    def use(
+        self,
+        model: str | ResourceSpec,
+        *,
+        pre_activate: Callable[[CachedResource[Any]], None] | None = None,
+    ) -> Iterator[Any]:
         """Acquire an active lease on a cached resource.
 
         Accepts either a registered key (string) or a :class:`ResourceSpec`
@@ -343,6 +365,16 @@ class ModelCache:
         Re-entrant for the same key: nested ``use()`` calls bump a
         per-key refcount and share the already-active value (the
         underlying resource is *not* activated again).
+
+        ``pre_activate`` is an optional hook called with the strategy
+        on the first lease — after build (or LRU hit) and *while the
+        strategy is still deactivated*, before :meth:`activate`. Use
+        for per-acquire configuration that requires the deactivated
+        state (e.g., :meth:`ModelOffloader.set_loras`). The hook does
+        NOT run on re-entrant nested acquires (the strategy is already
+        active). A raising hook is treated as activation poison: the
+        entry is discarded and the exception is wrapped in
+        :class:`ActivationError`.
         """
         spec = model if isinstance(model, ResourceSpec) else None
         key = spec.key if spec is not None else model
@@ -357,7 +389,7 @@ class ModelCache:
             self.register(spec)
             entry = self._entries[key]
 
-        value = self._acquire(entry)
+        value = self._acquire(entry, pre_activate=pre_activate)
         try:
             yield value
         finally:
@@ -420,22 +452,49 @@ class ModelCache:
     # Lease lifecycle
     # ------------------------------------------------------------------
 
-    def _acquire(self, entry: _Entry) -> Any:
-        """Build (if needed), activate, and return the resource value.
+    def _acquire(
+        self,
+        entry: _Entry,
+        *,
+        pre_activate: Callable[[CachedResource[Any]], None] | None = None,
+    ) -> Any:
+        """Build (if needed), run ``pre_activate``, activate, and
+        return the resource value.
 
         Re-entrant: if the entry is already active, bump the refcount
-        and share the value without re-activating. On activate or
-        post-activate-reconcile failure, the entry is discarded and
-        an exception propagates."""
+        and share the value without re-activating or re-running
+        ``pre_activate``. Same-key re-entry from inside ``pre_activate``
+        itself is rejected with :class:`ModelCacheError` to preserve
+        the LRU invariant. On pre_activate / activate / post-activate-
+        reconcile failure, the entry is discarded and an exception
+        propagates (pre_activate / activate failures are wrapped in
+        :class:`ActivationError`)."""
+        key = entry.spec.key
+
+        # Same-key re-entry from inside the hook would acquire while
+        # active_count is still 0, run a full activate/deactivate cycle
+        # on the inner lease, leave the key in LRU, then continue the
+        # outer activate path — yielding an active entry that's also
+        # in LRU. A later eviction would assert. The hook already has
+        # the strategy as its argument; legitimate re-entry is for
+        # *different* keys.
+        if entry.configuring:
+            raise ModelCacheError(
+                f"cannot acquire {key!r} from inside its own pre_activate "
+                "hook; the strategy is already available as the hook argument"
+            )
+
         # Re-entrant lease: strategy is already active. The protocol
         # contract guarantees `value` is stable across activation
-        # cycles, so re-reading it is safe.
+        # cycles, so re-reading it is safe. pre_activate is skipped —
+        # the strategy is active, can't be reconfigured, and the
+        # caller's hook would either fail or silently violate
+        # invariants.
         if entry.active_count > 0:
             value = entry.strategy.value
             entry.active_count += 1
             return value
 
-        key = entry.spec.key
         if entry.strategy is None:
             self._build_into_entry(entry)
         else:
@@ -443,6 +502,26 @@ class ModelCache:
             self._lru.pop(key, None)  # leaving the inactive set
 
         assert entry.strategy is not None
+
+        # pre_activate runs while the strategy is still deactivated —
+        # this is the user's hook for per-acquire configuration that
+        # requires the deactivated state (e.g., set_loras). A raising
+        # hook leaves the strategy in an unknown state; treat as
+        # activation poison. The `configuring` flag locks out same-key
+        # re-entry through user code calling back into `cache.use()`.
+        if pre_activate is not None:
+            entry.configuring = True
+            try:
+                pre_activate(entry.strategy)
+            except BaseException as exc:
+                entry.configuring = False
+                self._stats.activation_errors += 1
+                self._release_strategy(entry, evicted=False)
+                raise ActivationError(
+                    f"pre_activate() failed for {key!r}"
+                ) from exc
+            entry.configuring = False
+
         # Read value BEFORE activate. The protocol says `value` is
         # available regardless of activation state; reading first
         # eliminates a post-activate exception window where a raising

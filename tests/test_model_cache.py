@@ -16,6 +16,7 @@ from torch_offload import (
     ActivationError,
     DuplicateModelKeyError,
     ModelCache,
+    ModelCacheError,
     ModelInUseError,
     ModelNotRegisteredError,
     ModelSpec,
@@ -743,6 +744,143 @@ class TestHostEmptyCache:
             pass
         # Should not propagate the callback failure.
         cache.evict("a")
+
+
+# ---------------------------------------------------------------------------
+# pre_activate hook
+# ---------------------------------------------------------------------------
+
+
+class TestPreActivate:
+    def test_runs_after_build_before_activate(self) -> None:
+        # Hook fires while the strategy is still deactivated. Capture the
+        # event ordering by appending into the strategy's events list.
+        observed: list[str] = []
+
+        def configure(strategy):
+            observed.append(f"pre_activate(active={strategy._active})")
+
+        cache = ModelCache(200)
+        with cache.use(_spec("a", 100), pre_activate=configure):
+            pass
+        s = FakeStrategy.instances[0]
+        assert observed == ["pre_activate(active=False)"]
+        # pre_activate ran before activate, activate ran before deactivate.
+        assert s.events == ["activate", "deactivate"]
+
+    def test_runs_on_cache_hit_too(self) -> None:
+        # First use builds + activates; second use hits the LRU. The hook
+        # must run on both paths (anything keyed off activation state needs
+        # per-acquire reconfiguration).
+        calls = {"n": 0}
+
+        def configure(strategy):
+            calls["n"] += 1
+
+        cache = ModelCache(200)
+        cache.register(_spec("a", 100))
+        with cache.use("a", pre_activate=configure):
+            pass
+        with cache.use("a", pre_activate=configure):
+            pass
+        assert calls["n"] == 2
+
+    def test_failure_poisons_entry(self) -> None:
+        # A raising hook leaves the strategy in an unknown state — discard
+        # the entry, wrap in ActivationError, registration persists for retry.
+        def configure(strategy):
+            raise RuntimeError("config boom")
+
+        cache = ModelCache(200)
+        cache.register(_spec("a", 100))
+        with pytest.raises(ActivationError, match="pre_activate"):
+            with cache.use("a", pre_activate=configure):
+                pass
+        snap = cache.snapshot()
+        assert "a" not in snap.cached_keys_lru_to_mru
+        assert snap.used_cache_bytes == 0
+        assert snap.stats.activation_errors == 1
+        assert "a" in snap.registered_keys
+        # Strategy must NOT have been activated (hook ran before activate
+        # and raised, so activate never fired).
+        s = FakeStrategy.instances[0]
+        assert "activate" not in s.events
+
+    def test_skipped_on_reentrant_use(self) -> None:
+        # Re-entrant lease shares the active strategy; the hook would
+        # either fail (strategy active, can't reconfigure) or silently
+        # violate invariants. Skip it.
+        calls = {"n": 0}
+
+        def configure(strategy):
+            calls["n"] += 1
+
+        cache = ModelCache(200)
+        cache.register(_spec("a", 100))
+        with cache.use("a", pre_activate=configure):
+            with cache.use("a", pre_activate=configure):
+                pass
+        assert calls["n"] == 1
+
+    def test_same_key_reentry_from_inside_hook_raises(self) -> None:
+        # A hook that re-enters cache.use() for the SAME key would
+        # otherwise corrupt the LRU invariant: active_count is still 0
+        # during the hook, so the inner acquire treats it as a fresh
+        # lease and runs a full activate/deactivate cycle, leaving the
+        # key in LRU when the outer continues to activate.
+        cache = ModelCache(200)
+        cache.register(_spec("a", 100))
+
+        def reenter_same(strategy):
+            with cache.use("a"):
+                pass
+
+        with pytest.raises(ModelCacheError, match="pre_activate"):
+            with cache.use("a", pre_activate=reenter_same):
+                pass
+        # Failure poisons the entry just like any pre_activate failure.
+        snap = cache.snapshot()
+        assert "a" not in snap.cached_keys_lru_to_mru
+        assert snap.used_cache_bytes == 0
+
+    def test_different_key_reentry_from_inside_hook_works(self) -> None:
+        # Re-entering the cache for a DIFFERENT key during the hook is
+        # legitimate — different entries don't share the LRU slot.
+        cache = ModelCache(300)
+        cache.register(_spec("a", 100))
+        cache.register(_spec("b", 100))
+
+        captured: list[str] = []
+
+        def use_other(strategy):
+            with cache.use("b") as m:
+                captured.append(type(m).__name__)
+
+        with cache.use("a", pre_activate=use_other) as m_a:
+            assert m_a is not None
+        # Both keys present; "a" is in LRU at MRU, "b" was used during
+        # "a"'s hook so it's at the older end.
+        snap = cache.snapshot()
+        assert set(snap.cached_keys_lru_to_mru) == {"a", "b"}
+        assert captured == ["Identity"]
+
+    def test_configuring_flag_clears_on_failure_so_retry_works(self) -> None:
+        # If the hook raises, the entry is poisoned but the registration
+        # persists. A subsequent use() with a non-failing hook must succeed
+        # — the configuring flag must be reset on the failure path.
+        cache = ModelCache(200)
+        cache.register(_spec("a", 100))
+
+        def boom(strategy):
+            raise RuntimeError("first attempt fails")
+
+        with pytest.raises(ActivationError):
+            with cache.use("a", pre_activate=boom):
+                pass
+
+        # Retry without the failing hook — must work.
+        with cache.use("a") as m:
+            assert m is not None
 
 
 # ---------------------------------------------------------------------------
