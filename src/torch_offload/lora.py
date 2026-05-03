@@ -13,9 +13,13 @@ Two application paths share the same :class:`LoRA` data container:
   the layer that adds ``α · (x @ A.T @ B.T)`` to the layer's output;
   base weight is not touched in place. Restricted to ``nn.Linear``
   parents (other layer types raise) and tied weights are rejected.
-  Quantized bases (GGUF / quanto) are not exercised by tests in this
-  library — for production quantized + LoRA workflows, prefer PEFT's
-  per-type LoraLayer subclasses.
+  Compatible with quantized bases whose ``weight.dtype`` reports the
+  compute dtype (quanto ``WeightQBytesTensor``) or that expose
+  ``module.compute_dtype`` (BitsAndBytes ``Linear4bit``); formats
+  that report storage int via ``weight.dtype`` and provide no
+  module-level compute dtype (``Linear8bitLt``, GGUF) need a forward
+  probe and aren't covered here. For richer per-format LoRA coverage,
+  prefer PEFT's per-type LoraLayer subclasses.
 
 :class:`~torch_offload.ModelOffloader` is the consumer-facing API; its
 ``set_loras(..., mode=...)`` picks the path. The merge path fires

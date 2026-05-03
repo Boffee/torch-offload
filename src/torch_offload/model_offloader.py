@@ -36,6 +36,31 @@ __all__ = [
 ]
 
 
+def _routed_factor_dtype(module: nn.Module) -> torch.dtype:
+    """Compute dtype to cast routed-mode LoRA factors into.
+
+    For routed LoRA, the hook adds ``x @ A.T @ B.T`` to the layer's
+    output, so factors must land in the same dtype the layer produces.
+
+    Probe order:
+
+    - ``module.compute_dtype`` — BitsAndBytes ``Linear4bit`` and
+      similar modules that carry an explicit compute-dtype attribute.
+    - ``module.weight.dtype`` — plain fp16/bf16/fp32, plus quanto
+      (``WeightQBytesTensor.dtype`` is the scale dtype, not the int8
+      storage of ``_data``).
+
+    Formats whose ``weight.dtype`` reports the storage int (e.g.,
+    BitsAndBytes ``Linear8bitLt``'s ``Int8Params``, GGUF's packed
+    ``uint8``) and which don't expose ``compute_dtype`` would need a
+    forward probe; not handled here.
+    """
+    compute = getattr(module, "compute_dtype", None)
+    if compute is not None:
+        return compute
+    return module.weight.dtype
+
+
 class ModelOffloader:
     """Stream transformer blocks between pinned CPU and GPU with
     optional LoRA merge and trainable-parameter support.
@@ -178,9 +203,17 @@ class ModelOffloader:
           Doesn't touch the base weight in place. Restricted to
           ``nn.Linear`` parents (the math assumes ``y = x @ W.T``);
           tied targets and non-Linear parents raise. Quantized bases
-          (GGUF / quanto) are not exercised by the integration tests
-          here — for production quantized + LoRA workflows, prefer
-          PEFT's per-type LoraLayer subclasses.
+          work when the compute dtype is probeable via
+          :func:`_routed_factor_dtype` — covers plain fp/bf16/fp16,
+          quanto (``weight.dtype`` already reports scale dtype), and
+          formats that expose ``module.compute_dtype`` (BitsAndBytes
+          ``Linear4bit``). Formats that report storage int via
+          ``weight.dtype`` without a module-level compute dtype
+          (``Linear8bitLt``, GGUF) aren't covered.
+
+        Routed mode requires activations to reach the hooked layer in
+        the layer's compute dtype (or under autocast). Mixed-dtype
+        inputs without autocast will error in the hook's matmul.
 
         Pass an empty sequence to clear all LoRAs (base-only forward).
         """
@@ -301,14 +334,15 @@ class ModelOffloader:
                 # so the LIFO ExitStack unwinds them FIRST on
                 # deactivate — routes come down before component
                 # teardown, which means the hook is gone by the time
-                # streamers reset slot Parameters. Cast factors to
-                # match the parent's weight dtype — LoRA state-dicts
-                # are typically fp32 while the base layer is bf16/fp16,
-                # and the hook math needs matching dtypes.
+                # streamers reset slot Parameters. Cast factors to the
+                # parent's compute dtype (see _routed_factor_dtype) —
+                # LoRA state-dicts are typically fp32 and the base may
+                # be bf16, fp16, or quantized; the hook math needs
+                # factors in the same dtype the layer outputs.
                 for parent, refs in self._pending_routes:
                     handle = LoRARouteHandle(
                         parent, refs, self._target_device,
-                        dtype=parent.weight.dtype,
+                        dtype=_routed_factor_dtype(parent),
                     )
                     stack.callback(handle.remove)
                 self._teardown_stack = stack.pop_all()

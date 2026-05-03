@@ -868,6 +868,54 @@ class TestRoutedMode:
             s.deactivate()
 
 
+class TestRoutedFactorDtype:
+    """Unit tests for the compute-dtype probe used to cast routed LoRA
+    factors. The probe must return the layer's *output* dtype, not the
+    weight's *storage* dtype — for quantized layers these differ.
+    """
+
+    def test_plain_linear_returns_weight_dtype(self) -> None:
+        from torch_offload.model_offloader import _routed_factor_dtype
+
+        layer = nn.Linear(8, 8, bias=False).to(torch.bfloat16)
+        assert _routed_factor_dtype(layer) is torch.bfloat16
+
+    def test_module_compute_dtype_takes_precedence(self) -> None:
+        # BitsAndBytes Linear4bit pattern: subclass of nn.Linear that
+        # exposes `compute_dtype` on the module. Probe must prefer that
+        # over weight.dtype (which is int8 for bnb's Int8Params).
+        from torch_offload.model_offloader import _routed_factor_dtype
+
+        layer = nn.Linear(8, 8, bias=False).to(torch.bfloat16)
+        layer.compute_dtype = torch.float16  # type: ignore[assignment]
+        assert _routed_factor_dtype(layer) is torch.float16
+
+    def test_quanto_weight_dtype_is_compute_dtype(self) -> None:
+        # quanto's WeightQBytesTensor wraps an int8 _data plus a fp
+        # _scale, but the wrapper-subclass dtype is set to scale.dtype
+        # (per `_make_wrapper_subclass(... dtype=scale.dtype ...)`).
+        # That means `weight.dtype` already reports the compute dtype —
+        # no special-casing needed for routed mode.
+        quanto = pytest.importorskip("optimum.quanto")
+        from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
+
+        from torch_offload.model_offloader import _routed_factor_dtype
+
+        rows, cols = 4, 8
+        data = torch.randint(-128, 127, (rows, cols), dtype=torch.int8)
+        scale = torch.rand(rows, 1, dtype=torch.bfloat16)
+        qt = WeightQBytesTensor.create(
+            quanto.qint8, 0, (rows, cols), (cols, 1), data, scale, None,
+        )
+        layer = nn.Linear(cols, rows, bias=False)
+        layer.weight = nn.Parameter(qt, requires_grad=False)
+
+        # Storage is int8; advertised dtype is bf16 (matches scale).
+        assert layer.weight._data.dtype == torch.int8
+        assert layer.weight.dtype == torch.bfloat16
+        assert _routed_factor_dtype(layer) is torch.bfloat16
+
+
 class TestDeactivateCleanupInvariants:
     @CUDA
     def test_cleanup_runs_even_when_streamer_deactivate_raises(
