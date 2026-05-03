@@ -339,6 +339,180 @@ class TestHookLifecycle:
 
 
 # ---------------------------------------------------------------------------
+# Cyclic prefetch
+# ---------------------------------------------------------------------------
+
+
+class TestCyclicPrefetch:
+    """Cyclic mode: iteration loops over the same block list (diffusion,
+    multi-step decoders) detect end-of-iteration as wraparound rather
+    than direction reversal, and prefetch indices wrap modulo N.
+    """
+
+    def _record_prefetches(
+        self, streamer: StreamedWeights,
+    ) -> tuple[list[int], object]:
+        """Wrap streamer._submit_prefetch to record idx without disabling
+        the actual prefetch (so on-GPU residency stays consistent)."""
+        recorded: list[int] = []
+        original = streamer._submit_prefetch
+
+        def record(idx: int, max_on_gpu: int) -> None:
+            recorded.append(idx)
+            original(idx, max_on_gpu)
+
+        streamer._submit_prefetch = record  # type: ignore[method-assign]
+        return recorded, original
+
+    @CUDA
+    def test_cyclic_mode_wraps_prefetch_at_iteration_boundary(self) -> None:
+        # Two iterations through 4 blocks with cyclic=True. Second
+        # iteration's idx=0 hook must submit prefetches for 1 and 2
+        # (forward direction inferred from wraparound), not -1 and -2.
+        m = _make_block_model(num_blocks=4, width=8)
+        strategy = ModelOffloader(
+            m, torch.device("cuda"),
+            layers_attr="transformer_blocks", blocks_to_swap=1,
+            prefetch_count=2, cyclic=True,
+        )
+        streamer: StreamedWeights = strategy._streamers[0]
+
+        with strategy:
+            recorded, _ = self._record_prefetches(streamer)
+            x = torch.randn(2, 8, device="cuda")
+            m(x)  # iteration 1
+            torch.cuda.synchronize()
+            recorded.clear()
+            m(x)  # iteration 2
+            torch.cuda.synchronize()
+
+        # 4 blocks * 2 prefetches per hook = 8 entries.
+        # Per-hook expected (cyclic, prefetch_count=2):
+        #   idx=0 (last=3, |Δ|=3 > 2 → wrap-forward): 1, 2
+        #   idx=1 (last=0, Δ=1 → forward):           2, 3
+        #   idx=2 (last=1, Δ=1 → forward):           3, 0 (wrap)
+        #   idx=3 (last=2, Δ=1 → forward):           0, 1 (wrap)
+        assert recorded == [1, 2, 2, 3, 3, 0, 0, 1], recorded
+
+    @CUDA
+    def test_non_cyclic_mode_misfires_at_iteration_boundary(self) -> None:
+        # Documented prior behavior preserved: with cyclic=False, the
+        # second iteration's idx=0 hook detects backward direction
+        # (because last_idx=N-1) and submits negative indices that
+        # _submit_prefetch's bounds check drops. Asserting the misfire
+        # so future cyclic-default changes are caught.
+        m = _make_block_model(num_blocks=4, width=8)
+        strategy = ModelOffloader(
+            m, torch.device("cuda"),
+            layers_attr="transformer_blocks", blocks_to_swap=1,
+            prefetch_count=2, cyclic=False,
+        )
+        streamer: StreamedWeights = strategy._streamers[0]
+
+        with strategy:
+            recorded, _ = self._record_prefetches(streamer)
+            x = torch.randn(2, 8, device="cuda")
+            m(x)  # iteration 1
+            torch.cuda.synchronize()
+            recorded.clear()
+            m(x)  # iteration 2
+            torch.cuda.synchronize()
+
+        # idx=0 hook in iteration 2: last=3 → 0 < 3 → backward,
+        # prefetch -1, -2 (no-op via bounds check downstream).
+        assert recorded[0] == -1
+        assert recorded[1] == -2
+
+    @CUDA
+    def test_cyclic_mode_continuous_backward_stays_backward(self) -> None:
+        # Step-by-step reverse traversal (3, 2, 1, 0): each Δ=-1 is
+        # below the wrap threshold, so direction inference yields
+        # backward — not wrap-forward. Prefetch indices wrap modulo
+        # N when the target falls below 0.
+        m = _make_block_model(num_blocks=4, width=8)
+        strategy = ModelOffloader(
+            m, torch.device("cuda"),
+            layers_attr="transformer_blocks", blocks_to_swap=1,
+            prefetch_count=1, cyclic=True,
+        )
+        streamer: StreamedWeights = strategy._streamers[0]
+
+        with strategy:
+            recorded, _ = self._record_prefetches(streamer)
+            x = torch.randn(2, 8, device="cuda")
+            for idx in (3, 2, 1, 0):
+                streamer._blocks[idx](x)
+            torch.cuda.synchronize()
+
+        # Per-hook (cyclic, prefetch_count=1):
+        #   idx=3 (last=-1 → forward init): prefetch 4 → wrap to 0
+        #   idx=2 (last=3, Δ=-1 → backward): prefetch 1
+        #   idx=1 (last=2, Δ=-1 → backward): prefetch 0
+        #   idx=0 (last=1, Δ=-1 → backward): prefetch -1 → wrap to 3
+        assert recorded == [0, 1, 0, 3], recorded
+
+    @CUDA
+    def test_cyclic_mode_two_iterations_match_eager_baseline(self) -> None:
+        # Forward correctness: cyclic prefetch must not change which
+        # block executes for which input. Two iterations through the
+        # offloaded model must produce identical outputs to two
+        # iterations of the same model on GPU without offloading.
+        torch.manual_seed(42)
+        m_eager = _make_block_model(num_blocks=4, width=8).cuda()
+        x = torch.randn(2, 8, device="cuda")
+        with torch.no_grad():
+            expected_1 = m_eager(x)
+            expected_2 = m_eager(expected_1)
+
+        torch.manual_seed(42)
+        m_off = _make_block_model(num_blocks=4, width=8)
+        strategy = ModelOffloader(
+            m_off, torch.device("cuda"),
+            layers_attr="transformer_blocks", blocks_to_swap=1,
+            prefetch_count=2, cyclic=True,
+        )
+        try:
+            with strategy:
+                with torch.no_grad():
+                    got_1 = m_off(x)
+                    got_2 = m_off(got_1)
+                torch.cuda.synchronize()
+            torch.testing.assert_close(got_1, expected_1, atol=1e-5, rtol=1e-5)
+            torch.testing.assert_close(got_2, expected_2, atol=1e-5, rtol=1e-5)
+        finally:
+            strategy.deactivate()
+
+    @CUDA
+    def test_cyclic_mode_small_n_threshold_corner(self) -> None:
+        # num_blocks=3 puts wrap_threshold at 1, the smallest meaningful
+        # threshold (any |Δ|>1 wraps). Locks in current behavior at
+        # this corner: forward continuation uses Δ=1 (no wrap), and
+        # iteration boundary 2→0 has |Δ|=2>1 (wraps to forward).
+        m = _make_block_model(num_blocks=3, width=8)
+        strategy = ModelOffloader(
+            m, torch.device("cuda"),
+            layers_attr="transformer_blocks", blocks_to_swap=1,
+            prefetch_count=1, cyclic=True,
+        )
+        streamer: StreamedWeights = strategy._streamers[0]
+
+        with strategy:
+            recorded, _ = self._record_prefetches(streamer)
+            x = torch.randn(2, 8, device="cuda")
+            m(x)  # iteration 1
+            torch.cuda.synchronize()
+            recorded.clear()
+            m(x)  # iteration 2
+            torch.cuda.synchronize()
+
+        # 3 blocks * 1 prefetch each:
+        #   idx=0 (last=2, |Δ|=2>1 → wrap-forward): prefetch 1
+        #   idx=1 (last=0, Δ=1 → forward):          prefetch 2
+        #   idx=2 (last=1, Δ=1 → forward):          prefetch 3 → wrap to 0
+        assert recorded == [1, 2, 0], recorded
+
+
+# ---------------------------------------------------------------------------
 # Forward correctness
 # ---------------------------------------------------------------------------
 

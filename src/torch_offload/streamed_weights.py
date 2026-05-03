@@ -471,6 +471,25 @@ class StreamedWeights:
         be ``< len(blocks)``.
     prefetch_count:
         How many blocks ahead to prefetch on a background thread.
+    cyclic:
+        Default ``False``. When ``True``, treat the block list as a
+        cyclic sequence: large index jumps (``|Δidx| > num_blocks/2``)
+        are interpreted as iteration wraparound rather than direction
+        reversal, and prefetch indices wrap modulo ``num_blocks``.
+        Suitable for inference loops that iterate the model repeatedly
+        (diffusion denoising, multi-step decoders) — the prefetcher
+        keeps streaming the next iteration's leading blocks instead
+        of misfiring at iteration boundaries. Leave ``False`` for
+        single-shot or genuinely non-cyclic traversals.
+
+        The wraparound heuristic assumes monotonic intra-iteration
+        traversal (each iteration walks blocks in order, forward or
+        reverse, possibly skipping by one or two). Non-monotonic
+        forward jumps larger than ``num_blocks/2`` within a single
+        iteration would be misclassified as wraparound. The flag is
+        captured at :meth:`activate` time; flipping ``self._cyclic``
+        on a live streamer has no effect until the next
+        deactivate/activate cycle.
     name:
         Optional human-readable label for log messages.
     strict_homogeneous:
@@ -503,6 +522,7 @@ class StreamedWeights:
         *,
         blocks_to_swap: int,
         prefetch_count: int = 2,
+        cyclic: bool = False,
         name: str | None = None,
         strict_homogeneous: bool = True,
         skip_slots: set[SlotOwnership] | None = None,
@@ -511,6 +531,7 @@ class StreamedWeights:
         self._target_device = target_device
         self._blocks_to_swap = blocks_to_swap
         self._prefetch_count = prefetch_count
+        self._cyclic = cyclic
         self._name = name or f"StreamedWeights({len(self._blocks)} blocks)"
 
         if blocks_to_swap >= len(self._blocks):
@@ -782,6 +803,9 @@ class StreamedWeights:
         idx_map: dict[int, int] = {id(layer): idx for idx, layer in enumerate(self._blocks)}
         prefetch_count = self._prefetch_count  # capture as local — no `self` ref in closure
         max_on_gpu = num_resident + prefetch_count
+        cyclic = self._cyclic
+        num_layers = len(self._blocks)
+        wrap_threshold = num_layers // 2  # |Δidx| > this counts as wraparound
         # weakref breaks the cycle: layer → hook → closure → streamer
         # → _blocks → layer. Without it, dropping the strategy without
         # first calling deactivate() would keep everything alive until
@@ -811,10 +835,26 @@ class StreamedWeights:
                     streamer._evict_one(protected, compute_event)
                 streamer._ensure_on_gpu(idx)
 
-            direction = 1 if idx >= streamer._last_idx else -1
+            # Direction inference. In cyclic mode, a large index jump
+            # (|Δ| > num_layers/2) is iteration wraparound, not a
+            # reversal: keep the same forward/backward sense and let
+            # prefetch indices wrap modulo num_layers so the next
+            # iteration's leading blocks get streamed proactively.
+            last = streamer._last_idx
             streamer._last_idx = idx
+            if last < 0:
+                direction = 1
+            else:
+                diff = idx - last
+                if cyclic and abs(diff) > wrap_threshold:
+                    direction = -1 if diff > 0 else 1
+                else:
+                    direction = 1 if diff >= 0 else -1
             for offset in range(1, prefetch_count + 1):
-                streamer._submit_prefetch(idx + direction * offset, max_on_gpu)
+                target = idx + direction * offset
+                if cyclic:
+                    target %= num_layers
+                streamer._submit_prefetch(target, max_on_gpu)
 
             total = len(tracker._on_gpu) + len(pending)
             tracker.peak_gpu_blocks = max(tracker.peak_gpu_blocks, total)

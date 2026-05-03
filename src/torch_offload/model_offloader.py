@@ -87,6 +87,13 @@ class ModelOffloader:
         to all groups) or one int per group.
     prefetch_count:
         Per-group prefetch depth. Same broadcasting as *blocks_to_swap*.
+    cyclic:
+        Default ``False``. Forwarded to every :class:`StreamedWeights`.
+        Set ``True`` for inference loops that iterate the model
+        repeatedly (diffusion denoising, multi-step decoders); the
+        prefetcher then treats end-of-iteration as wraparound and
+        keeps streaming the next iteration's leading blocks. Leave
+        ``False`` for single-shot inference or training.
     strict_homogeneous:
         Forwarded to each :class:`StreamedWeights`. When True (default),
         non-homogeneous groups raise at construction. Pass False for
@@ -101,6 +108,7 @@ class ModelOffloader:
         layers_attr: str | Sequence[str],
         blocks_to_swap: int | Sequence[int],
         prefetch_count: int | Sequence[int] = 2,
+        cyclic: bool = False,
         strict_homogeneous: bool = True,
     ) -> None:
         layer_paths: list[str] = (
@@ -137,6 +145,7 @@ class ModelOffloader:
                     target_device=target_device,
                     blocks_to_swap=swap_list[i],
                     prefetch_count=pf_list[i],
+                    cyclic=cyclic,
                     name=f"StreamedWeights[{layer_paths[i]}]",
                     strict_homogeneous=strict_homogeneous,
                     skip_slots=trainable_slots,
