@@ -54,7 +54,6 @@ Class-specific caveats
 
 from __future__ import annotations
 
-import logging
 from types import TracebackType
 from typing import Any
 
@@ -64,29 +63,6 @@ from torch import nn
 from .pinned_buffer import PinnedParamBuffer, storage_key
 from .protocols import SlotOwnership
 from .slots import BufferSlot, ParamSlot, iter_buffer_slots, iter_param_slots
-
-logger = logging.getLogger(__name__)
-
-
-def _set_buffer(module: nn.Module, name: str, value: torch.Tensor, persistent: bool) -> None:
-    """Replace a registered buffer in-place by its leaf name on
-    ``module``, preserving the original ``persistent`` flag so
-    ``state_dict()`` behavior survives the swap."""
-    module.register_buffer(name, value, persistent=persistent)
-
-
-def _dedupe_param_locs(
-    members: list[tuple[str, nn.Parameter, nn.Module, str]]
-) -> list[tuple[nn.Module, str]]:
-    seen_locs: set[tuple[int, str]] = set()
-    locs: list[tuple[nn.Module, str]] = []
-    for _, _, parent, leaf in members:
-        key = (id(parent), leaf)
-        if key in seen_locs:
-            continue
-        seen_locs.add(key)
-        locs.append((parent, leaf))
-    return locs
 
 
 class PinnedWeights:
@@ -179,7 +155,7 @@ class PinnedWeights:
                 parent._parameters[leaf] = buf.cpu_param
         for pinned, locs in self._buffer_slots:
             for parent, leaf, persistent in locs:
-                _set_buffer(parent, leaf, pinned, persistent)
+                parent.register_buffer(leaf, pinned, persistent=persistent)
 
         # Reject only if there is nothing at all to manage — neither
         # frozen params nor (when include_buffers=True) registered
@@ -216,7 +192,14 @@ class PinnedWeights:
         for members in groups.values():
             first_name, first_p = members[0][0], members[0][1]
             buf = PinnedParamBuffer(first_name, first_p)
-            locs = _dedupe_param_locs(members)
+            seen_locs: set[tuple[int, str]] = set()
+            locs: list[tuple[nn.Module, str]] = []
+            for _, _, parent, leaf in members:
+                key = (id(parent), leaf)
+                if key in seen_locs:
+                    continue
+                seen_locs.add(key)
+                locs.append((parent, leaf))
             slots.append((buf, locs))
         return slots
 
@@ -366,7 +349,7 @@ class PinnedWeights:
             for pinned, locs in self._buffer_slots:
                 gpu = pinned.to(self._device, non_blocking=True)
                 for parent, leaf, persistent in locs:
-                    _set_buffer(parent, leaf, gpu, persistent)
+                    parent.register_buffer(leaf, gpu, persistent=persistent)
         if self._device.type == "cuda":
             torch.cuda.synchronize(self._device)
 
@@ -377,4 +360,4 @@ class PinnedWeights:
         if self._include_buffers:
             for pinned, locs in self._buffer_slots:
                 for parent, leaf, persistent in locs:
-                    _set_buffer(parent, leaf, pinned, persistent)
+                    parent.register_buffer(leaf, pinned, persistent=persistent)

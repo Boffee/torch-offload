@@ -134,10 +134,6 @@ class LoRATransform:
             b_gpu = b.to(device=dev, dtype=dt, non_blocking=True)
             gpu_data.addmm_(b_gpu, a_gpu, alpha=strength)
 
-    @property
-    def nbytes(self) -> int:
-        return sum(a.nbytes + b.nbytes for a, b, _ in self._refs)
-
 
 class LoRARouteHandle:
     """Live forward-hook for one routed LoRA target.
@@ -248,15 +244,6 @@ class LoRARouteHandle:
         # closure becomes unreachable and Python refcount-GCs it.
         self._a_fused = None
         self._b_fused = None
-
-    @property
-    def nbytes(self) -> int:
-        if self._a_fused is None:
-            return 0
-        return (
-            self._a_fused.numel() * self._a_fused.element_size()
-            + self._b_fused.numel() * self._b_fused.element_size()
-        )
 
 
 # ---------------------------------------------------------------------------

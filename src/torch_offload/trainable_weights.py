@@ -48,10 +48,6 @@ class TrainableWeights:
     def cache_bytes(self) -> int:
         return 0
 
-    @property
-    def name(self) -> str:
-        return "TrainableWeights"
-
     def activate(self) -> None:
         self._move(self._target_device)
 

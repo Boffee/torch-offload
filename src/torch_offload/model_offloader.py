@@ -157,7 +157,12 @@ class ModelOffloader:
             skip_slots |= s.slot_filter
 
         non_block: PinnedWeights | None = None
-        if _has_pinnable_content(model, skip_slots):
+        has_pinnable = any(
+            s.slot not in skip_slots for s in iter_param_slots(model)
+        ) or any(
+            s.slot not in skip_slots for s in iter_buffer_slots(model)
+        )
+        if has_pinnable:
             non_block = PinnedWeights(model, target_device, skip_slots=skip_slots)
 
         components: list[ModelStrategyComponent] = []
@@ -168,10 +173,8 @@ class ModelOffloader:
 
         self._model = model
         self._target_device = target_device
-        self._layer_paths = layer_paths
         self._components = components
         self._streamers = streamers
-        self._non_block = non_block
         self._teardown_stack: contextlib.ExitStack | None = None
 
         self._reverse_index, self._reverse_parents = self._build_reverse_index(
@@ -473,16 +476,6 @@ def _broadcast(value: int | Sequence[int], n: int, name: str) -> list[int]:
     if len(out) != n:
         raise ValueError(f"{name} length {len(out)} != layers_attr length {n}")
     return out
-
-
-def _has_pinnable_content(
-    model: nn.Module, skip_slots: set[SlotOwnership]
-) -> bool:
-    return any(
-        s.slot not in skip_slots for s in iter_param_slots(model)
-    ) or any(
-        s.slot not in skip_slots for s in iter_buffer_slots(model)
-    )
 
 
 # ---------------------------------------------------------------------------

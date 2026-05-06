@@ -15,7 +15,6 @@ plus the pinned-host state that adapter produced.
 
 from __future__ import annotations
 
-import logging
 from collections.abc import Hashable
 from typing import Any
 
@@ -27,12 +26,6 @@ from . import (
     quanto_adapter,  # noqa: F401 — registration side effect
 )
 from .tensor_adapters import TensorAdapter, select_adapter
-
-
-def _is_subclass_tensor(t: torch.Tensor) -> bool:
-    return type(t) is not torch.Tensor
-
-logger = logging.getLogger(__name__)
 
 
 def storage_key(t: torch.Tensor) -> tuple[Any, ...]:
@@ -88,7 +81,7 @@ class PinnedParamBuffer:
         # activate() — doubling peak CPU memory for the model.
         # Only safe for plain tensors; quanto uses a subclass wrapper
         # that .data= would strip, so those skip this optimization.
-        if not _is_subclass_tensor(param.data):
+        if type(param.data) is torch.Tensor:
             param.data = self.cpu_param.data
 
     def allocate_gpu_storage(self, device: torch.device) -> object:

@@ -385,8 +385,7 @@ class _BlockPinnedStore:
 
 
 class _BlockTracker:
-    def __init__(self, num_layers: int) -> None:
-        self.num_layers = num_layers
+    def __init__(self) -> None:
         self._on_gpu: set[int] = set()
         self._lru: OrderedDict[int, None] = OrderedDict()
         self.peak_gpu_blocks = 0
@@ -625,10 +624,6 @@ class StreamedWeights:
         return self._store._param_locs
 
     @property
-    def name(self) -> str:
-        return self._name
-
-    @property
     def cache_bytes(self) -> int:
         return self._store.cache_bytes if self._store is not None else 0
 
@@ -658,7 +653,7 @@ class StreamedWeights:
         num_resident = num_layers - self._blocks_to_swap
         num_gpu_slots = num_resident + self._prefetch_count
 
-        self._tracker = _BlockTracker(num_layers)
+        self._tracker = _BlockTracker()
         self._executor = ThreadPoolExecutor(max_workers=1)
         self._stream = torch.cuda.Stream(device=self._target_device, priority=-1)
         self._pending = {}
