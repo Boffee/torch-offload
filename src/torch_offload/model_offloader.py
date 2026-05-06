@@ -263,13 +263,33 @@ class ModelOffloader:
                         f"B@A produces ({b.shape[0]}, {a.shape[1]}), "
                         f"target shape is {expected}."
                     )
-                if mode == "merge" and buf.cpu_param.dtype not in _ADDMM_DTYPES:
-                    raise ValueError(
-                        f"LoRA target {target_key!r} has dtype "
-                        f"{buf.cpu_param.dtype}; addmm_ merge requires "
-                        f"bf16, fp16, or fp32. Use mode='routed' (or "
-                        f"PEFT routed mode) for quantized params."
-                    )
+                if mode == "merge":
+                    cpu_data = buf.cpu_param.data
+                    # Two distinct rejection paths for merge mode:
+                    # - Subclassed tensors (quanto WeightQBytesTensor,
+                    #   GGUFWeight, etc.) advertise a float dtype but
+                    #   silently drop in-place ops on the wrapper —
+                    #   addmm_ on a quanto tensor returns success while
+                    #   leaving the int8 _data unchanged.
+                    # - Plain float tensors must be in the addmm-capable
+                    #   dtype set.
+                    if type(cpu_data) is not torch.Tensor:
+                        raise ValueError(
+                            f"LoRA target {target_key!r} is wrapped in "
+                            f"{type(cpu_data).__name__}; merge mode "
+                            f"requires a plain torch.Tensor (in-place "
+                            f"addmm_ on subclassed tensors silently "
+                            f"drops the update). Use mode='routed' (or "
+                            f"PEFT routed mode), or apply "
+                            f"torch_offload.merge_lora() permanently."
+                        )
+                    if cpu_data.dtype not in _ADDMM_DTYPES:
+                        raise ValueError(
+                            f"LoRA target {target_key!r} has dtype "
+                            f"{cpu_data.dtype}; addmm_ merge requires "
+                            f"bf16, fp16, or fp32. Use mode='routed' (or "
+                            f"PEFT routed mode) for non-float bases."
+                        )
                 per_target.setdefault(target_key, []).append(
                     (a, b, strength)
                 )

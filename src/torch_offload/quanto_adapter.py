@@ -85,7 +85,8 @@ class QuantoAdapter:
         if not QUANTO_AVAILABLE or not isinstance(t, WeightQBytesTensor):
             return False
         # Validate the layout we read in clone_pin/_build_qbytes is
-        # still present. Cheap one-time check at first match.
+        # still present. Cheap (four hasattr calls) and runs on every
+        # dispatch — no caching needed at this scale.
         validate_layout(t)
         return True
 

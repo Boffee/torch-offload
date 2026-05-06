@@ -58,10 +58,21 @@ def merge_lora(
                 # from the model so subsequent LoRAs targeting the same
                 # key see whatever is actually installed (not just the
                 # local Parameter we built — a custom __setattr__ /
-                # parametrize hook could have transformed it).
-                param_index[target_key] = (
-                    real_name, walk_attr_path(model, real_name),
-                )
+                # parametrize hook could have transformed it). If the
+                # re-read returns a non-Parameter, fail loud rather
+                # than silently letting the next iteration mutate a
+                # transient object that doesn't reach the model.
+                reread = walk_attr_path(model, real_name)
+                if not isinstance(reread, nn.Parameter):
+                    raise RuntimeError(
+                        f"After merging into quanto target "
+                        f"{target_key!r}, reading {real_name!r} from "
+                        f"the model returned {type(reread).__name__} "
+                        "instead of nn.Parameter. merge_lora doesn't "
+                        "support parametrize / custom __setattr__ "
+                        "hooks on quanto-quantized weights."
+                    )
+                param_index[target_key] = (real_name, reread)
             elif param.data.dtype in _ADDMM_DTYPES:
                 dev = param.data.device
                 param.data.addmm_(

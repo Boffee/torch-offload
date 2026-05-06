@@ -263,6 +263,35 @@ class TestSetLorasValidation:
         s.set_loras([])
         assert not _has_transform(s, "transformer_blocks.0.attn.weight")
 
+    def test_rejects_quanto_target_in_merge_mode(self) -> None:
+        # Regression: quanto WeightQBytesTensor advertises the scale's
+        # float dtype (bf16/fp16) via `weight.dtype`, which used to
+        # pass the merge-mode dtype gate. addmm_ on the wrapper then
+        # silently drops the LoRA — _data stays untouched. set_loras
+        # must reject subclassed wrappers in merge mode regardless of
+        # the advertised dtype.
+        quanto = pytest.importorskip("optimum.quanto")
+        from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
+
+        m = _make_bf16_model()
+        rows = cols = 16
+        data = torch.randint(-128, 127, (rows, cols), dtype=torch.int8)
+        scale = torch.rand(rows, 1, dtype=torch.bfloat16)
+        qt = WeightQBytesTensor.create(
+            quanto.qint8, 0, (rows, cols), (cols, 1), data, scale, None,
+        )
+        m.embed.weight = nn.Parameter(qt, requires_grad=False)
+
+        s = _make_strategy(m)
+        sd = {
+            "embed.lora_A.weight": torch.randn(4, 16),
+            "embed.lora_B.weight": torch.randn(16, 4),
+        }
+        with pytest.raises(ValueError, match="merge mode|wrapped in|subclass"):
+            s.set_loras([(LoRA(state_dict=sd), 1.0)], mode="merge")
+        # routed mode must still accept it.
+        s.set_loras([(LoRA(state_dict=sd), 1.0)], mode="routed")
+
     def test_accepts_fp16_base(self) -> None:
         m = _make_bf16_model().to(torch.float16)
         for p in m.parameters():

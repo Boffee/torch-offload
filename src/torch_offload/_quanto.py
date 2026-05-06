@@ -44,11 +44,12 @@ fail with a generic ``AttributeError`` later in the access path.
 def validate_layout(qt: torch.Tensor) -> None:
     """Raise if ``qt`` is missing any of :data:`LAYOUT_ATTRS`.
 
-    Cheap one-time guard. Both the streaming adapter
-    (:meth:`QuantoAdapter.matches`) and the permanent-merge path
-    (:func:`requantize_with_addmm_delta`) call this so a layout drift
-    in optimum-quanto is reported uniformly rather than as a generic
-    ``AttributeError`` partway through the dispatch.
+    Both the streaming adapter (:meth:`QuantoAdapter.matches`) and the
+    permanent-merge path (:func:`requantize_with_addmm_delta`) call
+    this so a layout drift in optimum-quanto is reported uniformly
+    rather than as a generic ``AttributeError`` partway through the
+    dispatch. The check itself is four ``hasattr`` calls — cheap to
+    run on every dispatch, no caching.
     """
     missing = [a for a in LAYOUT_ATTRS if not hasattr(qt, a)]
     if not missing:
