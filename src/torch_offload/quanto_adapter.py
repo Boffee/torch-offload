@@ -166,15 +166,6 @@ class QuantoAdapter:
             + state.scale.numel() * state.scale.element_size()
         )
 
-    @staticmethod
-    def homogeneity_key(state: _QuantoPinned) -> tuple:
-        return (
-            state.data.dtype, tuple(state.data.shape), state.data.stride(),
-            state.scale.dtype, tuple(state.scale.shape), state.scale.stride(),
-            state.qtype, state.axis, state.act_qt,
-            tuple(state.size), state.stride,
-        )
-
 
 if QUANTO_AVAILABLE:
     register_adapter(QuantoAdapter)

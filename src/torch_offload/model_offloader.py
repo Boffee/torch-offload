@@ -94,10 +94,6 @@ class ModelOffloader:
         prefetcher then treats end-of-iteration as wraparound and
         keeps streaming the next iteration's leading blocks. Leave
         ``False`` for single-shot inference or training.
-    strict_homogeneous:
-        Forwarded to each :class:`StreamedWeights`. When True (default),
-        non-homogeneous groups raise at construction. Pass False for
-        the per-load-allocation fallback.
     """
 
     def __init__(
@@ -109,7 +105,6 @@ class ModelOffloader:
         blocks_to_swap: int | Sequence[int],
         prefetch_count: int | Sequence[int] = 2,
         cyclic: bool = False,
-        strict_homogeneous: bool = True,
     ) -> None:
         layer_paths: list[str] = (
             [layers_attr] if isinstance(layers_attr, str) else list(layers_attr)
@@ -147,7 +142,6 @@ class ModelOffloader:
                     prefetch_count=pf_list[i],
                     cyclic=cyclic,
                     name=f"StreamedWeights[{layer_paths[i]}]",
-                    strict_homogeneous=strict_homogeneous,
                     skip_slots=trainable_slots,
                 )
             )

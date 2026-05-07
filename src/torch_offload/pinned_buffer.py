@@ -15,7 +15,6 @@ plus the pinned-host state that adapter produced.
 
 from __future__ import annotations
 
-from collections.abc import Hashable
 from typing import Any
 
 import torch
@@ -104,9 +103,10 @@ class PinnedParamBuffer:
         self, device: torch.device, non_blocking: bool = False
     ) -> nn.Parameter:
         """Convenience: allocate GPU storage and copy in one shot.
-        Used by the no-pool fallback path; the pooled path uses
-        :meth:`allocate_gpu_storage` + :meth:`make_gpu_param` once at
-        slot construction and :meth:`copy_to_gpu` on each load."""
+        Used by :class:`PinnedWeights` (one-shot per-param load on
+        activate); :class:`StreamedWeights` instead reuses a slot pool
+        via :meth:`allocate_gpu_storage` + :meth:`make_gpu_param` once
+        at pool construction and :meth:`copy_to_gpu` on each load."""
         gpu_state = self.allocate_gpu_storage(device)
         self.copy_to_gpu(gpu_state, non_blocking=non_blocking)
         gpu_param = self.make_gpu_param(gpu_state)
@@ -118,15 +118,3 @@ class PinnedParamBuffer:
     def cache_bytes(self) -> int:
         """Bytes this buffer consumes in pinned host memory."""
         return self.adapter.cache_bytes(self.pinned_state)
-
-    @property
-    def homogeneity_key(self) -> Hashable:
-        """Identity tuple for layout homogeneity checks. Used by
-        :class:`StreamedWeights` to verify all blocks share the same
-        layout before allocating a single GPU pool slot.
-
-        Includes the adapter class so distinct adapters can never
-        collide on tuple shape — a quanto state and a regular state
-        with coincidentally matching layout fields stay distinguishable.
-        """
-        return (self.adapter, self.adapter.homogeneity_key(self.pinned_state))

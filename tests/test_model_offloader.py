@@ -1207,12 +1207,76 @@ class TestActivatePoolIdempotency:
 
 
 # ---------------------------------------------------------------------------
-# Strict-homogeneity failure leaves model untouched (two-phase pinning)
+# Layout-signature check rejects heterogeneous block layouts
 # ---------------------------------------------------------------------------
 
 
-class TestStrictHomogeneousFailure:
-    def test_failure_leaves_model_untouched(self) -> None:
+class TestBlockLayoutSignature:
+    """Block 0 is the pool template; later blocks copy raw bytes into
+    its slot. ``Tensor.copy_`` silently casts dtype and silently
+    broadcasts compatible shapes, so mismatches that don't trip the
+    copy_ shape check would silently corrupt forward. The constructor's
+    layout-signature check rejects them up front."""
+
+    def test_shape_mismatch_raises(self) -> None:
+        class M(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.blocks = nn.ModuleList(
+                    [nn.Linear(4, 4, bias=False), nn.Linear(8, 8, bias=False)]
+                )
+
+        m = M()
+        for p in m.parameters():
+            p.requires_grad = False
+        with pytest.raises(ValueError, match="layout differs"):
+            StreamedWeights(
+                blocks=list(m.blocks),
+                target_device=torch.device("cpu"),
+                blocks_to_swap=1,
+            )
+
+    def test_dtype_mismatch_raises(self) -> None:
+        # Same shape, different dtype: Tensor.copy_ would silently
+        # cast — the silent corruption surface this check exists for.
+        b0 = nn.Linear(4, 4, bias=False).to(torch.float16)
+        b1 = nn.Linear(4, 4, bias=False).to(torch.bfloat16)
+        for b in (b0, b1):
+            for p in b.parameters():
+                p.requires_grad = False
+        with pytest.raises(ValueError, match="layout differs"):
+            StreamedWeights(
+                blocks=[b0, b1],
+                target_device=torch.device("cpu"),
+                blocks_to_swap=1,
+            )
+
+    def test_param_name_mismatch_raises(self) -> None:
+        # Different param names per block — would be a KeyError later;
+        # the check catches it cleanly at construction.
+        class A(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.foo = nn.Parameter(torch.randn(4, 4), requires_grad=False)
+
+        class B(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.bar = nn.Parameter(torch.randn(4, 4), requires_grad=False)
+
+        with pytest.raises(ValueError, match="layout differs"):
+            StreamedWeights(
+                blocks=[A(), B()],
+                target_device=torch.device("cpu"),
+                blocks_to_swap=1,
+            )
+
+    def test_failure_leaves_model_unpinned_and_unmutated(self) -> None:
+        # Strong-exception-safety: the validator runs in pass 1
+        # (collect specs) before pass 2 (pin) and pass 3 (apply slot
+        # mutations). On a layout mismatch, the user's Parameter
+        # objects must be the same identities and not pinned —
+        # neither pin_memory() nor _parameters[leaf] = ... fires.
         class M(nn.Module):
             def __init__(self):
                 super().__init__()
@@ -1227,7 +1291,7 @@ class TestStrictHomogeneousFailure:
         original_params = [b.weight for b in m.blocks]
         original_pinned = [b.weight.is_pinned() for b in m.blocks]
 
-        with pytest.raises(ValueError, match="not homogeneous"):
+        with pytest.raises(ValueError, match="layout differs"):
             StreamedWeights(
                 blocks=list(m.blocks),
                 target_device=torch.device("cpu"),
@@ -1237,41 +1301,13 @@ class TestStrictHomogeneousFailure:
         for block, orig_p, orig_pin in zip(
             m.blocks, original_params, original_pinned, strict=True,
         ):
-            assert block.weight is orig_p, "slot was mutated despite strict failure"
-            assert block.weight.is_pinned() == orig_pin
-
-    def test_compose_construction_failure_propagates(self) -> None:
-        # group_a is homogeneous and constructs successfully (pins +
-        # mutates slots). group_b is internally heterogeneous so its
-        # constructor raises. With no factory rollback, group_a's
-        # mutations stay in place; the partial state goes out of scope
-        # when caller drops the model. Caller's responsibility.
-        class M(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.group_a = nn.ModuleList(
-                    [nn.Linear(4, 4, bias=False) for _ in range(3)]
-                )
-                self.group_b = nn.ModuleList(
-                    [nn.Linear(4, 4, bias=False), nn.Linear(8, 8, bias=False)]
-                )
-
-        m = M()
-        for p in m.parameters():
-            p.requires_grad = False
-
-        with pytest.raises(ValueError, match="not homogeneous"):
-            ModelOffloader(
-                m, torch.device("cpu"),
-                layers_attr=["group_a", "group_b"],
-                blocks_to_swap=1,
+            assert block.weight is orig_p, (
+                "slot identity mutated despite pre-pin validation failure"
+            )
+            assert block.weight.is_pinned() == orig_pin, (
+                "param was pinned despite pre-pin validation failure"
             )
 
-        # group_a's slots were mutated to pinned cpu_params before the
-        # group_b constructor raised. Slots stay mutated; pinned memory
-        # released when caller drops the model.
-        for block in m.group_a:
-            assert block.weight.is_pinned()
 
 
 # ---------------------------------------------------------------------------

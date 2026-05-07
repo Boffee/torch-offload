@@ -1,10 +1,13 @@
 """Block-streaming primitive for memory-efficient training and inference.
 
-A :class:`StreamedWeights` manages a single homogeneous block list:
-pins the frozen weights to CPU at construction time, streams them
-to GPU on demand via forward-pre hooks, and uses a pre-allocated
-GPU slot pool plus a background prefetcher to overlap DMA with
-compute.
+A :class:`StreamedWeights` manages a single block list whose blocks
+share the same parameter layout (names, shapes, dtypes, and any
+quanto/GGUF wrapper metadata): pins the frozen weights to CPU at
+construction time, streams them to GPU on demand via forward-pre
+hooks, and uses a pre-allocated GPU slot pool plus a background
+prefetcher to overlap DMA with compute. Heterogeneous block lists
+(e.g. Flux's two block kinds) split into multiple
+:class:`StreamedWeights` instances composed via :class:`ModelOffloader`.
 
 This is the sharp, low-level primitive. It does NOT manage:
 
@@ -140,22 +143,98 @@ class _GpuSlotPool:
 # ---------------------------------------------------------------------------
 
 
+def _layout_signature(p: nn.Parameter) -> tuple:
+    """Layout fields that block 0's pool template must match across blocks.
+
+    ``Tensor.copy_`` silently casts dtype and silently broadcasts
+    compatible shapes — both invisible failure modes that would
+    silently corrupt a load. Wrapper metadata (qtype, axis,
+    activation_qtype, quant_type) is similarly invisible to copy_.
+
+    For plain tensors, stride is normalized to contiguous by
+    ``clone_pin`` so it's not part of the signature — including it
+    would falsely reject transposed inputs that pinning normalizes.
+    For subclassed wrappers (quanto, GGUF), the wrapper's logical
+    stride is captured by ``clone_pin`` into ``state.stride`` and
+    survives pinning (the GPU param is rebuilt with that stride),
+    so it IS load-bearing and goes in the signature. Inner storage
+    shapes/dtypes (``_data``, ``_scale``) are also captured for
+    subclassed wrappers — they're mostly determined by the other
+    fields, but explicit is cheap and forecloses any wrapper-class
+    edge case.
+    """
+    t = p.data
+    parts: list = [tuple(t.shape), t.dtype]
+    for attr in ("qtype", "axis", "activation_qtype", "quant_type"):
+        if hasattr(t, attr):
+            parts.append((attr, getattr(t, attr)))
+    if type(t) is not torch.Tensor:
+        parts.append(("wrapper_stride", tuple(t.stride())))
+        for inner_attr in ("_data", "_scale"):
+            inner = getattr(t, inner_attr, None)
+            if inner is not None:
+                parts.append((inner_attr, tuple(inner.shape), inner.dtype))
+    return tuple(parts)
+
+
+def _check_block_layouts_match(
+    param_specs: list[list[tuple[str, nn.Parameter, nn.Module, str]]],
+) -> None:
+    """Raise if blocks have mismatched param layouts. Called before
+    pinning so failures leave the model untouched.
+
+    See :func:`_layout_signature` for what counts as "matched."
+    """
+    if len(param_specs) <= 1:
+        return
+
+    def sig(specs: list[tuple[str, nn.Parameter, nn.Module, str]]) -> tuple:
+        return tuple((name, _layout_signature(param)) for name, param, _, _ in specs)
+
+    ref = sig(param_specs[0])
+    for i in range(1, len(param_specs)):
+        if sig(param_specs[i]) != ref:
+            raise ValueError(
+                f"Block {i} param layout differs from block 0. "
+                "All blocks in a StreamedWeights group must share the "
+                "same param structure (names, shapes, dtypes, and any "
+                "quanto/GGUF wrapper metadata). Split heterogeneous "
+                "block lists across separate `layers_attr=[...]` "
+                "groups in ModelOffloader."
+            )
+
+
 class _BlockPinnedStore:
     """Per-block pinned CPU + (when activated) per-slot GPU storage.
 
-    Two-phase construction:
+    Construction is three-phase so an invalid configuration **does
+    not pin and does not mutate the model's slot identities**:
 
-    - ``__init__`` pins every frozen param/buffer into a fresh
-      :class:`PinnedParamBuffer` / pinned clone, and records the slot
-      locations these will eventually be installed at — but DOES NOT
-      mutate the model's slots. This means a homogeneity check (or any
-      other validation) can run on the templates and reject the
-      configuration without leaving the model in a half-pinned state.
-      If the store is dropped before :meth:`apply_slot_mutations`, the
-      pinned tensors are released by GC.
-    - :meth:`apply_slot_mutations` swaps the model's slots to point
-      at the pinned objects. After this point the store owns slot
-      state and :meth:`evict_block` is needed to restore CPU params.
+    1. ``__init__`` first walks each block to collect param/buffer
+       slot specs (no pinning) and verifies that every block shares
+       the same layout signature. A mismatch raises ``ValueError``
+       before any pin or slot mutation.
+    2. Then it pins every frozen param/buffer into a fresh
+       :class:`PinnedParamBuffer` / pinned clone and records the
+       slot locations they'll be installed at. ``__init__`` does NOT
+       install those pinned objects into the model's slots.
+    3. :meth:`apply_slot_mutations` swaps the model's slots to point
+       at the pinned objects. After this point the store owns slot
+       state and :meth:`evict_block` is needed to restore CPU params.
+
+    Scope of the "no pin / no slot mutation" guarantee on
+    validation failure: callers (``StreamedWeights.__init__`` and
+    ``ModelOffloader.__init__``) move the model to CPU *before*
+    invoking this constructor — that placement change is not
+    undone by the validator. The guarantee covers ``pin_memory()``
+    and ``submod._parameters[leaf] = ...`` mutations only.
+
+    Note also that ``PinnedParamBuffer.__init__`` opportunistically
+    repoints the user's Parameter ``.data`` at the pinned clone as a
+    memory optimization (see ``pinned_buffer.py``). That mutation
+    happens during phase 2 and isn't undoable, but phase 1 has
+    already validated the configuration so it only fires for
+    configs that are about to succeed.
     """
 
     def __init__(
@@ -181,15 +260,16 @@ class _BlockPinnedStore:
         # skip_slots) can reference it before OR after mutation.
         slot_filter: set[SlotOwnership] = set()
 
+        # Pass 1: walk each block to collect param/buffer slot specs
+        # WITHOUT pinning anything. Slot filter and trainable-rejection
+        # also happen here. Pinning runs in pass 2 only after the
+        # layout-signature check passes — so an invalid configuration
+        # raises before any model mutation, and the failing tests don't
+        # need GPU IOMMU to fire.
+        param_specs: list[list[tuple[str, nn.Parameter, nn.Module, str]]] = []
+        buffer_specs: list[list[tuple[torch.Tensor, nn.Module, str]]] = []
         for layer in self._layers:
-            block_bufs: list[PinnedParamBuffer] = []
-            block_locs: list[tuple[str, nn.Module, str]] = []
-            # Slot filter covers every alias slot (so a composed
-            # PinnedWeights skips them all). Pinning is deduped by id(p) —
-            # intra-block aliasing is unsupported and must be rejected
-            # upstream by detect_streaming_region_ties; if the caller
-            # bypasses that, the alias slot silently keeps the original
-            # Parameter on activate (the user's bug, not ours).
+            block_params: list[tuple[str, nn.Parameter, nn.Module, str]] = []
             seen_param_ids: set[int] = set()
             for s in iter_param_slots(layer):
                 if s.slot in skip:
@@ -202,15 +282,16 @@ class _BlockPinnedStore:
                 # users are on the hook.
                 assert_frozen(s, owner="StreamedWeights")
                 slot_filter.add(s.slot)
+                # Pinning is deduped by id(p) — intra-block aliasing
+                # is unsupported and must be rejected upstream by
+                # detect_streaming_region_ties.
                 if id(s.param) in seen_param_ids:
                     continue
                 seen_param_ids.add(id(s.param))
-                block_bufs.append(PinnedParamBuffer(s.name, s.param))
-                block_locs.append((s.name, s.parent, s.leaf))
-            self._param_bufs.append(block_bufs)
-            self._param_locs.append(block_locs)
+                block_params.append((s.name, s.param, s.parent, s.leaf))
+            param_specs.append(block_params)
 
-            buf_records: list[tuple[torch.Tensor, nn.Module, str, torch.Tensor]] = []
+            block_bufs: list[tuple[torch.Tensor, nn.Module, str]] = []
             seen_buffer_ids: set[int] = set()
             for s in iter_buffer_slots(layer):
                 if s.slot in skip:
@@ -219,11 +300,36 @@ class _BlockPinnedStore:
                 if id(s.buffer) in seen_buffer_ids:
                     continue
                 seen_buffer_ids.add(id(s.buffer))
-                cpu_clone = s.buffer.data.clone(memory_format=torch.contiguous_format).pin_memory()
-                buf_records.append((s.buffer, s.parent, s.leaf, cpu_clone))
-            self._buf_records.append(buf_records)
+                block_bufs.append((s.buffer, s.parent, s.leaf))
+            buffer_specs.append(block_bufs)
 
         self._slot_filter: frozenset[SlotOwnership] = frozenset(slot_filter)
+
+        # Validate before pinning. ``Tensor.copy_`` silently casts dtype
+        # and silently broadcasts compatible shapes, so any block N with
+        # mismatched dtype, name, or wrapper metadata would otherwise
+        # load into block 0's pool slot without raising and corrupt
+        # forward. Run before pinning so an invalid config leaves the
+        # model untouched.
+        _check_block_layouts_match(param_specs)
+
+        # Pass 2: pin params + buffers.
+        for block_params in param_specs:
+            block_pinned: list[PinnedParamBuffer] = []
+            block_locs: list[tuple[str, nn.Module, str]] = []
+            for name, param, parent, leaf in block_params:
+                block_pinned.append(PinnedParamBuffer(name, param))
+                block_locs.append((name, parent, leaf))
+            self._param_bufs.append(block_pinned)
+            self._param_locs.append(block_locs)
+
+        for block_bufs in buffer_specs:
+            buf_records: list[tuple[torch.Tensor, nn.Module, str, torch.Tensor]] = []
+            for buf, parent, leaf in block_bufs:
+                cpu_clone = buf.data.clone(memory_format=torch.contiguous_format).pin_memory()
+                buf_records.append((buf, parent, leaf, cpu_clone))
+            self._buf_records.append(buf_records)
+
         self._device: torch.device | None = None
         self._pool: _GpuSlotPool | None = None
         self._block_to_slot: dict[int, int] = {}
@@ -265,27 +371,6 @@ class _BlockPinnedStore:
                 total += cpu_clone.numel() * cpu_clone.element_size()
         return total
 
-    def is_homogeneous(self) -> bool:
-        if len(self._param_bufs) <= 1:
-            return True
-        ref = self._param_bufs[0]
-
-        # Per-block layout signature: each buffer's name (slot identity)
-        # paired with its adapter-provided homogeneity_key (storage
-        # shape/dtype/stride/quant-metadata, whatever the adapter
-        # considers layout-significant).
-        def _key(b: PinnedParamBuffer) -> tuple:
-            return (b.name, b.homogeneity_key)
-
-        ref_keys = [_key(b) for b in ref]
-        for block in self._param_bufs[1:]:
-            if len(block) != len(ref_keys):
-                return False
-            for ref_tup, b in zip(ref_keys, block, strict=True):
-                if _key(b) != ref_tup:
-                    return False
-        return True
-
     def activate_pool(self, num_gpu_slots: int, device: torch.device) -> None:
         if self._pool_config is not None:
             existing = self._pool_config
@@ -296,10 +381,17 @@ class _BlockPinnedStore:
                     f"{device}). Call deactivate_pool() first."
                 )
             return
+        if num_gpu_slots <= 0:
+            raise ValueError(
+                f"num_gpu_slots must be > 0, got {num_gpu_slots}. "
+                "num_resident is always >= 1 by construction; this only "
+                "fires when prefetch_count is negative."
+            )
         self._device = device
         self._pool_config = (num_gpu_slots, device)
-        if num_gpu_slots > 0 and self._param_bufs and self.is_homogeneous():
-            self._pool = _GpuSlotPool(self._param_bufs[0], num_gpu_slots, device)
+        # Pool template comes from block 0. The constructor's layout
+        # check has already verified every other block matches.
+        self._pool = _GpuSlotPool(self._param_bufs[0], num_gpu_slots, device)
 
     def deactivate_pool(self) -> None:
         self._pool = None
@@ -309,16 +401,10 @@ class _BlockPinnedStore:
     def load_block(
         self,
         idx: int,
-        device: torch.device,
         non_blocking: bool = False,
         stream: torch.cuda.Stream | None = None,
     ) -> None:
-        if self._pool is not None:
-            self._load_pooled(idx, non_blocking, stream)
-        else:
-            self._load_alloc(idx, device, non_blocking)
-
-    def _load_pooled(self, idx: int, non_blocking: bool, stream: torch.cuda.Stream | None) -> None:
+        assert self._pool is not None, "activate_pool not called"
         slot_id = self._block_to_slot.get(idx)
         if slot_id is None:
             slot_id = self._pool.acquire()
@@ -332,25 +418,20 @@ class _BlockPinnedStore:
         for mod_buf, _sm, _ln, cpu_clone in self._buf_records[idx]:
             mod_buf.data = cpu_clone.to(self._device, non_blocking=non_blocking)
 
-    def _load_alloc(self, idx: int, device: torch.device, non_blocking: bool) -> None:
-        for buf, (_qn, submod, local_name) in zip(
-            self._param_bufs[idx], self._param_locs[idx], strict=True,
-        ):
-            submod._parameters[local_name] = buf.load_to_gpu(device, non_blocking=non_blocking)
-        for mod_buf, _sm, _ln, cpu_clone in self._buf_records[idx]:
-            mod_buf.data = cpu_clone.to(device, non_blocking=non_blocking)
-
-    def evict_block_fast(self, idx: int) -> None:
-        if self._pool is None:
-            # Without a pool there's no slot to release — restore the
-            # CPU param to drop the model's reference to GPU storage
-            # so it can be reclaimed by refcount.
-            return self.evict_block(idx)
+    def release_slot(self, idx: int) -> None:
+        """Return ``idx``'s pool slot for reuse without restoring the
+        slot Parameter on the model. Used in the steady-state hot path
+        where the next load will overwrite the slot anyway. For full
+        teardown (deactivate), use :meth:`evict_block` instead."""
+        assert self._pool is not None, "activate_pool not called"
         slot_id = self._block_to_slot.pop(idx, None)
         if slot_id is not None:
             self._pool.release(slot_id)
 
     def evict_block(self, idx: int) -> None:
+        """Restore ``idx``'s slot Parameters to their pinned CPU
+        forms and release the pool slot. Used for teardown so the
+        model can be safely accessed without the streamer."""
         for buf, (_qn, submod, local_name) in zip(
             self._param_bufs[idx], self._param_locs[idx], strict=True,
         ):
@@ -363,10 +444,10 @@ class _BlockPinnedStore:
                 self._pool.release(slot_id)
 
     def mark_compute_done(self, idx: int, event: torch.cuda.Event) -> None:
-        if self._pool is not None:
-            slot_id = self._block_to_slot.get(idx)
-            if slot_id is not None:
-                self._pool.set_compute_event(slot_id, event)
+        assert self._pool is not None, "activate_pool not called"
+        slot_id = self._block_to_slot.get(idx)
+        if slot_id is not None:
+            self._pool.set_compute_event(slot_id, event)
 
 
 # ---------------------------------------------------------------------------
@@ -481,17 +562,6 @@ class StreamedWeights:
         deactivate/activate cycle.
     name:
         Optional human-readable label for log messages.
-    strict_homogeneous:
-        Default ``True``. When True, raises ``ValueError`` if the
-        blocks are not layout-identical (param names/shapes/dtypes/
-        quanto specs differ). The check runs before any slot
-        mutation, so failure leaves the user's model untouched.
-        When False, falls back to per-load ``cudaMalloc`` allocation
-        — slow but works for heterogeneous configurations. Use
-        multiple :class:`StreamedWeights`s (one per homogeneous group)
-        with :func:`ModelOffloader` /
-        :class:`ModelOffloader` to get the pool benefit on
-        heterogeneous models like Flux.
     skip_slots:
         Optional set of :class:`SlotOwnership` tuples identifying
         ``(parent_module, leaf, kind)`` slots inside the blocks that
@@ -513,7 +583,6 @@ class StreamedWeights:
         prefetch_count: int = 2,
         cyclic: bool = False,
         name: str | None = None,
-        strict_homogeneous: bool = True,
         skip_slots: set[SlotOwnership] | None = None,
     ) -> None:
         self._blocks: list[nn.Module] = list(blocks)
@@ -530,25 +599,15 @@ class StreamedWeights:
 
         # Pin in __init__ — uniform lifecycle with PinnedWeights, and
         # ModelCache integration sees a final `cache_bytes` immediately.
-        # Two-phase under the hood: build pinned templates → validate
-        # homogeneity → apply slot mutations. If the homogeneity check
-        # fails, the local `store` binding falls out of scope, the
-        # pinned tensors are GC'd, and the user's model is left
-        # untouched.
+        # _BlockPinnedStore validates that every block shares the same
+        # param-layout signature; mismatched configs raise here, before
+        # any model slot is mutated. Heterogeneous block lists split
+        # across separate `layers_attr=[...]` entries in ModelOffloader.
         for block in self._blocks:
             block.to("cpu")
         store = _BlockPinnedStore(
             self._blocks, skip_slots=skip_slots,
         )
-        if strict_homogeneous and not store.is_homogeneous():
-            raise ValueError(
-                f"{self._name}: blocks are not homogeneous (different "
-                "param names/shapes/dtypes/quanto specs across blocks). "
-                "Either pass strict_homogeneous=False to opt into the "
-                "slower per-load allocation fallback, or split into "
-                "multiple StreamedWeights instances — one per homogeneous group — "
-                "and compose with ModelOffloader()."
-            )
         store.apply_slot_mutations()
         self._store: _BlockPinnedStore | None = store
 
@@ -653,7 +712,7 @@ class StreamedWeights:
         self._store.activate_pool(num_gpu_slots, self._target_device)
 
         for idx in range(min(num_resident, num_layers)):
-            self._store.load_block(idx, self._target_device)
+            self._store.load_block(idx)
             self._tracker.mark_on_gpu(idx)
 
         self._register_hooks(num_resident)
@@ -753,12 +812,12 @@ class StreamedWeights:
         victim = self._tracker.pick_victim(protected=protected)
         if compute_event is not None:
             self._store.mark_compute_done(victim, compute_event)
-        self._store.evict_block_fast(victim)
+        self._store.release_slot(victim)
         self._tracker.mark_on_cpu(victim)
 
     def _do_prefetch(self, idx: int) -> None:
         with torch.cuda.stream(self._stream):
-            self._store.load_block(idx, self._target_device, non_blocking=True, stream=self._stream)
+            self._store.load_block(idx, non_blocking=True, stream=self._stream)
             self._prefetch_events[idx].record(self._stream)
 
     def _submit_prefetch(self, idx: int, max_on_gpu: int) -> None:
@@ -781,7 +840,7 @@ class StreamedWeights:
             return
 
         if not self._tracker.is_on_gpu(idx):
-            self._store.load_block(idx, self._target_device)
+            self._store.load_block(idx)
             self._tracker.mark_on_gpu(idx)
 
     def _register_hooks(self, num_resident: int) -> None:

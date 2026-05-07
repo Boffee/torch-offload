@@ -25,7 +25,6 @@ the ``gguf`` package is not installed — GGUF support is optional.
 
 from __future__ import annotations
 
-from collections.abc import Hashable
 from dataclasses import dataclass
 
 import torch
@@ -218,15 +217,6 @@ class GgufAdapter:
     @staticmethod
     def cache_bytes(state: _GgufPinned) -> int:
         return state.data.nbytes
-
-    @staticmethod
-    def homogeneity_key(state: _GgufPinned) -> Hashable:
-        return (
-            tuple(state.data.shape),
-            state.quant_type,
-            tuple(state.dequant_shape),
-            state.compute_dtype,
-        )
 
 
 if _GGUF_AVAILABLE:

@@ -26,7 +26,6 @@ class and calling :func:`register_adapter`.
 
 from __future__ import annotations
 
-from collections.abc import Hashable
 from dataclasses import dataclass
 from typing import Any, Protocol, TypeVar, runtime_checkable
 
@@ -124,15 +123,6 @@ class TensorAdapter(Protocol[PinnedStateT, GpuStateT]):
         :class:`ModelCache` for budget accounting."""
         ...
 
-    @staticmethod
-    def homogeneity_key(state: PinnedStateT) -> Hashable:
-        """Identity used to test that a list of states is
-        layout-homogeneous (same dtype/shape/stride/quant-metadata).
-        Required by :class:`StreamedWeights`'s GPU pool, which preallocates
-        slots assuming all blocks share the same layout. Returns any
-        hashable value — typically a tuple of layout components."""
-        ...
-
 
 # ---------------------------------------------------------------------------
 # RegularAdapter — plain torch.Tensor (bf16/fp16/fp32, etc.)
@@ -220,10 +210,6 @@ class RegularAdapter:
     @staticmethod
     def cache_bytes(state: _RegularPinned) -> int:
         return state.data.numel() * state.data.element_size()
-
-    @staticmethod
-    def homogeneity_key(state: _RegularPinned) -> tuple:
-        return (state.data.dtype, tuple(state.data.shape), state.data.stride())
 
 
 # ---------------------------------------------------------------------------

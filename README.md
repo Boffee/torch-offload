@@ -152,9 +152,10 @@ the previous merge — no explicit unmerge step needed.
 
 `layers_attr` accepts a list of dotted paths for models with
 multiple kinds of blocks (e.g. Flux's `transformer_blocks` +
-`single_transformer_blocks`). Each path becomes its own homogeneous
-streaming group with its own slot pool — no per-load `cudaMalloc`
-fallback:
+`single_transformer_blocks`). Each path becomes its own streaming
+group with its own slot pool. Blocks within a group must share the
+same parameter layout (names/shapes/dtypes/quant-metadata) — split
+heterogeneous block lists into separate `layers_attr` entries:
 
 ```python
 offloader = ModelOffloader(
