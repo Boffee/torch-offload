@@ -5,23 +5,25 @@ strategies for moving model weights between host and GPU, plus an LRU
 cache that swaps multiple independent models in and out of GPU memory.
 
 Self-contained, library-friendly: no dependencies beyond `torch` (plus
-optional `optimum.quanto` for quantized models). Designed to be lifted
-into its own package when a second consumer appears.
+optional `optimum.quanto` and `gguf` for quantized models). Designed
+to be lifted into its own package when a second consumer appears.
 
 ## What's in here
 
 | Module | Role |
 |---|---|
-| `protocols.py` | `ModelStrategy` / `ModelStrategyComponent` plug-in contracts; `SlotOwnership` skip-filter type |
+| `protocols.py` | `CachedResource` (generic), `ModelStrategy` / `ModelStrategyComponent` plug-in contracts; `SlotOwnership` skip-filter type |
 | `pinned_weights.py` | `PinnedWeights` — whole-model bulk pinned-CPU↔GPU strategy |
 | `streamed_weights.py` | `StreamedWeights` — sharp per-block-list streaming primitive (component) |
 | `model_offloader.py` | `ModelOffloader` — unified composite: block streaming + non-block pinning + trainable params + optional LoRA merge |
 | `trainable_weights.py` | `TrainableWeights` — identity-preserving trainable parameter mover |
-| `lora.py` | `LoRA`, `LoRATransform` — per-weight LoRA merge transform + factor pairing/validation |
-| `pinned_buffer.py` | `PinnedParamBuffer` — per-tensor pinning primitive (handles quanto) |
-| `tensor_adapters.py`, `quanto_adapter.py` | Tensor-type adapter registry and optional optimum-quanto support |
-| `model_cache.py` | `ModelCache` — LRU pool over strategies with active-set leases |
-| `pipeline_install.py` | LTX-specific integration shim; keep outside the generic core surface when publishing independently |
+| `lora.py` | `LoRA`, `LoRATransform`, `LoRARouteHandle` — pinned factor storage + merge / routed-hook application |
+| `merge.py` | `merge_lora()` — permanent in-place LoRA merge into base weights (alternative to `set_loras`) |
+| `pinned_buffer.py` | `PinnedParamBuffer` — per-tensor pinning primitive (handles quanto + GGUF via adapters) |
+| `tensor_adapters.py`, `quanto_adapter.py`, `gguf_adapter.py`, `gguf_dequant.py` | Tensor-type adapter registry and optional optimum-quanto / gguf support |
+| `_quanto.py` | Internal: optimum-quanto optional-import + layout validation; consumed by `quanto_adapter.py` and `merge.py` |
+| `slots.py` | Slot-resolution helpers: `iter_param_slots`, `iter_buffer_slots`, `assert_frozen`, `canonical_param_name`, dotted-path walkers |
+| `model_cache.py` | `ModelCache` — LRU pool over `CachedResource` instances with active-set leases |
 
 ## Why use this
 
@@ -147,6 +149,34 @@ offloader.set_loras([])
 
 Block reload from pristine pinned CPU storage automatically clears
 the previous merge — no explicit unmerge step needed.
+
+`set_loras` accepts `mode="routed"` as an alternative to the default
+`mode="merge"`. Routed mode installs a forward hook on each matched
+`nn.Linear` parent — `y = base(x) + α·B·A·x` — instead of merging
+into the base weight. Use it when:
+
+- The base weight is quantized (quanto): `mode="merge"` rejects
+  subclassed wrappers because in-place `addmm_` silently drops the
+  update on them; `mode="routed"` works because it doesn't touch
+  the base.
+- You want to switch LoRAs frequently without re-streaming the
+  underlying base weight.
+
+Routed mode is restricted to `nn.Linear` parents and rejects tied
+weights (the hook would only fire on one alias).
+
+For a one-shot **permanent** merge — bake the LoRA into the model
+weights and discard the LoRA — use `merge_lora`:
+
+```python
+from torch_offload import merge_lora, LoRA
+
+merge_lora(model, [(LoRA(state_dict=load_file("lora.safetensors")), 0.8)])
+```
+
+This dequantizes-and-requantizes for quanto bases (lossy but
+standard) and uses an in-place `addmm_` for fp/bf bases. Unlike
+`set_loras`, this is not reversible.
 
 ### Heterogeneous block lists
 
@@ -342,6 +372,12 @@ storage on activation.
 A naive `param.data.clone()` on a quanto tensor silently
 *dequantizes* it via the dispatch fallback — the explicit decomposition
 is required for correctness.
+
+LoRA on quanto bases: `set_loras(mode="merge")` rejects quanto
+targets (in-place `addmm_` on a `WeightQBytesTensor` returns success
+but silently leaves `_data` untouched). Use `set_loras(mode="routed")`
+for inference-time application, or `merge_lora()` for a permanent
+dequant→addmm→requant bake-in.
 
 ## Failure modes
 
