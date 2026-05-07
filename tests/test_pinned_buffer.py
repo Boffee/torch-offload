@@ -164,3 +164,154 @@ class TestPinnedParamBufferQuanto:
         qt_pinned = buf.cpu_param.data
         assert torch.equal(gpu_param.data._data.cpu(), qt_pinned._data)
         assert torch.equal(gpu_param.data._scale.cpu(), qt_pinned._scale)
+
+
+# ---------------------------------------------------------------------------
+# requires_grad propagation through the wrapper builders
+# ---------------------------------------------------------------------------
+
+
+class TestRequiresGradPropagation:
+    """The buffer captures the source param's ``requires_grad`` at
+    construction time and threads it through to ``cpu_param`` /
+    ``gpu_param``. Frozen sources get historic ``requires_grad=False``
+    wrappers; trainable sources get ``True`` wrappers so consumers
+    that DO use the wrapper objects (rather than ``.data``-swapping)
+    see the right autograd flag."""
+
+    def test_frozen_source_yields_frozen_cpu_param(self) -> None:
+        p = nn.Parameter(torch.randn(8, dtype=torch.bfloat16), requires_grad=False)
+        buf = PinnedParamBuffer("w", p)
+        assert buf.requires_grad is False
+        assert buf.cpu_param.requires_grad is False
+
+    def test_trainable_source_yields_trainable_cpu_param(self) -> None:
+        p = nn.Parameter(torch.randn(8, dtype=torch.bfloat16), requires_grad=True)
+        buf = PinnedParamBuffer("w", p)
+        assert buf.requires_grad is True
+        assert buf.cpu_param.requires_grad is True
+
+    @CUDA
+    def test_trainable_source_yields_trainable_gpu_param(self) -> None:
+        p = nn.Parameter(torch.randn(8, dtype=torch.bfloat16), requires_grad=True)
+        buf = PinnedParamBuffer("w", p)
+        gpu_state = buf.allocate_gpu_storage(torch.device("cuda"))
+        gpu_param = buf.make_gpu_param(gpu_state)
+        assert gpu_param.requires_grad is True
+
+    @CUDA
+    def test_frozen_source_yields_frozen_gpu_param(self) -> None:
+        p = nn.Parameter(torch.randn(8, dtype=torch.bfloat16), requires_grad=False)
+        buf = PinnedParamBuffer("w", p)
+        gpu_state = buf.allocate_gpu_storage(torch.device("cuda"))
+        gpu_param = buf.make_gpu_param(gpu_state)
+        assert gpu_param.requires_grad is False
+
+
+# ---------------------------------------------------------------------------
+# copy_to_cpu — D2H counterpart to copy_to_gpu
+# ---------------------------------------------------------------------------
+
+
+class TestCopyToCpu:
+    """Symmetric D2H of GPU contents back into the pinned host state.
+    Used at the optimizer-step boundary in trainable streaming: GPU
+    weights got updated in place by ``optimizer.step()``, scatter the
+    update back to the pinned clone so the next H2D reads it."""
+
+    @CUDA
+    def test_regular_round_trip(self) -> None:
+        p = nn.Parameter(torch.randn(16, dtype=torch.bfloat16), requires_grad=False)
+        original = p.data.clone()
+        buf = PinnedParamBuffer("w", p)
+        device = torch.device("cuda")
+        gpu_state = buf.allocate_gpu_storage(device)
+        buf.copy_to_gpu(gpu_state, non_blocking=True)
+        torch.cuda.synchronize()
+
+        # Mutate GPU side as if optimizer.step had run there.
+        new_vals_gpu = torch.randn(16, dtype=torch.bfloat16, device=device)
+        gpu_state.data.copy_(new_vals_gpu)
+        torch.cuda.synchronize()
+
+        # D2H should overwrite the pinned host state with the new GPU contents.
+        buf.copy_to_cpu(gpu_state, non_blocking=True)
+        torch.cuda.synchronize()
+        assert torch.equal(buf.pinned_state.data, new_vals_gpu.cpu())
+        # The pinned state has actually changed from the original.
+        assert not torch.equal(buf.pinned_state.data, original)
+
+    @CUDA
+    def test_regular_pinned_storage_identity_preserved(self) -> None:
+        # The pinned-host buffer stays at the same address after D2H —
+        # we're overwriting in place, not allocating a new tensor.
+        # Callers that hold cpu_param.data references rely on this.
+        p = nn.Parameter(torch.randn(16, dtype=torch.bfloat16), requires_grad=True)
+        buf = PinnedParamBuffer("w", p)
+        original_ptr = buf.pinned_state.data.data_ptr()
+        gpu_state = buf.allocate_gpu_storage(torch.device("cuda"))
+        buf.copy_to_gpu(gpu_state)
+        buf.copy_to_cpu(gpu_state)
+        torch.cuda.synchronize()
+        assert buf.pinned_state.data.data_ptr() == original_ptr
+
+    @CUDA
+    def test_quanto_round_trip(self) -> None:
+        # Quanto D2H must write back BOTH _data (int8) and _scale, and
+        # the quant metadata on the pinned wrapper must be unchanged.
+        quanto = pytest.importorskip("optimum.quanto")
+        from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
+
+        rows, cols = 4, 8
+        data = torch.randint(-128, 127, (rows, cols), dtype=torch.int8)
+        scale = torch.rand(rows, 1, dtype=torch.bfloat16)
+        qt = WeightQBytesTensor.create(
+            quanto.qint8, 0, (rows, cols), (cols, 1), data, scale, None,
+        )
+        p = nn.Parameter(qt, requires_grad=False)
+        buf = PinnedParamBuffer("w", p)
+        device = torch.device("cuda")
+        gpu_state = buf.allocate_gpu_storage(device)
+        buf.copy_to_gpu(gpu_state)
+        torch.cuda.synchronize()
+
+        # Mutate GPU-side _data and _scale in place.
+        new_data = torch.randint(-128, 127, (rows, cols), dtype=torch.int8, device=device)
+        new_scale = torch.rand(rows, 1, dtype=torch.bfloat16, device=device)
+        gpu_state.data.copy_(new_data)
+        gpu_state.scale.copy_(new_scale)
+        torch.cuda.synchronize()
+
+        buf.copy_to_cpu(gpu_state)
+        torch.cuda.synchronize()
+        assert torch.equal(buf.pinned_state.data, new_data.cpu())
+        assert torch.equal(buf.pinned_state.scale, new_scale.cpu())
+        # Metadata untouched — qtype, axis, etc. live on the pinned
+        # state and are not part of the GPU representation.
+        assert buf.pinned_state.qtype is quanto.qint8
+        assert buf.pinned_state.axis == 0
+
+    @CUDA
+    def test_gguf_raises_not_implemented(self) -> None:
+        # GGUF stores packed quantized bytes on CPU but dequantized
+        # bf16 on GPU — D2H would require re-quantization, which isn't
+        # implemented. Surface it as NotImplementedError, not a silent
+        # corruption of the pinned packed bytes.
+        gguf = pytest.importorskip("gguf")
+        from torch_offload.gguf_adapter import GGUFWeight, GgufAdapter
+
+        # Build minimal GGUF state directly via the adapter — avoids
+        # needing a real .gguf file to load. Q4_0 has the simplest
+        # block layout and is broadly supported.
+        qt_value = int(gguf.GGMLQuantizationType.Q4_0)
+        # Q4_0 packs 32 fp16 weights into an 18-byte block (2 scale + 16 quants).
+        packed = torch.zeros(18, dtype=torch.uint8)
+        gguf_t = GGUFWeight(packed, quant_type=qt_value)
+        p = nn.Parameter(gguf_t, requires_grad=False)
+        buf = PinnedParamBuffer("w", p)
+        gpu_state = buf.allocate_gpu_storage(torch.device("cuda"))
+        with pytest.raises(NotImplementedError, match="re-quantization"):
+            buf.copy_to_cpu(gpu_state)
+        # Adapter dispatch path also surfaces it.
+        with pytest.raises(NotImplementedError):
+            GgufAdapter.copy_to_cpu(gpu_state, buf.pinned_state)

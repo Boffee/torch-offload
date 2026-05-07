@@ -4,20 +4,22 @@ Different tensor subclasses need different machinery to move bytes
 across the CPU↔GPU boundary while preserving correctness:
 
 - Plain ``torch.Tensor`` (bf16/fp16/fp32): single contiguous pinned
-  buffer; consumers slot-replace via ``module._parameters[leaf] = ...``
-  with a fresh :class:`nn.Parameter` wrapping it.
+  buffer; consumers either slot-replace via ``module._parameters[leaf]
+  = ...`` with a fresh :class:`nn.Parameter` wrapping it, or ``.data``-
+  swap to preserve identity for trainable params.
 - Quanto ``WeightQBytesTensor``: two pinned tensors (``_data`` + ``_scale``)
-  plus quant metadata; the wrapper must be reconstructed on each move
-  and installed via the same slot-replacement mechanism.
-
-Both paths orphan the user's pre-wrap Parameter, so optimizer state
-keyed by that object is lost — these adapters are frozen-only when used
-through :class:`PinnedParamBuffer`.
+  plus quant metadata; the wrapper must be reconstructed on each move.
+  ``.data``-swap doesn't work for quanto — its quant state is part of
+  the Parameter's wrapped object, not its bytes — so quanto stays
+  frozen-only via slot replacement.
 
 Each adapter encapsulates the mechanics for one tensor type. The rest
 of the package (:class:`PinnedParamBuffer`, :class:`PinnedWeights`,
 :class:`StreamedWeights`) is type-agnostic and dispatches through
-:func:`select_adapter`.
+:func:`select_adapter`. Wrapper builders (:meth:`cpu_param`,
+:meth:`gpu_param`) accept a ``requires_grad`` keyword so consumers can
+opt in to trainable wrappers; D2H is symmetric with H2D via
+:meth:`copy_to_cpu`.
 
 This module is internal to :mod:`torch_offload`. Adapters are registered
 at module import time; new types can be added by writing a new adapter
@@ -87,10 +89,17 @@ class TensorAdapter(Protocol[PinnedStateT, GpuStateT]):
         ...
 
     @staticmethod
-    def cpu_param(state: PinnedStateT) -> nn.Parameter:
+    def cpu_param(
+        state: PinnedStateT, *, requires_grad: bool = False
+    ) -> nn.Parameter:
         """Build a stable :class:`nn.Parameter` wrapping the host state.
         Used as the deactivated-state slot value
-        (``module._parameters[leaf] = cpu_param``)."""
+        (``module._parameters[leaf] = cpu_param``).
+
+        ``requires_grad`` defaults to ``False`` to match the historic
+        frozen-only callers; pass ``True`` when building a wrapper for
+        a trainable param the caller intends to keep in the model tree.
+        """
         ...
 
     @staticmethod
@@ -100,14 +109,20 @@ class TensorAdapter(Protocol[PinnedStateT, GpuStateT]):
         ...
 
     @staticmethod
-    def gpu_param(pinned: PinnedStateT, gpu_state: GpuStateT) -> nn.Parameter:
+    def gpu_param(
+        pinned: PinnedStateT, gpu_state: GpuStateT, *, requires_grad: bool = False
+    ) -> nn.Parameter:
         """Build a stable :class:`nn.Parameter` wrapping the GPU state.
         Reused across many :meth:`copy_to_gpu` calls.
 
         Takes both the pinned host state and the GPU state because
         adapters with structured tensors (e.g. quanto) need metadata
         captured at pin time to reconstruct the GPU-side wrapper. Plain
-        adapters ignore ``pinned``."""
+        adapters ignore ``pinned``.
+
+        ``requires_grad`` defaults to ``False``; pass ``True`` for
+        trainable use cases where the wrapper participates in autograd.
+        """
         ...
 
     @staticmethod
@@ -115,6 +130,23 @@ class TensorAdapter(Protocol[PinnedStateT, GpuStateT]):
         src: PinnedStateT, dst: GpuStateT, *, non_blocking: bool = False
     ) -> None:
         """Bulk DMA the pinned state's bytes into pre-allocated GPU storage."""
+        ...
+
+    @staticmethod
+    def copy_to_cpu(
+        src: GpuStateT, dst: PinnedStateT, *, non_blocking: bool = False
+    ) -> None:
+        """Bulk D2H the GPU state's bytes into pinned host storage.
+
+        Symmetric counterpart to :meth:`copy_to_gpu`. Used to sync the
+        pinned host clone with post-update GPU contents — e.g., after
+        an optimizer step has written into the GPU param, scatter the
+        update back to the pinned state so the next H2D reads it.
+
+        Adapters whose GPU representation is not round-trippable (GGUF
+        dequantizes to bf16 on H2D and would need re-quantization for
+        D2H) should raise :class:`NotImplementedError`.
+        """
         ...
 
     @staticmethod
@@ -147,13 +179,15 @@ class RegularAdapter:
     """Adapter for plain ``torch.Tensor`` (no subclass machinery).
 
     Builds fresh :class:`nn.Parameter` objects wrapping the pinned-CPU
-    and GPU storages. Consumers (e.g., :class:`PinnedWeights`,
-    ``_BlockPinnedStore``) slot-replace via
-    ``module._parameters[leaf] = ...`` with the buffer's ``cpu_param``
-    or its pool-slot ``gpu_param``; the user's original Parameter object
-    is orphaned, so PyTorch optimizers keyed by that pre-wrap object
-    lose their references. Use this adapter through
-    :class:`PinnedParamBuffer` for frozen params only.
+    and GPU storages. The frozen-only callers (:class:`PinnedWeights`,
+    ``_BlockPinnedStore``) slot-replace via ``module._parameters[leaf]
+    = ...`` with the buffer's ``cpu_param`` or its pool-slot
+    ``gpu_param``; the user's original Parameter object is orphaned,
+    so optimizer state keyed on the pre-wrap object is lost. Trainable
+    callers can either request ``requires_grad=True`` wrappers or skip
+    the slot replacement entirely and ``.data``-swap into their own
+    persistent Parameter — both are supported by the shape of this
+    adapter (plain tensors round-trip through ``.data =`` cleanly).
 
     Conservative on dispatch: only matches exactly
     ``type(t) is torch.Tensor`` (or ``nn.Parameter``). Unrecognized
@@ -187,23 +221,36 @@ class RegularAdapter:
         )
 
     @staticmethod
-    def cpu_param(state: _RegularPinned) -> nn.Parameter:
-        return nn.Parameter(state.data, requires_grad=False)
+    def cpu_param(
+        state: _RegularPinned, *, requires_grad: bool = False
+    ) -> nn.Parameter:
+        return nn.Parameter(state.data, requires_grad=requires_grad)
 
     @staticmethod
     def alloc_gpu(state: _RegularPinned, device: torch.device) -> _RegularGpu:
         return _RegularGpu(data=torch.empty_like(state.data, device=device))
 
     @staticmethod
-    def gpu_param(pinned: _RegularPinned, gpu_state: _RegularGpu) -> nn.Parameter:  # noqa: ARG004
+    def gpu_param(  # noqa: ARG004
+        pinned: _RegularPinned,
+        gpu_state: _RegularGpu,
+        *,
+        requires_grad: bool = False,
+    ) -> nn.Parameter:
         # pinned unused: regular tensors carry no metadata beyond storage.
         # Argument kept for Protocol parity with TensorAdapter — quanto
         # and other structured tensors need it to reconstruct wrappers.
-        return nn.Parameter(gpu_state.data, requires_grad=False)
+        return nn.Parameter(gpu_state.data, requires_grad=requires_grad)
 
     @staticmethod
     def copy_to_gpu(
         src: _RegularPinned, dst: _RegularGpu, *, non_blocking: bool = False
+    ) -> None:
+        dst.data.copy_(src.data, non_blocking=non_blocking)
+
+    @staticmethod
+    def copy_to_cpu(
+        src: _RegularGpu, dst: _RegularPinned, *, non_blocking: bool = False
     ) -> None:
         dst.data.copy_(src.data, non_blocking=non_blocking)
 

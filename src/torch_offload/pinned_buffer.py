@@ -56,23 +56,35 @@ class PinnedParamBuffer:
     (:attr:`cpu_param`).
 
     The lifecycle methods (:meth:`allocate_gpu_storage`,
-    :meth:`make_gpu_param`, :meth:`copy_to_gpu`, :meth:`load_to_gpu`)
-    all dispatch through the adapter. Consumers work with the opaque
-    :class:`GpuState` returned by :meth:`allocate_gpu_storage`; the
-    buffer round-trips that opaque handle through subsequent calls.
+    :meth:`make_gpu_param`, :meth:`copy_to_gpu`, :meth:`copy_to_cpu`,
+    :meth:`load_to_gpu`) all dispatch through the adapter. Consumers
+    work with the opaque :class:`GpuState` returned by
+    :meth:`allocate_gpu_storage`; the buffer round-trips that opaque
+    handle through subsequent calls.
 
-    Frozen-only by design — callers slot-replace with the buffer's
-    :attr:`cpu_param` / pool ``gpu_param``, which orphans any pre-wrap
-    Parameter identity. Trainable params should be routed elsewhere.
+    The buffer captures the source parameter's ``requires_grad`` at
+    construction time and threads it through to the adapter when
+    building :attr:`cpu_param` and the pool's ``gpu_param``. Frozen
+    callers (:class:`PinnedWeights`, ``_BlockPinnedStore`` for
+    ``requires_grad=False`` slots) get the historic behavior. Trainable
+    callers can either request the wrapper preserve ``requires_grad``
+    or skip the wrapper entirely and ``.data``-swap into their own
+    persistent Parameter — both are supported.
     """
 
-    __slots__ = ("adapter", "cpu_param", "name", "pinned_state", "transform")
+    __slots__ = (
+        "adapter", "cpu_param", "name", "pinned_state",
+        "requires_grad", "transform",
+    )
 
     def __init__(self, name: str, param: nn.Parameter) -> None:
         self.name = name
         self.adapter: type[TensorAdapter] = select_adapter(param.data)
+        self.requires_grad: bool = param.requires_grad
         self.pinned_state = self.adapter.clone_pin(param.data)
-        self.cpu_param: nn.Parameter = self.adapter.cpu_param(self.pinned_state)
+        self.cpu_param: nn.Parameter = self.adapter.cpu_param(
+            self.pinned_state, requires_grad=self.requires_grad,
+        )
         self.transform: Any = None
         # Release the original (non-pinned) storage by repointing the
         # model parameter at the pinned cpu_param data. Without this,
@@ -86,18 +98,33 @@ class PinnedParamBuffer:
     def allocate_gpu_storage(self, device: torch.device) -> object:
         """Allocate empty GPU storage mirroring this buffer's layout.
         Returns an opaque adapter-specific handle; pass it back to
-        :meth:`make_gpu_param` and :meth:`copy_to_gpu`."""
+        :meth:`make_gpu_param`, :meth:`copy_to_gpu`, and
+        :meth:`copy_to_cpu`."""
         return self.adapter.alloc_gpu(self.pinned_state, device)
 
     def make_gpu_param(self, gpu_state: object) -> nn.Parameter:
         """Build the GPU-side :class:`nn.Parameter` for this buffer.
         Adapter receives the paired pinned state so structured tensor
-        types (quanto) can reconstruct their wrappers."""
-        return self.adapter.gpu_param(self.pinned_state, gpu_state)
+        types (quanto) can reconstruct their wrappers. The wrapper's
+        ``requires_grad`` matches the source parameter's at pin time."""
+        return self.adapter.gpu_param(
+            self.pinned_state, gpu_state, requires_grad=self.requires_grad,
+        )
 
     def copy_to_gpu(self, gpu_state: object, *, non_blocking: bool = False) -> None:
         """Bulk DMA pinned host bytes into pre-allocated GPU storage."""
         self.adapter.copy_to_gpu(self.pinned_state, gpu_state, non_blocking=non_blocking)
+
+    def copy_to_cpu(self, gpu_state: object, *, non_blocking: bool = False) -> None:
+        """Bulk D2H GPU bytes back into the pinned host state.
+
+        Symmetric counterpart to :meth:`copy_to_gpu`. The pinned state
+        is overwritten in place with the current GPU contents — useful
+        for syncing the host clone after an in-place GPU update (e.g.,
+        an optimizer step). Adapters whose GPU representation is not
+        round-trippable (GGUF) raise :class:`NotImplementedError`.
+        """
+        self.adapter.copy_to_cpu(gpu_state, self.pinned_state, non_blocking=non_blocking)
 
     def load_to_gpu(
         self, device: torch.device, non_blocking: bool = False

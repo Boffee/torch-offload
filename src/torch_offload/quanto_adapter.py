@@ -134,9 +134,11 @@ class QuantoAdapter:
         )
 
     @staticmethod
-    def cpu_param(state: _QuantoPinned) -> nn.Parameter:
+    def cpu_param(
+        state: _QuantoPinned, *, requires_grad: bool = False
+    ) -> nn.Parameter:
         qt = _build_qbytes(state, state.data, state.scale)
-        return nn.Parameter(qt, requires_grad=False)
+        return nn.Parameter(qt, requires_grad=requires_grad)
 
     @staticmethod
     def alloc_gpu(state: _QuantoPinned, device: torch.device) -> _QuantoGpu:
@@ -146,16 +148,32 @@ class QuantoAdapter:
         )
 
     @staticmethod
-    def gpu_param(pinned: _QuantoPinned, gpu_state: _QuantoGpu) -> nn.Parameter:
+    def gpu_param(
+        pinned: _QuantoPinned,
+        gpu_state: _QuantoGpu,
+        *,
+        requires_grad: bool = False,
+    ) -> nn.Parameter:
         # Quant metadata comes from the pinned state; only the storage
         # tensors come from the GPU side.
         qt = _build_qbytes(pinned, gpu_state.data, gpu_state.scale)
-        return nn.Parameter(qt, requires_grad=False)
+        return nn.Parameter(qt, requires_grad=requires_grad)
 
     @staticmethod
     def copy_to_gpu(
         src: _QuantoPinned, dst: _QuantoGpu, *, non_blocking: bool = False
     ) -> None:
+        dst.data.copy_(src.data, non_blocking=non_blocking)
+        dst.scale.copy_(src.scale, non_blocking=non_blocking)
+
+    @staticmethod
+    def copy_to_cpu(
+        src: _QuantoGpu, dst: _QuantoPinned, *, non_blocking: bool = False
+    ) -> None:
+        # Symmetric D2H of both packed tensors. Quant metadata lives on
+        # the pinned state already and is unaffected by GPU operations,
+        # so only the int8/fp8 _data and the fp16/fp32 _scale need to
+        # round-trip back to host.
         dst.data.copy_(src.data, non_blocking=non_blocking)
         dst.scale.copy_(src.scale, non_blocking=non_blocking)
 

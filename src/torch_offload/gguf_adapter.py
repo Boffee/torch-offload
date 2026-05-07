@@ -182,10 +182,12 @@ class GgufAdapter:
         )
 
     @staticmethod
-    def cpu_param(state: _GgufPinned) -> nn.Parameter:
+    def cpu_param(
+        state: _GgufPinned, *, requires_grad: bool = False
+    ) -> nn.Parameter:
         return nn.Parameter(
             GGUFWeight(state.data, quant_type=state.quant_type),
-            requires_grad=False,
+            requires_grad=requires_grad,
         )
 
     @staticmethod
@@ -199,8 +201,10 @@ class GgufAdapter:
         return _GgufGpu(staging=staging, dequant=dequant)
 
     @staticmethod
-    def gpu_param(pinned: _GgufPinned, gpu_state: _GgufGpu) -> nn.Parameter:  # noqa: ARG004
-        return nn.Parameter(gpu_state.dequant, requires_grad=False)
+    def gpu_param(  # noqa: ARG004
+        pinned: _GgufPinned, gpu_state: _GgufGpu, *, requires_grad: bool = False,
+    ) -> nn.Parameter:
+        return nn.Parameter(gpu_state.dequant, requires_grad=requires_grad)
 
     @staticmethod
     def copy_to_gpu(
@@ -213,6 +217,23 @@ class GgufAdapter:
         # output buffer so gpu_param().data sees the update.
         result = dequantize(dst.staging, src.quant_type, dtype=src.compute_dtype)
         dst.dequant.copy_(result)
+
+    @staticmethod
+    def copy_to_cpu(
+        src: _GgufGpu, dst: _GgufPinned, *, non_blocking: bool = False,  # noqa: ARG004
+    ) -> None:
+        # GGUF's GPU representation is the dequantized bf16 weight
+        # (``dst.dequant``), not the original packed quantized bytes.
+        # Round-tripping back to the pinned packed form would require
+        # re-quantization, which is lossy and not currently implemented.
+        # GGUF weights are inference-only by design, so this path
+        # shouldn't fire in practice.
+        raise NotImplementedError(
+            "GgufAdapter.copy_to_cpu is not supported: GGUF weights are "
+            "stored as packed quantized bytes on CPU but dequantized to "
+            "bf16 on GPU, and re-quantization is not implemented. GGUF "
+            "weights are inference-only."
+        )
 
     @staticmethod
     def cache_bytes(state: _GgufPinned) -> int:
