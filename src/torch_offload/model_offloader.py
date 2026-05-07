@@ -72,6 +72,35 @@ class ModelOffloader:
     :class:`PinnedParamBuffer` objects so the merge fires automatically
     during DMA — no separate merge strategy needed.
 
+    Training
+    --------
+    Training through streamed blocks **requires activation
+    checkpointing on each block** — wrap call sites in
+    :func:`torch.utils.checkpoint.checkpoint`, or call
+    ``model.gradient_checkpointing_enable()`` on a HuggingFace model.
+    Without it, ``loss.backward()`` raises ``RuntimeError: ... has
+    been modified by an inplace operation`` on the first slot reuse.
+
+    Why: autograd saves a reference to each ``Linear``'s weight
+    tensor at forward time and records its version counter. Streaming
+    is a sequence of in-place ``copy_`` writes into a fixed pool of
+    GPU slot tensors — every load bumps the slot tensor's version,
+    invalidating any previously-saved reference into that slot.
+    Checkpointing makes each block's internal forward run under
+    ``no_grad`` (no internal tensors saved); when backward arrives,
+    PyTorch re-runs the block's forward with grad enabled, building
+    a fresh autograd graph whose saved references only live within
+    that one block's recompute-then-backward window. Slot reuse
+    outside that window is then safe.
+
+    :meth:`activate` emits a one-time warning if ``model.training``
+    is ``True`` with trainable params present and no HuggingFace
+    ``gradient_checkpointing`` flag is set on the streamed blocks.
+    The check is heuristic — it cannot see manual call-site
+    ``checkpoint(...)`` wrapping, which is invisible from the module
+    tree. Callers using that style will see a false-positive warning
+    that can be filtered via standard ``logging`` config.
+
     Parameters
     ----------
     model:
@@ -174,6 +203,8 @@ class ModelOffloader:
         self._reverse_index, self._reverse_parents = self._build_reverse_index(
             streamers, layer_paths, non_block,
         )
+        self._block_groups: list[list[nn.Module]] = block_groups
+        self._warned_about_checkpointing: bool = False
         # Pending routed-mode LoRAs: list of (parent_module, refs).
         # Populated by set_loras(mode="routed"); the actual hooks are
         # installed on activate() and removed on deactivate(). Cleared
@@ -350,6 +381,7 @@ class ModelOffloader:
         return sum(c.cache_bytes for c in self._components)
 
     def activate(self) -> None:
+        self._warn_if_training_without_checkpointing()
         try:
             with contextlib.ExitStack() as stack:
                 for component in self._components:
@@ -401,6 +433,62 @@ class ModelOffloader:
         self.deactivate()
 
     # ----------------------------------------------------------- Internals
+
+    def _warn_if_training_without_checkpointing(self) -> None:
+        """Emit a one-time warning when training-shaped use is detected
+        without HuggingFace-style ``gradient_checkpointing`` on streamed
+        blocks.
+
+        Heuristic: only catches the HF flag (``module.gradient_checkpointing
+        = True``, set by ``model.gradient_checkpointing_enable()``). Manual
+        :func:`torch.utils.checkpoint.checkpoint` wrapping at call sites is
+        invisible from the module tree, so users of that style will see a
+        false-positive warning the first time they activate. See the class
+        docstring's "Training" section for the full explanation.
+        """
+        if self._warned_about_checkpointing:
+            return
+        if not self._model.training:
+            return
+        # Tighten the false-positive case for inference users who left
+        # the model in train mode: only warn when at least one trainable
+        # param actually exists.
+        if not any(p.requires_grad for p in self._model.parameters()):
+            return
+
+        any_with = False
+        any_without = False
+        for blocks in self._block_groups:
+            for block in blocks:
+                if getattr(block, "gradient_checkpointing", False):
+                    any_with = True
+                else:
+                    any_without = True
+
+        if any_with and any_without:
+            logger.warning(
+                "ModelOffloader: streamed blocks have inconsistent "
+                "gradient_checkpointing flags. Backward through any "
+                "non-checkpointed streamed block will raise on the first "
+                "slot reuse — call model.gradient_checkpointing_enable() "
+                "to enable on every block."
+            )
+            self._warned_about_checkpointing = True
+        elif not any_with:
+            logger.warning(
+                "ModelOffloader: model.training=True with trainable "
+                "params, but no gradient_checkpointing flag is set on "
+                "the streamed blocks. Training through streamed blocks "
+                "requires checkpointing each block "
+                "(model.gradient_checkpointing_enable() for HF models, "
+                "or torch.utils.checkpoint.checkpoint() at call sites). "
+                "Without it, loss.backward() will raise an in-place "
+                "modification error from autograd's saved-tensor check. "
+                "If you are wrapping blocks manually at call sites, "
+                "ignore this warning (the wrap is invisible from the "
+                "module tree)."
+            )
+            self._warned_about_checkpointing = True
 
     @staticmethod
     def _build_reverse_index(

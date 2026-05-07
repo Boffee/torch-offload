@@ -11,10 +11,12 @@ CUDA-only tests gate on availability.
 
 from __future__ import annotations
 
+import logging
 from concurrent.futures import Future
 
 import pytest
 import torch
+import torch.utils.checkpoint
 from torch import nn
 
 from torch_offload import (
@@ -54,6 +56,44 @@ def _make_block_model(num_blocks: int = 4, width: int = 8) -> nn.Module:
 
     m = TinyModel()
     for p in m.parameters():
+        p.requires_grad = False
+    return m
+
+
+def _make_trainable_block_model(num_blocks: int = 4, width: int = 8) -> nn.Module:
+    """LoRA-shaped training model: trainable embed/head wrapping
+    a frozen streamed block list.
+
+    Forward accepts ``use_checkpoint=`` so a single model can be
+    driven both ways under the training tests — with checkpointing
+    (correct under streaming) and without (expected to raise on
+    backward via autograd's saved-tensor version check).
+    """
+
+    class TrainableBlockModel(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.embed = nn.Linear(width, width, bias=False)
+            self.transformer_blocks = nn.ModuleList(
+                nn.Linear(width, width, bias=False) for _ in range(num_blocks)
+            )
+            self.head = nn.Linear(width, width, bias=False)
+
+        def forward(
+            self, x: torch.Tensor, *, use_checkpoint: bool = False
+        ) -> torch.Tensor:
+            x = self.embed(x)
+            for block in self.transformer_blocks:
+                if use_checkpoint:
+                    x = torch.utils.checkpoint.checkpoint(
+                        block, x, use_reentrant=False,
+                    )
+                else:
+                    x = block(x)
+            return self.head(x)
+
+    m = TrainableBlockModel()
+    for p in m.transformer_blocks.parameters():
         p.requires_grad = False
     return m
 
@@ -1848,3 +1888,217 @@ class TestLoRAInBlockRouting:
                     )
         finally:
             strat.deactivate()
+
+
+# ---------------------------------------------------------------------------
+# Phase 1: training through streamed blocks under activation checkpointing
+# ---------------------------------------------------------------------------
+#
+# The block streamer's slot pool reuses GPU storage across blocks via
+# in-place ``copy_``, which bumps the slot tensor's autograd version
+# counter on every load. Without checkpointing, the original forward's
+# saved-tensor references into a slot are invalidated as soon as that
+# slot is reused later in the same forward, and ``loss.backward()``
+# raises ``RuntimeError: ... has been modified by an inplace
+# operation`` before producing any grad.
+#
+# Activation checkpointing fixes this by deferring autograd-graph
+# construction for each block to backward time (the recompute), at
+# which point the forward-pre hook ensures the right block is loaded
+# and the saved-tensor lifetimes don't span slot reuses.
+#
+# These tests pin Phase 1's contract: forward+backward through a
+# streamed model produces baseline-matching grads under checkpointing,
+# raises a loud, recognisable error without it, and the activate-time
+# warning fires exactly when training-shape use is detected without
+# HF-style ``gradient_checkpointing`` flags.
+
+_OFFLOADER_LOGGER = "torch_offload.model_offloader"
+
+
+class TestTrainingWithCheckpointing:
+    @CUDA
+    def test_grads_match_baseline_under_checkpointing(self) -> None:
+        """Backward through a streamed model with per-block checkpointing
+        produces grads that match a non-streamed CUDA baseline."""
+        torch.manual_seed(42)
+        m_baseline = _make_trainable_block_model(num_blocks=4, width=8)
+        m_streamed = _make_trainable_block_model(num_blocks=4, width=8)
+        m_streamed.load_state_dict(m_baseline.state_dict())
+
+        x = torch.randn(2, 8, device="cuda")
+        target = torch.randn(2, 8, device="cuda")
+
+        m_baseline.to("cuda")
+        out_b = m_baseline(x, use_checkpoint=True)
+        ((out_b - target) ** 2).mean().backward()
+        baseline_grads = {
+            n: p.grad.detach().clone()
+            for n, p in m_baseline.named_parameters()
+            if p.grad is not None
+        }
+        assert baseline_grads, "baseline run produced no grads — bad fixture"
+
+        # blocks_to_swap=2 + prefetch_count=0 → pool size 2 < 4 blocks,
+        # so forward forces real slot reuse on blocks 2 and 3. That
+        # reuse is what the checkpointing contract has to survive.
+        offloader = ModelOffloader(
+            m_streamed, torch.device("cuda"),
+            layers_attr="transformer_blocks",
+            blocks_to_swap=2, prefetch_count=0,
+        )
+        try:
+            with offloader as gpu_model:
+                out_s = gpu_model(x, use_checkpoint=True)
+                ((out_s - target) ** 2).mean().backward()
+                torch.cuda.synchronize()
+                streamed_grads = {
+                    n: p.grad.detach().clone()
+                    for n, p in gpu_model.named_parameters()
+                    if p.grad is not None
+                }
+        finally:
+            offloader.deactivate()
+
+        assert set(baseline_grads) == set(streamed_grads), (
+            f"grad keys differ: baseline={sorted(baseline_grads)}, "
+            f"streamed={sorted(streamed_grads)}"
+        )
+        for name, g_baseline in baseline_grads.items():
+            torch.testing.assert_close(
+                streamed_grads[name], g_baseline, atol=1e-5, rtol=1e-5,
+            )
+
+    @CUDA
+    def test_backward_without_checkpointing_raises_in_place_error(self) -> None:
+        """Without checkpointing, slot reuse during forward bumps the
+        version counter on a slot tensor whose forward-time reference
+        autograd needs at backward. PyTorch's saved-tensor check
+        catches this and raises."""
+        torch.manual_seed(42)
+        m = _make_trainable_block_model(num_blocks=4, width=8)
+        offloader = ModelOffloader(
+            m, torch.device("cuda"),
+            layers_attr="transformer_blocks",
+            blocks_to_swap=2, prefetch_count=0,
+        )
+        try:
+            with offloader as gpu_model:
+                x = torch.randn(2, 8, device="cuda")
+                out = gpu_model(x, use_checkpoint=False)
+                with pytest.raises(
+                    RuntimeError, match="modified by an inplace operation",
+                ):
+                    out.sum().backward()
+        finally:
+            offloader.deactivate()
+
+
+def _make_offloader_for_warning_test(model: nn.Module) -> ModelOffloader:
+    """Build a CPU-targeted offloader for warning-logic unit tests.
+
+    The warning helper is called directly on the constructed offloader
+    rather than via ``activate()`` because ``StreamedWeights.activate()``
+    builds a ``torch.cuda.Stream`` and so requires a real CUDA device.
+    The wiring of ``_warn_if_training_without_checkpointing()`` into
+    ``activate()`` itself is exercised by the CUDA training tests
+    above — these tests pin the helper's *behaviour*, not its
+    invocation site.
+    """
+    return ModelOffloader(
+        model, torch.device("cpu"),
+        layers_attr="transformer_blocks", blocks_to_swap=2,
+    )
+
+
+class TestTrainingWarning:
+    """The activate-time warning is heuristic: it fires when
+    ``model.training=True`` and at least one trainable param exists
+    but no HuggingFace ``gradient_checkpointing`` flag is detected
+    on the streamed blocks. Manual call-site checkpointing isn't
+    visible from the module tree, so users wrapping that way will
+    see a false-positive warning the first time they activate."""
+
+    def test_fires_in_train_mode_with_trainables_and_no_flag(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        m = _make_trainable_block_model(num_blocks=4)
+        offloader = _make_offloader_for_warning_test(m)
+        with caplog.at_level(logging.WARNING, logger=_OFFLOADER_LOGGER):
+            offloader._warn_if_training_without_checkpointing()
+        warnings = [
+            r for r in caplog.records
+            if "no gradient_checkpointing flag" in r.message
+        ]
+        assert len(warnings) == 1, (
+            f"expected one missing-checkpointing warning, got "
+            f"{[r.message for r in caplog.records]}"
+        )
+
+    def test_silent_when_not_in_train_mode(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        m = _make_trainable_block_model(num_blocks=4)
+        m.train(False)
+        offloader = _make_offloader_for_warning_test(m)
+        with caplog.at_level(logging.WARNING, logger=_OFFLOADER_LOGGER):
+            offloader._warn_if_training_without_checkpointing()
+        assert not any(
+            "gradient_checkpointing" in r.message for r in caplog.records
+        )
+
+    def test_silent_when_no_trainable_params(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # Inference user with model.training=True but nothing to train.
+        # Heuristic should suppress the warning.
+        m = _make_block_model(num_blocks=4)  # all frozen
+        assert m.training, "fixture invariant: default modules are in train mode"
+        offloader = _make_offloader_for_warning_test(m)
+        with caplog.at_level(logging.WARNING, logger=_OFFLOADER_LOGGER):
+            offloader._warn_if_training_without_checkpointing()
+        assert not any(
+            "gradient_checkpointing" in r.message for r in caplog.records
+        )
+
+    def test_silent_when_hf_flag_set_on_all_blocks(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        m = _make_trainable_block_model(num_blocks=4)
+        for block in m.transformer_blocks:
+            block.gradient_checkpointing = True
+        offloader = _make_offloader_for_warning_test(m)
+        with caplog.at_level(logging.WARNING, logger=_OFFLOADER_LOGGER):
+            offloader._warn_if_training_without_checkpointing()
+        assert not any(
+            "gradient_checkpointing" in r.message for r in caplog.records
+        )
+
+    def test_inconsistent_flags_emit_dedicated_warning(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        m = _make_trainable_block_model(num_blocks=4)
+        m.transformer_blocks[0].gradient_checkpointing = True
+        # blocks 1..3 left unflagged
+        offloader = _make_offloader_for_warning_test(m)
+        with caplog.at_level(logging.WARNING, logger=_OFFLOADER_LOGGER):
+            offloader._warn_if_training_without_checkpointing()
+        assert any(
+            "inconsistent gradient_checkpointing" in r.message
+            for r in caplog.records
+        ), [r.message for r in caplog.records]
+
+    def test_fires_only_once_across_repeated_invocations(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        m = _make_trainable_block_model(num_blocks=4)
+        offloader = _make_offloader_for_warning_test(m)
+        with caplog.at_level(logging.WARNING, logger=_OFFLOADER_LOGGER):
+            offloader._warn_if_training_without_checkpointing()
+            offloader._warn_if_training_without_checkpointing()
+            offloader._warn_if_training_without_checkpointing()
+        n = sum(
+            1 for r in caplog.records
+            if "gradient_checkpointing" in r.message
+        )
+        assert n == 1, f"expected one warning across 3 invocations, got {n}"

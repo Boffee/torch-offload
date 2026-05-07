@@ -197,6 +197,64 @@ offloader = ModelOffloader(
 )
 ```
 
+### Training streamed blocks
+
+Training through a streamed block **requires activation checkpointing
+on each block** — wrap call sites in
+`torch.utils.checkpoint.checkpoint`, or call
+`model.gradient_checkpointing_enable()` on a HuggingFace model.
+Without it, `loss.backward()` raises:
+
+```
+RuntimeError: one of the variables needed for gradient computation
+has been modified by an inplace operation
+```
+
+The reason is autograd's saved-tensor mechanism. A `Linear` saves a
+reference to its weight tensor at forward time and records the
+tensor's version counter. Streaming is a sequence of in-place `copy_`
+writes into a fixed pool of GPU slot tensors — every block load
+bumps the slot tensor's version, so by the time backward arrives at
+an earlier block, the slot has been overwritten and the version
+mismatch raises.
+
+Activation checkpointing sidesteps this. With checkpointing, the
+block's internal forward runs under `no_grad` — no internal tensors
+are saved for backward. When backward arrives, PyTorch re-runs the
+block's forward with grad enabled, building a fresh autograd graph
+whose saved references only live within that one block's
+recompute-then-backward window. Slot reuse outside that window is
+safe because no autograd graph spans across reuses.
+
+```python
+import torch
+from torch_offload import ModelOffloader
+
+offloader = ModelOffloader(
+    model,
+    target_device=torch.device("cuda"),
+    layers_attr="transformer_blocks",
+    blocks_to_swap=24,
+)
+
+model.gradient_checkpointing_enable()  # required for training
+model.train()
+
+with offloader as gpu_model:
+    for batch in loader:
+        loss = gpu_model(**batch).loss
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
+```
+
+`ModelOffloader.activate()` emits a one-time warning if
+`model.training=True` with trainable params present and no
+HuggingFace `gradient_checkpointing` flag is detected on the streamed
+blocks. The check has false negatives for manual `checkpoint(...)`
+wrapping at call sites — that style is invisible from the module
+tree. Filter the warning via `logging` config if needed.
+
 ## Quick start: ModelCache
 
 For multiple independent models swapping in and out of GPU.
@@ -348,6 +406,12 @@ don't guard against caller misuse.
   Suitable for inference of stateless modules; not suitable for models
   that need persistent buffer state across calls (BatchNorm running
   stats updated in training mode, RNN/SSM hidden state, KV cache).
+- **Training requires activation checkpointing** on every streamed
+  block (`model.gradient_checkpointing_enable()` for HF models, or
+  manual `torch.utils.checkpoint.checkpoint` wrapping). Without it,
+  `loss.backward()` raises an in-place modification error from
+  autograd's saved-tensor check. See
+  [Training streamed blocks](#training-streamed-blocks).
 
 ## Tied weights
 
