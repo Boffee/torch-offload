@@ -40,7 +40,7 @@ from torch import nn
 
 from .pinned_buffer import PinnedParamBuffer
 from .protocols import SlotOwnership
-from .slots import iter_buffer_slots, iter_param_slots
+from .slots import assert_frozen, iter_buffer_slots, iter_param_slots
 
 logger = logging.getLogger(__name__)
 
@@ -197,20 +197,10 @@ class _BlockPinnedStore:
                 # Contract guard: streaming cycles slots through
                 # pre-allocated requires_grad=False Parameter wrappers,
                 # which destroys the per-Parameter identity that
-                # optimizers and grad accumulation rely on. Trainable
-                # slots must be partitioned out by the caller (composer
-                # routes them via skip_slots; direct users are on the
-                # hook). Fail loudly here rather than silently freezing.
-                if s.param.requires_grad:
-                    raise ValueError(
-                        f"StreamedWeights cannot manage trainable slot {s.name!r}: "
-                        "streaming swaps slot Parameters with frozen pool "
-                        "wrappers, breaking optimizer identity. Use "
-                        "ModelOffloader (which partitions trainables "
-                        "into TrainableWeights automatically), or pass the "
-                        "slot in skip_slots and route it to a separate "
-                        "trainable mover."
-                    )
+                # optimizers and grad accumulation rely on. The
+                # composer routes trainables via skip_slots; direct
+                # users are on the hook.
+                assert_frozen(s, owner="StreamedWeights")
                 slot_filter.add(s.slot)
                 if id(s.param) in seen_param_ids:
                     continue

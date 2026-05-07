@@ -15,16 +15,16 @@ import contextlib
 import logging
 from collections.abc import Sequence
 from types import TracebackType
-from typing import Any, Literal
+from typing import Literal
 
 import torch
 from torch import nn
 
-from .lora import LoRA, LoRARouteHandle, LoRATransform
+from .lora import _ADDMM_DTYPES, LoRA, LoRARouteHandle, LoRATransform
 from .pinned_buffer import PinnedParamBuffer, storage_key
 from .pinned_weights import PinnedWeights
 from .protocols import ModelStrategyComponent, SlotOwnership
-from .slots import iter_buffer_slots, iter_param_slots
+from .slots import canonical_param_name, iter_buffer_slots, iter_param_slots, walk_attr_path
 from .streamed_weights import StreamedWeights
 from .trainable_weights import TrainableWeights
 
@@ -249,7 +249,6 @@ class ModelOffloader:
         per_target: dict[str, list[tuple[torch.Tensor, torch.Tensor, float]]] = {}
         total_targets = 0
         matched_targets = 0
-        addmm_dtypes = (torch.bfloat16, torch.float16, torch.float32)
         for lora, strength in loras:
             for target_key, (a, b) in lora.targets.items():
                 total_targets += 1
@@ -264,7 +263,7 @@ class ModelOffloader:
                         f"B@A produces ({b.shape[0]}, {a.shape[1]}), "
                         f"target shape is {expected}."
                     )
-                if mode == "merge" and buf.cpu_param.dtype not in addmm_dtypes:
+                if mode == "merge" and buf.cpu_param.dtype not in _ADDMM_DTYPES:
                     raise ValueError(
                         f"LoRA target {target_key!r} has dtype "
                         f"{buf.cpu_param.dtype}; addmm_ merge requires "
@@ -429,13 +428,13 @@ class ModelOffloader:
                     block_bufs, block_locs, strict=True
                 ):
                     full_name = f"{layer_path}.{block_idx}.{qual_name}"
-                    key = _canonical_key(full_name)
+                    key = canonical_param_name(full_name)
                     bufs[key] = buf
                     parents[key] = (parent,)
 
         if non_block is not None:
             for buf, locs in non_block.slots:
-                key = _canonical_key(buf.name)
+                key = canonical_param_name(buf.name)
                 bufs[key] = buf
                 if locs:
                     parents[key] = tuple(p for p, _leaf in locs)
@@ -447,21 +446,8 @@ class ModelOffloader:
 # Module-private helpers (used only by ModelOffloader constructor)
 # ---------------------------------------------------------------------------
 
-def _canonical_key(name: str) -> str:
-    """Normalize a parameter name to its canonical (non-PEFT) form.
-
-    PEFT inserts ``.base_layer.`` into wrapped module paths
-    (e.g. ``to_q.base_layer.weight`` instead of ``to_q.weight``).
-    LoRA state dicts always use the original names, so the reverse
-    index must store canonical keys for matching to work.
-    """
-    return name.replace(".base_layer.", ".")
-
-
 def _resolve_layers_attr(module: nn.Module, dotted_path: str) -> nn.ModuleList:
-    obj: Any = module
-    for part in dotted_path.split("."):
-        obj = getattr(obj, part)
+    obj = walk_attr_path(module, dotted_path)
     if not isinstance(obj, nn.ModuleList):
         raise TypeError(
             f"Expected nn.ModuleList at '{dotted_path}', got {type(obj).__name__}"

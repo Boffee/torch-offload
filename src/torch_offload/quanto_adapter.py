@@ -32,21 +32,8 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 
+from ._quanto import QUANTO_AVAILABLE, WeightQBytesTensor, validate_layout
 from .tensor_adapters import register_adapter
-
-try:
-    from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
-
-    _QUANTO_AVAILABLE = True
-except ImportError:
-    _QUANTO_AVAILABLE = False
-    WeightQBytesTensor = None  # type: ignore[assignment,misc]
-
-
-_QUANTO_LAYOUT_ATTRS = ("_data", "_scale", "qtype", "axis")
-"""Attributes :class:`QuantoAdapter` reads from a ``WeightQBytesTensor``.
-If quanto refactors and any of these vanishes, :meth:`matches` raises a
-clear error rather than silently misbehaving."""
 
 
 @dataclass(slots=True)
@@ -95,18 +82,11 @@ class QuantoAdapter:
 
     @staticmethod
     def matches(t: torch.Tensor) -> bool:
-        if not _QUANTO_AVAILABLE or not isinstance(t, WeightQBytesTensor):
+        if not QUANTO_AVAILABLE or not isinstance(t, WeightQBytesTensor):
             return False
         # Validate the layout we read in clone_pin/_build_qbytes is
         # still present. Cheap one-time check at first match.
-        missing = [a for a in _QUANTO_LAYOUT_ATTRS if not hasattr(t, a)]
-        if missing:
-            raise RuntimeError(
-                f"QuantoAdapter expects WeightQBytesTensor to expose "
-                f"{_QUANTO_LAYOUT_ATTRS}; missing {missing!r}. "
-                f"This adapter is pinned to optimum-quanto's internal "
-                f"layout — upgrade quanto with care."
-            )
+        validate_layout(t)
         return True
 
     @staticmethod
@@ -195,5 +175,5 @@ class QuantoAdapter:
         )
 
 
-if _QUANTO_AVAILABLE:
+if QUANTO_AVAILABLE:
     register_adapter(QuantoAdapter)

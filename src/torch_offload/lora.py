@@ -44,6 +44,16 @@ __all__ = [
 ]
 
 
+# Float dtypes that support an in-place ``addmm_`` merge of ``B @ A``
+# into the base weight. Quanto / int8 / packed quant types take a
+# different path (dequant → addmm → requant). Used by upstream
+# validators (:meth:`ModelOffloader.set_loras` and :func:`merge_lora`)
+# to gate the merge-mode path before any :class:`LoRATransform` is
+# built. The transform itself does not re-check — it trusts the
+# upstream gate.
+_ADDMM_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
+
+
 KeyTransformT = Callable[[str], str] | None
 
 

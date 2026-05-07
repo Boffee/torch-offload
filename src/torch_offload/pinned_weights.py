@@ -62,7 +62,7 @@ from torch import nn
 
 from .pinned_buffer import PinnedParamBuffer, storage_key
 from .protocols import SlotOwnership
-from .slots import BufferSlot, ParamSlot, iter_buffer_slots, iter_param_slots
+from .slots import BufferSlot, ParamSlot, assert_frozen, iter_buffer_slots, iter_param_slots
 
 
 class PinnedWeights:
@@ -183,7 +183,15 @@ class PinnedWeights:
         for s in iter_param_slots(model):
             if s.slot in self._skip_slots:
                 continue
-            self._validate_frozen_slot(s)
+            assert_frozen(
+                s, owner="PinnedWeights",
+                extra=(
+                    "Splitting a tied storage group between skip_slots "
+                    "and PinnedWeights silently breaks the alias on "
+                    "GPU — validate ties yourself if you go that route, "
+                    "or use ModelOffloader which handles it upstream."
+                ),
+            )
             groups.setdefault(self._param_storage_key(s), []).append(
                 (s.name, s.param, s.parent, s.leaf)
             )
@@ -224,25 +232,6 @@ class PinnedWeights:
                 if (id(s.parent), s.leaf) not in seen_locs:
                     existing[1].append((s.parent, s.leaf, persistent))
         return list(buf_groups.values())
-
-    @staticmethod
-    def _validate_frozen_slot(s: ParamSlot) -> None:
-        # Slot replacement installs a fresh requires_grad=False Parameter
-        # wrapper, orphaning optimizer state keyed by the user's original
-        # Parameter. Fail loudly rather than silently freezing a trainable.
-        if not s.param.requires_grad:
-            return
-        raise ValueError(
-            f"PinnedWeights cannot manage trainable slot {s.name!r}: "
-            "slot replacement installs a frozen Parameter wrapper, "
-            "orphaning any optimizer state keyed by the user's "
-            "pre-wrap Parameter. Use ModelOffloader (which "
-            "partitions trainables into TrainableWeights and validates "
-            "tied storage upstream), or pass the slot in skip_slots "
-            "and validate ties yourself — splitting a tied group "
-            "between skip_slots and PinnedWeights silently breaks "
-            "the alias on GPU."
-        )
 
     @staticmethod
     def _param_storage_key(s: ParamSlot) -> tuple[Any, ...]:

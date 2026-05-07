@@ -29,9 +29,92 @@ from .protocols import SlotOwnership
 __all__ = [
     "BufferSlot",
     "ParamSlot",
+    "assert_frozen",
+    "canonical_param_name",
     "iter_buffer_slots",
     "iter_param_slots",
+    "split_attr_path",
+    "walk_attr_path",
 ]
+
+
+def walk_attr_path(root: nn.Module, dotted_path: str) -> object:
+    """Walk a dotted attribute path from ``root``, returning the leaf.
+
+    Equivalent to a chained ``getattr``. Used to resolve dotted paths
+    like ``"transformer.blocks"`` or ``"a.b.weight"`` to their target.
+    Raises ``AttributeError`` if any segment is missing.
+    """
+    obj: object = root
+    for part in dotted_path.split("."):
+        obj = getattr(obj, part)
+    return obj
+
+
+def split_attr_path(
+    root: nn.Module, dotted_path: str,
+) -> tuple[nn.Module, str]:
+    """Resolve all but the last segment, returning ``(parent, leaf)``.
+
+    Useful for in-place mutation: ``parent, leaf = split_attr_path(...);
+    setattr(parent, leaf, ...)``. Raises ``ValueError`` for a top-level
+    path (no parent to mutate).
+    """
+    parts = dotted_path.rsplit(".", 1)
+    if len(parts) == 1:
+        raise ValueError(f"Cannot split top-level path {dotted_path!r}")
+    parent_path, leaf = parts
+    parent = walk_attr_path(root, parent_path)
+    if not isinstance(parent, nn.Module):
+        raise TypeError(
+            f"Path '{parent_path}' resolved to {type(parent).__name__}, "
+            "expected nn.Module"
+        )
+    return parent, leaf
+
+
+def canonical_param_name(name: str) -> str:
+    """Normalize a parameter name to its canonical (non-PEFT) form.
+
+    PEFT inserts ``.base_layer.`` into wrapped module paths
+    (e.g. ``to_q.base_layer.weight`` instead of ``to_q.weight``).
+    LoRA state dicts always use the original names, so any reverse
+    index keyed off named-parameter walks must store canonical keys
+    for matching to work.
+    """
+    return name.replace(".base_layer.", ".")
+
+
+def assert_frozen(
+    slot: "ParamSlot", owner: str, *, extra: str | None = None,
+) -> None:
+    """Raise if ``slot`` is trainable.
+
+    Both :class:`PinnedWeights` and :class:`StreamedWeights` replace
+    the Parameter object at every slot they manage. That orphans
+    optimizer state keyed by the user's pre-wrap Parameter and breaks
+    grad identity, so trainable slots must be partitioned out by the
+    caller. The composer (:class:`ModelOffloader`) does this
+    automatically via ``skip_slots``; direct users are on the hook.
+    Fail loud rather than silently freeze.
+
+    ``owner`` is surfaced in the error message (e.g.
+    ``"PinnedWeights"``, ``"StreamedWeights"``). ``extra`` is appended
+    verbatim for owner-specific recovery guidance.
+    """
+    if not slot.param.requires_grad:
+        return
+    msg = (
+        f"{owner} cannot manage trainable slot {slot.name!r}: slot "
+        "replacement installs a fresh frozen Parameter wrapper, "
+        "breaking optimizer/grad identity. Use ModelOffloader (which "
+        "partitions trainables into TrainableWeights automatically), "
+        "or pass the slot in skip_slots and route it to a separate "
+        "trainable mover."
+    )
+    if extra:
+        msg = f"{msg} {extra}"
+    raise ValueError(msg)
 
 
 @dataclass(slots=True, frozen=True)
