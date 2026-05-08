@@ -106,7 +106,11 @@ def _expected_merged_weight(
         if factors is None:
             continue
         a, b = factors
-        out = out + strength * (b.to(base.dtype) @ a.to(base.dtype))
+        out.addmm_(
+            b.to(device=out.device, dtype=out.dtype),
+            a.to(device=out.device, dtype=out.dtype),
+            alpha=strength,
+        )
     return out
 
 
@@ -353,7 +357,7 @@ class TestLifecycle:
             torch.cuda.synchronize()
             actual = m.transformer_blocks[0].attn.weight.detach()
             assert torch.allclose(
-                actual, captured.to("cuda"), rtol=0.0, atol=0.0,
+                actual.cpu(), captured, rtol=0.0, atol=0.0,
             ), "no LoRAs must leave base weights unmodified"
         finally:
             s.deactivate()
@@ -386,9 +390,13 @@ class TestMergeCorrectness:
                 x = blk(x)
             torch.cuda.synchronize()
             for i in range(4):
+                _ = m.transformer_blocks[i](
+                    torch.randn(2, 16, dtype=torch.bfloat16, device="cuda")
+                )
+                torch.cuda.synchronize()
                 expected = _expected_merged_weight(
-                    captured_base[i], loras, i, "attn.weight",
-                ).to("cuda")
+                    captured_base[i].to("cuda"), loras, i, "attn.weight",
+                )
                 actual = m.transformer_blocks[i].attn.weight.detach()
                 assert torch.allclose(actual, expected, rtol=0.01, atol=0.01), (
                     f"block {i} merged weight mismatch:\n"
@@ -418,9 +426,13 @@ class TestMergeCorrectness:
                 x = blk(x)
             torch.cuda.synchronize()
             for i in range(4):
+                _ = m.transformer_blocks[i](
+                    torch.randn(2, 16, dtype=torch.bfloat16, device="cuda")
+                )
+                torch.cuda.synchronize()
                 expected = _expected_merged_weight(
-                    captured_base[i], [(lora, 0.7)], i, "attn.weight",
-                ).to("cuda")
+                    captured_base[i].to("cuda"), [(lora, 0.7)], i, "attn.weight",
+                )
                 actual = m.transformer_blocks[i].attn.weight.detach()
                 assert torch.allclose(actual, expected, rtol=0.01, atol=0.01)
         finally:
@@ -498,9 +510,13 @@ class TestMergeCorrectness:
             m(x)
             torch.cuda.synchronize()
             for i in range(4):
+                _ = m.transformer_blocks[i](
+                    torch.randn(2, 16, dtype=torch.bfloat16, device="cuda")
+                )
+                torch.cuda.synchronize()
                 expected = _expected_merged_weight(
-                    captured_base[i], [(lora, 0.7)], i, "attn.weight",
-                ).to("cuda")
+                    captured_base[i].to("cuda"), [(lora, 0.7)], i, "attn.weight",
+                )
                 actual = m.transformer_blocks[i].attn.base_layer.weight.detach()
                 assert torch.allclose(actual, expected, rtol=0.01, atol=0.01), (
                     f"block {i} PEFT-wrapped merge mismatch"
@@ -531,21 +547,27 @@ class TestRoutedMode:
         and we'd be comparing the hook against itself)."""
         import torch.nn.functional as F  # noqa: N812
 
-        h = F.linear(x, model.embed.weight)
+        h = F.linear(x, model.embed.weight.to(x.device))
         for i, blk in enumerate(model.transformer_blocks):
-            base_attn = F.linear(h, blk.attn.weight)
-            extra = torch.zeros_like(base_attn)
+            base_attn = F.linear(h, blk.attn.weight.to(h.device))
             target_name = f"transformer_blocks.{i}.attn.weight"
+            a_parts = []
+            b_parts = []
             for lora, strength in loras:
                 factors = lora.targets.get(target_name)
                 if factors is None:
                     continue
                 a, b = factors
-                a_dev = a.to(device=h.device, dtype=h.dtype)
-                b_dev = b.to(device=h.device, dtype=h.dtype)
-                extra = extra + strength * (h @ a_dev.T @ b_dev.T)
-            h = F.linear(base_attn + extra, blk.ff.weight)
-        return F.linear(h, model.head.weight)
+                a_parts.append(a.to(device=h.device, dtype=h.dtype))
+                b_part = b.to(device=h.device, dtype=h.dtype).clone()
+                b_part.mul_(strength)
+                b_parts.append(b_part)
+            if a_parts:
+                a_fused = torch.cat(a_parts, dim=0)
+                b_fused = torch.cat(b_parts, dim=1)
+                base_attn = base_attn + (h @ a_fused.T) @ b_fused.T
+            h = F.linear(base_attn, blk.ff.weight.to(h.device))
+        return F.linear(h, model.head.weight.to(h.device))
 
     @CUDA
     def test_routed_forward_matches_manual_baseline(self) -> None:
@@ -569,11 +591,6 @@ class TestRoutedMode:
             actual = m(x)
             torch.cuda.synchronize()
             expected = self._expected_routed_output(m, x, loras)
-            # Tolerance accounts for bf16 rounding noise accumulating
-            # across 3 blocks of GEMMs + LoRA contributions; the hook's
-            # sequential `output + strength * (...)` adds round
-            # differently than the F.linear baseline's single
-            # accumulator path.
             assert torch.allclose(actual, expected, rtol=0.1, atol=0.1), (
                 f"routed forward mismatch:\n"
                 f"  expected: {expected.flatten()[:4]}\n"
@@ -620,9 +637,9 @@ class TestRoutedMode:
     @CUDA
     def test_routed_concat_handles_mixed_ranks(self) -> None:
         # Multiple LoRAs targeting the same weight at different ranks
-        # must produce the same forward output as the un-fused loop.
-        # Validates the concat math: fused rank = r1 + r2 + ..., and
-        # B_fused @ A_fused == sum_i strength_i * B_i @ A_i.
+        # must produce the same forward output as the fused route math:
+        # fused rank = r1 + r2 + ..., and B_fused @ A_fused equals
+        # sum_i strength_i * B_i @ A_i.
         m = _make_bf16_model(num_blocks=2, dim=16)
         # Two LoRAs targeting the same blocks with different ranks.
         lora_r4 = _make_lora(num_blocks=2, dim=16, rank=4, seed=101)
@@ -879,9 +896,13 @@ class TestRoutedMode:
             torch.cuda.synchronize()
             # Manual baseline: walk layers via F.linear (bypasses hooks)
             # with bias included on attn.
-            h = F.linear(x, m.embed.weight)
+            h = F.linear(x, m.embed.weight.to(x.device))
             for i, blk in enumerate(m.transformer_blocks):
-                base_attn = F.linear(h, blk.attn.weight, blk.attn.bias)
+                base_attn = F.linear(
+                    h,
+                    blk.attn.weight.to(h.device),
+                    blk.attn.bias.to(h.device),
+                )
                 lora = loras[0][0]
                 strength = loras[0][1]
                 a, b = lora.targets[
@@ -890,8 +911,8 @@ class TestRoutedMode:
                 a_dev = a.to(device=h.device, dtype=h.dtype)
                 b_dev = b.to(device=h.device, dtype=h.dtype)
                 attn_out = base_attn + strength * (h @ a_dev.T @ b_dev.T)
-                h = F.linear(attn_out, blk.ff.weight)
-            expected = F.linear(h, m.head.weight)
+                h = F.linear(attn_out, blk.ff.weight.to(h.device))
+            expected = F.linear(h, m.head.weight.to(h.device))
             assert torch.allclose(actual, expected, rtol=0.1, atol=0.1)
         finally:
             s.deactivate()

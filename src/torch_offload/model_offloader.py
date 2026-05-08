@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
-from collections.abc import Sequence
+from collections.abc import Callable, Iterator, Sequence
 from types import TracebackType
 from typing import Literal
 
@@ -93,13 +93,40 @@ class ModelOffloader:
     that one block's recompute-then-backward window. Slot reuse
     outside that window is then safe.
 
-    :meth:`activate` emits a one-time warning if ``model.training``
-    is ``True`` with trainable params present and no HuggingFace
-    ``gradient_checkpointing`` flag is set on the streamed blocks.
-    The check is heuristic — it cannot see manual call-site
-    ``checkpoint(...)`` wrapping, which is invisible from the module
-    tree. Callers using that style will see a false-positive warning
-    that can be filtered via standard ``logging`` config.
+    For **frozen-only** streamed blocks (training touches only
+    out-of-block trainables), :meth:`activate` emits a one-time
+    warning if no HuggingFace ``gradient_checkpointing`` flag is
+    detected — the failure mode without checkpointing is a loud
+    ``RuntimeError`` from autograd's saved-tensor check, so a
+    warning suffices.
+
+    By default, trainable params keep the historical behavior: all
+    trainables, including adapters inside streamed blocks, stay GPU-
+    resident while the offloader is active and work with normal
+    PyTorch optimizers.
+
+    Pass ``trainable_residency="streamed_data"`` to stream in-block
+    trainable parameter data through the block slot pool. In that
+    mode, :meth:`activate` *raises* during training if no
+    ``gradient_checkpointing`` flag is detected. The failure mode
+    here is **silent gradient corruption** rather than a loud
+    error — the ``.data`` swap path used for trainable streaming
+    bypasses autograd's version-counter check, so we hard-guard
+    the precondition. Pass ``assume_checkpointed=True`` to suppress
+    the check if you wrap blocks manually via
+    ``torch.utils.checkpoint.checkpoint`` at call sites (the
+    wrapping is invisible from the module tree, so detection has
+    false negatives). Callers passing this flag take responsibility
+    for ensuring every streamed block that participates in training
+    is wrapped.
+
+    In streamed-data mode, :meth:`optimizer_step` is the optimizer
+    boundary: it materializes streamed trainable ``.data`` on GPU
+    while an arbitrary PyTorch optimizer updates it, then copies the
+    updated data back to pinned CPU. Gradients are not streamed; they
+    live on GPU throughout backward via PyTorch's native
+    ``AccumulateGrad``, so ``optimizer.zero_grad()``, ``clip_grad_norm_``,
+    and AMP's ``GradScaler`` operate on normal grad tensors.
 
     Parameters
     ----------
@@ -123,6 +150,33 @@ class ModelOffloader:
         prefetcher then treats end-of-iteration as wraparound and
         keeps streaming the next iteration's leading blocks. Leave
         ``False`` for single-shot inference or training.
+    trainable_residency:
+        ``"always_gpu"`` (default) preserves the historical contract:
+        all trainable params are skipped by block streaming and managed
+        by :class:`TrainableWeights`, so normal ``optimizer.step()``
+        works unchanged. ``"streamed_data"`` streams in-block trainable
+        parameter data with the block residency manager; use
+        :meth:`optimizer_step` around the optimizer update.
+    assume_checkpointed:
+        Default ``False``. Suppresses the activate-time checkpointing
+        guard/warning entirely. Pass ``True`` only if you wrap each
+        streamed block that participates in training manually via
+        ``torch.utils.checkpoint.checkpoint`` at call sites — that
+        style is invisible from the module tree, so the auto-detect
+        sees no flag and would raise. By passing ``True`` you take
+        responsibility for ensuring every streamed block that
+        participates in training is checkpointed; otherwise trainable
+        streaming may silently corrupt gradients.
+    is_block_checkpointed:
+        Optional per-block predicate, called once per streamed block
+        at :meth:`activate` to decide whether the block runs under
+        activation checkpointing. Default detection reads the
+        HuggingFace ``gradient_checkpointing`` boolean attribute on
+        the block module. Pass a custom callable to support
+        non-HF frameworks (DeepSpeed, custom training loops, etc.) —
+        the predicate sees the block module and should return
+        ``True`` iff that block runs under activation checkpointing.
+        Ignored when ``assume_checkpointed=True``.
     """
 
     def __init__(
@@ -134,7 +188,17 @@ class ModelOffloader:
         blocks_to_swap: int | Sequence[int],
         prefetch_count: int | Sequence[int] = 2,
         cyclic: bool = False,
+        trainable_residency: Literal["always_gpu", "streamed_data"] = "always_gpu",
+        assume_checkpointed: bool = False,
+        is_block_checkpointed: Callable[[nn.Module], bool] | None = None,
     ) -> None:
+        if trainable_residency not in ("always_gpu", "streamed_data"):
+            raise ValueError(
+                "trainable_residency must be 'always_gpu' or "
+                f"'streamed_data', got {trainable_residency!r}"
+            )
+        stream_trainable_data = trainable_residency == "streamed_data"
+
         layer_paths: list[str] = (
             [layers_attr] if isinstance(layers_attr, str) else list(layers_attr)
         )
@@ -154,13 +218,23 @@ class ModelOffloader:
                     f"layers_attr[{i}] = {layer_paths[i]!r} resolved to empty list"
                 )
 
-        detect_streaming_region_ties(model, block_groups)
+        _check_block_groups_disjoint(block_groups, layer_paths)
+        detect_streaming_region_ties(
+            model, block_groups, stream_trainables=stream_trainable_data,
+        )
         model.to("cpu")
 
         trainable_slots: set[SlotOwnership] = {
             s.slot for s in iter_param_slots(model) if s.param.requires_grad
         }
 
+        # In legacy mode, streamers skip trainables and TrainableWeights
+        # keeps them all GPU-resident. In streamed-data mode, streamers
+        # handle in-block params of both kinds: frozen via slot
+        # replacement and trainable via identity-preserving ``.data``
+        # swap. Gradients are NOT streamed — they live on GPU during
+        # backward via PyTorch's native ``AccumulateGrad`` mechanism.
+        streamer_skip_slots = None if stream_trainable_data else trainable_slots
         streamers: list[StreamedWeights] = []
         for i, blocks in enumerate(block_groups):
             streamers.append(
@@ -171,27 +245,47 @@ class ModelOffloader:
                     prefetch_count=pf_list[i],
                     cyclic=cyclic,
                     name=f"StreamedWeights[{layer_paths[i]}]",
-                    skip_slots=trainable_slots,
+                    skip_slots=streamer_skip_slots,
                 )
             )
 
-        skip_slots: set[SlotOwnership] = set(trainable_slots)
+        streamer_slots: set[SlotOwnership] = set()
         for s in streamers:
-            skip_slots |= s.slot_filter
+            streamer_slots |= s.slot_filter
+
+        # PinnedWeights manages frozen non-block params/buffers. Skip
+        # everything the streamers own (in-block, frozen + trainable)
+        # plus any remaining out-of-block trainables (those go to
+        # TrainableWeights). Equivalent to ``streamer_slots |
+        # trainable_slots`` since streamer_slots already covers in-
+        # block trainables.
+        pinned_skip_slots = streamer_slots | trainable_slots
 
         non_block: PinnedWeights | None = None
         has_pinnable = any(
-            s.slot not in skip_slots for s in iter_param_slots(model)
+            s.slot not in pinned_skip_slots for s in iter_param_slots(model)
         ) or any(
-            s.slot not in skip_slots for s in iter_buffer_slots(model)
+            s.slot not in pinned_skip_slots for s in iter_buffer_slots(model)
         )
         if has_pinnable:
-            non_block = PinnedWeights(model, target_device, skip_slots=skip_slots)
+            non_block = PinnedWeights(
+                model, target_device, skip_slots=pinned_skip_slots,
+            )
 
+        # TrainableWeights handles only out-of-block trainables (in-
+        # block trainables stream through the slot pool with .data
+        # swap). Skip the streamer's territory; the requires_grad
+        # filter inside TrainableWeights handles frozen slots in
+        # streamer_slots automatically.
         components: list[ModelStrategyComponent] = []
         if non_block is not None:
             components.append(non_block)
-        components.append(TrainableWeights(model, target_device))
+        if stream_trainable_data:
+            components.append(
+                TrainableWeights(model, target_device, skip_slots=streamer_slots),
+            )
+        else:
+            components.append(TrainableWeights(model, target_device))
         components.extend(streamers)
 
         self._model = model
@@ -205,6 +299,13 @@ class ModelOffloader:
         )
         self._block_groups: list[list[nn.Module]] = block_groups
         self._warned_about_checkpointing: bool = False
+        self._stream_trainable_data: bool = stream_trainable_data
+        self._assume_checkpointed: bool = assume_checkpointed
+        self._is_block_checkpointed: Callable[[nn.Module], bool] = (
+            is_block_checkpointed
+            if is_block_checkpointed is not None
+            else _hf_block_has_checkpointing_flag
+        )
         # Pending routed-mode LoRAs: list of (parent_module, refs).
         # Populated by set_loras(mode="routed"); the actual hooks are
         # installed on activate() and removed on deactivate(). Cleared
@@ -215,7 +316,7 @@ class ModelOffloader:
 
     # ------------------------------------------------------------------ API
 
-    def set_loras(
+    def set_loras(  # noqa: PLR0912
         self,
         loras: Sequence[tuple[LoRA, float]],
         *,
@@ -236,7 +337,7 @@ class ModelOffloader:
           streaming cycle. Requires base weight dtype to be bf16, fp16,
           or fp32.
         - ``"routed"``: registers a forward hook on each matched
-          parent module. Forward becomes ``y = base(x) + α·B·A·x``.
+          parent module. Forward becomes ``y = base(x) + alpha * B * A * x``.
           Doesn't touch the base weight in place. Restricted to
           ``nn.Linear`` parents (the math assumes ``y = x @ W.T``);
           tied targets and non-Linear parents raise. Quantized bases
@@ -381,6 +482,7 @@ class ModelOffloader:
         return sum(c.cache_bytes for c in self._components)
 
     def activate(self) -> None:
+        self._enforce_checkpointing_for_trainable_streaming()
         self._warn_if_training_without_checkpointing()
         try:
             with contextlib.ExitStack() as stack:
@@ -420,6 +522,51 @@ class ModelOffloader:
                 buf.transform = None
             self._pending_routes = []
 
+    @contextlib.contextmanager
+    def optimizer_step(self) -> Iterator[None]:
+        """Context manager wrapping the optimizer-step boundary for
+        streamed-data trainables.
+
+        Brings every streamer-managed trainable's ``.data`` to GPU on
+        enter (force-evicting any currently-loaded blocks first to
+        normalize state), yields, and on exit D2H's the post-step
+        ``.data`` back to the pinned host clones (blocking, to avoid
+        racing the next iteration's prefetch).
+
+        ``param.grad`` is unaffected throughout — it lives on GPU
+        during backward via PyTorch's native ``AccumulateGrad`` and
+        is read+modified by the optimizer in place. ``optimizer.zero_grad()``,
+        ``clip_grad_norm_``, AMP's ``GradScaler.unscale_`` and other
+        grad-walking tools work as in vanilla PyTorch — they don't
+        need to be inside this context.
+
+        Out-of-block trainables (handled by ``TrainableWeights``) are
+        also unaffected; they're GPU-resident across the whole
+        activation cycle, just like before this PR.
+
+        Typical loop::
+
+            loss.backward()
+            with offloader.optimizer_step():
+                optimizer.step()
+            optimizer.zero_grad()
+        """
+        with contextlib.ExitStack() as stack:
+            for streamer in self._streamers:
+                stack.enter_context(streamer.optimizer_step())
+            yield
+
+    @contextlib.contextmanager
+    def gather_for_step(self) -> Iterator[None]:
+        """Backward-compatible alias for :meth:`optimizer_step`.
+
+        The streamed-data API names the boundary after the operation
+        that requires all streamed trainable data to be materialized:
+        the optimizer step.
+        """
+        with self.optimizer_step():
+            yield
+
     def __enter__(self) -> nn.Module:
         self.activate()
         return self.model
@@ -434,19 +581,93 @@ class ModelOffloader:
 
     # ----------------------------------------------------------- Internals
 
+    def _enforce_checkpointing_for_trainable_streaming(self) -> None:
+        """Hard-guard: refuse to activate if a streamer manages
+        trainable params and the configured checkpointing predicate
+        returns ``False`` for any block in that streamer.
+
+        Trainable streaming uses ``.data`` swap on the user's
+        ``Parameter`` (preserves identity for autograd / optimizer
+        state). Without checkpointing, autograd's version-counter
+        check is **bypassed** — ``Tensor.set_`` (which
+        ``param.data = ...`` invokes) repoints storage without
+        bumping anything autograd sees. Result: silent gradient
+        corruption rather than a loud error. Frozen streaming has
+        the same precondition but a loud failure mode (saved-tensor
+        version check raises), so it's a warning; trainable
+        streaming is silent, so it's a hard error.
+
+        Detection layers:
+
+        - ``assume_checkpointed=True`` short-circuits — caller takes
+          responsibility (typically used with manual call-site
+          ``torch.utils.checkpoint.checkpoint`` wrapping, which is
+          invisible from the module tree).
+        - ``is_block_checkpointed: Callable[[nn.Module], bool]`` is
+          the configurable per-block predicate. Default checks the
+          HuggingFace per-block flag; non-HF frameworks (DeepSpeed,
+          custom training loops) plug in their own detection.
+
+        We deliberately do NOT walk module ancestors looking for the
+        flag. Some HF model versions set ``gradient_checkpointing``
+        on the root ``PreTrainedModel`` rather than each block; an
+        ancestor walk would silence the guard for those — but a
+        root-level flag does not prove that each block actually
+        runs under checkpointing, so accepting it would re-introduce
+        the silent-corruption failure mode. Users on those model
+        families should either pass an ``is_block_checkpointed``
+        predicate that knows the framework's conventions, or
+        ``assume_checkpointed=True`` after manually verifying.
+        """
+        if self._assume_checkpointed:
+            return
+        if not self._stream_trainable_data:
+            return
+        if not self._model.training:
+            return
+
+        for streamer, blocks in zip(self._streamers, self._block_groups, strict=True):
+            if not streamer.has_trainables:
+                continue
+            for block in blocks:
+                if not self._is_block_checkpointed(block):
+                    raise RuntimeError(
+                        "ModelOffloader: in-block trainable params "
+                        "detected but the configured checkpointing "
+                        "predicate (`is_block_checkpointed`) reports "
+                        "False for at least one streamed block. "
+                        "Trainable streaming uses .data swap, which "
+                        "bypasses autograd's version-counter check "
+                        "and silently corrupts gradients without "
+                        "checkpointing — so this is a hard error, "
+                        "not a warning.\n\n"
+                        "Fix: call model.gradient_checkpointing_enable() "
+                        "before constructing the offloader (HF models, "
+                        "default detection); pass an "
+                        "is_block_checkpointed predicate matching your "
+                        "framework's conventions; or, if you wrap each "
+                        "streamed block manually via "
+                        "torch.utils.checkpoint.checkpoint at call "
+                        "sites, pass assume_checkpointed=True to "
+                        "suppress this guard (call-site wrapping is "
+                        "invisible from the module tree)."
+                    )
+
     def _warn_if_training_without_checkpointing(self) -> None:
         """Emit a one-time warning when training-shaped use is detected
-        without HuggingFace-style ``gradient_checkpointing`` on streamed
+        without configured checkpointing detection on streamed
         blocks.
 
-        Heuristic: only catches the HF flag (``module.gradient_checkpointing
-        = True``, set by ``model.gradient_checkpointing_enable()``). Manual
-        :func:`torch.utils.checkpoint.checkpoint` wrapping at call sites is
-        invisible from the module tree, so users of that style will see a
-        false-positive warning the first time they activate. See the class
-        docstring's "Training" section for the full explanation.
+        The default predicate only catches the HF flag
+        (``module.gradient_checkpointing = True``, set by
+        ``model.gradient_checkpointing_enable()``). Manual
+        :func:`torch.utils.checkpoint.checkpoint` wrapping at call sites
+        is invisible from the module tree, so callers using that style
+        should pass ``assume_checkpointed=True``.
         """
         if self._warned_about_checkpointing:
+            return
+        if self._assume_checkpointed:
             return
         if not self._model.training:
             return
@@ -460,7 +681,7 @@ class ModelOffloader:
         any_without = False
         for blocks in self._block_groups:
             for block in blocks:
-                if getattr(block, "gradient_checkpointing", False):
+                if self._is_block_checkpointed(block):
                     any_with = True
                 else:
                     any_without = True
@@ -566,13 +787,90 @@ def _broadcast(value: int | Sequence[int], n: int, name: str) -> list[int]:
     return out
 
 
+def _hf_block_has_checkpointing_flag(block: nn.Module) -> bool:
+    """Default ``is_block_checkpointed`` predicate.
+
+    Checks the HuggingFace per-block ``gradient_checkpointing``
+    boolean attribute set by older ``model.gradient_checkpointing_enable()``
+    implementations (and still used by many HF model families). Does
+    NOT walk ancestors; conservative on purpose — see
+    :meth:`ModelOffloader._enforce_checkpointing_for_trainable_streaming`
+    for why.
+    """
+    return bool(getattr(block, "gradient_checkpointing", False))
+
+
+# ---------------------------------------------------------------------------
+# Composer-level invariants
+# ---------------------------------------------------------------------------
+
+
+def _check_block_groups_disjoint(
+    block_groups: Sequence[Sequence[nn.Module]], layer_paths: Sequence[str]
+) -> None:
+    """Reject configurations where any :class:`SlotOwnership` is owned
+    by more than one streamer region (or appears twice in a single
+    region).
+
+    Each ``StreamedWeights`` instance assumes it is the sole owner of
+    every ``(parent_module, leaf, kind)`` slot inside its blocks.
+    Overlapping ownership comes in three shapes:
+
+    - **Same block module listed in two groups** (or twice in one):
+      both streamers would pin and slot-replace the same ``nn.Module``,
+      and per-block ``.data`` swap during streaming would race.
+    - **Parent/child blocks across groups** (group A has a parent
+      module, group B has one of its children): different
+      ``id(parent)`` block instances, but their per-leaf
+      ``SlotOwnership`` tuples coincide on the child's slots.
+    - **Within a single group, the same nn.Module appearing twice**:
+      the streamer would create per-index pinned clones for the same
+      slots and swap ``.data`` redundantly.
+
+    This check is the precondition for
+    :func:`detect_streaming_region_ties` and the per-block pinning
+    walk inside :class:`_BlockPinnedStore` to be unambiguous; it lives
+    at the composer because it is about how the caller composed
+    ``layers_attr`` paths, not about parameter aliasing.
+    """
+    slot_owner: dict[SlotOwnership, str] = {}
+    duplicates: dict[SlotOwnership, list[str]] = {}
+    for group_idx, blocks in enumerate(block_groups):
+        for block_idx, layer in enumerate(blocks):
+            label = f"{layer_paths[group_idx]}[{block_idx}]"
+            slots: set[SlotOwnership] = set()
+            for s in iter_param_slots(layer):
+                slots.add(s.slot)
+            for s in iter_buffer_slots(layer):
+                slots.add(s.slot)
+            for slot in slots:
+                if slot in slot_owner:
+                    duplicates.setdefault(slot, [slot_owner[slot]]).append(label)
+                else:
+                    slot_owner[slot] = label
+    if duplicates:
+        sample = next(iter(duplicates.items()))
+        raise ValueError(
+            f"Streamer block groups must own disjoint module slots, "
+            f"but {len(duplicates)} slot(s) are claimed by multiple "
+            f"block locations. Example: leaf {sample[0].leaf!r} is "
+            f"owned by {sample[1]}. Likely causes: the same block is "
+            f"listed in two `layers_attr` paths, a path resolves to a "
+            f"module that contains another resolved path, or a block "
+            f"appears twice in a single `nn.ModuleList`."
+        )
+
+
 # ---------------------------------------------------------------------------
 # Cross-region tied-weight detection
 # ---------------------------------------------------------------------------
 
 
 def detect_streaming_region_ties(  # noqa: PLR0912
-    model: nn.Module, block_groups: Sequence[Sequence[nn.Module]]
+    model: nn.Module,
+    block_groups: Sequence[Sequence[nn.Module]],
+    *,
+    stream_trainables: bool = False,
 ) -> None:
     """Raise if any frozen storage is shared across streaming regions.
 
@@ -580,7 +878,7 @@ def detect_streaming_region_ties(  # noqa: PLR0912
     per block. Everything else in ``model`` is the "non_block"
     region.
 
-    Three configurations are unsupported:
+    Unsupported configurations:
 
     - **Cross-region ties** (block<->block, block<->non-block): the per-
       region pinning regimes can't coordinate to share storage.
@@ -589,29 +887,39 @@ def detect_streaming_region_ties(  # noqa: PLR0912
       replaced while the trainable side is moved via storage swap on
       activate; the two mechanisms cannot share a tied storage
       without breaking aliasing invariants silently.
-    - **Intra-block ties** (two slots in the same block sharing
-      storage): per-block stores walk ``named_parameters()`` with
-      default duplicate removal and only swap one alias slot,
-      leaving the other pointing at non-pinned data.
+    - **Streamed trainable ties across regions** when
+      ``stream_trainables=True``. The same Parameter object is safe
+      under legacy all-trainables-on-GPU movement, but unsafe when
+      one streamed region owns a distinct pinned clone.
+    - **Unsupported intra-block ties** (two distinct slots in the
+      same block sharing storage). Same-Parameter all-trainable
+      aliases are safe because a single ``.data`` swap reaches every
+      alias slot; frozen aliases and distinct-Parameter trainable
+      aliases are rejected.
 
     Non-block-internal all-frozen ties (the standard ``tie_weights()``
     embed<->head pattern) are handled correctly by
     :class:`PinnedWeights`'s storage-key dedup and are NOT rejected
     here.
     """
-    param_id_to_region: dict[int, str] = {}
+    # Slot-level region map. Distinguishes "this slot lives in block X"
+    # from "this slot's Parameter is also referenced from block Y" — the
+    # latter is what cross-region same-Parameter aliasing produces, and a
+    # Parameter-id-only map (with setdefault) would silently collapse
+    # both slots to the first block's region.
+    slot_to_region: dict[tuple[int, str], str] = {}
     for group_idx, blocks in enumerate(block_groups):
         for block_idx, layer in enumerate(blocks):
-            for p in layer.parameters():
-                param_id_to_region.setdefault(
-                    id(p), f"block:{group_idx}:{block_idx}"
+            for s in iter_param_slots(layer):
+                slot_to_region[(id(s.parent), s.leaf)] = (
+                    f"block:{group_idx}:{block_idx}"
                 )
 
     groups: dict[tuple, list[tuple[str, str, bool, int, str, int]]] = {}
     for s in iter_param_slots(model):
         if s.param.numel() == 0:
             continue
-        region = param_id_to_region.get(id(s.param), "non_block")
+        region = slot_to_region.get((id(s.parent), s.leaf), "non_block")
         skey = storage_key(s.param.data)
         groups.setdefault(skey, []).append(
             (region, s.name, s.param.requires_grad, id(s.parent), s.leaf, id(s.param))
@@ -638,6 +946,27 @@ def detect_streaming_region_ties(  # noqa: PLR0912
                     "storage alias on GPU. Untie the parameters or use "
                     "tie_weights() to share a single Parameter object."
                 )
+            # Same Parameter object, all-trainable. In legacy mode this
+            # is fine across regions because TrainableWeights owns the
+            # single Parameter object directly. In streamed-data mode,
+            # cross-region aliasing is NOT fine: each region builds its
+            # own ``_BlockPinnedStore`` (or composes TrainableWeights for
+            # ``non_block``) with an independent pinned clone.
+            if stream_trainables and len(regions) > 1:
+                raise ValueError(
+                    f"All-trainable tied storage spans streamed regions "
+                    f"{sorted(regions)}: {names}. The same trainable "
+                    "Parameter aliased across regions creates divergent "
+                    "per-region pinned clones; per-block .data swap and "
+                    "optimizer-step materialize/scatter cannot coordinate to "
+                    "preserve the alias. Untie the parameters, refactor "
+                    "so the alias is intra-region, or use "
+                    "trainable_residency='always_gpu'."
+                )
+            # Same-Parameter all-trainable ties that reach here are
+            # either legacy-mode cross-region ties (handled by one
+            # TrainableWeights mover) or intra-region streamed-data ties
+            # (handled by one _BlockPinnedStore clone).
             continue
         if len(regions) > 1:
             raise ValueError(

@@ -8,10 +8,14 @@ brings trainable params (LoRA adapters, PEFT layers) to GPU on
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from types import TracebackType
 
 import torch
 from torch import nn
+
+from .protocols import SlotOwnership
+from .slots import iter_param_slots
 
 __all__ = ["TrainableWeights"]
 
@@ -32,17 +36,38 @@ class TrainableWeights:
       ``p.data`` storage moves via ``p.data = p.data.to(device)``.
       Identity-preserving — optimizer state survives.
 
-    Walks ``model.parameters()`` each transition (deduped by Parameter
-    identity), so the standard ``tie_weights()`` pattern (one Parameter
-    aliased at multiple slots) is handled correctly. Distinct-Parameter
-    tied storage is rejected upstream by
-    :func:`detect_streaming_region_ties` because moving each Parameter
-    independently would untie the alias on GPU.
+    Each transition walks the model and moves every currently
+    trainable Parameter. With ``skip_slots`` the walk is slot-aware,
+    which lets :class:`ModelOffloader` route in-block streamed-data
+    trainables to the streamer while leaving out-of-block trainables
+    here. Keeping the walk dynamic preserves the historical behavior
+    for late ``requires_grad`` changes.
+
+    Parameters
+    ----------
+    model:
+        The model whose trainable params should be moved.
+    target_device:
+        GPU device to move to on :meth:`activate`.
+    skip_slots:
+        Optional set of :class:`SlotOwnership` tuples identifying
+        ``(parent_module, leaf, kind)`` slots to skip — used by
+        composers that route some trainables to a different mover
+        (e.g., :class:`ModelOffloader` routes in-block trainables to
+        the streamer's per-block ``.data``-swap path and only hands
+        out-of-block trainables to ``TrainableWeights``).
     """
 
-    def __init__(self, model: nn.Module, target_device: torch.device) -> None:
+    def __init__(
+        self,
+        model: nn.Module,
+        target_device: torch.device,
+        *,
+        skip_slots: set[SlotOwnership] | None = None,
+    ) -> None:
         self._model = model
         self._target_device = target_device
+        self._skip_slots = frozenset(skip_slots) if skip_slots is not None else None
 
     @property
     def cache_bytes(self) -> int:
@@ -55,12 +80,29 @@ class TrainableWeights:
         self._move(torch.device("cpu"))
 
     def _move(self, device: torch.device) -> None:
-        for p in self._model.parameters():
-            if p.requires_grad:
-                if p.data.device != device:
-                    p.data = p.data.to(device)
-                if p.grad is not None and p.grad.device != device:
-                    p.grad = p.grad.to(device)
+        for p in self._iter_trainable_params():
+            if not p.requires_grad:
+                continue
+            if p.data.device != device:
+                p.data = p.data.to(device)
+            if p.grad is not None and p.grad.device != device:
+                p.grad = p.grad.to(device)
+
+    def _iter_trainable_params(self) -> Iterator[nn.Parameter]:
+        if self._skip_slots is None:
+            yield from self._model.parameters()
+            return
+
+        seen_ids: set[int] = set()
+        for s in iter_param_slots(self._model):
+            if s.slot in self._skip_slots:
+                continue
+            if not s.param.requires_grad:
+                continue
+            if id(s.param) in seen_ids:
+                continue
+            seen_ids.add(id(s.param))
+            yield s.param
 
     def __enter__(self) -> None:
         self.activate()

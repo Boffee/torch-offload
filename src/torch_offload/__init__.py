@@ -6,7 +6,10 @@ Two complementary offload strategies:
   merge and trainable-parameter support. Use for models whose
   individual blocks fit on GPU but the whole model does not.
   Hooks-based, prefetches upcoming blocks on a secondary CUDA stream,
-  supports gradient checkpointing through autograd backward. Composes
+  supports gradient checkpointing through autograd backward. By
+  default, trainable params stay GPU-resident while active; opt into
+  ``trainable_residency="streamed_data"`` to stream in-block trainable
+  data and materialize it only around ``optimizer.step()``. Composes
   :class:`PinnedWeights` + :class:`TrainableWeights` +
   :class:`StreamedWeights` internally.
 
@@ -33,7 +36,8 @@ everything to GPU; ``deactivate()`` returns to pinned CPU.
 :class:`ModelOffloader` composes (in order):
   1. A non-block :class:`PinnedWeights` with a :class:`SlotOwnership`
      skip filter for everything outside the block list.
-  2. A :class:`TrainableWeights` for LoRA / adapter weights.
+  2. A :class:`TrainableWeights` for LoRA / adapter weights
+     (or only out-of-block trainables in streamed-data mode).
   3. One :class:`StreamedWeights` per ``layers_attr`` path.
 
 Optional LoRA merging is handled by attaching

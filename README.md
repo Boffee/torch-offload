@@ -108,9 +108,29 @@ with offloader as gpu_model:
 del offloader, model  # drop refs to free pinned host memory
 ```
 
-Trainable parameters (e.g. LoRA adapters) move to GPU on activate
-and back to CPU on deactivate via the bundled `TrainableWeights`
-component — backward through them is unaffected by the offload.
+By default, trainable parameters (e.g. LoRA adapters) move to GPU on
+activate and back to CPU on deactivate via the bundled
+`TrainableWeights` component. This preserves ordinary PyTorch
+optimizer behavior: `optimizer.step()`, gradient accumulation, AMP
+unscale, and grad clipping see normal GPU trainables while the
+offloader is active.
+
+To reduce trainable-weight residency during training, opt into
+streaming in-block trainable data:
+
+```python
+offloader = ModelOffloader(
+    model,
+    target_device=torch.device("cuda"),
+    layers_attr="transformer_blocks",
+    blocks_to_swap=24,
+    trainable_residency="streamed_data",
+)
+```
+
+In this mode, in-block trainable `.data` is GPU-resident only while
+its block is resident, plus during the optimizer update. Gradients are
+not streamed; PyTorch owns `param.grad` normally.
 
 ### LoRA merge
 
@@ -132,6 +152,7 @@ offloader = ModelOffloader(
     target_device=torch.device("cuda"),
     layers_attr="transformer_blocks",
     blocks_to_swap=24,
+    # Default: trainable_residency="always_gpu"
 )
 
 # Attach LoRAs (must be called while deactivated)
@@ -254,6 +275,27 @@ HuggingFace `gradient_checkpointing` flag is detected on the streamed
 blocks. The check has false negatives for manual `checkpoint(...)`
 wrapping at call sites — that style is invisible from the module
 tree. Filter the warning via `logging` config if needed.
+
+For `trainable_residency="streamed_data"`, wrap the optimizer update
+so streamed trainable data is materialized on GPU while a normal
+PyTorch optimizer mutates it:
+
+```python
+with offloader as gpu_model:
+    for batch in loader:
+        loss = gpu_model(**batch).loss
+        loss.backward()
+
+        with offloader.optimizer_step():
+            optimizer.step()
+
+        optimizer.zero_grad()
+```
+
+This boundary is not optimizer-specific. It temporarily materializes
+the streamed trainable `.data` tensors on GPU, runs whatever
+`optimizer.step()` does, copies updated data back to pinned CPU, and
+leaves gradients on GPU.
 
 ## Quick start: ModelCache
 

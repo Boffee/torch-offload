@@ -2,23 +2,33 @@
 
 A :class:`StreamedWeights` manages a single block list whose blocks
 share the same parameter layout (names, shapes, dtypes, and any
-quanto/GGUF wrapper metadata): pins the frozen weights to CPU at
+quanto/GGUF wrapper metadata): pins the params to CPU at
 construction time, streams them to GPU on demand via forward-pre
 hooks, and uses a pre-allocated GPU slot pool plus a background
 prefetcher to overlap DMA with compute. Heterogeneous block lists
 (e.g. Flux's two block kinds) split into multiple
 :class:`StreamedWeights` instances composed via :class:`ModelOffloader`.
 
+In-block trainable params (LoRA adapters) flow through the same slot
+pool; ``_BlockPinnedStore`` branches on ``buf.requires_grad`` to swap
+``.data`` (preserves user Parameter identity for autograd / optimizer
+state) instead of replacing the Parameter wrapper. Gradients live on
+GPU during backward via PyTorch's native ``AccumulateGrad``; only
+``.data`` is materialized around ``optimizer.step()`` via
+:meth:`optimizer_step`.
+
 This is the sharp, low-level primitive. It does NOT manage:
 
 - Non-block parts of the model (parent-module state, sibling
   modules) — caller composes :class:`PinnedWeights` with the
   streamer's :attr:`slot_filter` for that.
-- Trainable parameter movement — caller handles a separate
-  :class:`~torch_offload.trainable_weights.TrainableWeights`.
+- Out-of-block trainable parameter movement — caller handles a
+  separate :class:`~torch_offload.trainable_weights.TrainableWeights`.
 - Cross-region tied-weight detection — that's a composer concern
   (see :func:`ModelOffloader` /
   :class:`~torch_offload.model_offloader.ModelOffloader`).
+- Activation-checkpointing enforcement — required for in-block
+  trainable streaming, but checked at the composer level.
 
 Most users want :func:`ModelOffloader` (the blessed safe
 API). Reach for :class:`StreamedWeights` directly only when you need
@@ -33,7 +43,7 @@ import functools
 import logging
 import weakref
 from collections import OrderedDict
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from types import TracebackType
 from typing import Any
@@ -43,9 +53,23 @@ from torch import nn
 
 from .pinned_buffer import PinnedParamBuffer
 from .protocols import SlotOwnership
-from .slots import assert_frozen, iter_buffer_slots, iter_param_slots
+from .slots import iter_buffer_slots, iter_param_slots
+from .tensor_adapters import RegularAdapter
 
 logger = logging.getLogger(__name__)
+
+
+def _repoint_data_to_pinned(
+    param: nn.Parameter, buf: PinnedParamBuffer
+) -> None:
+    """ExitStack callback used by :meth:`StreamedWeights.optimizer_step`.
+
+    Repoints ``param.data`` at the pinned host clone, releasing the
+    optimizer-step GPU allocation that was assigned to ``param.data``
+    on enter. Defined at module scope so the closure registered with
+    ``ExitStack.callback`` doesn't capture a streamer reference.
+    """
+    param.data = buf.cpu_param.data
 
 
 def _release_cuda_cache_on_drop(is_cuda: bool) -> None:
@@ -214,7 +238,7 @@ class _BlockPinnedStore:
        slot specs (no pinning) and verifies that every block shares
        the same layout signature. A mismatch raises ``ValueError``
        before any pin or slot mutation.
-    2. Then it pins every frozen param/buffer into a fresh
+    2. Then it pins every managed param/buffer into a fresh
        :class:`PinnedParamBuffer` / pinned clone and records the
        slot locations they'll be installed at. ``__init__`` does NOT
        install those pinned objects into the model's slots.
@@ -274,17 +298,24 @@ class _BlockPinnedStore:
             for s in iter_param_slots(layer):
                 if s.slot in skip:
                     continue
-                # Contract guard: streaming cycles slots through
-                # pre-allocated requires_grad=False Parameter wrappers,
-                # which destroys the per-Parameter identity that
-                # optimizers and grad accumulation rely on. The
-                # composer routes trainables via skip_slots; direct
-                # users are on the hook.
-                assert_frozen(s, owner="StreamedWeights")
+                # Trainables flow through alongside frozen params: the
+                # slot pool's GPU storage is reused for both, but
+                # ``_BlockPinnedStore`` branches on ``buf.requires_grad``
+                # at swap time — frozen → Parameter swap (existing,
+                # orphans user Parameter); trainable → ``.data`` swap
+                # (preserves user's Parameter for autograd / optimizer
+                # state). Grads are NOT streamed in this design — they
+                # stay on GPU during backward via PyTorch's native
+                # ``AccumulateGrad`` mechanism, which is correctness-
+                # preserving and avoids cross-device-add complexity.
+                # Cross-region trainable ties are rejected by
+                # ``detect_streaming_region_ties`` upstream.
                 slot_filter.add(s.slot)
-                # Pinning is deduped by id(p) — intra-block aliasing
-                # is unsupported and must be rejected upstream by
-                # detect_streaming_region_ties.
+                # Pinning is deduped by id(p). Frozen intra-block aliases
+                # and distinct-Parameter trainable aliases are rejected
+                # upstream by detect_streaming_region_ties; same-Parameter
+                # trainable aliases are safe because one .data swap reaches
+                # every alias slot.
                 if id(s.param) in seen_param_ids:
                     continue
                 seen_param_ids.add(id(s.param))
@@ -318,7 +349,22 @@ class _BlockPinnedStore:
             block_pinned: list[PinnedParamBuffer] = []
             block_locs: list[tuple[str, nn.Module, str]] = []
             for name, param, parent, leaf in block_params:
-                block_pinned.append(PinnedParamBuffer(name, param))
+                buf = PinnedParamBuffer(name, param)
+                # Trainable streaming uses ``.data`` swap, which doesn't
+                # preserve quanto's subclass wrapper on assignment.
+                # Trainable quantized weights also aren't a real
+                # workload (PyTorch can't easily train through quanto).
+                # Reject at construction rather than failing later.
+                if buf.requires_grad and buf.adapter is not RegularAdapter:
+                    raise NotImplementedError(
+                        f"Trainable streaming requires plain "
+                        f"torch.Tensor params; slot {name!r} uses "
+                        f"{buf.adapter.__name__}. Quantized weights "
+                        f"are inference-only — keep them frozen, or "
+                        f"wrap with PEFT/LoRA so the trainable "
+                        f"adapter is plain-tensor."
+                    )
+                block_pinned.append(buf)
                 block_locs.append((name, parent, leaf))
             self._param_bufs.append(block_pinned)
             self._param_locs.append(block_locs)
@@ -343,7 +389,21 @@ class _BlockPinnedStore:
 
     def apply_slot_mutations(self) -> None:
         """Install the pinned cpu_params + buffer clones into the
-        model's slots. Idempotent."""
+        model's slots. Idempotent.
+
+        Frozen params: ``submod._parameters[leaf] = buf.cpu_param``
+        replaces the slot Parameter with a fresh
+        ``Parameter(requires_grad=False)`` wrapping the pinned host
+        clone. This orphans the user's pre-pin Parameter — fine for
+        frozen, since there's no autograd/optimizer state to lose.
+
+        Trainable params: leave the user's Parameter in place so
+        autograd and optimizer references survive. The
+        ``PinnedParamBuffer`` constructor already repointed the user
+        Parameter's ``.data`` at the pinned clone (plain-tensor
+        memory optimization), so the original storage is released
+        without slot mutation.
+        """
         if self._slots_applied:
             return
         for block_bufs, block_locs in zip(
@@ -352,6 +412,9 @@ class _BlockPinnedStore:
             for buf, (_qn, submod, local_name) in zip(
                 block_bufs, block_locs, strict=True,
             ):
+                if buf.requires_grad:
+                    # Trainable: keep user's Parameter, .data is already pinned.
+                    continue
                 # _parameters[leaf] swap (rather than .data) is required
                 # for quanto correctness — see PinnedWeights for details.
                 submod._parameters[local_name] = buf.cpu_param
@@ -413,29 +476,48 @@ class _BlockPinnedStore:
         slot = self._pool.slot(slot_id)
         slot.copy_from(self._param_bufs[idx], non_blocking=non_blocking)
 
-        for qual_name, submod, local_name in self._param_locs[idx]:
-            submod._parameters[local_name] = slot.get_param(qual_name)
+        for buf, (qual_name, submod, local_name) in zip(
+            self._param_bufs[idx], self._param_locs[idx], strict=True,
+        ):
+            if buf.requires_grad:
+                # Trainable: .data swap into the slot's GPU storage.
+                # Preserves the user's Parameter object identity — so
+                # autograd and optimizer state survive across cycles.
+                # Reuses ``slot.get_param`` purely for its ``.data``
+                # storage; the wrapper itself isn't installed.
+                submod._parameters[local_name].data = slot.get_param(qual_name).data
+            else:
+                submod._parameters[local_name] = slot.get_param(qual_name)
         for mod_buf, _sm, _ln, cpu_clone in self._buf_records[idx]:
             mod_buf.data = cpu_clone.to(self._device, non_blocking=non_blocking)
 
     def release_slot(self, idx: int) -> None:
-        """Return ``idx``'s pool slot for reuse without restoring the
-        slot Parameter on the model. Used in the steady-state hot path
-        where the next load will overwrite the slot anyway. For full
-        teardown (deactivate), use :meth:`evict_block` instead."""
-        assert self._pool is not None, "activate_pool not called"
-        slot_id = self._block_to_slot.pop(idx, None)
-        if slot_id is not None:
-            self._pool.release(slot_id)
+        """Return ``idx``'s pool slot for reuse.
+
+        Releasing a block always restores every managed slot in that
+        block to its pinned CPU representation before the pool slot is
+        reusable. This is the core residency invariant: a non-resident
+        block never leaves module slots pointing at reusable GPU scratch
+        storage.
+        """
+        self.evict_block(idx)
 
     def evict_block(self, idx: int) -> None:
         """Restore ``idx``'s slot Parameters to their pinned CPU
         forms and release the pool slot. Used for teardown so the
-        model can be safely accessed without the streamer."""
+        model can be safely accessed without the streamer.
+
+        Frozen: ``submod._parameters[leaf] = buf.cpu_param``.
+        Trainable: ``submod._parameters[leaf].data = buf.cpu_param.data``
+        (preserve the user's Parameter object).
+        """
         for buf, (_qn, submod, local_name) in zip(
             self._param_bufs[idx], self._param_locs[idx], strict=True,
         ):
-            submod._parameters[local_name] = buf.cpu_param
+            if buf.requires_grad:
+                submod._parameters[local_name].data = buf.cpu_param.data
+            else:
+                submod._parameters[local_name] = buf.cpu_param
         for mod_buf, _sm, _ln, cpu_clone in self._buf_records[idx]:
             mod_buf.data = cpu_clone
         if self._pool is not None:
@@ -443,11 +525,81 @@ class _BlockPinnedStore:
             if slot_id is not None:
                 self._pool.release(slot_id)
 
+    def evict_allocated_blocks(self) -> None:
+        """Evict every block that currently holds a pool slot.
+
+        ``_block_to_slot`` is the source of truth for slot allocation:
+        a block is recorded there as soon as :meth:`load_block`
+        (foreground or prefetch) acquires its slot, and removed only
+        by :meth:`evict_block` / :meth:`release_slot`. Iterating it
+        catches both currently-resident blocks and pending-prefetch
+        blocks whose H2D may still be in flight — so callers (teardown,
+        optimizer_step) don't have to reconcile multiple bookkeeping sources
+        (tracker, pending dict, etc.).
+
+        Caller is responsible for stream/event synchronization before
+        the eviction so in-flight DMA into the slot bytes has settled.
+        """
+        for idx in list(self._block_to_slot.keys()):
+            self.evict_block(idx)
+
+    def move_trainable_grads_to(self, device: torch.device) -> None:
+        """Move each trainable's ``.grad`` (if any) to ``device``.
+
+        During backward, PyTorch's native ``AccumulateGrad`` writes
+        grads on the param's data device — which is GPU at that point
+        because the ``.data`` swap in :meth:`load_block` repointed
+        ``.data`` at slot storage. The streamer's ``.data`` lifecycle
+        restores ``.data`` to pinned CPU on eviction, but ``.grad``
+        keeps living wherever AccumulateGrad placed it.
+
+        This is called on activate to move any previously-deactivated
+        CPU grads back to GPU before accumulation, and on deactivate
+        to honor the documented "model on CPU" contract.
+        """
+        for _buf, parent, leaf in self.iter_trainables():
+            param = parent._parameters[leaf]
+            if param.grad is not None and param.grad.device != device:
+                moved = param.grad.to(device)
+                if param.data.device == device:
+                    param.grad = moved
+                else:
+                    # PyTorch's grad setter rejects cross-device grad/data
+                    # pairs. Streamed trainables intentionally have CPU
+                    # data and GPU grads while active between block loads,
+                    # so move the grad storage in place when the data is
+                    # currently offloaded.
+                    param.grad.data = moved.data
+
     def mark_compute_done(self, idx: int, event: torch.cuda.Event) -> None:
         assert self._pool is not None, "activate_pool not called"
         slot_id = self._block_to_slot.get(idx)
         if slot_id is not None:
             self._pool.set_compute_event(slot_id, event)
+
+    def iter_trainables(
+        self,
+    ) -> "Iterator[tuple[PinnedParamBuffer, nn.Module, str]]":
+        """Yield ``(buf, parent, leaf)`` for every trainable buffer
+        across all blocks. Used by ``StreamedWeights.optimizer_step``
+        to walk all trainables when bringing them to GPU around the
+        optimizer-step boundary."""
+        for block_bufs, block_locs in zip(
+            self._param_bufs, self._param_locs, strict=True,
+        ):
+            for buf, (_qn, parent, leaf) in zip(block_bufs, block_locs, strict=True):
+                if buf.requires_grad:
+                    yield buf, parent, leaf
+
+    def has_trainables(self) -> bool:
+        """True if any block contains a trainable param. Used by the
+        composer to decide whether to enforce checkpointing as a
+        precondition for ``activate``."""
+        return any(
+            buf.requires_grad
+            for block_bufs in self._param_bufs
+            for buf in block_bufs
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -496,12 +648,14 @@ class _BlockTracker:
 class StreamedWeights:
     """Streams a single block list between pinned CPU and GPU.
 
-    The sharp, low-level streaming primitive. Manages frozen weights
-    of the block list ONLY: pins them to CPU at construction time,
+    The sharp, low-level streaming primitive. Manages the block list's
+    owned params and buffers: pins them to CPU at construction time,
     streams them to GPU via forward-pre hooks on :meth:`activate`,
-    releases GPU resources on :meth:`deactivate`. Does not touch
-    parent modules, sibling modules, or trainable parameters — those
-    are the composer's responsibility.
+    releases GPU resources on :meth:`deactivate`. Frozen params use
+    slot replacement; trainable params keep Parameter identity and
+    swap only ``.data``. Does not touch parent modules, sibling
+    modules, or out-of-block trainable parameters — those are the
+    composer's responsibility.
 
     A :class:`StreamedWeights` is a *component* meant to be composed
     inside a :class:`~torch_offload.model_offloader.ModelOffloader`.
@@ -565,13 +719,17 @@ class StreamedWeights:
     skip_slots:
         Optional set of :class:`SlotOwnership` tuples identifying
         ``(parent_module, leaf, kind)`` slots inside the blocks that
-        the streamer should not pin. Used by composers to route
-        trainable in-block params (LoRA / PEFT adapters) to a separate
-        strategy. Streaming cannot host trainables — slot replacement
-        breaks Parameter identity. A trainable slot not in
-        ``skip_slots`` triggers a contract-guard ValueError at
-        construction; this is intentional, fail-loud over silent
-        freezing of the param.
+        the streamer should not pin / stream. Used by composers
+        (typically :class:`ModelOffloader`) to surgically exclude
+        slots that need a different lifecycle. The streamer manages
+        the rest — both frozen params (slot replacement) and
+        trainable params (``.data`` swap, identity-preserving) flow
+        through the same slot pool.
+
+        Trainable streaming requires activation checkpointing on
+        every block (the ``.data`` swap bypasses autograd's
+        version-counter check). The streamer doesn't enforce that
+        precondition itself — :class:`ModelOffloader` does.
     """
 
     def __init__(
@@ -620,6 +778,11 @@ class StreamedWeights:
         self._pending: dict[int, Future[None]] = {}
         self._prefetch_events: dict[int, torch.cuda.Event] = {}
         self._last_idx: int = -1
+        # Single-active-step invariant: nested optimizer_step()
+        # would scatter outer state on top of inner updates, silently
+        # discarding the outer optimizer step. Reentrant entry is
+        # rejected at optimizer_step() entry.
+        self._optimizer_step_active: bool = False
 
         # Auto-flush the CUDA allocator cache when the streamer is GC'd,
         # so callers don't need to remember an explicit empty_cache() at
@@ -676,6 +839,10 @@ class StreamedWeights:
     def cache_bytes(self) -> int:
         return self._store.cache_bytes if self._store is not None else 0
 
+    @property
+    def has_trainables(self) -> bool:
+        return self._store is not None and self._store.has_trainables()
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -697,6 +864,16 @@ class StreamedWeights:
         action is :meth:`deactivate`, which idempotently tears down
         whatever was allocated."""
         assert self._store is not None
+        # Hard-guard against the documented "don't activate twice"
+        # case. Without this, a double-activate would double-install
+        # forward-pre hooks (silent grad doubling) and stack a second
+        # slot pool on top of an active one.
+        if self._executor is not None:
+            raise RuntimeError(
+                "StreamedWeights.activate() called while already "
+                "active. Deactivate first, or check for a leaked "
+                "context manager."
+            )
 
         num_layers = len(self._blocks)
         num_resident = num_layers - self._blocks_to_swap
@@ -710,6 +887,7 @@ class StreamedWeights:
         self._last_idx = -1
 
         self._store.activate_pool(num_gpu_slots, self._target_device)
+        self._store.move_trainable_grads_to(self._target_device)
 
         for idx in range(min(num_resident, num_layers)):
             self._store.load_block(idx)
@@ -746,6 +924,172 @@ class StreamedWeights:
     ) -> None:
         self.deactivate()
 
+    @contextlib.contextmanager
+    def optimizer_step(self) -> Iterator[None]:
+        """Context manager bringing trainable ``.data`` to GPU around
+        the optimizer-step boundary.
+
+        Gradients live on GPU throughout backward via PyTorch's
+        native ``AccumulateGrad`` — we don't D2H them inside this
+        context. Only ``.data`` is materialized: streamed trainables are
+        on pinned CPU after backward (the streamer's eviction path
+        restores them) and the optimizer needs them on GPU.
+
+        Lifecycle:
+
+        Enter:
+          1. Quiesce streaming via :meth:`_drain_and_evict_all`
+             (drain pending prefetch, sync prefetch stream, evict
+             every allocated slot). Raises if a prefetch errored —
+             eviction still ran first so the streamer is in a
+             consistent baseline.
+          2. On the streamer's private ``self._stream``, H2D each
+             trainable's pinned ``.data`` to a fresh allocator-managed
+             GPU buffer. Each H2D registers a rollback (repoint
+             ``.data`` at pinned) on an :class:`~contextlib.ExitStack`.
+          3. Have the user's current CUDA stream wait on
+             ``self._stream`` so the optimizer (running on the user's
+             stream) sees the materialized bytes.
+
+        Exit (clean OR body exception):
+          1. Have ``self._stream`` wait on the user's current stream
+             so D2H sees the optimizer's writes.
+          2. Blocking D2H of updated ``.data`` to the pinned clone
+             on ``self._stream``, then sync. Blocking + sync so the
+             next iteration's prefetch can't race against an
+             unfinished D2H to the same pinned bytes.
+          3. ExitStack unwinds: each materialized param's ``.data`` is
+             repointed at its pinned clone, releasing the optimizer-step
+             GPU allocation.
+
+        Failure modes:
+
+        - **Enter raises mid-loop** (e.g., OOM on H2D for one
+          trainable): ExitStack unwinds the rollbacks already
+          registered, restoring ``.data`` to pinned for previously
+          materialized params. No scatter (the data was never modified
+          on GPU). Streamer is left in a clean post-quiesce state.
+        - **Body raises after yield** (e.g., optimizer.step OOMs
+          mid-iteration): scatter still runs, preserving whatever
+          partial state the optimizer mutated, then the exception
+          propagates. The pinned clones reflect the partial step;
+          the user's exception handler sees the actual failure
+          rather than a silent rollback to stale bytes.
+        - **Reentrant entry**: rejected at top of the context
+          manager. A nested optimizer-step boundary would discard the
+          outer update.
+
+        ``param.grad`` is untouched throughout: autograd manages it
+        natively. ``optimizer.zero_grad()``, ``clip_grad_norm_``,
+        ``GradScaler.unscale_``, and other grad-walking tools work
+        orthogonally to the optimizer-step materialization window.
+
+        Typical loop::
+
+            loss.backward()
+            with offloader.optimizer_step():
+                optimizer.step()
+            optimizer.zero_grad()  # can be inside or outside
+
+        The slot pool's pre-warmed state is lost (next forward
+        re-loads from pinned), but that cost is dominated by the
+        forward + backward of the next iteration.
+        """
+        assert self._store is not None, (
+            "StreamedWeights.optimizer_step() requires activate() to "
+            "have been called and not yet deactivated."
+        )
+        if self._executor is None:
+            raise RuntimeError(
+                "StreamedWeights.optimizer_step() called on inactive "
+                "streamer. Use it inside the offloader's context "
+                "manager, between backward and the next forward."
+            )
+        if self._optimizer_step_active:
+            raise RuntimeError(
+                "StreamedWeights.optimizer_step() does not support "
+                "reentrant entry. A nested optimizer-step boundary would "
+                "scatter the outer step's stale pinned bytes on top of "
+                "the inner update."
+            )
+        if not self._store.has_trainables():
+            yield
+            return
+
+        # Quiesce streaming via the unified drain+sync+evict path.
+        # Raises if any pending prefetch errored — eviction still
+        # runs first inside _drain_and_evict_all so the streamer
+        # stays in a consistent state on the way out.
+        first_prefetch_exc = self._drain_and_evict_all()
+        if first_prefetch_exc is not None:
+            raise first_prefetch_exc
+
+        # Stream choreography: H2D runs on self._stream so it can
+        # proceed without contention against work the user has on
+        # the default stream. After H2D enqueueing, we have the
+        # user's current_stream wait on self._stream before yielding,
+        # so the optimizer (which runs on user's stream) sees the
+        # materialized bytes. _drain_and_evict_all already synced
+        # self._stream so it is safe to reuse here.
+        target = self._target_device
+        step_stream = self._stream
+        assert step_stream is not None, "stream allocated in activate()"
+
+        self._optimizer_step_active = True
+        try:
+            with contextlib.ExitStack() as stack:
+                # Each materialization registers a rollback that repoints
+                # the user's Parameter's .data back at its pinned
+                # cpu_param. ExitStack unwinds these on the way out
+                # whether enter failed mid-loop (no scatter), the body
+                # exited cleanly (scatter, then rollback), or the body
+                # raised after yield (still scatter, then rollback) —
+                # the rollback is idempotent w.r.t. a successful copy.
+                materialized: list[tuple[nn.Parameter, PinnedParamBuffer]] = []
+                with torch.cuda.stream(step_stream):
+                    for buf, parent, leaf in self._store.iter_trainables():
+                        param = parent._parameters[leaf]
+                        param.data = buf.cpu_param.data.to(
+                            target, non_blocking=True,
+                        )
+                        if param.grad is not None and param.grad.device != target:
+                            param.grad = param.grad.to(target, non_blocking=True)
+                        materialized.append((param, buf))
+                        stack.callback(_repoint_data_to_pinned, param, buf)
+                # User's current stream now waits for step_stream's
+                # H2D. After this point the optimizer can safely read
+                # param.data on its own stream.
+                torch.cuda.current_stream(target).wait_stream(step_stream)
+
+                try:
+                    yield
+                finally:
+                    # Scatter on body-exit (clean OR exception). On body
+                    # exception the optimizer may have mutated some params
+                    # before raising; preserve that partial state rather
+                    # than silently rolling back to pre-step pinned bytes.
+                    # The blocking copy + sync guarantees the next prefetch
+                    # reads stable bytes.
+                    step_stream.wait_stream(torch.cuda.current_stream(target))
+                    with torch.cuda.stream(step_stream):
+                        for param, buf in materialized:
+                            buf.cpu_param.data.copy_(
+                                param.data, non_blocking=False,
+                            )
+                    step_stream.synchronize()
+                    # ExitStack unwinds on `with` exit: each materialized
+                    # param's .data is repointed at its pinned
+                    # cpu_param.data, releasing the optimizer-step GPU
+                    # allocation.
+        finally:
+            self._optimizer_step_active = False
+
+    @contextlib.contextmanager
+    def gather_for_step(self) -> Iterator[None]:
+        """Backward-compatible alias for :meth:`optimizer_step`."""
+        with self.optimizer_step():
+            yield
+
     # ------------------------------------------------------------------
     # Diagnostics
     # ------------------------------------------------------------------
@@ -762,6 +1106,54 @@ class StreamedWeights:
     # Internals
     # ------------------------------------------------------------------
 
+    def _drain_and_evict_all(self) -> BaseException | None:
+        """Quiesce streaming back to a baseline state.
+
+        Drains pending prefetch futures (waits for completion),
+        synchronizes the prefetch stream so any in-flight H2D has
+        settled device-side, then evicts every block currently
+        holding a pool slot via the store's source-of-truth
+        (:meth:`_BlockPinnedStore.evict_allocated_blocks`), and
+        clears tracker + pending bookkeeping.
+
+        Idempotent — safe to call when no resources are active and
+        safe to call multiple times. Returns the first prefetch
+        exception encountered (or ``None``) so the caller can choose
+        to surface it. We don't raise here so eviction still runs
+        after a failed prefetch; without this, a transient prefetch
+        error would leak the GPU slot it had partially populated.
+
+        Used by both :meth:`_teardown_active_resources` (full
+        deactivate) and :meth:`optimizer_step` (mid-cycle quiesce
+        before optimizer step). Centralizing it removes the bug
+        class where the two paths' bookkeeping diverged — optimizer_step
+        used to walk ``_tracker._on_gpu`` and miss pending prefetch
+        slots, leaking them across step boundaries.
+        """
+        first_prefetch_exc: BaseException | None = None
+        for future in list(self._pending.values()):
+            try:
+                future.result()
+            except BaseException as e:
+                if first_prefetch_exc is None:
+                    first_prefetch_exc = e
+        self._pending.clear()
+
+        if self._stream is not None:
+            try:
+                self._stream.synchronize()
+            except BaseException as e:
+                if first_prefetch_exc is None:
+                    first_prefetch_exc = e
+
+        if self._store is not None:
+            self._store.evict_allocated_blocks()
+
+        if self._tracker is not None:
+            self._tracker.clear()
+
+        return first_prefetch_exc
+
     def _teardown_active_resources(self) -> BaseException | None:
         """Idempotent cleanup of all active resources. Returns the
         first prefetch exception encountered (or None) so the caller
@@ -770,35 +1162,29 @@ class StreamedWeights:
             h.remove()
         self._hooks.clear()
 
-        # Drain prefetcher first: shutdown(wait=True) blocks until all
-        # submitted futures complete (success OR fail). Then we use the
-        # non-raising future.exception() to inspect each — no per-future
-        # try/except needed.
+        # Shutdown executor first — shutdown(wait=True) waits for
+        # already-submitted prefetches to finish. After that, no
+        # background work can run, so the subsequent quiesce only
+        # has to drain the futures' results (no in-flight risk).
         if self._executor is not None:
             self._executor.shutdown(wait=True)
             self._executor = None
 
-        first_prefetch_exc: BaseException | None = None
-        for idx, future in self._pending.items():
-            exc = future.exception()
-            if exc is not None and first_prefetch_exc is None:
-                first_prefetch_exc = exc
-            if self._tracker is not None:
-                self._tracker.mark_on_gpu(idx)
-        self._pending.clear()
+        first_prefetch_exc = self._drain_and_evict_all()
+
         self._prefetch_events.clear()
 
         if self._stream is not None:
-            self._stream.synchronize()
             self._stream = None
 
-        if self._tracker is not None and self._store is not None:
-            torch.cuda.synchronize(device=self._target_device)
-            for idx in range(len(self._blocks)):
-                self._store.evict_block(idx)
-            self._tracker.clear()
-
+        # Move trainable grads to CPU so deactivate's contract
+        # (model on CPU after deactivate) holds for in-block
+        # trainables. Backward leaves grads GPU-resident via
+        # AccumulateGrad — this is the symmetric counterpart to
+        # the ``.data`` restoration that already happened in
+        # ``evict_allocated_blocks``.
         if self._store is not None:
+            self._store.move_trainable_grads_to(torch.device("cpu"))
             self._store.deactivate_pool()
 
         self._tracker = None
@@ -890,10 +1276,11 @@ class StreamedWeights:
                 direction = 1
             else:
                 diff = idx - last
-                if cyclic and abs(diff) > wrap_threshold:
-                    direction = -1 if diff > 0 else 1
-                else:
-                    direction = 1 if diff >= 0 else -1
+                direction = (
+                    (-1 if diff > 0 else 1)
+                    if cyclic and abs(diff) > wrap_threshold
+                    else 1 if diff >= 0 else -1
+                )
             for offset in range(1, prefetch_count + 1):
                 target = idx + direction * offset
                 if cyclic:
