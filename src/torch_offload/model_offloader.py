@@ -58,7 +58,13 @@ def _routed_factor_dtype(module: nn.Module) -> torch.dtype:
     compute = getattr(module, "compute_dtype", None)
     if compute is not None:
         return compute
-    return module.weight.dtype
+    weight = getattr(module, "weight", None)
+    if not isinstance(weight, torch.Tensor):
+        raise TypeError(
+            f"Routed LoRA mode requires a tensor-like weight on "
+            f"{type(module).__name__}; got {type(weight).__name__}"
+        )
+    return weight.dtype
 
 
 class ModelOffloader:
@@ -444,7 +450,7 @@ class ModelOffloader:
             ] = []
             for target_key, refs in per_target.items():
                 parents = self._reverse_parents[target_key]
-                if len(parents) > 1:
+                if len(parents) != 1:
                     raise ValueError(
                         f"Routed LoRA mode does not support tied "
                         f"weights; target {target_key!r} has "
@@ -455,7 +461,7 @@ class ModelOffloader:
                         f"merge mutates the shared storage so all "
                         f"locations see the LoRA contribution."
                     )
-                parent = parents[0]
+                parent = next(iter(parents))
                 if not isinstance(parent, nn.Linear):
                     raise ValueError(
                         f"Routed LoRA mode requires nn.Linear targets; "

@@ -46,7 +46,7 @@ from collections import OrderedDict
 from collections.abc import Iterator, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from types import TracebackType
-from typing import Any
+from typing import cast
 
 import torch
 from torch import nn
@@ -70,6 +70,13 @@ def _repoint_data_to_pinned(
     ``ExitStack.callback`` doesn't capture a streamer reference.
     """
     param.data = buf.cpu_param.data
+
+
+def _slot_param(parent: nn.Module, leaf: str) -> nn.Parameter:
+    param = parent._parameters[leaf]
+    if param is None:
+        raise RuntimeError(f"Parameter slot {leaf!r} is unexpectedly empty")
+    return param
 
 
 def _release_cuda_cache_on_drop(is_cuda: bool) -> None:
@@ -112,7 +119,7 @@ class _GpuSlot:
         # Opaque adapter-specific GPU state per buffer; the streamer
         # round-trips it through copy_to_gpu / make_gpu_param without
         # inspecting its shape.
-        self._gpu_states: dict[str, Any] = {}
+        self._gpu_states: dict[str, object] = {}
         self._gpu_params: dict[str, nn.Parameter] = {}
         for buf in template:
             gpu_state = buf.allocate_gpu_storage(device)
@@ -485,7 +492,7 @@ class _BlockPinnedStore:
                 # autograd and optimizer state survive across cycles.
                 # Reuses ``slot.get_param`` purely for its ``.data``
                 # storage; the wrapper itself isn't installed.
-                submod._parameters[local_name].data = slot.get_param(qual_name).data
+                _slot_param(submod, local_name).data = slot.get_param(qual_name).data
             else:
                 submod._parameters[local_name] = slot.get_param(qual_name)
         for mod_buf, _sm, _ln, cpu_clone in self._buf_records[idx]:
@@ -515,7 +522,7 @@ class _BlockPinnedStore:
             self._param_bufs[idx], self._param_locs[idx], strict=True,
         ):
             if buf.requires_grad:
-                submod._parameters[local_name].data = buf.cpu_param.data
+                _slot_param(submod, local_name).data = buf.cpu_param.data
             else:
                 submod._parameters[local_name] = buf.cpu_param
         for mod_buf, _sm, _ln, cpu_clone in self._buf_records[idx]:
@@ -558,7 +565,7 @@ class _BlockPinnedStore:
         to honor the documented "model on CPU" contract.
         """
         for _buf, parent, leaf in self.iter_trainables():
-            param = parent._parameters[leaf]
+            param = _slot_param(parent, leaf)
             if param.grad is not None and param.grad.device != device:
                 moved = param.grad.to(device)
                 if param.data.device == device:
@@ -1048,7 +1055,7 @@ class StreamedWeights:
                 materialized: list[tuple[nn.Parameter, PinnedParamBuffer]] = []
                 with torch.cuda.stream(step_stream):
                     for buf, parent, leaf in self._store.iter_trainables():
-                        param = parent._parameters[leaf]
+                        param = _slot_param(parent, leaf)
                         param.data = buf.cpu_param.data.to(
                             target, non_blocking=True,
                         )
@@ -1192,21 +1199,25 @@ class StreamedWeights:
 
         return first_prefetch_exc
 
-    def _evict_one(
-        self, protected: set[int], compute_event: torch.cuda.Event | None = None
-    ) -> None:
+    def _evict_one(self, protected: set[int], compute_event: object | None = None) -> None:
+        assert self._tracker is not None
+        assert self._store is not None
         victim = self._tracker.pick_victim(protected=protected)
         if compute_event is not None:
-            self._store.mark_compute_done(victim, compute_event)
+            self._store.mark_compute_done(victim, cast(torch.cuda.Event, compute_event))
         self._store.release_slot(victim)
         self._tracker.mark_on_cpu(victim)
 
     def _do_prefetch(self, idx: int) -> None:
+        assert self._stream is not None
+        assert self._store is not None
         with torch.cuda.stream(self._stream):
             self._store.load_block(idx, non_blocking=True, stream=self._stream)
             self._prefetch_events[idx].record(self._stream)
 
     def _submit_prefetch(self, idx: int, max_on_gpu: int) -> None:
+        assert self._tracker is not None
+        assert self._executor is not None
         if idx < 0 or idx >= len(self._blocks):
             return
         if self._tracker.is_on_gpu(idx) or idx in self._pending:
@@ -1216,6 +1227,8 @@ class StreamedWeights:
         self._pending[idx] = self._executor.submit(self._do_prefetch, idx)
 
     def _ensure_on_gpu(self, idx: int) -> None:
+        assert self._tracker is not None
+        assert self._store is not None
         future = self._pending.pop(idx, None)
         if future is not None:
             future.result()
@@ -1244,7 +1257,7 @@ class StreamedWeights:
         # caller drops it; orphaned hooks no-op safely.
         self_ref = weakref.ref(self)
 
-        def _pre_hook(_module: nn.Module, _args: Any, *, idx: int) -> None:  # noqa: ANN401
+        def _pre_hook(_module: nn.Module, _args: tuple[object, ...], *, idx: int) -> None:
             streamer = self_ref()
             if streamer is None:
                 # Strategy was dropped without deactivate. Hook is
@@ -1255,6 +1268,8 @@ class StreamedWeights:
                 # is slower but works on pinned tensors).
                 return
             tracker = streamer._tracker
+            if tracker is None or streamer._store is None:
+                return
             pending = streamer._pending
             if tracker.is_on_gpu(idx):
                 tracker.touch(idx)

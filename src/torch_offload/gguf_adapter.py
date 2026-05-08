@@ -26,18 +26,25 @@ the ``gguf`` package is not installed — GGUF support is optional.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any, cast
 
 import torch
 from torch import nn
 
 from .tensor_adapters import register_adapter
 
+_DEQUANT_SHAPE: Any = None
+_DEQUANTIZE: Any = None
 try:
-    from .gguf_dequant import dequant_shape, dequantize
+    from .gguf_dequant import dequant_shape as _dequant_shape
+    from .gguf_dequant import dequantize as _dequantize
 
     _GGUF_AVAILABLE = True
 except ImportError:
     _GGUF_AVAILABLE = False
+else:
+    _DEQUANT_SHAPE = _dequant_shape
+    _DEQUANTIZE = _dequantize
 
 __all__ = ["GGUFWeight", "GgufAdapter"]
 
@@ -63,10 +70,8 @@ class GGUFWeight(torch.Tensor):
     quant_type: int
 
     @staticmethod
-    def __new__(cls, data: torch.Tensor, *, quant_type: int) -> GGUFWeight:  # noqa: ANN001
-        t = torch.Tensor._make_subclass(cls, data, False)
-        t.quant_type = quant_type
-        return t
+    def __new__(cls: type[GGUFWeight], data: torch.Tensor, *, quant_type: int) -> GGUFWeight:
+        return _make_gguf_weight(cls, data, quant_type)
 
     @classmethod
     def __torch_function__(
@@ -83,7 +88,7 @@ class GGUFWeight(torch.Tensor):
                         r.quant_type = qt
         return result
 
-    def __repr__(self) -> str:
+    def __repr__(self, *, tensor_contents: object | None = None) -> str:
         import gguf as _gguf  # noqa: PLC0415
 
         try:
@@ -94,6 +99,19 @@ class GGUFWeight(torch.Tensor):
             f"GGUFWeight(quant_type={name}, packed_shape={list(self.shape)}, "
             f"device={self.device})"
         )
+
+
+def _make_gguf_weight(cls: type[GGUFWeight], data: torch.Tensor, quant_type: int) -> GGUFWeight:
+    t = torch.Tensor._make_subclass(cls, data, False)
+    weight = cast(GGUFWeight, t)
+    weight.quant_type = quant_type
+    return weight
+
+
+def _require_gguf_weight(t: torch.Tensor) -> GGUFWeight:
+    if not isinstance(t, GGUFWeight):
+        raise TypeError(f"expected GGUFWeight, got {type(t).__name__}")
+    return t
 
 
 def _extract_quant_type(args: tuple) -> int | None:
@@ -153,27 +171,31 @@ class GgufAdapter:
         return isinstance(t, GGUFWeight) and t.dtype == torch.uint8
 
     @staticmethod
-    def storage_key(t: torch.Tensor) -> tuple:
-        raw = t.as_subclass(torch.Tensor)
+    def storage_key(t: torch.Tensor) -> tuple[object, ...]:
+        weight = _require_gguf_weight(t)
+        raw = weight.as_subclass(torch.Tensor)
         return (
             "gguf",
             raw.untyped_storage().data_ptr(),
             raw.storage_offset(),
             tuple(raw.shape),
             raw.stride(),
-            t.quant_type,  # type: ignore[union-attr]
+            weight.quant_type,
         )
 
     @staticmethod
     def clone_pin(t: torch.Tensor) -> _GgufPinned:
-        raw = t.as_subclass(torch.Tensor)
+        weight = _require_gguf_weight(t)
+        raw = weight.as_subclass(torch.Tensor)
         if raw.is_cuda:
             pinned = torch.empty_like(raw, device="cpu").pin_memory()
             pinned.copy_(raw)
         else:
             pinned = raw.contiguous().clone().pin_memory()
-        qt: int = t.quant_type  # type: ignore[union-attr]
-        shape = torch.Size(dequant_shape(tuple(raw.shape), qt))
+        qt = weight.quant_type
+        if _DEQUANT_SHAPE is None:
+            raise RuntimeError("gguf is required to compute GGUF dequantized shapes")
+        shape = torch.Size(_DEQUANT_SHAPE(tuple(raw.shape), qt))
         return _GgufPinned(
             data=pinned,
             quant_type=qt,
@@ -186,7 +208,7 @@ class GgufAdapter:
         state: _GgufPinned, *, requires_grad: bool = False
     ) -> nn.Parameter:
         return nn.Parameter(
-            GGUFWeight(state.data, quant_type=state.quant_type),
+            _make_gguf_weight(GGUFWeight, state.data, state.quant_type),
             requires_grad=requires_grad,
         )
 
@@ -201,9 +223,10 @@ class GgufAdapter:
         return _GgufGpu(staging=staging, dequant=dequant)
 
     @staticmethod
-    def gpu_param(  # noqa: ARG004
+    def gpu_param(
         pinned: _GgufPinned, gpu_state: _GgufGpu, *, requires_grad: bool = False,
     ) -> nn.Parameter:
+        del pinned
         return nn.Parameter(gpu_state.dequant, requires_grad=requires_grad)
 
     @staticmethod
@@ -215,12 +238,14 @@ class GgufAdapter:
         # Stage 2: dequantize on-device into pre-allocated output.
         # dequantize() returns a new tensor; copy into the persistent
         # output buffer so gpu_param().data sees the update.
-        result = dequantize(dst.staging, src.quant_type, dtype=src.compute_dtype)
+        if _DEQUANTIZE is None:
+            raise RuntimeError("gguf is required to dequantize GGUF weights")
+        result = _DEQUANTIZE(dst.staging, src.quant_type, dtype=src.compute_dtype)
         dst.dequant.copy_(result)
 
     @staticmethod
     def copy_to_cpu(
-        src: _GgufGpu, dst: _GgufPinned, *, non_blocking: bool = False,  # noqa: ARG004
+        src: _GgufGpu, dst: _GgufPinned, *, non_blocking: bool = False,
     ) -> None:
         # GGUF's GPU representation is the dequantized bf16 weight
         # (``dst.dequant``), not the original packed quantized bytes.

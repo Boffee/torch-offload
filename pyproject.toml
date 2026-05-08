@@ -19,6 +19,7 @@ build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
+    "pyright>=1.1.409",
     "pytest~=9.0",
     "ruff>=0.14.3",
 ]
@@ -26,6 +27,14 @@ dev = [
 [tool.ruff]
 target-version = "py311"
 line-length = 120
+
+[tool.pyright]
+include = ["src/torch_offload"]
+exclude = ["tests"]
+pythonVersion = "3.10"
+typeCheckingMode = "standard"
+reportMissingImports = "none"
+reportPrivateImportUsage = "none"
 
 [tool.ruff.lint]
 select = [

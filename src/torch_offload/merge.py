@@ -16,7 +16,7 @@ from collections.abc import Sequence
 
 from torch import nn
 
-from ._quanto import QUANTO_AVAILABLE, WeightQBytesTensor, requantize_with_addmm_delta
+from ._quanto import is_weight_qbytes_tensor, requantize_with_addmm_delta
 from .lora import _ADDMM_DTYPES, LoRA
 from .slots import canonical_param_name, split_attr_path, walk_attr_path
 
@@ -47,7 +47,7 @@ def merge_lora(
                 continue
             real_name, param = entry
 
-            if QUANTO_AVAILABLE and isinstance(param.data, WeightQBytesTensor):
+            if is_weight_qbytes_tensor(param.data):
                 new_qt = requantize_with_addmm_delta(param.data, a, b, strength)
                 parent, leaf = split_attr_path(model, real_name)
                 setattr(
@@ -89,5 +89,5 @@ def merge_lora(
             merged += 1
 
     logger.info("merge_lora: merged %d/%d targets", merged,
-                sum(len(l.targets) for l, _ in loras))
+                sum(len(lora.targets) for lora, _ in loras))
     return merged

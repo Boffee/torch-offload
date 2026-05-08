@@ -32,7 +32,14 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 
-from ._quanto import QUANTO_AVAILABLE, WeightQBytesTensor, validate_layout
+from ._quanto import (
+    QUANTO_AVAILABLE,
+    create_qbytes_tensor,
+    is_weight_qbytes_tensor,
+    qbytes_activation_qtype,
+    require_qbytes_tensor,
+    validate_layout,
+)
 from .tensor_adapters import register_adapter
 
 
@@ -44,10 +51,10 @@ class _QuantoPinned:
     data: torch.Tensor   # pinned int8/fp8
     scale: torch.Tensor  # pinned fp16/fp32
     qtype: object
-    axis: object
+    axis: int
     size: torch.Size
-    stride: tuple
-    act_qt: object
+    stride: tuple[int, ...]
+    act_qt: object | None
 
 
 @dataclass(slots=True)
@@ -65,7 +72,7 @@ def _build_qbytes(
 ) -> torch.Tensor:
     """Reconstruct a :class:`WeightQBytesTensor` from raw pieces +
     cached quant metadata."""
-    return WeightQBytesTensor.create(  # type: ignore[union-attr]
+    return create_qbytes_tensor(
         state.qtype, state.axis, state.size, state.stride,
         data, scale, state.act_qt,
     )
@@ -82,41 +89,42 @@ class QuantoAdapter:
 
     @staticmethod
     def matches(t: torch.Tensor) -> bool:
-        if not QUANTO_AVAILABLE or not isinstance(t, WeightQBytesTensor):
+        if not is_weight_qbytes_tensor(t):
             return False
-        # Validate the layout we read in clone_pin/_build_qbytes is
-        # still present. Cheap (four hasattr calls) and runs on every
-        # dispatch — no caching needed at this scale.
+        # Validate the private layout we read in clone_pin/_build_qbytes.
+        # Cheap (four hasattr calls) and runs on every dispatch.
         validate_layout(t)
         return True
 
     @staticmethod
-    def storage_key(t: torch.Tensor) -> tuple:
+    def storage_key(t: torch.Tensor) -> tuple[object, ...]:
         # Composite identity: the two underlying buffers plus the quant
         # metadata. Two distinct WeightQBytesTensors with the same
         # underlying _data/_scale storage AND matching quant params are
         # the same logical tensor and dedup safely.
+        qt = require_qbytes_tensor(t)
         return (
             "quanto",
-            t._data.data_ptr(),
-            t._data.dtype,
-            tuple(t._data.shape),
-            t._data.stride(),
-            t._data.storage_offset(),
-            t._scale.data_ptr(),
-            t._scale.dtype,
-            tuple(t._scale.shape),
-            t._scale.stride(),
-            t._scale.storage_offset(),
-            t.qtype,
-            t.axis,
-            tuple(t.size()),
-            t.stride(),
-            getattr(t, "activation_qtype", None),
+            qt._data.data_ptr(),
+            qt._data.dtype,
+            tuple(qt._data.shape),
+            qt._data.stride(),
+            qt._data.storage_offset(),
+            qt._scale.data_ptr(),
+            qt._scale.dtype,
+            tuple(qt._scale.shape),
+            qt._scale.stride(),
+            qt._scale.storage_offset(),
+            qt.qtype,
+            qt.axis,
+            tuple(qt.size()),
+            qt.stride(),
+            qbytes_activation_qtype(qt),
         )
 
     @staticmethod
     def clone_pin(t: torch.Tensor) -> _QuantoPinned:
+        qt = require_qbytes_tensor(t)
         # contiguous_format clone: fp8-quanto leaves some _data buffers
         # strided via internal transposes; the default preserve_format
         # would carry that through pin_memory(), breaking downstream
@@ -124,13 +132,13 @@ class QuantoAdapter:
         # stride is captured separately and reapplied via
         # WeightQBytesTensor.create on the GPU side.
         return _QuantoPinned(
-            data=t._data.clone(memory_format=torch.contiguous_format).pin_memory(),
-            scale=t._scale.clone(memory_format=torch.contiguous_format).pin_memory(),
-            qtype=t.qtype,
-            axis=t.axis,
-            size=t.size(),
-            stride=t.stride(),
-            act_qt=getattr(t, "activation_qtype", None),
+            data=qt._data.clone(memory_format=torch.contiguous_format).pin_memory(),
+            scale=qt._scale.clone(memory_format=torch.contiguous_format).pin_memory(),
+            qtype=qt.qtype,
+            axis=qt.axis,
+            size=qt.size(),
+            stride=qt.stride(),
+            act_qt=qbytes_activation_qtype(qt),
         )
 
     @staticmethod

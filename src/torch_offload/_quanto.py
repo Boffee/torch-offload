@@ -20,16 +20,9 @@ Pinned to optimum-quanto's internal layout. Not part of the public API.
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
-
-try:
-    from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
-
-    QUANTO_AVAILABLE = True
-except ImportError:
-    QUANTO_AVAILABLE = False
-    WeightQBytesTensor = None  # type: ignore[assignment,misc]
-
 
 LAYOUT_ATTRS = ("_data", "_scale", "qtype", "axis")
 """Attributes this repo reads from a ``WeightQBytesTensor``.
@@ -39,6 +32,48 @@ go through :func:`validate_layout` get a framed :class:`RuntimeError`
 naming the missing attribute(s); callers that don't would otherwise
 fail with a generic ``AttributeError`` later in the access path.
 """
+
+
+try:
+    from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
+
+    QUANTO_AVAILABLE = True
+except ImportError:
+    QUANTO_AVAILABLE = False
+    WeightQBytesTensor: Any = None
+
+
+def is_weight_qbytes_tensor(t: object) -> bool:
+    """Return whether ``t`` is an optimum-quanto WeightQBytesTensor."""
+    return QUANTO_AVAILABLE and isinstance(t, WeightQBytesTensor)
+
+
+def require_qbytes_tensor(t: torch.Tensor) -> Any:  # noqa: ANN401
+    """Return ``t`` as a validated quanto tensor, or raise."""
+    if not is_weight_qbytes_tensor(t):
+        raise TypeError(f"expected optimum-quanto WeightQBytesTensor, got {type(t).__name__}")
+    validate_layout(t)
+    return t
+
+
+def qbytes_activation_qtype(t: Any) -> object | None:  # noqa: ANN401
+    """Optional activation quant type stored by some quanto versions."""
+    return getattr(t, "activation_qtype", None)
+
+
+def create_qbytes_tensor(
+    qtype: object,
+    axis: int,
+    size: torch.Size,
+    stride: tuple[int, ...],
+    data: torch.Tensor,
+    scale: torch.Tensor,
+    activation_qtype: object | None,
+) -> torch.Tensor:
+    """Create an optimum-quanto WeightQBytesTensor."""
+    if not QUANTO_AVAILABLE:
+        raise RuntimeError("optimum-quanto is required to create a WeightQBytesTensor")
+    return WeightQBytesTensor.create(qtype, axis, size, stride, data, scale, activation_qtype)
 
 
 def validate_layout(qt: torch.Tensor) -> None:
@@ -74,32 +109,33 @@ def requantize_with_addmm_delta(
     original scale, and returns a fresh :class:`WeightQBytesTensor`.
     Lossy but standard for permanent LoRA merges into quantized bases.
     """
-    validate_layout(qt)
-    dev = qt.device
-    float_data = qt.dequantize().to(device=dev, dtype=torch.float32)
+    qbytes = require_qbytes_tensor(qt)
+    dev = qbytes.device
+    float_data = qbytes.dequantize().to(device=dev, dtype=torch.float32)
     float_data.addmm_(
         b.to(device=dev, dtype=torch.float32),
         a.to(device=dev, dtype=torch.float32),
         alpha=strength,
     )
-    return WeightQBytesTensor.create(  # type: ignore[union-attr]
-        qt.qtype, qt.axis, qt.size(), qt.stride(),
-        _quantize_to_qbytes(float_data, qt),
-        qt._scale.clone(),
-        getattr(qt, "activation_qtype", None),
+    return create_qbytes_tensor(
+        qbytes.qtype, qbytes.axis, qbytes.size(), qbytes.stride(),
+        _quantize_to_qbytes(float_data, qbytes),
+        qbytes._scale.clone(),
+        qbytes_activation_qtype(qbytes),
     )
 
 
 def _quantize_to_qbytes(
-    float_data: torch.Tensor, reference: torch.Tensor,
+    float_data: torch.Tensor, reference: Any,  # noqa: ANN401
 ) -> torch.Tensor:
     """Quantize float data using the same scale as ``reference``."""
     scale = reference._scale
     axis = reference.axis
-    if axis == 0:
-        scaled = float_data / scale.view(-1, *([1] * (float_data.dim() - 1)))
-    else:
-        scaled = float_data / scale
+    scaled = (
+        float_data / scale.view(-1, *([1] * (float_data.dim() - 1)))
+        if axis == 0
+        else float_data / scale
+    )
     return scaled.round().clamp(
         torch.iinfo(reference._data.dtype).min,
         torch.iinfo(reference._data.dtype).max,

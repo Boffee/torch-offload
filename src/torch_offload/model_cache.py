@@ -44,7 +44,7 @@ import logging
 from collections import OrderedDict
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
-from typing import Any, Generic, TypeVar, overload
+from typing import Any, Generic, TypeVar, cast, overload
 
 import torch
 
@@ -271,9 +271,9 @@ class ModelCache:
             return cb
         # Best-effort default: PyTorch's CachingHostAllocator flush is
         # only present when CUDA is available and only on torch >= 2.x.
-        host_empty: Any = getattr(torch._C, "_host_emptyCache", None)
+        host_empty: object = getattr(torch._C, "_host_emptyCache", None)
         if callable(host_empty) and torch.cuda.is_available():
-            return host_empty
+            return cast(Callable[[], None], host_empty)
         return None
 
     # ------------------------------------------------------------------
@@ -457,7 +457,7 @@ class ModelCache:
         entry: _Entry,
         *,
         pre_activate: Callable[[CachedResource[Any]], None] | None = None,
-    ) -> Any:
+    ) -> object:
         """Build (if needed), run ``pre_activate``, activate, and
         return the resource value.
 
@@ -491,7 +491,9 @@ class ModelCache:
         # caller's hook would either fail or silently violate
         # invariants.
         if entry.active_count > 0:
-            value = entry.strategy.value
+            strategy = entry.strategy
+            assert strategy is not None
+            value = strategy.value
             entry.active_count += 1
             return value
 
@@ -501,7 +503,8 @@ class ModelCache:
             self._stats.hits += 1
             self._lru.pop(key, None)  # leaving the inactive set
 
-        assert entry.strategy is not None
+        strategy = entry.strategy
+        assert strategy is not None
 
         # pre_activate runs while the strategy is still deactivated —
         # this is the user's hook for per-acquire configuration that
@@ -512,7 +515,7 @@ class ModelCache:
         if pre_activate is not None:
             entry.configuring = True
             try:
-                pre_activate(entry.strategy)
+                pre_activate(strategy)
             except BaseException as exc:
                 entry.configuring = False
                 self._stats.activation_errors += 1
@@ -527,19 +530,19 @@ class ModelCache:
         # eliminates a post-activate exception window where a raising
         # `value` getter would skip the deactivate path on the now-
         # active strategy.
-        value = entry.strategy.value
+        value = strategy.value
         try:
-            entry.strategy.activate()
+            strategy.activate()
         except BaseException as exc:
             self._stats.activation_errors += 1
             self._release_strategy(entry, evicted=False)
             raise ActivationError(f"activate() failed for {key!r}") from exc
 
         try:
-            self._reconcile_bytes(entry, entry.strategy.cache_bytes, phase="activate")
+            self._reconcile_bytes(entry, strategy.cache_bytes, phase="activate")
         except BaseException:
             with contextlib.suppress(BaseException):
-                entry.strategy.deactivate()
+                strategy.deactivate()
             self._stats.activation_errors += 1
             self._release_strategy(entry, evicted=False)
             raise
@@ -555,8 +558,10 @@ class ModelCache:
         entry.active_count -= 1
         if entry.active_count > 0:
             return
+        strategy = entry.strategy
+        assert strategy is not None
         try:
-            entry.strategy.deactivate()
+            strategy.deactivate()
         except BaseException:
             self._release_strategy(entry, evicted=False)
             raise
@@ -679,7 +684,8 @@ class ModelCache:
         precondition (built + inactive); :meth:`_release_strategy`
         bumps eviction stats."""
         entry = self._entries[key]
-        assert entry.strategy is not None and entry.active_count == 0
+        assert entry.strategy is not None
+        assert entry.active_count == 0
         self._release_strategy(entry, evicted=True)
 
     def _release_strategy(self, entry: _Entry, *, evicted: bool) -> None:
