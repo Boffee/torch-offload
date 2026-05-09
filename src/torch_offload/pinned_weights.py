@@ -64,6 +64,9 @@ from .pinned_buffer import PinnedParamBuffer, storage_key
 from .protocols import SlotOwnership
 from .slots import BufferSlot, ParamSlot, assert_frozen, iter_buffer_slots, iter_param_slots
 
+ParamSlotGroup = tuple[PinnedParamBuffer, list[tuple[nn.Module, str]]]
+ParamAliasGroup = tuple[PinnedParamBuffer, list[tuple[str, nn.Module, str]]]
+
 
 class PinnedWeights:
     """Whole-model pinned-CPU weight cache with bulk GPU transfer.
@@ -139,7 +142,7 @@ class PinnedWeights:
 
         # Phase 1: build all pinned templates without mutating slots. A
         # collection failure leaves the user's model untouched.
-        self._slots = self._collect_param_slots(model)
+        self._slots, self._param_aliases = self._collect_param_slots(model)
         self._buffer_slots = (
             self._collect_buffer_slots(model) if include_buffers else []
         )
@@ -175,7 +178,7 @@ class PinnedWeights:
 
     def _collect_param_slots(
         self, model: nn.Module
-    ) -> list[tuple[PinnedParamBuffer, list[tuple[nn.Module, str]]]]:
+    ) -> tuple[list[ParamSlotGroup], list[ParamAliasGroup]]:
         # Tied-weight aware pinning. We walk with remove_duplicate=False so
         # shared submodule aliases and standard tie_weights() aliases both
         # show up, then group by storage identity.
@@ -196,20 +199,27 @@ class PinnedWeights:
                 (s.name, s.param, s.parent, s.leaf)
             )
 
-        slots: list[tuple[PinnedParamBuffer, list[tuple[nn.Module, str]]]] = []
+        slots: list[ParamSlotGroup] = []
+        aliases: list[ParamAliasGroup] = []
         for members in groups.values():
             first_name, first_p = members[0][0], members[0][1]
             buf = PinnedParamBuffer(first_name, first_p)
             seen_locs: set[tuple[int, str]] = set()
+            seen_aliases: set[str] = set()
             locs: list[tuple[nn.Module, str]] = []
-            for _, _, parent, leaf in members:
+            alias_locs: list[tuple[str, nn.Module, str]] = []
+            for name, _, parent, leaf in members:
+                if name not in seen_aliases:
+                    seen_aliases.add(name)
+                    alias_locs.append((name, parent, leaf))
                 key = (id(parent), leaf)
                 if key in seen_locs:
                     continue
                 seen_locs.add(key)
                 locs.append((parent, leaf))
             slots.append((buf, locs))
-        return slots
+            aliases.append((buf, alias_locs))
+        return slots, aliases
 
     def _collect_buffer_slots(
         self, model: nn.Module
@@ -252,13 +262,23 @@ class PinnedWeights:
     # ------------------------------------------------------------------
 
     @property
-    def slots(self) -> list[tuple[PinnedParamBuffer, list[tuple[nn.Module, str]]]]:
+    def slots(self) -> list[ParamSlotGroup]:
         """Per-parameter ``(buffer, locations)`` pairs managed by this instance.
 
         Used by :class:`~torch_offload.ModelOffloader` to build a
         reverse index from parameter qualified names to their buffers.
         """
         return self._slots
+
+    @property
+    def param_aliases(self) -> list[ParamAliasGroup]:
+        """Per-parameter ``(buffer, aliases)`` pairs managed by this instance.
+
+        Each alias is ``(qualified_name, parent_module, leaf_name)`` from the
+        duplicate-aware parameter walk. Tied weights share one buffer but keep
+        every public name so LoRA target matching can resolve any alias.
+        """
+        return self._param_aliases
 
     @property
     def cache_bytes(self) -> int:

@@ -19,6 +19,7 @@ from torch_offload import (
     ModelCache,
     ModelOffloader,
     ResourceSpec,
+    merge_lora,
 )
 from torch_offload.lora import KeyTransformT
 from torch_offload.protocols import CachedResource
@@ -63,6 +64,39 @@ def _make_bf16_model(num_blocks: int = 4, dim: int = 16) -> nn.Module:
     for p in m.parameters():
         p.requires_grad = False
     return m
+
+
+def _make_tied_non_block_model(
+    num_blocks: int = 2, dim: int = 16, dtype: torch.dtype = torch.float32,
+) -> nn.Module:
+    class Block(nn.Module):
+        def __init__(self, dim: int) -> None:
+            super().__init__()
+            self.attn = nn.Linear(dim, dim, bias=False)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return self.attn(x)
+
+    class M(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.embed = nn.Linear(dim, dim, bias=False)
+            self.transformer_blocks = nn.ModuleList(
+                [Block(dim) for _ in range(num_blocks)]
+            )
+            self.head = nn.Linear(dim, dim, bias=False)
+            self.head.weight = self.embed.weight
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            x = self.embed(x)
+            for blk in self.transformer_blocks:
+                x = blk(x)
+            return self.head(x)
+
+    model = M().to(dtype)
+    for p in model.parameters():
+        p.requires_grad = False
+    return model
 
 
 def _make_lora_sd(
@@ -225,6 +259,55 @@ class TestSetLorasValidation:
         }
         s.set_loras([(LoRA(state_dict=sd), 1.0)])
         assert _has_transform(s, "embed.weight")
+
+    def test_non_block_tied_alias_target_matched(self) -> None:
+        m = _make_tied_non_block_model(dtype=torch.bfloat16)
+        s = _make_strategy(m)
+        sd = {
+            "head.lora_A.weight": torch.randn(4, 16),
+            "head.lora_B.weight": torch.randn(16, 4),
+        }
+        s.set_loras([(LoRA(state_dict=sd), 1.0)], mode="merge")
+        assert _has_transform(s, "head.weight")
+        assert _has_transform(s, "embed.weight")
+
+    def test_rejects_duplicate_tied_alias_targets(self) -> None:
+        m = _make_tied_non_block_model(dtype=torch.bfloat16)
+        s = _make_strategy(m)
+        sd = {
+            "embed.lora_A.weight": torch.randn(4, 16),
+            "embed.lora_B.weight": torch.randn(16, 4),
+            "head.lora_A.weight": torch.randn(4, 16),
+            "head.lora_B.weight": torch.randn(16, 4),
+        }
+        with pytest.raises(ValueError, match="same tied parameter storage"):
+            s.set_loras([(LoRA(state_dict=sd), 1.0)], mode="merge")
+
+    def test_streamed_block_shared_submodule_alias_target_matched(self) -> None:
+        class Block(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.a = nn.Linear(16, 16, bias=False)
+                self.b = self.a
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                return self.b(self.a(x))
+
+        class M(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.transformer_blocks = nn.ModuleList([Block(), Block()])
+
+        m = M().to(torch.bfloat16)
+        m.requires_grad_(False)
+        s = _make_strategy(m)
+        sd = {
+            "transformer_blocks.0.b.lora_A.weight": torch.randn(4, 16),
+            "transformer_blocks.0.b.lora_B.weight": torch.randn(16, 4),
+        }
+        s.set_loras([(LoRA(state_dict=sd), 1.0)], mode="merge")
+        assert _has_transform(s, "transformer_blocks.0.b.weight")
+        assert _has_transform(s, "transformer_blocks.0.a.weight")
 
     def test_key_transform_strips_prefix(self) -> None:
         m = _make_bf16_model()
@@ -525,6 +608,75 @@ class TestMergeCorrectness:
             s.deactivate()
 
 
+class TestPermanentMerge:
+    def test_tied_alias_target_merges_shared_storage(self) -> None:
+        m = _make_tied_non_block_model(dtype=torch.float32)
+        base = m.embed.weight.detach().clone()
+        sd = {
+            "head.lora_A.weight": torch.randn(4, 16),
+            "head.lora_B.weight": torch.randn(16, 4),
+        }
+        lora = LoRA(state_dict=sd, key_transform=None)
+        a, b = lora.targets["head.weight"]
+
+        merged = merge_lora(m, [(lora, 0.25)])
+
+        expected = base.clone()
+        expected.addmm_(
+            b.to(dtype=expected.dtype), a.to(dtype=expected.dtype), alpha=0.25,
+        )
+        assert merged == 1
+        torch.testing.assert_close(m.embed.weight, expected)
+        torch.testing.assert_close(m.head.weight, expected)
+        assert m.head.weight is m.embed.weight
+
+    def test_duplicate_tied_alias_targets_raise_before_mutation(self) -> None:
+        m = _make_tied_non_block_model(dtype=torch.float32)
+        before = m.embed.weight.detach().clone()
+        sd = {
+            "embed.lora_A.weight": torch.randn(4, 16),
+            "embed.lora_B.weight": torch.randn(16, 4),
+            "head.lora_A.weight": torch.randn(4, 16),
+            "head.lora_B.weight": torch.randn(16, 4),
+        }
+
+        with pytest.raises(ValueError, match="same tied parameter storage"):
+            merge_lora(m, [(LoRA(state_dict=sd, key_transform=None), 1.0)])
+
+        torch.testing.assert_close(m.embed.weight, before)
+        assert m.head.weight is m.embed.weight
+
+    def test_unmatched_unsupported_tensor_subclass_is_ignored(self) -> None:
+        class UnknownTensor(torch.Tensor):
+            pass
+
+        class M(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.target = nn.Linear(16, 16, bias=False)
+                self.other = nn.Linear(16, 16, bias=False)
+                wrapped = torch.Tensor._make_subclass(
+                    UnknownTensor, torch.randn(16, 16), False,
+                )
+                self.other.weight = nn.Parameter(wrapped, requires_grad=False)
+
+        m = M()
+        before = m.target.weight.detach().clone()
+        sd = {
+            "target.lora_A.weight": torch.randn(4, 16),
+            "target.lora_B.weight": torch.randn(16, 4),
+        }
+        lora = LoRA(state_dict=sd, key_transform=None)
+        a, b = lora.targets["target.weight"]
+
+        merged = merge_lora(m, [(lora, 0.5)])
+
+        expected = before.clone()
+        expected.addmm_(b, a, alpha=0.5)
+        assert merged == 1
+        torch.testing.assert_close(m.target.weight, expected)
+
+
 # ---------------------------------------------------------------------------
 # Cleanup invariants
 # ---------------------------------------------------------------------------
@@ -797,49 +949,22 @@ class TestRoutedMode:
         finally:
             s.deactivate()
 
-    def test_routed_tied_weight_target_raises(self) -> None:
+    @pytest.mark.parametrize("target", ["embed", "head"])
+    def test_routed_tied_weight_target_raises(self, target: str) -> None:
         # Standard tied embed/head pattern: one Parameter aliased at
         # multiple slots. PinnedWeights dedups them into one buffer
         # with multiple parent locations. Routed mode would only hook
         # one location and silently miss the others — reject explicitly.
-        class M(nn.Module):
-            def __init__(self, dim: int = 16, num_blocks: int = 2) -> None:
-                super().__init__()
-                self.embed = nn.Linear(dim, dim, bias=False)
-                self.transformer_blocks = nn.ModuleList(
-                    [
-                        type("B", (nn.Module,), {
-                            "__init__": lambda self, d=dim: (
-                                super(self.__class__, self).__init__(),
-                                setattr(self, "attn", nn.Linear(d, d, bias=False)),
-                            )[0],
-                            "forward": lambda self, x: self.attn(x),
-                        })()
-                        for _ in range(num_blocks)
-                    ]
-                )
-                self.head = nn.Linear(dim, dim, bias=False)
-                # Tie embed.weight to head.weight (standard pattern).
-                self.head.weight = self.embed.weight
-
-            def forward(self, x: torch.Tensor) -> torch.Tensor:
-                x = self.embed(x)
-                for blk in self.transformer_blocks:
-                    x = blk(x)
-                return self.head(x)
-
-        model = M(dim=16, num_blocks=2).to(torch.bfloat16)
-        for p in model.parameters():
-            p.requires_grad = False
+        model = _make_tied_non_block_model(dtype=torch.bfloat16)
 
         s = ModelOffloader(
             model, torch.device("cpu"),
             layers_attr="transformer_blocks", blocks_to_swap=1,
         )
-        # Build a LoRA that targets embed.weight (the tied head shares it).
+        # Build a LoRA that targets either alias of the tied weight.
         sd = {
-            "embed.lora_A.weight": torch.randn(4, 16),
-            "embed.lora_B.weight": torch.randn(16, 4),
+            f"{target}.lora_A.weight": torch.randn(4, 16),
+            f"{target}.lora_B.weight": torch.randn(16, 4),
         }
         lora = LoRA(state_dict=sd, key_transform=None)
         with pytest.raises(ValueError, match="tied weights"):

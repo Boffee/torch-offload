@@ -379,6 +379,7 @@ class ModelOffloader:
             return
 
         per_target: dict[str, list[tuple[torch.Tensor, torch.Tensor, float]]] = {}
+        per_buffer_target: dict[int, str] = {}
         total_targets = 0
         matched_targets = 0
         for lora, strength in loras:
@@ -394,6 +395,15 @@ class ModelOffloader:
                         f"LoRA factor shape mismatch for {target_key!r}: "
                         f"B@A produces ({b.shape[0]}, {a.shape[1]}), "
                         f"target shape is {expected}."
+                    )
+                existing_target = per_buffer_target.setdefault(id(buf), target_key)
+                if existing_target != target_key:
+                    raise ValueError(
+                        f"LoRA targets {existing_target!r} and {target_key!r} "
+                        f"resolve to the same tied parameter storage. Apply "
+                        f"only one alias for a tied weight in a single "
+                        f"set_loras() call; otherwise the same base weight "
+                        f"would receive multiple logical updates."
                     )
                 if mode == "merge":
                     cpu_data = buf.cpu_param.data
@@ -749,24 +759,43 @@ class ModelOffloader:
 
         for streamer, layer_path in zip(streamers, layer_paths, strict=True):
             block_bufs_per = streamer.param_bufs_per_block
-            block_locs_per = streamer.param_locs_per_block
-            for block_idx, (block_bufs, block_locs) in enumerate(
-                zip(block_bufs_per, block_locs_per, strict=True)
+            block_aliases_per = streamer.param_aliases_per_block
+            for block_idx, (block_bufs, block_aliases) in enumerate(
+                zip(block_bufs_per, block_aliases_per, strict=True)
             ):
-                for buf, (qual_name, parent, _leaf) in zip(
-                    block_bufs, block_locs, strict=True
-                ):
-                    full_name = f"{layer_path}.{block_idx}.{qual_name}"
-                    key = canonical_param_name(full_name)
-                    bufs[key] = buf
-                    parents[key] = (parent,)
+                for buf, aliases in zip(block_bufs, block_aliases, strict=True):
+                    seen_parent_ids: set[int] = set()
+                    alias_parents: list[nn.Module] = []
+                    for _qual_name, parent, _leaf in aliases:
+                        parent_id = id(parent)
+                        if parent_id in seen_parent_ids:
+                            continue
+                        seen_parent_ids.add(parent_id)
+                        alias_parents.append(parent)
+                    parent_tuple = tuple(alias_parents)
+                    for qual_name, _parent, _leaf in aliases:
+                        full_name = f"{layer_path}.{block_idx}.{qual_name}"
+                        key = canonical_param_name(full_name)
+                        bufs[key] = buf
+                        parents[key] = parent_tuple
 
         if non_block is not None:
-            for buf, locs in non_block.slots:
-                key = canonical_param_name(buf.name)
-                bufs[key] = buf
-                if locs:
-                    parents[key] = tuple(p for p, _leaf in locs)
+            for buf, aliases in non_block.param_aliases:
+                if not aliases:
+                    continue
+                seen_parent_ids: set[int] = set()
+                alias_parents: list[nn.Module] = []
+                for _name, parent, _leaf in aliases:
+                    parent_id = id(parent)
+                    if parent_id in seen_parent_ids:
+                        continue
+                    seen_parent_ids.add(parent_id)
+                    alias_parents.append(parent)
+                parent_tuple = tuple(alias_parents)
+                for name, _parent, _leaf in aliases:
+                    key = canonical_param_name(name)
+                    bufs[key] = buf
+                    parents[key] = parent_tuple
 
         return bufs, parents
 

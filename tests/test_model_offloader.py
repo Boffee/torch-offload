@@ -621,6 +621,23 @@ class TestValidation:
                 layers_attr="transformer_blocks", blocks_to_swap=4,  # equal to num_blocks
             )
 
+    def test_blocks_to_swap_must_be_non_negative(self) -> None:
+        m = _make_block_model(num_blocks=4)
+        with pytest.raises(ValueError, match="blocks_to_swap"):
+            ModelOffloader(
+                m, torch.device("cpu"),
+                layers_attr="transformer_blocks", blocks_to_swap=-1,
+            )
+
+    def test_prefetch_count_must_be_non_negative(self) -> None:
+        m = _make_block_model(num_blocks=4)
+        with pytest.raises(ValueError, match="prefetch_count"):
+            ModelOffloader(
+                m, torch.device("cpu"),
+                layers_attr="transformer_blocks", blocks_to_swap=2,
+                prefetch_count=-1,
+            )
+
     def test_empty_layers_attr_raises(self) -> None:
         m = _make_block_model(num_blocks=4)
         with pytest.raises(ValueError, match="at least one path"):
