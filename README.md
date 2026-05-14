@@ -116,7 +116,7 @@ unscale, and grad clipping see normal GPU trainables while the
 offloader is active.
 
 To reduce trainable-weight residency during training, opt into
-streaming in-block trainable data:
+streaming in-block trainable weights:
 
 ```python
 offloader = ModelOffloader(
@@ -124,13 +124,13 @@ offloader = ModelOffloader(
     target_device=torch.device("cuda"),
     layers_attr="transformer_blocks",
     blocks_to_swap=24,
-    trainable_residency="streamed_data",
+    stream_trainable_weights=True,
 )
 ```
 
-In this mode, in-block trainable `.data` is GPU-resident only while
-its block is resident, plus during the optimizer update. Gradients are
-not streamed; PyTorch owns `param.grad` normally.
+In this mode, only the trainable parameter `.data` streams. It is
+GPU-resident while its block is resident, plus during the optimizer
+update. Gradients are not streamed; PyTorch owns `param.grad` normally.
 
 ### LoRA merge
 
@@ -152,7 +152,7 @@ offloader = ModelOffloader(
     target_device=torch.device("cuda"),
     layers_attr="transformer_blocks",
     blocks_to_swap=24,
-    # Default: trainable_residency="always_gpu"
+    # Default: stream_trainable_weights=False
 )
 
 # Attach LoRAs (must be called while deactivated)
@@ -272,12 +272,15 @@ with offloader as gpu_model:
 `ModelOffloader.activate()` emits a one-time warning if
 `model.training=True` with trainable params present and no
 HuggingFace `gradient_checkpointing` flag is detected on the streamed
-blocks. The check has false negatives for manual `checkpoint(...)`
-wrapping at call sites — that style is invisible from the module
-tree. Filter the warning via `logging` config if needed.
+blocks. With `stream_trainable_weights=True`, the same missing check is
+a hard error because trainable weight streaming can silently corrupt
+gradients without checkpointing. Manual `checkpoint(...)` wrapping at
+call sites is invisible from the module tree; pass
+`skip_checkpointing_check=True` only after verifying every streamed
+training block is checkpointed.
 
-For `trainable_residency="streamed_data"`, wrap the optimizer update
-so streamed trainable data is materialized on GPU while a normal
+For `stream_trainable_weights=True`, wrap the optimizer update
+so streamed trainable weights are materialized on GPU while a normal
 PyTorch optimizer mutates it:
 
 ```python

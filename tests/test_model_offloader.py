@@ -931,7 +931,7 @@ class TestCrossRegionTiedDetection:
             ModelOffloader(
                 m, torch.device("cpu"),
                 layers_attr="transformer_blocks", blocks_to_swap=1,
-                trainable_residency="streamed_data",
+                stream_trainable_weights=True,
             )
 
     def test_block_to_non_block_tied_raises(self) -> None:
@@ -956,7 +956,7 @@ class TestCrossRegionTiedDetection:
             ModelOffloader(
                 m, torch.device("cpu"),
                 layers_attr="transformer_blocks", blocks_to_swap=1,
-                trainable_residency="streamed_data",
+                stream_trainable_weights=True,
             )
 
     def test_mixed_trainable_frozen_cross_region_tied_raises(self) -> None:
@@ -1769,10 +1769,10 @@ class TestMixedGradTieDetection:
             ModelOffloader(
                 m, torch.device("cpu"),
                 layers_attr="transformer_blocks", blocks_to_swap=1,
-                trainable_residency="streamed_data",
+                stream_trainable_weights=True,
             )
 
-    def test_all_trainable_same_parameter_legacy_mode_constructs(self) -> None:
+    def test_all_trainable_same_parameter_default_mode_constructs(self) -> None:
         # Legacy/default mode skips all trainables in StreamedWeights and
         # moves the single shared Parameter through TrainableWeights, so
         # same-Parameter all-trainable cross-region ties remain valid.
@@ -1832,7 +1832,7 @@ class TestMixedGradTieDetection:
         strategy = ModelOffloader(
             m, torch.device("cpu"),
             layers_attr="transformer_blocks", blocks_to_swap=1,
-            trainable_residency="streamed_data",
+            stream_trainable_weights=True,
         )
 
         # Both aliased slots in block 0 still reference the same Parameter.
@@ -1940,7 +1940,7 @@ class TestLoRAInBlockRouting:
         strat = ModelOffloader(
             m, torch.device("cpu"),
             layers_attr="transformer_blocks", blocks_to_swap=1,
-            trainable_residency="streamed_data",
+            stream_trainable_weights=True,
         )
         try:
             # Each StreamedWeights's slot_filter contains BOTH frozen
@@ -2102,7 +2102,7 @@ class TestTrainingWithCheckpointing:
             m_streamed, torch.device("cuda"),
             layers_attr="transformer_blocks",
             blocks_to_swap=2, prefetch_count=0,
-            trainable_residency="streamed_data",
+            stream_trainable_weights=True,
         )
         try:
             with offloader as gpu_model:
@@ -2246,14 +2246,14 @@ class TestTrainingWarning:
             "gradient_checkpointing" in r.message for r in caplog.records
         )
 
-    def test_assume_checkpointed_suppresses_warning(
+    def test_skip_checkpointing_check_suppresses_warning(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
         m = _make_trainable_block_model(num_blocks=4)
         offloader = ModelOffloader(
             m, torch.device("cpu"),
             layers_attr="transformer_blocks", blocks_to_swap=2,
-            assume_checkpointed=True,
+            skip_checkpointing_check=True,
         )
         with caplog.at_level(logging.WARNING, logger=_OFFLOADER_LOGGER):
             offloader._warn_if_training_without_checkpointing()
@@ -2343,7 +2343,7 @@ class TestInBlockTrainableCheckpointingGuard:
     guard that prevents silent gradient corruption when in-block
     trainables are streamed without activation checkpointing. The
     guard is heuristic (HF-style ``gradient_checkpointing`` flag), so
-    ``assume_checkpointed=True`` provides an escape hatch for
+    ``skip_checkpointing_check=True`` provides an escape hatch for
     call-site checkpointing.
     """
 
@@ -2352,7 +2352,7 @@ class TestInBlockTrainableCheckpointingGuard:
         offloader = ModelOffloader(
             m, torch.device("cpu"),
             layers_attr="transformer_blocks", blocks_to_swap=1,
-            trainable_residency="streamed_data",
+            stream_trainable_weights=True,
         )
         with pytest.raises(RuntimeError, match="gradient_checkpointing"):
             offloader._enforce_checkpointing_for_trainable_streaming()
@@ -2364,7 +2364,7 @@ class TestInBlockTrainableCheckpointingGuard:
         offloader = ModelOffloader(
             m, torch.device("cpu"),
             layers_attr="transformer_blocks", blocks_to_swap=1,
-            trainable_residency="streamed_data",
+            stream_trainable_weights=True,
         )
         offloader._enforce_checkpointing_for_trainable_streaming()  # no raise
 
@@ -2376,23 +2376,23 @@ class TestInBlockTrainableCheckpointingGuard:
         offloader = ModelOffloader(
             m, torch.device("cpu"),
             layers_attr="transformer_blocks", blocks_to_swap=1,
-            trainable_residency="streamed_data",
+            stream_trainable_weights=True,
         )
         with pytest.raises(RuntimeError, match="gradient_checkpointing"):
             offloader._enforce_checkpointing_for_trainable_streaming()
 
-    def test_assume_checkpointed_suppresses_guard(self) -> None:
+    def test_skip_checkpointing_check_suppresses_guard(self) -> None:
         m = _make_lora_in_block_model(num_blocks=2)
         offloader = ModelOffloader(
             m, torch.device("cpu"),
             layers_attr="transformer_blocks", blocks_to_swap=1,
-            assume_checkpointed=True,
-            trainable_residency="streamed_data",
+            skip_checkpointing_check=True,
+            stream_trainable_weights=True,
         )
         offloader._enforce_checkpointing_for_trainable_streaming()  # no raise
 
     def test_eval_mode_suppresses_guard(self) -> None:
-        # Streamed-data trainables are safe for inference/eval activation:
+        # Streamed trainable weights are safe for inference/eval activation:
         # the silent-corruption risk requires grad-enabled training through
         # streamed blocks.
         m = _make_lora_in_block_model(num_blocks=2)
@@ -2400,7 +2400,7 @@ class TestInBlockTrainableCheckpointingGuard:
         offloader = ModelOffloader(
             m, torch.device("cpu"),
             layers_attr="transformer_blocks", blocks_to_swap=1,
-            trainable_residency="streamed_data",
+            stream_trainable_weights=True,
         )
         offloader._enforce_checkpointing_for_trainable_streaming()  # no raise
 
@@ -2435,7 +2435,7 @@ class TestInBlockTrainableCheckpointingGuard:
             m, torch.device("cpu"),
             layers_attr=["transformer_blocks", "frozen_blocks"],
             blocks_to_swap=1,
-            trainable_residency="streamed_data",
+            stream_trainable_weights=True,
         )
         offloader._enforce_checkpointing_for_trainable_streaming()  # no raise
 
@@ -2506,7 +2506,7 @@ class TestInBlockTrainableStreamingEndToEnd:
             m_streamed, torch.device("cuda"),
             layers_attr="transformer_blocks",
             blocks_to_swap=2, prefetch_count=0,
-            trainable_residency="streamed_data",
+            stream_trainable_weights=True,
         )
         try:
             with offloader as gpu_model:
@@ -2567,7 +2567,7 @@ class TestInBlockTrainableStreamingEndToEnd:
             m_streamed, torch.device("cuda"),
             layers_attr="transformer_blocks",
             blocks_to_swap=2, prefetch_count=0,
-            trainable_residency="streamed_data",
+            stream_trainable_weights=True,
         )
         try:
             with offloader as gpu_model:
@@ -2611,7 +2611,7 @@ class TestInBlockTrainableStreamingEndToEnd:
             m, torch.device("cuda"),
             layers_attr="transformer_blocks",
             blocks_to_swap=1, prefetch_count=0,
-            trainable_residency="streamed_data",
+            stream_trainable_weights=True,
         )
         try:
             with offloader as gpu_model:
@@ -2751,7 +2751,7 @@ class TestBlockGroupsDisjoint:
 
 class TestPluggableCheckpointingDetection:
     """``is_block_checkpointed`` callable lets callers wire framework-
-    specific detection without resorting to ``assume_checkpointed=True``
+    specific detection without resorting to ``skip_checkpointing_check=True``
     (which silences the guard entirely). The default predicate stays
     HF-per-block-flag — conservative on purpose."""
 
@@ -2763,7 +2763,7 @@ class TestPluggableCheckpointingDetection:
             m, torch.device("cpu"),
             layers_attr="transformer_blocks", blocks_to_swap=1,
             is_block_checkpointed=lambda block: True,
-            trainable_residency="streamed_data",
+            stream_trainable_weights=True,
         )
         offloader._enforce_checkpointing_for_trainable_streaming()  # no raise
 
@@ -2781,13 +2781,13 @@ class TestPluggableCheckpointingDetection:
             m, torch.device("cpu"),
             layers_attr="transformer_blocks", blocks_to_swap=1,
             is_block_checkpointed=predicate,
-            trainable_residency="streamed_data",
+            stream_trainable_weights=True,
         )
         with pytest.raises(RuntimeError, match="is_block_checkpointed"):
             offloader._enforce_checkpointing_for_trainable_streaming()
 
-    def test_assume_checkpointed_overrides_predicate(self) -> None:
-        # assume_checkpointed=True short-circuits before the predicate
+    def test_skip_checkpointing_check_overrides_predicate(self) -> None:
+        # skip_checkpointing_check=True short-circuits before the predicate
         # is even consulted. Use a sentinel predicate that would raise
         # if called to verify it isn't.
         m = _make_lora_in_block_model(num_blocks=2)
@@ -2798,9 +2798,9 @@ class TestPluggableCheckpointingDetection:
         offloader = ModelOffloader(
             m, torch.device("cpu"),
             layers_attr="transformer_blocks", blocks_to_swap=1,
-            assume_checkpointed=True,
+            skip_checkpointing_check=True,
             is_block_checkpointed=fail_predicate,
-            trainable_residency="streamed_data",
+            stream_trainable_weights=True,
         )
         offloader._enforce_checkpointing_for_trainable_streaming()  # no raise
 
@@ -2830,7 +2830,7 @@ class TestRevisedDataOnlyDesign:
             m, torch.device("cuda"),
             layers_attr="transformer_blocks",
             blocks_to_swap=1, prefetch_count=0,
-            trainable_residency="streamed_data",
+            stream_trainable_weights=True,
         )
         with offloader as gpu_model:
             x = torch.randn(2, 8, device="cuda")
@@ -2893,7 +2893,7 @@ class TestRevisedDataOnlyDesign:
             m_streamed, torch.device("cuda"),
             layers_attr="transformer_blocks",
             blocks_to_swap=1, prefetch_count=0,
-            trainable_residency="streamed_data",
+            stream_trainable_weights=True,
         )
 
         with offloader as gpu_model:
@@ -2938,7 +2938,7 @@ class TestRevisedDataOnlyDesign:
             m, torch.device("cuda"),
             layers_attr="transformer_blocks",
             blocks_to_swap=1, prefetch_count=0,
-            trainable_residency="streamed_data",
+            stream_trainable_weights=True,
         )
         try:
             with offloader as gpu_model:
@@ -2976,7 +2976,7 @@ class TestRevisedDataOnlyDesign:
             m, torch.device("cuda"),
             layers_attr="transformer_blocks",
             blocks_to_swap=1, prefetch_count=0,
-            trainable_residency="streamed_data",
+            stream_trainable_weights=True,
         )
         sentinel = RuntimeError("simulated optimizer.step failure")
         try:
@@ -3041,7 +3041,7 @@ class TestRevisedDataOnlyDesign:
             m_streamed, torch.device("cuda"),
             layers_attr="transformer_blocks",
             blocks_to_swap=3, prefetch_count=2,
-            trainable_residency="streamed_data",
+            stream_trainable_weights=True,
         )
         try:
             with offloader as gpu_model:
@@ -3102,7 +3102,7 @@ class TestRevisedDataOnlyDesign:
             m_streamed, torch.device("cuda"),
             layers_attr="transformer_blocks",
             blocks_to_swap=2, prefetch_count=0,
-            trainable_residency="streamed_data",
+            stream_trainable_weights=True,
         )
         try:
             with offloader as gpu_model:

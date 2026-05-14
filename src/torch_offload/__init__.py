@@ -7,9 +7,9 @@ Two complementary offload strategies:
   individual blocks fit on GPU but the whole model does not.
   Hooks-based, prefetches upcoming blocks on a secondary CUDA stream,
   supports gradient checkpointing through autograd backward. By
-  default, trainable params stay GPU-resident while active; opt into
-  ``trainable_residency="streamed_data"`` to stream in-block trainable
-  data and materialize it only around ``optimizer.step()``. Composes
+  default, trainable params stay GPU-resident while active; set
+  ``stream_trainable_weights=True`` to stream in-block trainable
+  weights and materialize them only around ``optimizer.step()``. Composes
   :class:`PinnedWeights` + :class:`TrainableWeights` +
   :class:`StreamedWeights` internally.
 
@@ -37,7 +37,8 @@ everything to GPU; ``deactivate()`` returns to pinned CPU.
   1. A non-block :class:`PinnedWeights` with a :class:`SlotOwnership`
      skip filter for everything outside the block list.
   2. A :class:`TrainableWeights` for LoRA / adapter weights
-     (or only out-of-block trainables in streamed-data mode).
+     (or only out-of-block trainables when
+     ``stream_trainable_weights=True``).
   3. One :class:`StreamedWeights` per ``layers_attr`` path.
 
 Optional LoRA merging is handled by attaching

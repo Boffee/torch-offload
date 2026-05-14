@@ -38,10 +38,10 @@ class TrainableWeights:
 
     Each transition walks the model and moves every currently
     trainable Parameter. With ``skip_slots`` the walk is slot-aware,
-    which lets :class:`ModelOffloader` route in-block streamed-data
-    trainables to the streamer while leaving out-of-block trainables
-    here. Keeping the walk dynamic preserves the historical behavior
-    for late ``requires_grad`` changes.
+    which lets :class:`ModelOffloader` route in-block streamed
+    trainable weights to the streamer while leaving out-of-block
+    trainables here. Keeping the walk dynamic preserves the historical
+    behavior for late ``requires_grad`` changes.
 
     Parameters
     ----------
