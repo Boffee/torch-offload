@@ -30,8 +30,9 @@ storage/placement strategies that :class:`ModelCache` consumes.
 
 All strategies pin in their constructor, so ``cache_bytes`` is final
 immediately and :class:`ModelCache` can admit them without a
-factory-side ``prepare()`` dance. ``activate()`` then brings
-everything to GPU; ``deactivate()`` returns to pinned CPU.
+factory-side ``prepare()`` dance. ``activate(device)`` then brings
+everything to the requested device; ``deactivate()`` returns to pinned
+CPU.
 
 :class:`ModelOffloader` composes (in order):
   1. A non-block :class:`PinnedWeights` with a :class:`SlotOwnership`

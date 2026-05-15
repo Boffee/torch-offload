@@ -45,12 +45,12 @@ import weakref
 from collections import OrderedDict
 from collections.abc import Iterator, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
-from types import TracebackType
 from typing import cast
 
 import torch
 from torch import nn
 
+from ._devices import canonical_device
 from .pinned_buffer import PinnedParamBuffer
 from .protocols import SlotOwnership
 from .slots import iter_buffer_slots, iter_param_slots
@@ -711,8 +711,6 @@ class StreamedWeights:
     blocks:
         The resolved sequence of block modules. Caller is responsible
         for path resolution. Typically an ``nn.ModuleList``.
-    target_device:
-        GPU device to stream to.
     blocks_to_swap:
         Number of blocks to keep offloaded on CPU at any time. Must
         be ``< len(blocks)``.
@@ -758,7 +756,6 @@ class StreamedWeights:
     def __init__(
         self,
         blocks: Sequence[nn.Module],
-        target_device: torch.device,
         *,
         blocks_to_swap: int,
         prefetch_count: int = 2,
@@ -767,7 +764,7 @@ class StreamedWeights:
         skip_slots: set[SlotOwnership] | None = None,
     ) -> None:
         self._blocks: list[nn.Module] = list(blocks)
-        self._target_device = target_device
+        self._active_device: torch.device | None = None
         self._blocks_to_swap = blocks_to_swap
         self._prefetch_count = prefetch_count
         self._cyclic = cyclic
@@ -816,7 +813,9 @@ class StreamedWeights:
         # workload boundaries. Captures only a bool (no self ref) so it
         # never blocks collection.
         weakref.finalize(
-            self, _release_cuda_cache_on_drop, target_device.type == "cuda"
+            self,
+            _release_cuda_cache_on_drop,
+            True,
         )
 
     @property
@@ -882,11 +881,24 @@ class StreamedWeights:
     def has_trainables(self) -> bool:
         return self._store is not None and self._store.has_trainables()
 
+    def _resolve_device(self, device: torch.device | str | None) -> torch.device:
+        if device is not None:
+            return canonical_device(device)
+        raise ValueError(
+            "StreamedWeights.activate() requires a device"
+        )
+
+    def _require_active_device(self) -> torch.device:
+        device = self._active_device
+        if device is None:
+            raise RuntimeError("StreamedWeights has no active device")
+        return device
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
-    def activate(self) -> None:
+    def activate(self, device: torch.device | str | None = None) -> None:
         """Allocate per-activation resources (GPU slot pool, CUDA
         stream/events, prefetch executor, forward hooks). The
         composite's :meth:`activate` returns the model — this method
@@ -913,20 +925,27 @@ class StreamedWeights:
                 "active. Deactivate first, or check for a leaked "
                 "context manager."
             )
+        active_device = self._resolve_device(device)
+        if active_device.type != "cuda":
+            raise ValueError(
+                "StreamedWeights.activate() requires a CUDA device; "
+                f"got {active_device}"
+            )
 
         num_layers = len(self._blocks)
         num_resident = num_layers - self._blocks_to_swap
         num_gpu_slots = num_resident + self._prefetch_count
 
+        self._active_device = active_device
         self._tracker = _BlockTracker()
         self._executor = ThreadPoolExecutor(max_workers=1)
-        self._stream = torch.cuda.Stream(device=self._target_device, priority=-1)
+        self._stream = torch.cuda.Stream(device=active_device, priority=-1)
         self._pending = {}
         self._prefetch_events = {i: torch.cuda.Event() for i in range(num_layers)}
         self._last_idx = -1
 
-        self._store.activate_pool(num_gpu_slots, self._target_device)
-        self._store.move_trainable_grads_to(self._target_device)
+        self._store.activate_pool(num_gpu_slots, active_device)
+        self._store.move_trainable_grads_to(active_device)
 
         for idx in range(min(num_resident, num_layers)):
             self._store.load_block(idx)
@@ -952,16 +971,14 @@ class StreamedWeights:
         if prefetch_exc is not None:
             raise prefetch_exc
 
-    def __enter__(self) -> None:
-        self.activate()
-
-    def __exit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        tb: TracebackType | None,
-    ) -> None:
-        self.deactivate()
+    @contextlib.contextmanager
+    def use(self, device: torch.device | str) -> Iterator[None]:
+        """Activate streaming on ``device`` for the duration of the context."""
+        self.activate(device)
+        try:
+            yield
+        finally:
+            self.deactivate()
 
     @contextlib.contextmanager
     def optimizer_step(self) -> Iterator[None]:
@@ -1070,7 +1087,7 @@ class StreamedWeights:
         # so the optimizer (which runs on user's stream) sees the
         # materialized bytes. _drain_and_evict_all already synced
         # self._stream so it is safe to reuse here.
-        target = self._target_device
+        target = self._require_active_device()
         step_stream = self._stream
         assert step_stream is not None, "stream allocated in activate()"
 
@@ -1228,6 +1245,7 @@ class StreamedWeights:
 
         self._tracker = None
         self._last_idx = -1
+        self._active_device = None
 
         return first_prefetch_exc
 
@@ -1266,7 +1284,7 @@ class StreamedWeights:
             future.result()
             ev = self._prefetch_events[idx]
             if not ev.query():
-                torch.cuda.current_stream(self._target_device).wait_event(ev)
+                torch.cuda.current_stream(self._require_active_device()).wait_event(ev)
             self._tracker.mark_on_gpu(idx)
             return
 
@@ -1306,7 +1324,9 @@ class StreamedWeights:
             if tracker.is_on_gpu(idx):
                 tracker.touch(idx)
             else:
-                compute_event = torch.cuda.current_stream(streamer._target_device).record_event()
+                compute_event = torch.cuda.current_stream(
+                    streamer._require_active_device()
+                ).record_event()
                 while len(tracker._on_gpu) >= num_resident:
                     protected = {idx} | set(pending.keys())
                     streamer._evict_one(protected, compute_event)

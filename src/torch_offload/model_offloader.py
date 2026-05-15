@@ -14,12 +14,12 @@ from __future__ import annotations
 import contextlib
 import logging
 from collections.abc import Callable, Iterator, Sequence
-from types import TracebackType
 from typing import Literal
 
 import torch
 from torch import nn
 
+from ._devices import canonical_device
 from .lora import _ADDMM_DTYPES, LoRA, LoRARouteHandle, LoRATransform
 from .pinned_buffer import PinnedParamBuffer, storage_key
 from .pinned_weights import PinnedWeights
@@ -138,8 +138,6 @@ class ModelOffloader:
     ----------
     model:
         The model containing the block list(s). Must be on CPU.
-    target_device:
-        GPU device for inference / training.
     layers_attr:
         Dotted attribute path(s) to ``nn.ModuleList`` block list(s).
         Single string or sequence. For PEFT-wrapped models, include
@@ -188,7 +186,6 @@ class ModelOffloader:
     def __init__(
         self,
         model: nn.Module,
-        target_device: torch.device,
         *,
         layers_attr: str | Sequence[str],
         blocks_to_swap: int | Sequence[int],
@@ -239,7 +236,6 @@ class ModelOffloader:
             streamers.append(
                 StreamedWeights(
                     blocks=blocks,
-                    target_device=target_device,
                     blocks_to_swap=swap_list[i],
                     prefetch_count=pf_list[i],
                     cyclic=cyclic,
@@ -268,7 +264,7 @@ class ModelOffloader:
         )
         if has_pinnable:
             non_block = PinnedWeights(
-                model, target_device, skip_slots=pinned_skip_slots,
+                model, skip_slots=pinned_skip_slots,
             )
 
         # TrainableWeights handles only out-of-block trainables (in-
@@ -281,14 +277,14 @@ class ModelOffloader:
             components.append(non_block)
         if stream_trainable_weights:
             components.append(
-                TrainableWeights(model, target_device, skip_slots=streamer_slots),
+                TrainableWeights(model, skip_slots=streamer_slots),
             )
         else:
-            components.append(TrainableWeights(model, target_device))
+            components.append(TrainableWeights(model))
         components.extend(streamers)
 
         self._model = model
-        self._target_device = target_device
+        self._active_device: torch.device | None = None
         self._components = components
         self._streamers = streamers
         self._teardown_stack: contextlib.ExitStack | None = None
@@ -490,14 +486,25 @@ class ModelOffloader:
     def cache_bytes(self) -> int:
         return sum(c.cache_bytes for c in self._components)
 
-    def activate(self) -> None:
+    def _resolve_device(self, device: torch.device | str | None) -> torch.device:
+        if device is not None:
+            return canonical_device(device)
+        raise ValueError(
+            "ModelOffloader.activate() requires a device; pass "
+            "activate(device) or use this strategy through "
+            "ModelCache.use(..., device=...)"
+        )
+
+    def activate(self, device: torch.device | str | None = None) -> None:
         self._enforce_checkpointing_for_trainable_streaming()
         self._warn_if_training_without_checkpointing()
+        active_device = self._resolve_device(device)
+        self._active_device = active_device
         try:
             with contextlib.ExitStack() as stack:
                 for component in self._components:
                     stack.callback(component.deactivate)
-                    component.activate()
+                    component.activate(active_device)
                 # Install routed-mode hooks AFTER components activate
                 # so the LIFO ExitStack unwinds them FIRST on
                 # deactivate — routes come down before component
@@ -509,7 +516,7 @@ class ModelOffloader:
                 # factors in the same dtype the layer outputs.
                 for parent, refs in self._pending_routes:
                     handle = LoRARouteHandle(
-                        parent, refs, self._target_device,
+                        parent, refs, active_device,
                         dtype=_routed_factor_dtype(parent),
                     )
                     stack.callback(handle.remove)
@@ -518,6 +525,7 @@ class ModelOffloader:
             for buf in self._reverse_index.values():
                 buf.transform = None
             self._pending_routes = []
+            self._active_device = None
             raise
 
     def deactivate(self) -> None:
@@ -530,6 +538,7 @@ class ModelOffloader:
             for buf in self._reverse_index.values():
                 buf.transform = None
             self._pending_routes = []
+            self._active_device = None
 
     @contextlib.contextmanager
     def optimizer_step(self) -> Iterator[None]:
@@ -577,17 +586,14 @@ class ModelOffloader:
         with self.optimizer_step():
             yield
 
-    def __enter__(self) -> nn.Module:
-        self.activate()
-        return self.model
-
-    def __exit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        tb: TracebackType | None,
-    ) -> None:
-        self.deactivate()
+    @contextlib.contextmanager
+    def use(self, device: torch.device | str) -> Iterator[nn.Module]:
+        """Activate on ``device`` for the duration of the context."""
+        self.activate(device)
+        try:
+            yield self.model
+        finally:
+            self.deactivate()
 
     # ----------------------------------------------------------- Internals
 

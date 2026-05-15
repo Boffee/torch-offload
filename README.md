@@ -62,14 +62,15 @@ import torch
 from torch_offload import PinnedWeights
 
 model = build_my_model()  # any nn.Module with frozen params
-strategy = PinnedWeights(model, target_device=torch.device("cuda"))
+strategy = PinnedWeights(model)
+device = torch.device("cuda")
 
 # First use pays the pinning cost (clone + pin_memory).
 # Subsequent uses skip pinning — bulk-DMA only.
-with strategy as gpu_model:
+with strategy.use(device) as gpu_model:
     output = gpu_model(input_tensor)
 
-with strategy as gpu_model:
+with strategy.use(device) as gpu_model:
     output = gpu_model(input_tensor_2)
 
 del strategy, model  # drop refs to free pinned host memory
@@ -78,7 +79,8 @@ del strategy, model  # drop refs to free pinned host memory
 `PinnedWeights` mutates the model in place: every frozen
 `nn.Parameter` slot gets repointed at a Parameter wrapping pinned CPU
 storage. After construction, only access the model through the
-strategy's context manager (or `activate()` / `deactivate()`).
+strategy's `use(device)` context manager (or `activate(device)` /
+`deactivate()`).
 **Drop the strategy and model references to release pinned host
 memory** — there's no `close()`; resource cleanup is reference-drop
 + GC.
@@ -96,13 +98,13 @@ from torch_offload import ModelOffloader
 # Constructor pins everything; cache_bytes is final immediately.
 offloader = ModelOffloader(
     model,
-    target_device=torch.device("cuda"),
     layers_attr="transformer_blocks",  # path to the nn.ModuleList
     blocks_to_swap=24,                 # offload N blocks; rest GPU-resident
     prefetch_count=2,
 )
+device = torch.device("cuda")
 
-with offloader as gpu_model:
+with offloader.use(device) as gpu_model:
     output = gpu_model(input_tensor)
 
 del offloader, model  # drop refs to free pinned host memory
@@ -121,7 +123,6 @@ streaming in-block trainable weights:
 ```python
 offloader = ModelOffloader(
     model,
-    target_device=torch.device("cuda"),
     layers_attr="transformer_blocks",
     blocks_to_swap=24,
     stream_trainable_weights=True,
@@ -144,16 +145,17 @@ the offloader is left in base-only mode; this avoids briefly holding
 both old and new pinned LoRA factors in host memory.
 
 ```python
+import torch
 from torch_offload import ModelOffloader, LoRA
 from safetensors.torch import load_file
 
 offloader = ModelOffloader(
     model,
-    target_device=torch.device("cuda"),
     layers_attr="transformer_blocks",
     blocks_to_swap=24,
     # Default: stream_trainable_weights=False
 )
+device = torch.device("cuda")
 
 # Attach LoRAs (must be called while deactivated)
 offloader.set_loras([
@@ -161,7 +163,7 @@ offloader.set_loras([
     (LoRA(state_dict=load_file("lora_b.safetensors")), 0.5),
 ])
 
-with offloader as gpu_model:
+with offloader.use(device) as gpu_model:
     output = gpu_model(input_tensor)
 
 # Switch to different LoRAs or clear (base-only)
@@ -211,7 +213,6 @@ heterogeneous block lists into separate `layers_attr` entries:
 ```python
 offloader = ModelOffloader(
     model,
-    target_device=torch.device("cuda"),
     layers_attr=["transformer_blocks", "single_transformer_blocks"],
     blocks_to_swap=[8, 24],   # per-group; or pass a single int for both
     prefetch_count=[2, 4],
@@ -253,15 +254,15 @@ from torch_offload import ModelOffloader
 
 offloader = ModelOffloader(
     model,
-    target_device=torch.device("cuda"),
     layers_attr="transformer_blocks",
     blocks_to_swap=24,
 )
+device = torch.device("cuda")
 
 model.gradient_checkpointing_enable()  # required for training
 model.train()
 
-with offloader as gpu_model:
+with offloader.use(device) as gpu_model:
     for batch in loader:
         loss = gpu_model(**batch).loss
         loss.backward()
@@ -284,7 +285,7 @@ so streamed trainable weights are materialized on GPU while a normal
 PyTorch optimizer mutates it:
 
 ```python
-with offloader as gpu_model:
+with offloader.use(device) as gpu_model:
     for batch in loader:
         loss = gpu_model(**batch).loss
         loss.backward()
@@ -308,42 +309,45 @@ For multiple independent models swapping in and out of GPU.
 from torch_offload import ModelCache, ModelSpec, PinnedWeights
 
 cache = ModelCache(max_cache_bytes=80 * 1024**3)
+device = "cuda:0"
 
 # Register specs (lazy — factory only runs on first acquire / cache miss)
 cache.register(ModelSpec(
     key="text_encoder",
     estimated_cache_bytes=12 * 1024**3,
-    factory=lambda: PinnedWeights(build_text_encoder(), device),
+    factory=lambda: PinnedWeights(build_text_encoder()),
 ))
 cache.register(ModelSpec(
     key="diffusion_model",
     estimated_cache_bytes=24 * 1024**3,
-    factory=lambda: PinnedWeights(build_diffusion_model(), device),
+    factory=lambda: PinnedWeights(build_diffusion_model()),
 ))
 
 # First use builds via factory; subsequent uses hit the cache.
-with cache.use("text_encoder") as enc:
+with cache.use("text_encoder", device=device) as enc:
     embeddings = enc.encode(prompt)
 
-with cache.use("diffusion_model") as t:
+with cache.use("diffusion_model", device=device) as t:
     latent = t(...)
 
 # When budget pressure forces eviction, LRU inactive entries go first.
 # Active entries (currently inside `cache.use(...)`) are never evicted.
+# Re-entrant use of the same key must use the same device; simultaneous
+# activation of one cached strategy on multiple devices is rejected.
 ```
 
 You can also auto-register at acquire time:
 
 ```python
 spec = ModelSpec(key="vae", estimated_cache_bytes=500*1024**2,
-                 factory=lambda: PinnedWeights(build_vae(), device))
-with cache.use(spec) as vae:  # registers if missing, then uses
+                 factory=lambda: PinnedWeights(build_vae()))
+with cache.use(spec, device=device) as vae:  # registers if missing, then uses
     decoded = vae.decode(latent)
 ```
 
 > **Anti-pattern:** the factory should build a fresh model each call,
 > not capture an externally-held one. With `factory=lambda:
-> PinnedWeights(my_kept_model, device)` the cache is no longer the
+> PinnedWeights(my_kept_model)` the cache is no longer the
 > sole owner of the model — eviction drops the strategy, but
 > `my_kept_model` keeps the pinned slots alive. `used_cache_bytes`
 > will lie about freed memory. Always have the factory build the
@@ -386,7 +390,8 @@ with cache.use(spec) as vae:  # registers if missing, then uses
 
 `ModelStrategy` is the protocol every top-level strategy implements:
 `cache_bytes`, `model` (the wrapped module, stable across cycles),
-`activate()`, `deactivate()`, plus context-manager dunders.
+`activate(device=None)`, and `deactivate()`. Device-aware package
+strategies also expose `use(device)` for direct exception-safe use.
 `ModelCache` only talks to this protocol; write a new strategy and
 it slots in:
 
@@ -398,13 +403,8 @@ class MyStrategy:
     def cache_bytes(self) -> int: ...
     @property
     def model(self) -> nn.Module: ...
-    def activate(self) -> None: ...
+    def activate(self, device=None) -> None: ...
     def deactivate(self) -> None: ...
-    def __enter__(self) -> nn.Module:
-        self.activate()
-        return self.model
-    def __exit__(self, *exc) -> None:
-        self.deactivate()
 ```
 
 A narrower `ModelStrategyComponent` Protocol (just `cache_bytes` +
@@ -421,9 +421,12 @@ Uniform across all strategies — pinning happens in `__init__` so
 constructed → activate ↔ deactivate → drop refs
 ```
 
-`activate()` makes the model usable for compute. `deactivate()`
-releases transient GPU resources (the `cache_bytes` worth of pinned
-storage stays held in module slots, ready for fast re-activation).
+`activate(device=...)` makes the model usable for compute on the
+requested device. `PinnedWeights`, `ModelOffloader`, `StreamedWeights`,
+and `TrainableWeights` require an explicit device.
+`deactivate()` releases transient GPU resources (the `cache_bytes` worth
+of pinned storage stays held in module slots, ready for fast
+re-activation).
 **There is no `close()`.** To release pinned host memory, drop the
 strategy reference (and the model reference if you don't need it
 anymore). Python's refcount-based GC frees pinned tensors

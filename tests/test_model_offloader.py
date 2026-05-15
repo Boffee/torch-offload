@@ -107,7 +107,7 @@ class TestModelStrategyConformance:
     def test_isinstance_runtime_check(self) -> None:
         m = _make_block_model()
         strategy = ModelOffloader(
-            m, torch.device("cpu"),
+            m,
             layers_attr="transformer_blocks", blocks_to_swap=2,
         )
         try:
@@ -118,7 +118,7 @@ class TestModelStrategyConformance:
     def test_has_lifecycle_methods(self) -> None:
         m = _make_block_model()
         strategy = ModelOffloader(
-            m, torch.device("cpu"),
+            m,
             layers_attr="transformer_blocks", blocks_to_swap=2,
         )
         try:
@@ -138,7 +138,7 @@ class TestConstructorPins:
     def test_constructor_pins_blocks(self) -> None:
         m = _make_block_model()
         strategy = ModelOffloader(
-            m, torch.device("cpu"),
+            m,
             layers_attr="transformer_blocks", blocks_to_swap=2,
         )
         try:
@@ -163,12 +163,27 @@ class TestLifecycle:
     def test_activate_returns_model(self) -> None:
         m = _make_block_model()
         strategy = ModelOffloader(
-            m, torch.device("cuda"),
+            m,
             layers_attr="transformer_blocks", blocks_to_swap=2,
         )
         try:
-            strategy.activate()
+            strategy.activate("cuda")
             assert strategy.model is m
+        finally:
+            strategy.deactivate()
+
+    @CUDA
+    def test_activate_canonicalizes_bare_cuda_device(self) -> None:
+        m = _make_block_model()
+        expected = torch.device("cuda", torch.cuda.current_device())
+        strategy = ModelOffloader(
+            m,
+            layers_attr="transformer_blocks", blocks_to_swap=2,
+        )
+        try:
+            strategy.activate("cuda")
+            assert strategy._active_device == expected
+            assert strategy._streamers[0]._active_device == expected
         finally:
             strategy.deactivate()
 
@@ -177,10 +192,10 @@ class TestLifecycle:
         m = _make_block_model()
         target = torch.device("cuda")
         strategy = ModelOffloader(
-            m, target, layers_attr="transformer_blocks", blocks_to_swap=2,
+            m, layers_attr="transformer_blocks", blocks_to_swap=2,
         )
         try:
-            strategy.activate()
+            strategy.activate("cuda")
             assert m.embed.weight.is_cuda
             assert m.head.weight.is_cuda
         finally:
@@ -191,10 +206,10 @@ class TestLifecycle:
         m = _make_block_model()
         target = torch.device("cuda")
         strategy = ModelOffloader(
-            m, target, layers_attr="transformer_blocks", blocks_to_swap=2,
+            m, layers_attr="transformer_blocks", blocks_to_swap=2,
         )
         try:
-            strategy.activate()
+            strategy.activate("cuda")
             assert m.embed.weight.is_cuda
             strategy.deactivate()
             assert m.embed.weight.device != target
@@ -208,14 +223,14 @@ class TestLifecycle:
         m = _make_block_model()
         target = torch.device("cuda")
         strategy = ModelOffloader(
-            m, target, layers_attr="transformer_blocks", blocks_to_swap=2,
+            m, layers_attr="transformer_blocks", blocks_to_swap=2,
         )
         try:
             cache_bytes = strategy.cache_bytes
-            strategy.activate()
+            strategy.activate("cuda")
             strategy.deactivate()
             assert strategy.cache_bytes == cache_bytes
-            strategy.activate()
+            strategy.activate("cuda")
             strategy.deactivate()
         finally:
             strategy.deactivate()
@@ -223,7 +238,7 @@ class TestLifecycle:
     def test_deactivate_when_not_active_is_noop(self) -> None:
         m = _make_block_model()
         strategy = ModelOffloader(
-            m, torch.device("cpu"),
+            m,
             layers_attr="transformer_blocks", blocks_to_swap=2,
         )
         try:
@@ -243,10 +258,10 @@ class TestCleanup:
     def test_deactivate_restores_cpu_state(self) -> None:
         m = _make_block_model()
         strategy = ModelOffloader(
-            m, torch.device("cuda"),
+            m,
             layers_attr="transformer_blocks", blocks_to_swap=2,
         )
-        strategy.activate()
+        strategy.activate("cuda")
         strategy.deactivate()
         # Model is back in CPU/pinned state — usable, just without the
         # strategy's GPU streaming.
@@ -256,7 +271,7 @@ class TestCleanup:
     def test_deactivate_is_idempotent(self) -> None:
         m = _make_block_model()
         strategy = ModelOffloader(
-            m, torch.device("cpu"),
+            m,
             layers_attr="transformer_blocks", blocks_to_swap=2,
         )
         strategy.deactivate()
@@ -266,10 +281,10 @@ class TestCleanup:
     def test_deactivate_consumes_teardown_stack(self) -> None:
         m = _make_block_model()
         strategy = ModelOffloader(
-            m, torch.device("cuda"),
+            m,
             layers_attr="transformer_blocks", blocks_to_swap=2,
         )
-        strategy.activate()
+        strategy.activate("cuda")
         assert strategy._teardown_stack is not None
         strategy.deactivate()
         assert strategy._teardown_stack is None
@@ -289,10 +304,10 @@ class TestCleanup:
 
         m = _make_block_model()
         strategy = ModelOffloader(
-            m, torch.device("cuda"),
+            m,
             layers_attr="transformer_blocks", blocks_to_swap=2,
         )
-        strategy.activate()  # installs hooks; no deactivate
+        strategy.activate("cuda")  # installs hooks; no deactivate
         # Reach the streamer (last component).
         streamer = strategy._components[-1]
         streamer_ref = weakref.ref(streamer)
@@ -316,10 +331,10 @@ class TestCleanup:
         torch.manual_seed(0)
         m = _make_block_model(num_blocks=4, width=8)
         strategy = ModelOffloader(
-            m, torch.device("cuda"),
+            m,
             layers_attr="transformer_blocks", blocks_to_swap=2,
         )
-        strategy.activate()
+        strategy.activate("cuda")
         # Drop without deactivate.
         del strategy
 
@@ -351,11 +366,11 @@ class TestHookLifecycle:
     def test_hooks_installed_on_activate_removed_on_deactivate(self) -> None:
         m = _make_block_model()
         strategy = ModelOffloader(
-            m, torch.device("cuda"),
+            m,
             layers_attr="transformer_blocks", blocks_to_swap=2,
         )
         try:
-            strategy.activate()
+            strategy.activate("cuda")
             for block in m.transformer_blocks:
                 assert len(block._forward_pre_hooks) > 0
             strategy.deactivate()
@@ -368,10 +383,10 @@ class TestHookLifecycle:
     def test_hooks_removed_on_deactivate_drop(self) -> None:
         m = _make_block_model()
         strategy = ModelOffloader(
-            m, torch.device("cuda"),
+            m,
             layers_attr="transformer_blocks", blocks_to_swap=2,
         )
-        strategy.activate()
+        strategy.activate("cuda")
         blocks = list(m.transformer_blocks)
         strategy.deactivate()
         for block in blocks:
@@ -411,13 +426,13 @@ class TestCyclicPrefetch:
         # (forward direction inferred from wraparound), not -1 and -2.
         m = _make_block_model(num_blocks=4, width=8)
         strategy = ModelOffloader(
-            m, torch.device("cuda"),
+            m,
             layers_attr="transformer_blocks", blocks_to_swap=1,
             prefetch_count=2, cyclic=True,
         )
         streamer: StreamedWeights = strategy._streamers[0]
 
-        with strategy:
+        with strategy.use("cuda"):
             recorded, _ = self._record_prefetches(streamer)
             x = torch.randn(2, 8, device="cuda")
             m(x)  # iteration 1
@@ -443,13 +458,13 @@ class TestCyclicPrefetch:
         # so future cyclic-default changes are caught.
         m = _make_block_model(num_blocks=4, width=8)
         strategy = ModelOffloader(
-            m, torch.device("cuda"),
+            m,
             layers_attr="transformer_blocks", blocks_to_swap=1,
             prefetch_count=2, cyclic=False,
         )
         streamer: StreamedWeights = strategy._streamers[0]
 
-        with strategy:
+        with strategy.use("cuda"):
             recorded, _ = self._record_prefetches(streamer)
             x = torch.randn(2, 8, device="cuda")
             m(x)  # iteration 1
@@ -471,13 +486,13 @@ class TestCyclicPrefetch:
         # N when the target falls below 0.
         m = _make_block_model(num_blocks=4, width=8)
         strategy = ModelOffloader(
-            m, torch.device("cuda"),
+            m,
             layers_attr="transformer_blocks", blocks_to_swap=1,
             prefetch_count=1, cyclic=True,
         )
         streamer: StreamedWeights = strategy._streamers[0]
 
-        with strategy:
+        with strategy.use("cuda"):
             recorded, _ = self._record_prefetches(streamer)
             x = torch.randn(2, 8, device="cuda")
             for idx in (3, 2, 1, 0):
@@ -507,12 +522,12 @@ class TestCyclicPrefetch:
         torch.manual_seed(42)
         m_off = _make_block_model(num_blocks=4, width=8)
         strategy = ModelOffloader(
-            m_off, torch.device("cuda"),
+            m_off,
             layers_attr="transformer_blocks", blocks_to_swap=1,
             prefetch_count=2, cyclic=True,
         )
         try:
-            with strategy:
+            with strategy.use("cuda"):
                 with torch.no_grad():
                     got_1 = m_off(x)
                     got_2 = m_off(got_1)
@@ -530,13 +545,13 @@ class TestCyclicPrefetch:
         # iteration boundary 2→0 has |Δ|=2>1 (wraps to forward).
         m = _make_block_model(num_blocks=3, width=8)
         strategy = ModelOffloader(
-            m, torch.device("cuda"),
+            m,
             layers_attr="transformer_blocks", blocks_to_swap=1,
             prefetch_count=1, cyclic=True,
         )
         streamer: StreamedWeights = strategy._streamers[0]
 
-        with strategy:
+        with strategy.use("cuda"):
             recorded, _ = self._record_prefetches(streamer)
             x = torch.randn(2, 8, device="cuda")
             m(x)  # iteration 1
@@ -569,11 +584,11 @@ class TestForwardCorrectness:
         torch.manual_seed(42)
         m_off = _make_block_model(num_blocks=4, width=8)
         strategy = ModelOffloader(
-            m_off, torch.device("cuda"),
+            m_off,
             layers_attr="transformer_blocks", blocks_to_swap=2,
         )
         try:
-            strategy.activate()
+            strategy.activate("cuda")
             with torch.no_grad():
                 got = m_off(x)
             torch.cuda.synchronize()
@@ -586,18 +601,18 @@ class TestForwardCorrectness:
         torch.manual_seed(42)
         m = _make_block_model(num_blocks=4, width=8)
         strategy = ModelOffloader(
-            m, torch.device("cuda"),
+            m,
             layers_attr="transformer_blocks", blocks_to_swap=2,
         )
         try:
             x = torch.randn(2, 8, device="cuda")
-            strategy.activate()
+            strategy.activate("cuda")
             with torch.no_grad():
                 first = m(x)
             torch.cuda.synchronize()
             strategy.deactivate()
 
-            strategy.activate()
+            strategy.activate("cuda")
             with torch.no_grad():
                 second = m(x)
             torch.cuda.synchronize()
@@ -617,7 +632,7 @@ class TestValidation:
         m = _make_block_model(num_blocks=4)
         with pytest.raises(ValueError, match="blocks_to_swap"):
             ModelOffloader(
-                m, torch.device("cpu"),
+                m,
                 layers_attr="transformer_blocks", blocks_to_swap=4,  # equal to num_blocks
             )
 
@@ -625,7 +640,7 @@ class TestValidation:
         m = _make_block_model(num_blocks=4)
         with pytest.raises(ValueError, match="blocks_to_swap"):
             ModelOffloader(
-                m, torch.device("cpu"),
+                m,
                 layers_attr="transformer_blocks", blocks_to_swap=-1,
             )
 
@@ -633,7 +648,7 @@ class TestValidation:
         m = _make_block_model(num_blocks=4)
         with pytest.raises(ValueError, match="prefetch_count"):
             ModelOffloader(
-                m, torch.device("cpu"),
+                m,
                 layers_attr="transformer_blocks", blocks_to_swap=2,
                 prefetch_count=-1,
             )
@@ -642,7 +657,7 @@ class TestValidation:
         m = _make_block_model(num_blocks=4)
         with pytest.raises(ValueError, match="at least one path"):
             ModelOffloader(
-                m, torch.device("cpu"),
+                m,
                 layers_attr=[], blocks_to_swap=2,
             )
 
@@ -650,7 +665,7 @@ class TestValidation:
         m = _make_block_model(num_blocks=4)
         with pytest.raises(TypeError, match="nn.ModuleList"):
             ModelOffloader(
-                m, torch.device("cpu"),
+                m,
                 layers_attr="embed",  # an nn.Linear, not a ModuleList
                 blocks_to_swap=2,
             )
@@ -671,13 +686,13 @@ class TestModelCacheIntegration:
         def factory():
             m = _make_block_model(num_blocks=4, width=8)
             return ModelOffloader(
-                m, device, layers_attr="transformer_blocks", blocks_to_swap=2,
+                m, layers_attr="transformer_blocks", blocks_to_swap=2,
             )
 
         cache = ModelCache(max_cache_bytes=10_000_000)
         spec = ModelSpec(key="xformer", estimated_cache_bytes=1024, factory=factory)
 
-        with cache.use(spec) as model:
+        with cache.use(spec, device=device) as model:
             assert isinstance(model, nn.Module)
             x = torch.randn(2, 8, device=device)
             with torch.no_grad():
@@ -691,7 +706,7 @@ class TestModelCacheIntegration:
         assert info.active_count == 0
 
         # Second use is a cache hit — no rebuild.
-        with cache.use("xformer"):
+        with cache.use("xformer", device=device):
             pass
         snap = cache.snapshot()
         assert snap.stats.builds == 1
@@ -715,7 +730,7 @@ class TestActivateFailurePoison:
         # strategy reference for full cleanup.
         m = _make_block_model()
         strategy = ModelOffloader(
-            m, torch.device("cuda"),
+            m,
             layers_attr="transformer_blocks", blocks_to_swap=2,
         )
         streamer: StreamedWeights = strategy._components[-1]
@@ -728,7 +743,7 @@ class TestActivateFailurePoison:
         monkeypatch.setattr(streamer, "_register_hooks", broken_register_hooks)
 
         with pytest.raises(RuntimeError, match="simulated activate failure"):
-            strategy.activate()
+            strategy.activate("cuda")
 
         assert strategy._teardown_stack is None
 
@@ -748,7 +763,8 @@ class TestActivateFailurePoison:
 
             cache_bytes = 0
 
-            def activate(self) -> None:
+            def activate(self, device: torch.device | str | None = None) -> None:
+                del device
                 events.append(f"activate:{self._name}")
                 if self._raise:
                     # Simulate partial mutation before failing.
@@ -760,13 +776,13 @@ class TestActivateFailurePoison:
 
         m = _make_block_model()
         strat = ModelOffloader(
-            m, torch.device("cpu"),
+            m,
             layers_attr="transformer_blocks", blocks_to_swap=2,
         )
         strat._components = [_Recorder("A"), _Recorder("B"), _Recorder("C", raise_on_activate=True)]
 
         with pytest.raises(RuntimeError, match="C activate failed"):
-            strat.activate()
+            strat.activate("cpu")
 
         # Activates ran in order until C raised.
         assert "activate:A" in events
@@ -794,10 +810,10 @@ class TestPrefetchFailureOnDeactivate:
     def test_prefetch_failure_propagates_after_cleanup(self) -> None:
         m = _make_block_model()
         strategy = ModelOffloader(
-            m, torch.device("cuda"),
+            m,
             layers_attr="transformer_blocks", blocks_to_swap=2,
         )
-        strategy.activate()
+        strategy.activate("cuda")
         streamer: StreamedWeights = strategy._components[-1]
         # Inject a pre-failed Future so deactivate's drain loop hits it.
         bad_future: Future[None] = Future()
@@ -823,14 +839,14 @@ class TestConstructedStateIsInactive:
     """Verifies the 'constructed but not active' state has no GPU
     footprint — the payoff of the SlotOwnership-based composition.
     Without it, non-block siblings (embed, head, norms) would sit on
-    target_device permanently, defeating ModelCache eviction."""
+    the activation device permanently, defeating ModelCache eviction."""
 
     @CUDA
-    def test_constructed_has_no_params_on_target_device(self) -> None:
+    def test_constructed_has_no_params_on_activation_device(self) -> None:
         m = _make_block_model(num_blocks=4, width=8)
         target = torch.device("cuda")
         strategy = ModelOffloader(
-            m, target, layers_attr="transformer_blocks", blocks_to_swap=2,
+            m, layers_attr="transformer_blocks", blocks_to_swap=2,
         )
         try:
             for p in m.parameters():
@@ -854,7 +870,7 @@ class TestConstructedStateIsInactive:
         for p in m.parameters():
             p.requires_grad = False
         strategy = ModelOffloader(
-            m, torch.device("cpu"),
+            m,
             layers_attr="transformer_blocks", blocks_to_swap=2,
         )
         try:
@@ -894,11 +910,11 @@ class TestBufferOnlyNonBlock:
             p.requires_grad = False
         target = torch.device("cuda")
         strategy = ModelOffloader(
-            m, target, layers_attr="transformer_blocks", blocks_to_swap=2,
+            m, layers_attr="transformer_blocks", blocks_to_swap=2,
         )
         try:
             assert m.rope.table.is_pinned()
-            strategy.activate()
+            strategy.activate("cuda")
             assert m.rope.table.is_cuda
             strategy.deactivate()
             assert m.rope.table.is_pinned()
@@ -929,7 +945,7 @@ class TestCrossRegionTiedDetection:
             p.requires_grad = False
         with pytest.raises(ValueError, match="streamed regions|tied"):
             ModelOffloader(
-                m, torch.device("cpu"),
+                m,
                 layers_attr="transformer_blocks", blocks_to_swap=1,
                 stream_trainable_weights=True,
             )
@@ -954,7 +970,7 @@ class TestCrossRegionTiedDetection:
             p.requires_grad = False
         with pytest.raises(ValueError, match="streamed regions|tied"):
             ModelOffloader(
-                m, torch.device("cpu"),
+                m,
                 layers_attr="transformer_blocks", blocks_to_swap=1,
                 stream_trainable_weights=True,
             )
@@ -979,7 +995,7 @@ class TestCrossRegionTiedDetection:
             p.requires_grad = False
         with pytest.raises(ValueError, match="streamed regions|tied"):
             ModelOffloader(
-                m, torch.device("cpu"),
+                m,
                 layers_attr="transformer_blocks", blocks_to_swap=1,
             )
 
@@ -1006,7 +1022,7 @@ class TestCrossRegionTiedDetection:
             p.requires_grad = False
         with pytest.raises(ValueError, match="intra-block tied"):
             ModelOffloader(
-                m, torch.device("cpu"),
+                m,
                 layers_attr="transformer_blocks", blocks_to_swap=1,
             )
 
@@ -1036,7 +1052,7 @@ class TestCrossRegionTiedDetection:
             p.requires_grad = False
         with pytest.raises(ValueError, match="tied buffers across"):
             ModelOffloader(
-                m, torch.device("cpu"),
+                m,
                 layers_attr="transformer_blocks", blocks_to_swap=1,
             )
 
@@ -1066,7 +1082,7 @@ class TestCrossRegionTiedDetection:
             p.requires_grad = False
         with pytest.raises(ValueError, match="tied buffers across"):
             ModelOffloader(
-                m, torch.device("cpu"),
+                m,
                 layers_attr="transformer_blocks", blocks_to_swap=1,
             )
 
@@ -1094,7 +1110,7 @@ class TestCrossRegionTiedDetection:
             p.requires_grad = False
         with pytest.raises(ValueError, match="intra-block tied buffers"):
             ModelOffloader(
-                m, torch.device("cpu"),
+                m,
                 layers_attr="transformer_blocks", blocks_to_swap=1,
             )
 
@@ -1118,7 +1134,7 @@ class TestCrossRegionTiedDetection:
         for p in m.parameters():
             p.requires_grad = False
         strategy = ModelOffloader(
-            m, torch.device("cpu"),
+            m,
             layers_attr="transformer_blocks", blocks_to_swap=2,
         )
         try:
@@ -1150,7 +1166,7 @@ class TestDirectParentStateHandled:
         for p in m.parameters():
             p.requires_grad = False
         strategy = ModelOffloader(
-            m, torch.device("cpu"),
+            m,
             layers_attr="transformer_blocks", blocks_to_swap=2,
         )
         try:
@@ -1172,7 +1188,7 @@ class TestDirectParentStateHandled:
         for p in m.parameters():
             p.requires_grad = False
         strategy = ModelOffloader(
-            m, torch.device("cpu"),
+            m,
             layers_attr="encoder.blocks", blocks_to_swap=2,
         )
         try:
@@ -1193,7 +1209,7 @@ class TestDirectParentStateHandled:
         for p in m.parameters():
             p.requires_grad = False
         strategy = ModelOffloader(
-            m, torch.device("cpu"),
+            m,
             layers_attr="transformer_blocks", blocks_to_swap=2,
         )
         try:
@@ -1226,7 +1242,7 @@ class TestBlockBuffersPinned:
         for p in m.parameters():
             p.requires_grad = False
         strategy = ModelOffloader(
-            m, torch.device("cpu"),
+            m,
             layers_attr="transformer_blocks", blocks_to_swap=2,
         )
         try:
@@ -1291,7 +1307,6 @@ class TestBlockLayoutSignature:
         with pytest.raises(ValueError, match="layout differs"):
             StreamedWeights(
                 blocks=list(m.blocks),
-                target_device=torch.device("cpu"),
                 blocks_to_swap=1,
             )
 
@@ -1306,7 +1321,6 @@ class TestBlockLayoutSignature:
         with pytest.raises(ValueError, match="layout differs"):
             StreamedWeights(
                 blocks=[b0, b1],
-                target_device=torch.device("cpu"),
                 blocks_to_swap=1,
             )
 
@@ -1326,7 +1340,6 @@ class TestBlockLayoutSignature:
         with pytest.raises(ValueError, match="layout differs"):
             StreamedWeights(
                 blocks=[A(), B()],
-                target_device=torch.device("cpu"),
                 blocks_to_swap=1,
             )
 
@@ -1353,7 +1366,6 @@ class TestBlockLayoutSignature:
         with pytest.raises(ValueError, match="layout differs"):
             StreamedWeights(
                 blocks=list(m.blocks),
-                target_device=torch.device("cpu"),
                 blocks_to_swap=1,
             )
 
@@ -1385,11 +1397,11 @@ class TestMultiComponentCleanup:
 
         m = _make_block_model()
         strategy = ModelOffloader(
-            m, torch.device("cuda"),
+            m,
             layers_attr="transformer_blocks", blocks_to_swap=2,
         )
         try:
-            strategy.activate()
+            strategy.activate("cuda")
             assert m.embed.weight.is_cuda  # type: ignore[union-attr]
 
             with patch.object(
@@ -1415,21 +1427,21 @@ class TestMultiComponentCleanup:
 class TestTrainableWeights:
     def test_cache_bytes_is_zero(self) -> None:
         m = _make_block_model()
-        mover = TrainableWeights(m, torch.device("cpu"))
+        mover = TrainableWeights(m)
         assert mover.cache_bytes == 0
         mover.deactivate()
 
     def test_activate_and_deactivate_noop_when_no_trainable(self) -> None:
         m = _make_block_model()  # all frozen
-        mover = TrainableWeights(m, torch.device("cpu"))
+        mover = TrainableWeights(m)
         try:
-            mover.activate()
+            mover.activate("cpu")
             mover.deactivate()
         finally:
             mover.deactivate()
 
     @CUDA
-    def test_moves_trainable_param_to_target_device_on_activate(self) -> None:
+    def test_moves_trainable_param_to_device_on_activate(self) -> None:
         class M(nn.Module):
             def __init__(self):
                 super().__init__()
@@ -1437,9 +1449,9 @@ class TestTrainableWeights:
 
         m = M()
         target = torch.device("cuda")
-        mover = TrainableWeights(m, target)
+        mover = TrainableWeights(m)
         try:
-            mover.activate()
+            mover.activate(target)
             assert m.lora.is_cuda
             mover.deactivate()
             assert not m.lora.is_cuda  # back to CPU
@@ -1448,7 +1460,7 @@ class TestTrainableWeights:
 
     def test_deactivate_idempotent(self) -> None:
         m = _make_block_model()
-        mover = TrainableWeights(m, torch.device("cpu"))
+        mover = TrainableWeights(m)
         mover.deactivate()
         mover.deactivate()
 
@@ -1468,7 +1480,7 @@ class TestTrainableWeights:
         skip_slots = {
             s.slot for s in iter_param_slots(m.streamed)
         }
-        mover = TrainableWeights(m, torch.device("cpu"), skip_slots=skip_slots)
+        mover = TrainableWeights(m, skip_slots=skip_slots)
 
         # Flip requires_grad after construction. The filtered mover
         # should preserve TrainableWeights' historical dynamic behavior
@@ -1492,7 +1504,6 @@ class TestSlotOwnershipFilter:
         m = _make_block_model()
         streamer = StreamedWeights(
             blocks=list(m.transformer_blocks),
-            target_device=torch.device("cpu"),
             blocks_to_swap=2,
         )
         try:
@@ -1515,7 +1526,6 @@ class TestSlotOwnershipFilter:
         # cpu_params (different Python objects than the originals).
         streamer = StreamedWeights(
             blocks=list(m.transformer_blocks),
-            target_device=torch.device("cpu"),
             blocks_to_swap=2,
         )
         try:
@@ -1614,7 +1624,6 @@ class TestStreamedWeightsContractGuard:
         }
         streamer = StreamedWeights(
             blocks=[block_0, block_1],
-            target_device=torch.device("cpu"),
             blocks_to_swap=1,
         )
         assert trainable_slots.issubset(streamer.slot_filter)
@@ -1641,7 +1650,6 @@ class TestStreamedWeightsContractGuard:
         # produces empty buffers but no contract violation.
         streamer = StreamedWeights(
             blocks=[block_0, block_1],
-            target_device=torch.device("cpu"),
             blocks_to_swap=1,
             skip_slots=trainable_slots,
         )
@@ -1662,7 +1670,6 @@ class TestStreamedWeightsContractGuard:
 
         streamer = StreamedWeights(
             blocks=blocks,
-            target_device=torch.device("cpu"),
             blocks_to_swap=1,
             skip_slots=buffer_slots,
         )
@@ -1703,7 +1710,7 @@ class TestMixedGradTieDetection:
             p.requires_grad = False
         with pytest.raises(ValueError, match="trainable and frozen"):
             ModelOffloader(
-                m, torch.device("cpu"),
+                m,
                 layers_attr="transformer_blocks", blocks_to_swap=1,
             )
 
@@ -1734,7 +1741,7 @@ class TestMixedGradTieDetection:
             ValueError, match="distinct Parameter objects|tie_weights",
         ):
             ModelOffloader(
-                m, torch.device("cpu"),
+                m,
                 layers_attr="transformer_blocks", blocks_to_swap=1,
             )
 
@@ -1767,7 +1774,7 @@ class TestMixedGradTieDetection:
             ValueError, match="spans streamed regions",
         ):
             ModelOffloader(
-                m, torch.device("cpu"),
+                m,
                 layers_attr="transformer_blocks", blocks_to_swap=1,
                 stream_trainable_weights=True,
             )
@@ -1792,7 +1799,7 @@ class TestMixedGradTieDetection:
 
         m = M()
         strategy = ModelOffloader(
-            m, torch.device("cpu"),
+            m,
             layers_attr="transformer_blocks", blocks_to_swap=1,
         )
         assert m.transformer_blocks[0]._parameters["a"] is shared
@@ -1830,7 +1837,7 @@ class TestMixedGradTieDetection:
         m = M()
 
         strategy = ModelOffloader(
-            m, torch.device("cpu"),
+            m,
             layers_attr="transformer_blocks", blocks_to_swap=1,
             stream_trainable_weights=True,
         )
@@ -1866,7 +1873,7 @@ class TestMixedGradTieDetection:
             ValueError, match="trainable and frozen",
         ):
             ModelOffloader(
-                m, torch.device("cpu"),
+                m,
                 layers_attr="transformer_blocks", blocks_to_swap=1,
             )
 
@@ -1898,7 +1905,7 @@ class TestMixedGradTieDetection:
             p.requires_grad = False
         with pytest.raises(ValueError, match="trainable and frozen|intra-block tied"):
             ModelOffloader(
-                m, torch.device("cpu"),
+                m,
                 layers_attr="transformer_blocks", blocks_to_swap=1,
             )
 
@@ -1938,7 +1945,7 @@ class TestLoRAInBlockRouting:
 
         m = M([self._make_lora_block() for _ in range(2)])
         strat = ModelOffloader(
-            m, torch.device("cpu"),
+            m,
             layers_attr="transformer_blocks", blocks_to_swap=1,
             stream_trainable_weights=True,
         )
@@ -1977,7 +1984,7 @@ class TestLoRAInBlockRouting:
 
         m = M([self._make_lora_block() for _ in range(2)])
         strat = ModelOffloader(
-            m, torch.device("cpu"),
+            m,
             layers_attr="transformer_blocks", blocks_to_swap=1,
         )
         try:
@@ -2019,7 +2026,7 @@ class TestLoRAInBlockRouting:
         # m.trainable_bias stays trainable
 
         strat = ModelOffloader(
-            m, torch.device("cpu"),
+            m,
             layers_attr="transformer_blocks", blocks_to_swap=1,
         )
         try:
@@ -2099,13 +2106,13 @@ class TestTrainingWithCheckpointing:
         # so forward forces real slot reuse on blocks 2 and 3. That
         # reuse is what the checkpointing contract has to survive.
         offloader = ModelOffloader(
-            m_streamed, torch.device("cuda"),
+            m_streamed,
             layers_attr="transformer_blocks",
             blocks_to_swap=2, prefetch_count=0,
             stream_trainable_weights=True,
         )
         try:
-            with offloader as gpu_model:
+            with offloader.use("cuda") as gpu_model:
                 out_s = gpu_model(x, use_checkpoint=True)
                 ((out_s - target) ** 2).mean().backward()
                 torch.cuda.synchronize()
@@ -2135,12 +2142,12 @@ class TestTrainingWithCheckpointing:
         torch.manual_seed(42)
         m = _make_trainable_block_model(num_blocks=4, width=8)
         offloader = ModelOffloader(
-            m, torch.device("cuda"),
+            m,
             layers_attr="transformer_blocks",
             blocks_to_swap=2, prefetch_count=0,
         )
         try:
-            with offloader as gpu_model:
+            with offloader.use("cuda") as gpu_model:
                 x = torch.randn(2, 8, device="cuda")
                 out = gpu_model(x, use_checkpoint=False)
                 with pytest.raises(
@@ -2163,7 +2170,7 @@ def _make_offloader_for_warning_test(model: nn.Module) -> ModelOffloader:
     invocation site.
     """
     return ModelOffloader(
-        model, torch.device("cpu"),
+        model,
         layers_attr="transformer_blocks", blocks_to_swap=2,
     )
 
@@ -2236,7 +2243,7 @@ class TestTrainingWarning:
     ) -> None:
         m = _make_trainable_block_model(num_blocks=4)
         offloader = ModelOffloader(
-            m, torch.device("cpu"),
+            m,
             layers_attr="transformer_blocks", blocks_to_swap=2,
             is_block_checkpointed=lambda block: True,
         )
@@ -2251,7 +2258,7 @@ class TestTrainingWarning:
     ) -> None:
         m = _make_trainable_block_model(num_blocks=4)
         offloader = ModelOffloader(
-            m, torch.device("cpu"),
+            m,
             layers_attr="transformer_blocks", blocks_to_swap=2,
             skip_checkpointing_check=True,
         )
@@ -2350,7 +2357,7 @@ class TestInBlockTrainableCheckpointingGuard:
     def test_raises_without_checkpointing_flag(self) -> None:
         m = _make_lora_in_block_model(num_blocks=2)
         offloader = ModelOffloader(
-            m, torch.device("cpu"),
+            m,
             layers_attr="transformer_blocks", blocks_to_swap=1,
             stream_trainable_weights=True,
         )
@@ -2362,7 +2369,7 @@ class TestInBlockTrainableCheckpointingGuard:
         for block in m.transformer_blocks:
             block.gradient_checkpointing = True
         offloader = ModelOffloader(
-            m, torch.device("cpu"),
+            m,
             layers_attr="transformer_blocks", blocks_to_swap=1,
             stream_trainable_weights=True,
         )
@@ -2374,7 +2381,7 @@ class TestInBlockTrainableCheckpointingGuard:
         m.transformer_blocks[1].gradient_checkpointing = True
         # blocks 2, 3 unflagged
         offloader = ModelOffloader(
-            m, torch.device("cpu"),
+            m,
             layers_attr="transformer_blocks", blocks_to_swap=1,
             stream_trainable_weights=True,
         )
@@ -2384,7 +2391,7 @@ class TestInBlockTrainableCheckpointingGuard:
     def test_skip_checkpointing_check_suppresses_guard(self) -> None:
         m = _make_lora_in_block_model(num_blocks=2)
         offloader = ModelOffloader(
-            m, torch.device("cpu"),
+            m,
             layers_attr="transformer_blocks", blocks_to_swap=1,
             skip_checkpointing_check=True,
             stream_trainable_weights=True,
@@ -2398,7 +2405,7 @@ class TestInBlockTrainableCheckpointingGuard:
         m = _make_lora_in_block_model(num_blocks=2)
         m.eval()
         offloader = ModelOffloader(
-            m, torch.device("cpu"),
+            m,
             layers_attr="transformer_blocks", blocks_to_swap=1,
             stream_trainable_weights=True,
         )
@@ -2411,7 +2418,7 @@ class TestInBlockTrainableCheckpointingGuard:
         # ``TestTrainingWarning``).
         m = _make_trainable_block_model(num_blocks=2)
         offloader = ModelOffloader(
-            m, torch.device("cpu"),
+            m,
             layers_attr="transformer_blocks", blocks_to_swap=1,
         )
         offloader._enforce_checkpointing_for_trainable_streaming()  # no raise
@@ -2432,7 +2439,7 @@ class TestInBlockTrainableCheckpointingGuard:
             block.gradient_checkpointing = True
 
         offloader = ModelOffloader(
-            m, torch.device("cpu"),
+            m,
             layers_attr=["transformer_blocks", "frozen_blocks"],
             blocks_to_swap=1,
             stream_trainable_weights=True,
@@ -2445,18 +2452,18 @@ class TestStreamedWeightsActivateTwice:
     def test_double_activate_raises(self) -> None:
         m = _make_block_model(num_blocks=4)
         offloader = ModelOffloader(
-            m, torch.device("cuda"),
+            m,
             layers_attr="transformer_blocks", blocks_to_swap=1,
         )
         try:
-            offloader.activate()
+            offloader.activate("cuda")
             # Reach into the streamer and call activate again — the
             # composer's activate handles its own teardown ExitStack,
             # but the streamer itself must hard-guard against
             # double-install of forward-pre hooks.
             streamer = offloader._streamers[0]
             with pytest.raises(RuntimeError, match="already.*active"):
-                streamer.activate()
+                streamer.activate("cuda")
         finally:
             offloader.deactivate()
 
@@ -2503,13 +2510,13 @@ class TestInBlockTrainableStreamingEndToEnd:
             block.gradient_checkpointing = True
 
         offloader = ModelOffloader(
-            m_streamed, torch.device("cuda"),
+            m_streamed,
             layers_attr="transformer_blocks",
             blocks_to_swap=2, prefetch_count=0,
             stream_trainable_weights=True,
         )
         try:
-            with offloader as gpu_model:
+            with offloader.use("cuda") as gpu_model:
                 out_s = gpu_model(x, use_checkpoint=True)
                 ((out_s - target) ** 2).mean().backward()
                 torch.cuda.synchronize()
@@ -2564,13 +2571,13 @@ class TestInBlockTrainableStreamingEndToEnd:
         }
 
         offloader = ModelOffloader(
-            m_streamed, torch.device("cuda"),
+            m_streamed,
             layers_attr="transformer_blocks",
             blocks_to_swap=2, prefetch_count=0,
             stream_trainable_weights=True,
         )
         try:
-            with offloader as gpu_model:
+            with offloader.use("cuda") as gpu_model:
                 out_s = gpu_model(x, use_checkpoint=True)
                 ((out_s - target) ** 2).mean().backward()
                 with offloader.optimizer_step():
@@ -2608,13 +2615,13 @@ class TestInBlockTrainableStreamingEndToEnd:
         }
 
         offloader = ModelOffloader(
-            m, torch.device("cuda"),
+            m,
             layers_attr="transformer_blocks",
             blocks_to_swap=1, prefetch_count=0,
             stream_trainable_weights=True,
         )
         try:
-            with offloader as gpu_model:
+            with offloader.use("cuda") as gpu_model:
                 # Run forward to warm the slot pool.
                 x = torch.randn(2, 8, device="cuda")
                 _ = gpu_model(x, use_checkpoint=True)
@@ -2692,7 +2699,7 @@ class TestBlockGroupsDisjoint:
             p.requires_grad = False
         with pytest.raises(ValueError, match="disjoint module slots"):
             ModelOffloader(
-                m, torch.device("cpu"),
+                m,
                 layers_attr=["group_a", "group_b"],
                 blocks_to_swap=1,
             )
@@ -2724,7 +2731,7 @@ class TestBlockGroupsDisjoint:
             p.requires_grad = False
         with pytest.raises(ValueError, match="disjoint module slots"):
             ModelOffloader(
-                m, torch.device("cpu"),
+                m,
                 layers_attr=["group_a", "group_b"],
                 blocks_to_swap=1,
             )
@@ -2744,7 +2751,7 @@ class TestBlockGroupsDisjoint:
             p.requires_grad = False
         with pytest.raises(ValueError, match="disjoint module slots"):
             ModelOffloader(
-                m, torch.device("cpu"),
+                m,
                 layers_attr="transformer_blocks", blocks_to_swap=1,
             )
 
@@ -2760,7 +2767,7 @@ class TestPluggableCheckpointingDetection:
         # guard pass even without per-block flags set.
         m = _make_lora_in_block_model(num_blocks=2)
         offloader = ModelOffloader(
-            m, torch.device("cpu"),
+            m,
             layers_attr="transformer_blocks", blocks_to_swap=1,
             is_block_checkpointed=lambda block: True,
             stream_trainable_weights=True,
@@ -2778,7 +2785,7 @@ class TestPluggableCheckpointingDetection:
             return len(seen) == 1  # True for first, False for second
 
         offloader = ModelOffloader(
-            m, torch.device("cpu"),
+            m,
             layers_attr="transformer_blocks", blocks_to_swap=1,
             is_block_checkpointed=predicate,
             stream_trainable_weights=True,
@@ -2796,7 +2803,7 @@ class TestPluggableCheckpointingDetection:
             raise AssertionError("should not be called")
 
         offloader = ModelOffloader(
-            m, torch.device("cpu"),
+            m,
             layers_attr="transformer_blocks", blocks_to_swap=1,
             skip_checkpointing_check=True,
             is_block_checkpointed=fail_predicate,
@@ -2827,12 +2834,12 @@ class TestRevisedDataOnlyDesign:
             block.gradient_checkpointing = True
 
         offloader = ModelOffloader(
-            m, torch.device("cuda"),
+            m,
             layers_attr="transformer_blocks",
             blocks_to_swap=1, prefetch_count=0,
             stream_trainable_weights=True,
         )
-        with offloader as gpu_model:
+        with offloader.use("cuda") as gpu_model:
             x = torch.randn(2, 8, device="cuda")
             target = torch.randn(2, 8, device="cuda")
             out = gpu_model(x, use_checkpoint=True)
@@ -2890,13 +2897,13 @@ class TestRevisedDataOnlyDesign:
             block.gradient_checkpointing = True
 
         offloader = ModelOffloader(
-            m_streamed, torch.device("cuda"),
+            m_streamed,
             layers_attr="transformer_blocks",
             blocks_to_swap=1, prefetch_count=0,
             stream_trainable_weights=True,
         )
 
-        with offloader as gpu_model:
+        with offloader.use("cuda") as gpu_model:
             x, target = batches[0]
             out = gpu_model(x, use_checkpoint=True)
             ((out - target) ** 2).mean().backward()
@@ -2908,7 +2915,7 @@ class TestRevisedDataOnlyDesign:
             if p.requires_grad
         )
 
-        with offloader as gpu_model:
+        with offloader.use("cuda") as gpu_model:
             assert all(
                 p.grad is not None and p.grad.device.type == "cuda"
                 for p in gpu_model.parameters()
@@ -2935,13 +2942,13 @@ class TestRevisedDataOnlyDesign:
             block.gradient_checkpointing = True
 
         offloader = ModelOffloader(
-            m, torch.device("cuda"),
+            m,
             layers_attr="transformer_blocks",
             blocks_to_swap=1, prefetch_count=0,
             stream_trainable_weights=True,
         )
         try:
-            with offloader as gpu_model:
+            with offloader.use("cuda") as gpu_model:
                 x = torch.randn(2, 8, device="cuda")
                 _ = gpu_model(x, use_checkpoint=True)
                 with offloader.optimizer_step():
@@ -2973,14 +2980,14 @@ class TestRevisedDataOnlyDesign:
         }
 
         offloader = ModelOffloader(
-            m, torch.device("cuda"),
+            m,
             layers_attr="transformer_blocks",
             blocks_to_swap=1, prefetch_count=0,
             stream_trainable_weights=True,
         )
         sentinel = RuntimeError("simulated optimizer.step failure")
         try:
-            with offloader as gpu_model:
+            with offloader.use("cuda") as gpu_model:
                 x = torch.randn(2, 8, device="cuda")
                 target = torch.randn(2, 8, device="cuda")
                 out = gpu_model(x, use_checkpoint=True)
@@ -3038,13 +3045,13 @@ class TestRevisedDataOnlyDesign:
             block.gradient_checkpointing = True
 
         offloader = ModelOffloader(
-            m_streamed, torch.device("cuda"),
+            m_streamed,
             layers_attr="transformer_blocks",
             blocks_to_swap=3, prefetch_count=2,
             stream_trainable_weights=True,
         )
         try:
-            with offloader as gpu_model:
+            with offloader.use("cuda") as gpu_model:
                 out_s = gpu_model(x, use_checkpoint=True)
                 ((out_s - target) ** 2).mean().backward()
                 torch.cuda.synchronize()
@@ -3099,13 +3106,13 @@ class TestRevisedDataOnlyDesign:
         }
 
         offloader = ModelOffloader(
-            m_streamed, torch.device("cuda"),
+            m_streamed,
             layers_attr="transformer_blocks",
             blocks_to_swap=2, prefetch_count=0,
             stream_trainable_weights=True,
         )
         try:
-            with offloader as gpu_model:
+            with offloader.use("cuda") as gpu_model:
                 for _ in range(3):
                     opt_streamed.zero_grad()
                     out_s = gpu_model(x, use_checkpoint=True)

@@ -48,6 +48,7 @@ from typing import Any, Generic, TypeVar, cast, overload
 
 import torch
 
+from ._devices import canonical_device
 from .protocols import CachedResource
 
 logger = logging.getLogger(__name__)
@@ -215,6 +216,9 @@ class _Entry:
     strategy: CachedResource | None = None
     cache_bytes: int = 0  # actual, post-build
     active_count: int = 0
+    # Acquire-time placement for the current active lease. ``None`` means
+    # the cache did not select a device for this resource.
+    active_device: torch.device | None = None
     # True while `pre_activate` is running. Guards against same-key
     # re-entry from inside the hook, which would otherwise activate
     # the strategy while we're still in the deactivated-config phase
@@ -338,6 +342,7 @@ class ModelCache:
         self,
         model: ResourceSpec[T],
         *,
+        device: torch.device | str | None = None,
         pre_activate: Callable[[CachedResource[T]], None] | None = None,
     ) -> contextlib.AbstractContextManager[T]: ...
     @overload
@@ -345,6 +350,7 @@ class ModelCache:
         self,
         model: str,
         *,
+        device: torch.device | str | None = None,
         pre_activate: Callable[[CachedResource[Any]], None] | None = None,
     ) -> contextlib.AbstractContextManager[Any]: ...
 
@@ -353,6 +359,7 @@ class ModelCache:
         self,
         model: str | ResourceSpec,
         *,
+        device: torch.device | str | None = None,
         pre_activate: Callable[[CachedResource[Any]], None] | None = None,
     ) -> Iterator[Any]:
         """Acquire an active lease on a cached resource.
@@ -361,6 +368,12 @@ class ModelCache:
         (auto-registers if its key isn't already known). Yields the
         resource's :attr:`~CachedResource.value` for use; on context
         exit, releases the lease.
+
+        ``device`` optionally selects placement for this acquire. It is
+        passed to the strategy's :meth:`~CachedResource.activate` on the
+        first lease. Re-entrant same-key acquires may omit ``device`` or
+        must pass the same device; simultaneous activation of one cached
+        entry on multiple devices is rejected.
 
         Re-entrant for the same key: nested ``use()`` calls bump a
         per-key refcount and share the already-active value (the
@@ -389,7 +402,11 @@ class ModelCache:
             self.register(spec)
             entry = self._entries[key]
 
-        value = self._acquire(entry, pre_activate=pre_activate)
+        value = self._acquire(
+            entry,
+            device=canonical_device(device) if device is not None else None,
+            pre_activate=pre_activate,
+        )
         try:
             yield value
         finally:
@@ -456,6 +473,7 @@ class ModelCache:
         self,
         entry: _Entry,
         *,
+        device: torch.device | None = None,
         pre_activate: Callable[[CachedResource[Any]], None] | None = None,
     ) -> object:
         """Build (if needed), run ``pre_activate``, activate, and
@@ -491,6 +509,20 @@ class ModelCache:
         # caller's hook would either fail or silently violate
         # invariants.
         if entry.active_count > 0:
+            if device is not None and entry.active_device is None:
+                raise ModelCacheError(
+                    f"cannot acquire active {key!r} with device {device}: "
+                    "the existing lease was activated without a cache-visible device"
+                )
+            if (
+                device is not None
+                and entry.active_device is not None
+                and device != entry.active_device
+            ):
+                raise ModelCacheError(
+                    f"cannot acquire active {key!r} on {device}: "
+                    f"already active on {entry.active_device}"
+                )
             strategy = entry.strategy
             assert strategy is not None
             value = strategy.value
@@ -532,7 +564,10 @@ class ModelCache:
         # active strategy.
         value = strategy.value
         try:
-            strategy.activate()
+            if device is None:
+                strategy.activate()
+            else:
+                strategy.activate(device)
         except BaseException as exc:
             self._stats.activation_errors += 1
             self._release_strategy(entry, evicted=False)
@@ -548,6 +583,7 @@ class ModelCache:
             raise
 
         entry.active_count = 1
+        entry.active_device = device
         return value
 
     def _release(self, entry: _Entry) -> None:
@@ -565,6 +601,7 @@ class ModelCache:
         except BaseException:
             self._release_strategy(entry, evicted=False)
             raise
+        entry.active_device = None
         self._lru[entry.spec.key] = None
 
     # ------------------------------------------------------------------
@@ -587,7 +624,7 @@ class ModelCache:
         estimate = entry.spec.estimated_cache_bytes
         self._evict_until_room(key, estimate)
         try:
-            strategy = entry.spec.factory()
+            strategy: CachedResource[Any] | None = entry.spec.factory()
         except BaseException:
             self._stats.factory_errors += 1
             raise
@@ -601,10 +638,11 @@ class ModelCache:
             if actual > estimate:
                 self._evict_until_room(key, actual)
         except BaseException:
-            del strategy
+            strategy = None
             self._after_release()
             raise
 
+        assert strategy is not None
         entry.strategy = strategy
         # Initial commit: cache_bytes is currently 0; reconcile against
         # actual to record the bytes and update peak. Build-path
@@ -704,6 +742,7 @@ class ModelCache:
         # them.
         entry.strategy = None
         entry.cache_bytes = 0
+        entry.active_device = None
         self._lru.pop(entry.spec.key, None)
         self._used_bytes -= bytes_freed
         if evicted:

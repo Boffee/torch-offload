@@ -149,11 +149,11 @@ def _expected_merged_weight(
 
 
 def _make_strategy(
-    model: nn.Module, device: str = "cpu", blocks_to_swap: int = 1,
+    model: nn.Module, blocks_to_swap: int = 1,
 ) -> ModelOffloader:
     """Shorthand for constructing the strategy with sensible defaults."""
     return ModelOffloader(
-        model, torch.device(device),
+        model,
         layers_attr="transformer_blocks",
         blocks_to_swap=blocks_to_swap,
     )
@@ -333,9 +333,9 @@ class TestSetLorasValidation:
     @CUDA
     def test_set_loras_raises_while_active(self) -> None:
         m = _make_bf16_model()
-        s = _make_strategy(m, device="cuda")
+        s = _make_strategy(m)
         s.set_loras([(_make_lora(4, 16), 1.0)])
-        s.activate()
+        s.activate("cuda")
         try:
             with pytest.raises(RuntimeError, match="inactive"):
                 s.set_loras([])
@@ -396,10 +396,10 @@ class TestLifecycle:
     @CUDA
     def test_activate_runs_components(self) -> None:
         m = _make_bf16_model()
-        s = _make_strategy(m, device="cuda")
+        s = _make_strategy(m)
         s.set_loras([(_make_lora(4, 16), 1.0)])
         try:
-            s.activate()
+            s.activate("cuda")
             assert m.embed.weight.is_cuda
             assert m.head.weight.is_cuda
         finally:
@@ -408,9 +408,9 @@ class TestLifecycle:
     @CUDA
     def test_deactivate_returns_to_pinned(self) -> None:
         m = _make_bf16_model()
-        s = _make_strategy(m, device="cuda")
+        s = _make_strategy(m)
         s.set_loras([(_make_lora(4, 16), 1.0)])
-        s.activate()
+        s.activate("cuda")
         s.deactivate()
         assert m.embed.weight.is_pinned()
         assert m.head.weight.is_pinned()
@@ -418,12 +418,12 @@ class TestLifecycle:
     @CUDA
     def test_reactivation_with_different_loras(self) -> None:
         m = _make_bf16_model()
-        s = _make_strategy(m, device="cuda")
+        s = _make_strategy(m)
         s.set_loras([(_make_lora(4, 16, seed=1), 1.0)])
-        s.activate()
+        s.activate("cuda")
         s.deactivate()
         s.set_loras([(_make_lora(4, 16, seed=2), 1.0)])
-        s.activate()
+        s.activate("cuda")
         s.deactivate()
         assert m.embed.weight.is_pinned()
 
@@ -431,8 +431,8 @@ class TestLifecycle:
     def test_activate_with_no_loras_runs_base_only(self) -> None:
         m = _make_bf16_model()
         captured = m.transformer_blocks[0].attn.weight.detach().clone()
-        s = _make_strategy(m, device="cuda")
-        s.activate()
+        s = _make_strategy(m)
+        s.activate("cuda")
         try:
             x = torch.randn(2, 16, dtype=torch.bfloat16, device="cuda")
             for blk in m.transformer_blocks:
@@ -464,9 +464,9 @@ class TestMergeCorrectness:
             (_make_lora(num_blocks=4, dim=16, seed=10), 0.5),
             (_make_lora(num_blocks=4, dim=16, seed=20), 0.25),
         ]
-        s = _make_strategy(m, device="cuda")
+        s = _make_strategy(m)
         s.set_loras(loras)
-        s.activate()
+        s.activate("cuda")
         try:
             x = torch.randn(2, 16, dtype=torch.bfloat16, device="cuda")
             for blk in m.transformer_blocks:
@@ -500,9 +500,9 @@ class TestMergeCorrectness:
         }
 
         lora = _make_lora(4, 16, seed=42, prefix="diffusion_model.")
-        s = _make_strategy(m, device="cuda")
+        s = _make_strategy(m)
         s.set_loras([(lora, 0.7)])
-        s.activate()
+        s.activate("cuda")
         try:
             x = torch.randn(2, 16, dtype=torch.bfloat16, device="cuda")
             for blk in m.transformer_blocks:
@@ -533,9 +533,9 @@ class TestMergeCorrectness:
             "embed.lora_B.weight": torch.randn(16, 4, generator=g, dtype=torch.float32),
         }
         lora = LoRA(state_dict=sd)
-        s = _make_strategy(m, device="cuda")
+        s = _make_strategy(m)
         s.set_loras([(lora, 0.5)])
-        s.activate()
+        s.activate("cuda")
         try:
             a, b = lora.targets["embed.weight"]
             expected = (
@@ -585,9 +585,9 @@ class TestMergeCorrectness:
         }
 
         lora = _make_lora(num_blocks=4, dim=16, seed=42)
-        s = _make_strategy(m, device="cuda")
+        s = _make_strategy(m)
         s.set_loras([(lora, 0.7)])
-        s.activate()
+        s.activate("cuda")
         try:
             x = torch.randn(2, 16, dtype=torch.bfloat16, device="cuda")
             m(x)
@@ -735,9 +735,9 @@ class TestRoutedMode:
             for i in range(3)
         ]
 
-        s = _make_strategy(m, device="cuda")
+        s = _make_strategy(m)
         s.set_loras(loras, mode="routed")
-        s.activate()
+        s.activate("cuda")
         try:
             x = torch.randn(2, 16, dtype=torch.bfloat16, device="cuda")
             actual = m(x)
@@ -764,9 +764,9 @@ class TestRoutedMode:
         # Hooks installed on activate must be removed on deactivate so
         # subsequent base-only forward sees the unaugmented model.
         m = _make_bf16_model(num_blocks=3, dim=16)
-        s = _make_strategy(m, device="cuda")
+        s = _make_strategy(m)
         s.set_loras([(_make_lora(3, 16, seed=7), 1.0)], mode="routed")
-        s.activate()
+        s.activate("cuda")
         x = torch.randn(2, 16, dtype=torch.bfloat16, device="cuda")
         with_lora = m(x).detach().clone()
         torch.cuda.synchronize()
@@ -775,7 +775,7 @@ class TestRoutedMode:
         # Re-activate without LoRAs; output should differ from with_lora
         # (the hooks should be gone).
         s.set_loras([], mode="routed")
-        s.activate()
+        s.activate("cuda")
         try:
             base_only = m(x)
             torch.cuda.synchronize()
@@ -798,9 +798,9 @@ class TestRoutedMode:
         lora_r8 = _make_lora(num_blocks=2, dim=16, rank=8, seed=202)
         loras = [(lora_r4, 0.6), (lora_r8, 0.3)]
 
-        s = _make_strategy(m, device="cuda")
+        s = _make_strategy(m)
         s.set_loras(loras, mode="routed")
-        s.activate()
+        s.activate("cuda")
         try:
             x = torch.randn(2, 16, dtype=torch.bfloat16, device="cuda")
             actual = m(x)
@@ -857,7 +857,7 @@ class TestRoutedMode:
             p.requires_grad = False
 
         s = ModelOffloader(
-            model, torch.device("cpu"),
+            model,
             layers_attr="transformer_blocks", blocks_to_swap=1,
         )
         # Build a LoRA targeting attn.weight (LinearLike, not nn.Linear).
@@ -914,7 +914,7 @@ class TestRoutedMode:
             p.requires_grad = False
 
         s = ModelOffloader(
-            model, torch.device("cpu"),
+            model,
             layers_attr="transformer_blocks", blocks_to_swap=1,
         )
         # Pre-populate _pending_routes with stale state to verify it
@@ -937,9 +937,9 @@ class TestRoutedMode:
         m = _make_bf16_model(num_blocks=2, dim=16)
         loras = [(_make_lora(num_blocks=2, dim=16, seed=33), 0.7)]
 
-        s = _make_strategy(m, device="cuda")
+        s = _make_strategy(m)
         s.set_loras(loras, mode="routed")
-        s.activate()
+        s.activate("cuda")
         try:
             x = torch.randn(2, 16, dtype=torch.bfloat16, device="cuda")
             actual = m(x)
@@ -958,7 +958,7 @@ class TestRoutedMode:
         model = _make_tied_non_block_model(dtype=torch.bfloat16)
 
         s = ModelOffloader(
-            model, torch.device("cpu"),
+            model,
             layers_attr="transformer_blocks", blocks_to_swap=1,
         )
         # Build a LoRA that targets either alias of the tied weight.
@@ -1010,11 +1010,11 @@ class TestRoutedMode:
 
         loras = [(_make_lora(num_blocks=2, dim=16, seed=55), 0.5)]
         s = ModelOffloader(
-            m, torch.device("cuda"),
+            m,
             layers_attr="transformer_blocks", blocks_to_swap=1,
         )
         s.set_loras(loras, mode="routed")
-        s.activate()
+        s.activate("cuda")
         try:
             x = torch.randn(2, 16, dtype=torch.bfloat16, device="cuda")
             actual = m(x)
@@ -1097,14 +1097,14 @@ class TestDeactivateCleanupInvariants:
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         m = _make_bf16_model()
-        s = _make_strategy(m, device="cuda")
+        s = _make_strategy(m)
         s.set_loras([(_make_lora(4, 16), 1.0)])
 
         def streamer_boom() -> None:
             raise RuntimeError("streamer cleanup failed")
 
         monkeypatch.setattr(s._streamers[0], "deactivate", streamer_boom)
-        s.activate()
+        s.activate("cuda")
 
         with pytest.raises(RuntimeError):
             s.deactivate()

@@ -25,7 +25,7 @@ Class-specific caveats
   parameter slot (``module._parameters[leaf]``) is replaced with a
   Parameter wrapping pinned CPU storage, and registered buffers are
   replaced with pinned copies. Only use the model via :meth:`activate`
-  or context-manager entry after wrapping.
+  or :meth:`use` after wrapping.
 - Slot replacement (rather than ``param.data`` swap) is required for
   correctness with quanto ``WeightQBytesTensor``: assigning
   ``param.data = new_quanto_tensor`` is a no-op for the inner ``_data``
@@ -54,12 +54,14 @@ Class-specific caveats
 
 from __future__ import annotations
 
-from types import TracebackType
+import contextlib
+from collections.abc import Iterator
 from typing import Any
 
 import torch
 from torch import nn
 
+from ._devices import canonical_device
 from .pinned_buffer import PinnedParamBuffer, storage_key
 from .protocols import SlotOwnership
 from .slots import BufferSlot, ParamSlot, assert_frozen, iter_buffer_slots, iter_param_slots
@@ -102,8 +104,6 @@ class PinnedWeights:
     model:
         The model to cache. Auto-moved to CPU at construction so
         ``pin_memory()`` succeeds.
-    target_device:
-        GPU device to bulk-transfer to in :meth:`activate`.
     include_buffers:
         Also cache registered buffers (LayerNorm running stats, position
         embeddings stored as buffers, etc.). Default True. Set False
@@ -125,13 +125,11 @@ class PinnedWeights:
     def __init__(
         self,
         model: nn.Module,
-        target_device: torch.device,
         include_buffers: bool = True,
         *,
         skip_slots: set[SlotOwnership] | None = None,
     ) -> None:
         self._model: nn.Module | None = model
-        self._device = target_device
         self._include_buffers = include_buffers
         self._skip_slots: set[SlotOwnership] = skip_slots or set()
 
@@ -300,7 +298,7 @@ class PinnedWeights:
     def value(self) -> nn.Module:
         return self.model
 
-    def activate(self) -> None:
+    def activate(self, device: torch.device | str | None = None) -> None:
         """Bulk-DMA pinned weights to GPU.
 
         Per-tensor ``.to()`` (non-blocking), then a single
@@ -320,7 +318,7 @@ class PinnedWeights:
         reference.
         """
         assert self._model is not None
-        self._move_to_gpu()
+        self._move_to_gpu(self._resolve_device(device))
 
     def deactivate(self) -> None:
         """Repoint slots back at pinned-CPU Parameters. Idempotent —
@@ -330,37 +328,43 @@ class PinnedWeights:
         anymore)."""
         self._move_to_pinned()
 
-    def __enter__(self) -> nn.Module:
-        self.activate()
-        return self.model
-
-    def __exit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        tb: TracebackType | None,
-    ) -> None:
-        self.deactivate()
+    @contextlib.contextmanager
+    def use(self, device: torch.device | str) -> Iterator[nn.Module]:
+        """Activate on ``device`` for the duration of the context."""
+        self.activate(device)
+        try:
+            yield self.model
+        finally:
+            self.deactivate()
 
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
 
-    def _move_to_gpu(self) -> None:
+    def _resolve_device(self, device: torch.device | str | None) -> torch.device:
+        if device is not None:
+            return canonical_device(device)
+        raise ValueError(
+            "PinnedWeights.activate() requires a device; pass "
+            "activate(device) or use this strategy through "
+            "ModelCache.use(..., device=...)"
+        )
+
+    def _move_to_gpu(self, device: torch.device) -> None:
         # One GPU Parameter per unique buffer. Tied slots all receive
         # the same Parameter object so the tying invariant survives on
         # device.
         for buf, locs in self._slots:
-            gpu_param = buf.load_to_gpu(self._device, non_blocking=True)
+            gpu_param = buf.load_to_gpu(device, non_blocking=True)
             for parent, leaf in locs:
                 parent._parameters[leaf] = gpu_param
         if self._include_buffers:
             for pinned, locs in self._buffer_slots:
-                gpu = pinned.to(self._device, non_blocking=True)
+                gpu = pinned.to(device, non_blocking=True)
                 for parent, leaf, persistent in locs:
                     parent.register_buffer(leaf, gpu, persistent=persistent)
-        if self._device.type == "cuda":
-            torch.cuda.synchronize(self._device)
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
 
     def _move_to_pinned(self) -> None:
         for buf, locs in self._slots:

@@ -9,11 +9,11 @@ brings trainable params (LoRA adapters, PEFT layers) to GPU on
 from __future__ import annotations
 
 from collections.abc import Iterator
-from types import TracebackType
 
 import torch
 from torch import nn
 
+from ._devices import canonical_device
 from .protocols import SlotOwnership
 from .slots import iter_param_slots
 
@@ -24,7 +24,7 @@ class TrainableWeights:
     """Strategy component for the model's trainable parameters.
 
     The trainable counterpart to :class:`PinnedWeights`. Both components
-    bring their managed params to the target device on
+    bring their managed params to the activation device on
     :meth:`activate` and return them to CPU on :meth:`deactivate`,
     but the mechanisms are mirror images:
 
@@ -47,8 +47,6 @@ class TrainableWeights:
     ----------
     model:
         The model whose trainable params should be moved.
-    target_device:
-        GPU device to move to on :meth:`activate`.
     skip_slots:
         Optional set of :class:`SlotOwnership` tuples identifying
         ``(parent_module, leaf, kind)`` slots to skip — used by
@@ -61,23 +59,28 @@ class TrainableWeights:
     def __init__(
         self,
         model: nn.Module,
-        target_device: torch.device,
         *,
         skip_slots: set[SlotOwnership] | None = None,
     ) -> None:
         self._model = model
-        self._target_device = target_device
         self._skip_slots = frozenset(skip_slots) if skip_slots is not None else None
 
     @property
     def cache_bytes(self) -> int:
         return 0
 
-    def activate(self) -> None:
-        self._move(self._target_device)
+    def activate(self, device: torch.device | str | None = None) -> None:
+        self._move(self._resolve_device(device))
 
     def deactivate(self) -> None:
         self._move(torch.device("cpu"))
+
+    def _resolve_device(self, device: torch.device | str | None) -> torch.device:
+        if device is not None:
+            return canonical_device(device)
+        raise ValueError(
+            "TrainableWeights.activate() requires a device"
+        )
 
     def _move(self, device: torch.device) -> None:
         for p in self._iter_trainable_params():
@@ -103,14 +106,3 @@ class TrainableWeights:
                 continue
             seen_ids.add(id(s.param))
             yield s.param
-
-    def __enter__(self) -> None:
-        self.activate()
-
-    def __exit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        tb: TracebackType | None,
-    ) -> None:
-        self.deactivate()

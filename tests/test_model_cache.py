@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections.abc import Callable
 
 import pytest
+import torch
 from torch import nn
 
 from torch_offload import (
@@ -23,6 +24,8 @@ from torch_offload import (
     ModelTooLargeError,
 )
 from torch_offload.protocols import ModelStrategy
+
+CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
 # ---------------------------------------------------------------------------
@@ -49,6 +52,7 @@ class FakeStrategy:
         self._activate_raises = activate_raises
         self._active = False
         self.events: list[str] = []
+        self.activate_devices: list[torch.device | None] = []
         self.module = nn.Identity()
         FakeStrategy.instances.append(self)
 
@@ -64,8 +68,9 @@ class FakeStrategy:
     def value(self) -> nn.Module:
         return self.module
 
-    def activate(self) -> None:
+    def activate(self, device: torch.device | str | None = None) -> None:
         self.events.append("activate")
+        self.activate_devices.append(torch.device(device) if device is not None else None)
         if self._activate_raises is not None:
             raise self._activate_raises
         if self._active:
@@ -379,6 +384,93 @@ class TestActiveSet:
         with cache.use("a"):
             pass
         assert cache.snapshot().cached_keys_lru_to_mru == ("b", "c", "a")
+
+
+# ---------------------------------------------------------------------------
+# Acquire-time device selection
+# ---------------------------------------------------------------------------
+
+
+class TestDeviceSelection:
+    def test_use_passes_device_to_activate(self) -> None:
+        cache = ModelCache(200)
+        cache.register(_spec("a", 100))
+
+        with cache.use("a", device="cpu") as m:
+            assert isinstance(m, nn.Module)
+
+        s = FakeStrategy.instances[0]
+        assert s.activate_devices == [torch.device("cpu")]
+
+    def test_reentrant_same_device_allowed(self) -> None:
+        cache = ModelCache(200)
+        cache.register(_spec("a", 100))
+
+        with cache.use("a", device="cpu"):
+            with cache.use("a", device=torch.device("cpu")):
+                pass
+
+        s = FakeStrategy.instances[0]
+        assert s.events.count("activate") == 1
+        assert s.events.count("deactivate") == 1
+
+    def test_reentrant_omitted_device_inherits_active_lease(self) -> None:
+        cache = ModelCache(200)
+        cache.register(_spec("a", 100))
+
+        with cache.use("a", device="cpu"):
+            with cache.use("a"):
+                pass
+
+        s = FakeStrategy.instances[0]
+        assert s.events.count("activate") == 1
+
+    def test_reentrant_different_device_rejected(self) -> None:
+        cache = ModelCache(200)
+        cache.register(_spec("a", 100))
+
+        with cache.use("a", device="cpu"):
+            with pytest.raises(ModelCacheError, match="already active"):
+                with cache.use("a", device="meta"):
+                    pass
+
+        s = FakeStrategy.instances[0]
+        assert s.events.count("activate") == 1
+        assert s.events.count("deactivate") == 1
+
+    def test_reentrant_device_after_unspecified_activation_rejected(self) -> None:
+        cache = ModelCache(200)
+        cache.register(_spec("a", 100))
+
+        with cache.use("a"):
+            with pytest.raises(ModelCacheError, match="without a cache-visible device"):
+                with cache.use("a", device="cpu"):
+                    pass
+
+    def test_inactive_entry_can_reactivate_on_different_device(self) -> None:
+        cache = ModelCache(200)
+        cache.register(_spec("a", 100))
+
+        with cache.use("a", device="cpu"):
+            pass
+        with cache.use("a", device="meta"):
+            pass
+
+        s = FakeStrategy.instances[0]
+        assert s.activate_devices == [torch.device("cpu"), torch.device("meta")]
+
+    @CUDA
+    def test_reentrant_bare_cuda_matches_current_indexed_cuda(self) -> None:
+        cache = ModelCache(200)
+        cache.register(_spec("a", 100))
+        expected = torch.device("cuda", torch.cuda.current_device())
+
+        with cache.use("a", device="cuda"):
+            with cache.use("a", device=expected):
+                pass
+
+        s = FakeStrategy.instances[0]
+        assert s.activate_devices == [expected]
 
 
 # ---------------------------------------------------------------------------

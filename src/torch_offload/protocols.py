@@ -4,12 +4,12 @@ Three Protocols form the contract:
 
 - :class:`ModelStrategyComponent` — pure lifecycle. A piece composable
   inside a top-level strategy (see :class:`ModelOffloader`).
-  Just ``cache_bytes`` + ``activate()`` + ``deactivate()``. Components
-  don't expose a value because their parent composite owns it.
+  Just ``cache_bytes`` + ``activate(device=...)`` + ``deactivate()``.
+  Components don't expose a value because their parent composite owns it.
 
 - :class:`CachedResource` — generic top-level cache contract.
-  Extends the component lifecycle with a typed :attr:`value` accessor
-  and context-manager methods. This is what
+  Extends the component lifecycle with a typed :attr:`value` accessor.
+  This is what
   :class:`~torch_offload.model_cache.ModelCache` registers and
   manages.  ``T`` is the type yielded by :meth:`~ModelCache.use`.
 
@@ -33,13 +33,14 @@ Lifecycle
 ``__init__`` sets up backing storage (pinning, etc.) so
 ``cache_bytes`` is final immediately and a top-level resource is ready
 for :class:`~torch_offload.model_cache.ModelCache` admission →
-``activate()`` (make resource usable) → ``deactivate()`` (release
-transient compute resources, keep ``cache_bytes`` resident).
+``activate(device=...)`` (make resource usable, on the caller-selected
+device when the resource has device placement) → ``deactivate()``
+(release transient compute resources, keep ``cache_bytes`` resident).
 
 ``activate()/deactivate()`` may be repeated as many times as you
-want. Top-level resources are also context managers:
-``with resource as value: ...`` is equivalent to ``activate()`` then
-yielding ``resource.value``.
+want. Device-aware package strategies provide ``use(device)`` for
+direct exception-safe use, while :class:`ModelCache` passes the
+acquire-time device into ``activate``.
 
 There is no ``close()``. To release ``cache_bytes`` (typically
 pinned host memory), drop the resource reference. Python's refcount-based
@@ -50,9 +51,9 @@ own; ownership of the user's model is the user's concern.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from types import TracebackType
 from typing import Literal, Protocol, TypeVar, runtime_checkable
 
+import torch
 from torch import nn
 
 
@@ -87,7 +88,7 @@ class ModelStrategyComponent(Protocol):
 
     Components don't expose a model — their parent composite owns
     that. They just contribute to the lifecycle: report cache budget,
-    activate, deactivate. The composite calls ``activate()`` /
+    activate, deactivate. The composite calls ``activate(device)`` /
     ``deactivate()`` on each component in order; return values are
     ignored.
 
@@ -108,13 +109,15 @@ class ModelStrategyComponent(Protocol):
         """
         ...
 
-    def activate(self) -> None:
+    def activate(self, device: torch.device | str | None = None) -> None:
         """Make this piece's contribution ready for compute.
 
         Implementations may move weights to GPU, allocate a slot pool,
         register forward hooks, install an mmap, or do nothing for
         always-resident pieces. Not necessarily re-entrant — call
-        :meth:`deactivate` before activating again.
+        :meth:`deactivate` before activating again. ``device`` lets a
+        top-level cache choose placement at acquire time; resources that
+        require placement should raise when it is omitted.
         """
         ...
 
@@ -139,9 +142,8 @@ class CachedResource(Protocol[T_co]):
     """Top-level cache-managed resource.
 
     Extends the component lifecycle with a typed :attr:`value`
-    accessor and context-manager methods.  This is the plug-in
-    contract that :class:`~torch_offload.model_cache.ModelCache`
-    consumes.
+    accessor.  This is the plug-in contract that
+    :class:`~torch_offload.model_cache.ModelCache` consumes.
 
     ``T`` is the type yielded by :meth:`~ModelCache.use`:
     ``nn.Module`` for model strategies, ``LoRA`` for standalone
@@ -162,27 +164,18 @@ class CachedResource(Protocol[T_co]):
         """
         ...
 
-    def activate(self) -> None:
-        """Make the resource ready for compute."""
+    def activate(self, device: torch.device | str | None = None) -> None:
+        """Make the resource ready for compute.
+
+        ``device`` is optional at the protocol boundary so device-neutral
+        resources can ignore it. Device-aware resources should require an
+        explicit placement and raise when it is omitted.
+        """
         ...
 
     def deactivate(self) -> None:
         """Undo :meth:`activate`.  ``cache_bytes`` remains held."""
         ...
-
-    def __enter__(self) -> T_co:
-        """Calls :meth:`activate`, returns :attr:`value`."""
-        ...
-
-    def __exit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        tb: TracebackType | None,
-    ) -> bool | None:
-        """Equivalent to :meth:`deactivate`."""
-        ...
-
 
 @runtime_checkable
 class ModelStrategy(CachedResource[nn.Module], Protocol):

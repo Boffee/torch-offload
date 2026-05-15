@@ -26,14 +26,14 @@ def _make_simple_model() -> nn.Module:
 
 class TestModelStrategyConformance:
     def test_isinstance_runtime_check(self) -> None:
-        pw = PinnedWeights(_make_simple_model(), torch.device("cpu"))
+        pw = PinnedWeights(_make_simple_model())
         try:
             assert isinstance(pw, ModelStrategy)
         finally:
             pw.deactivate()
 
     def test_has_lifecycle_methods(self) -> None:
-        pw = PinnedWeights(_make_simple_model(), torch.device("cpu"))
+        pw = PinnedWeights(_make_simple_model())
         try:
             assert callable(pw.activate)
             assert callable(pw.deactivate)
@@ -52,9 +52,9 @@ class TestLifecycle:
     @CUDA
     def test_activate_returns_model_on_gpu(self) -> None:
         m = _make_simple_model()
-        pw = PinnedWeights(m, torch.device("cuda"))
+        pw = PinnedWeights(m)
         try:
-            pw.activate()
+            pw.activate("cuda")
             assert pw.model is m
             for p in m.parameters():
                 assert p.is_cuda
@@ -67,9 +67,9 @@ class TestLifecycle:
 
     def test_context_manager_protocol(self) -> None:
         m = _make_simple_model()
-        pw = PinnedWeights(m, torch.device("cpu"))
+        pw = PinnedWeights(m)
         try:
-            with pw as model:
+            with pw.use("cpu") as model:
                 assert model is m
             for p in m.parameters():
                 assert p.is_pinned()
@@ -77,7 +77,7 @@ class TestLifecycle:
             pw.deactivate()
 
     def test_deactivate_when_not_active_is_noop(self) -> None:
-        pw = PinnedWeights(_make_simple_model(), torch.device("cpu"))
+        pw = PinnedWeights(_make_simple_model())
         try:
             pw.deactivate()
             pw.deactivate()
@@ -85,11 +85,30 @@ class TestLifecycle:
             pw.deactivate()
 
     def test_repeated_activate_deactivate_cycle(self) -> None:
-        pw = PinnedWeights(_make_simple_model(), torch.device("cpu"))
+        pw = PinnedWeights(_make_simple_model())
         try:
             for _ in range(3):
-                with pw:
+                with pw.use("cpu"):
                     pass
+        finally:
+            pw.deactivate()
+
+    def test_activate_accepts_device_without_constructor_default(self) -> None:
+        m = _make_simple_model()
+        pw = PinnedWeights(m)
+        try:
+            pw.activate(device="cpu")
+            for p in m.parameters():
+                assert p.device == torch.device("cpu")
+            pw.deactivate()
+        finally:
+            pw.deactivate()
+
+    def test_activate_without_any_device_raises(self) -> None:
+        pw = PinnedWeights(_make_simple_model())
+        try:
+            with pytest.raises(ValueError, match="requires a device"):
+                pw.activate()
         finally:
             pw.deactivate()
 
@@ -109,7 +128,7 @@ class TestCleanup:
         import weakref
 
         m = _make_simple_model()
-        pw = PinnedWeights(m, torch.device("cpu"))
+        pw = PinnedWeights(m)
         first_parent, first_leaf = pw._slots[0][1][0]
         slot_param_ref = weakref.ref(first_parent._parameters[first_leaf])
         pw.deactivate()
@@ -132,7 +151,7 @@ class TestConstruction:
         # silently freeze.
         m = nn.Linear(4, 4)  # default requires_grad=True, no buffers
         with pytest.raises(ValueError, match="cannot manage trainable slot"):
-            PinnedWeights(m, torch.device("cpu"))
+            PinnedWeights(m)
 
     def test_rejects_empty_model(self) -> None:
         # Frozen but with no params or buffers — nothing to manage.
@@ -140,7 +159,7 @@ class TestConstruction:
             pass
         m = Empty()
         with pytest.raises(ValueError, match="at least one frozen parameter"):
-            PinnedWeights(m, torch.device("cpu"))
+            PinnedWeights(m)
 
     def test_accepts_buffer_only_module(self) -> None:
         # A module with only registered buffers (no frozen params) is a
@@ -153,7 +172,7 @@ class TestConstruction:
                 self.register_buffer("table", torch.randn(8, 4))
 
         m = BufferOnly()
-        pw = PinnedWeights(m, torch.device("cpu"))
+        pw = PinnedWeights(m)
         try:
             assert pw.cache_bytes == 8 * 4 * 4  # float32
             assert m.table.is_pinned()
@@ -196,7 +215,7 @@ class TestTiedWeightDedup:
 
     def test_same_parameter_under_two_names_dedupes(self) -> None:
         m, embed, head = self._make_tied_model()
-        pw = PinnedWeights(m, torch.device("cpu"))
+        pw = PinnedWeights(m)
         try:
             # Exactly one unique pinned buffer for the tied weight.
             assert len(pw._slots) == 1
@@ -213,7 +232,7 @@ class TestTiedWeightDedup:
 
     def test_distinct_params_sharing_storage_dedupe(self) -> None:
         m, _, _ = self._make_distinct_param_tied_model()
-        pw = PinnedWeights(m, torch.device("cpu"))
+        pw = PinnedWeights(m)
         try:
             assert len(pw._slots) == 1
             _, locs = pw._slots[0]
@@ -229,7 +248,7 @@ class TestTiedWeightDedup:
         m.a = p
         m.b = p
 
-        pw = PinnedWeights(m, torch.device("cpu"))
+        pw = PinnedWeights(m)
         try:
             assert len(pw._slots) == 1
             assert m._parameters["a"] is m._parameters["b"]
@@ -238,7 +257,7 @@ class TestTiedWeightDedup:
 
     def test_cache_bytes_counts_tied_once(self) -> None:
         m, _, _ = self._make_tied_model()
-        pw = PinnedWeights(m, torch.device("cpu"))
+        pw = PinnedWeights(m)
         try:
             # 32 * 16 * 4 (float32 default) = 2048 bytes for one buffer.
             # If the dedup were broken this would double.
@@ -249,9 +268,9 @@ class TestTiedWeightDedup:
     @CUDA
     def test_tied_params_share_gpu_storage_on_activate(self) -> None:
         m, embed, head = self._make_tied_model()
-        pw = PinnedWeights(m, torch.device("cuda"))
+        pw = PinnedWeights(m)
         try:
-            with pw:
+            with pw.use("cuda"):
                 assert embed.weight.is_cuda
                 assert head.weight.is_cuda
                 assert embed.weight.data.data_ptr() == head.weight.data.data_ptr()
@@ -263,9 +282,9 @@ class TestTiedWeightDedup:
     @CUDA
     def test_distinct_tied_params_share_gpu_storage_on_activate(self) -> None:
         m, a, b = self._make_distinct_param_tied_model()
-        pw = PinnedWeights(m, torch.device("cuda"))
+        pw = PinnedWeights(m)
         try:
-            with pw:
+            with pw.use("cuda"):
                 # Slot identity comparison; the local `a` / `b` refs are
                 # the now-orphaned originals (replaced in module slots).
                 assert m._parameters["a"].is_cuda
@@ -293,7 +312,7 @@ class TestSharedSubmoduleAlias:
         m = nn.Module()
         m.a = shared
         m.b = shared
-        pw = PinnedWeights(m, torch.device("cpu"))
+        pw = PinnedWeights(m)
         try:
             # One pinned buffer (same Parameter via aliased module).
             assert len(pw._slots) == 1
@@ -320,7 +339,7 @@ class TestSharedSubmoduleAlias:
         m = nn.Module()
         m.a = Inner(shared_buf)
         m.b = Inner(shared_buf)
-        pw = PinnedWeights(m, torch.device("cpu"))
+        pw = PinnedWeights(m)
         try:
             # One pinned buffer covers both alias paths.
             assert len(pw._buffer_slots) == 1
@@ -345,7 +364,7 @@ class TestSharedSubmoduleAlias:
         m = nn.Module()
         m.a = Inner(shared_buf)
         m.b = Inner(shared_buf)
-        pw = PinnedWeights(m, torch.device("cpu"))
+        pw = PinnedWeights(m)
         try:
             assert len(pw._buffer_slots) == 1
             pinned, _locs = pw._buffer_slots[0]
@@ -370,7 +389,7 @@ class TestMixedTrainableFrozenTied:
         m.a = a
         m.b = b
         with pytest.raises(ValueError, match="cannot manage trainable slot"):
-            PinnedWeights(m, torch.device("cpu"))
+            PinnedWeights(m)
 
 
 class TestZeroSizedParams:
@@ -383,7 +402,7 @@ class TestZeroSizedParams:
         # Need at least one non-empty frozen param so the constructor doesn't
         # reject the model. The empties should each be their own slot.
         m.c = nn.Parameter(torch.randn(4), requires_grad=False)
-        pw = PinnedWeights(m, torch.device("cpu"))
+        pw = PinnedWeights(m)
         try:
             # 3 slots: a, b, c — empties did not collapse.
             assert len(pw._slots) == 3
@@ -422,7 +441,7 @@ class TestQuanto:
         # Verify the model now references pinned _data storage.
         m = self._make_quanto_model()
         original_data_ptr = m.weight._data.data_ptr()
-        pw = PinnedWeights(m, torch.device("cpu"))
+        pw = PinnedWeights(m)
         try:
             # Inner _data must now point at pinned storage, not the original.
             assert m.weight._data.data_ptr() != original_data_ptr
@@ -434,9 +453,9 @@ class TestQuanto:
     @CUDA
     def test_quanto_activate_moves_inner_to_cuda(self) -> None:
         m = self._make_quanto_model()
-        pw = PinnedWeights(m, torch.device("cuda"))
+        pw = PinnedWeights(m)
         try:
-            with pw:
+            with pw.use("cuda"):
                 assert m.weight._data.is_cuda
                 assert m.weight._scale.is_cuda
             # Back to pinned after deactivate
@@ -450,7 +469,7 @@ class TestQuanto:
         # parameter still references its pinned-CPU storage. Pinned
         # memory is freed when the caller drops the model reference.
         m = self._make_quanto_model()
-        pw = PinnedWeights(m, torch.device("cpu"))
+        pw = PinnedWeights(m)
         pw.deactivate()
         # Quanto wrapper still on CPU after deactivate.
         assert m.weight._data.is_pinned()
@@ -464,7 +483,7 @@ class TestQuanto:
 
 class TestCacheBytes:
     def test_cache_bytes_positive(self) -> None:
-        pw = PinnedWeights(_make_simple_model(), torch.device("cpu"))
+        pw = PinnedWeights(_make_simple_model())
         try:
             assert pw.cache_bytes > 0
         finally:
@@ -474,11 +493,11 @@ class TestCacheBytes:
         m = nn.Sequential(nn.Linear(4, 4, bias=False), nn.LayerNorm(4))
         for p in m.parameters():
             p.requires_grad = False
-        pw_with = PinnedWeights(m, torch.device("cpu"), include_buffers=True)
+        pw_with = PinnedWeights(m, include_buffers=True)
         with_bytes = pw_with.cache_bytes
 
         m2 = nn.Sequential(nn.Linear(4, 4, bias=False), nn.LayerNorm(4))
         for p in m2.parameters():
             p.requires_grad = False
-        pw_without = PinnedWeights(m2, torch.device("cpu"), include_buffers=False)
+        pw_without = PinnedWeights(m2, include_buffers=False)
         assert pw_without.cache_bytes <= with_bytes

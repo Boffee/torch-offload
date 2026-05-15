@@ -103,8 +103,8 @@ class LoRA:
     def value(self) -> LoRA:
         return self
 
-    def activate(self) -> None:
-        pass
+    def activate(self, device: torch.device | str | None = None) -> None:
+        del device
 
     def deactivate(self) -> None:
         pass
