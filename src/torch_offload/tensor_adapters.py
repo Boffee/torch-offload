@@ -231,12 +231,13 @@ class RegularAdapter:
         return _RegularGpu(data=torch.empty_like(state.data, device=device))
 
     @staticmethod
-    def gpu_param(  # noqa: ARG004
+    def gpu_param(
         pinned: _RegularPinned,
         gpu_state: _RegularGpu,
         *,
         requires_grad: bool = False,
     ) -> nn.Parameter:
+        _ = pinned
         # pinned unused: regular tensors carry no metadata beyond storage.
         # Argument kept for Protocol parity with TensorAdapter — quanto
         # and other structured tensors need it to reconstruct wrappers.

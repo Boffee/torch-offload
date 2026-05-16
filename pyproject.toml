@@ -52,6 +52,28 @@ ignore = [
     "N812",
 ]
 
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = [
+    # Tests intentionally use local helpers, optional imports guarded by
+    # importorskip(), and assertion-oriented context-manager structure.
+    "ANN",
+    "ARG",
+    "B007",
+    "ERA001",
+    "F841",
+    "I001",
+    "PLC0415",
+    "PT001",
+    "PT012",
+    "PT018",
+    "RUF003",
+    "RUF012",
+    "RUF043",
+    "RUF059",
+    "SIM108",
+    "SIM117",
+]
+
 [tool.ruff.lint.pylint]
 max-args = 10
 

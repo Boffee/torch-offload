@@ -422,7 +422,7 @@ class TestSetLorasValidation:
         # must reject subclassed wrappers in merge mode regardless of
         # the advertised dtype.
         quanto = pytest.importorskip("optimum.quanto")
-        from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor  # noqa: PLC0415
+        from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
 
         m = _make_bf16_model()
         rows = cols = 16
@@ -1135,7 +1135,7 @@ class TestRoutedFactorDtype:
         # That means `weight.dtype` already reports the compute dtype —
         # no special-casing needed for routed mode.
         quanto = pytest.importorskip("optimum.quanto")
-        from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor  # noqa: PLC0415
+        from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
 
         rows, cols = 4, 8
         data = torch.randint(-128, 127, (rows, cols), dtype=torch.int8)
