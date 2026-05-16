@@ -44,7 +44,7 @@ import functools
 import logging
 import weakref
 from collections import OrderedDict
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import cast
 
@@ -52,7 +52,7 @@ import torch
 from torch import nn
 
 from ._devices import canonical_device
-from .pinned_buffer import PinnedParamBuffer, PostCopyHooks
+from .pinned_buffer import PinnedParamBuffer, PostCopyHook, PostCopyHookHandle
 from .protocols import SlotOwnership
 from .slots import iter_buffer_slots, iter_param_slots
 from .tensor_adapters import RegularAdapter
@@ -134,7 +134,7 @@ class _GpuSlot:
     def copy_from(
         self,
         bufs: list[PinnedParamBuffer],
-        post_copy_hooks: PostCopyHooks | None = None,
+        post_copy_hooks: Mapping[int, PostCopyHook] | None = None,
         *,
         non_blocking: bool = False,
     ) -> None:
@@ -415,7 +415,7 @@ class _BlockPinnedStore:
         self._pool: _GpuSlotPool | None = None
         self._block_to_slot: dict[int, int] = {}
         self._pool_config: tuple[int, torch.device] | None = None
-        self._post_copy_hooks: PostCopyHooks | None = None
+        self._post_copy_hooks: dict[int, PostCopyHook] = {}
 
     @property
     def slot_filter(self) -> frozenset[SlotOwnership]:
@@ -497,8 +497,20 @@ class _BlockPinnedStore:
         self._block_to_slot.clear()
         self._pool_config = None
 
-    def set_post_copy_hooks(self, hooks: PostCopyHooks | None) -> None:
-        self._post_copy_hooks = hooks
+    def register_post_copy_hook(
+        self, buf: PinnedParamBuffer, hook: PostCopyHook,
+    ) -> PostCopyHookHandle:
+        if not any(owned is buf for block in self._param_bufs for owned in block):
+            raise ValueError(
+                f"buffer {buf.name!r} is not owned by this StreamedWeights store"
+            )
+        key = id(buf)
+        if key in self._post_copy_hooks:
+            raise RuntimeError(
+                f"post-copy hook already registered for buffer {buf.name!r}"
+            )
+        self._post_copy_hooks[key] = hook
+        return PostCopyHookHandle(self._post_copy_hooks, key)
 
     def load_block(
         self,
@@ -898,15 +910,17 @@ class StreamedWeights:
     def has_trainables(self) -> bool:
         return self._store is not None and self._store.has_trainables()
 
-    def set_post_copy_hooks(self, hooks: PostCopyHooks | None) -> None:
-        """Install activation-scoped hooks run after CPU->GPU weight copies.
+    def register_post_copy_hook(
+        self, buf: PinnedParamBuffer, hook: PostCopyHook,
+    ) -> PostCopyHookHandle:
+        """Register a hook run after this component copies ``buf`` to GPU.
 
         Package-internal: used by :class:`ModelOffloader` for merge-mode
-        LoRA. Hooks are keyed by ``id(PinnedParamBuffer)`` and are not a
-        public extension API.
+        LoRA. Mirrors PyTorch's hook registration pattern by returning a
+        handle whose :meth:`remove` method unregisters the hook.
         """
         assert self._store is not None
-        self._store.set_post_copy_hooks(hooks)
+        return self._store.register_post_copy_hook(buf, hook)
 
     def _resolve_device(self, device: torch.device | str | None) -> torch.device:
         if device is not None:

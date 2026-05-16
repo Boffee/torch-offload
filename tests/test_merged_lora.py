@@ -10,8 +10,6 @@ CUDA-only tests gate on availability.
 
 from __future__ import annotations
 
-import contextlib
-
 import pytest
 import torch
 import torch.nn.functional as F
@@ -21,7 +19,9 @@ from torch_offload import (
     LoRA,
     ModelCache,
     ModelOffloader,
+    PinnedWeights,
     ResourceSpec,
+    StreamedWeights,
     merge_lora,
 )
 from torch_offload.lora import KeyTransformT
@@ -195,8 +195,15 @@ def _make_strategy(
 def _has_post_copy_hook(strategy: ModelOffloader, target_key: str) -> bool:
     """Check whether a merge hook is installed for the given target."""
     buf = strategy._target_to_buffer.get(target_key)
-    hooks = strategy._post_copy_hooks
-    return buf is not None and hooks is not None and id(buf) in hooks
+    component = strategy._target_to_component.get(target_key)
+    if buf is None or component is None:
+        return False
+    if isinstance(component, PinnedWeights):
+        return id(buf) in component._post_copy_hooks
+    if isinstance(component, StreamedWeights):
+        assert component._store is not None
+        return id(buf) in component._store._post_copy_hooks
+    return False
 
 
 def _activate_loras_for_test(
@@ -204,12 +211,13 @@ def _activate_loras_for_test(
 ) -> int:
     targets = strategy._group_loras_by_target(strategy._loras)
     if strategy._lora_mode == "merge":
-        strategy._activate_merge_loras(torch.device("cuda"), targets)
+        strategy._register_lora_hooks(torch.device("cuda"), targets)
         return len(targets)
-
-    with contextlib.ExitStack() as stack:
-        strategy._activate_routed_loras(torch.device("cpu"), targets, stack)
-        return len(targets)
+    try:
+        strategy._register_lora_hooks(torch.device("cpu"), targets)
+    finally:
+        strategy._clear_active_lora_hooks()
+    return len(targets)
 
 
 # ---------------------------------------------------------------------------

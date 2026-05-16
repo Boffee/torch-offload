@@ -14,14 +14,14 @@ from __future__ import annotations
 import contextlib
 import logging
 from collections.abc import Callable, Iterator, Sequence
-from typing import Literal
+from typing import Literal, Protocol
 
 import torch
 from torch import nn
 
 from ._devices import canonical_device
 from .lora import _ADDMM_DTYPES, LoRA, LoRARouteHandle, LoRATransform
-from .pinned_buffer import PinnedParamBuffer, PostCopyHooks, storage_key
+from .pinned_buffer import PinnedParamBuffer, storage_key
 from .pinned_weights import PinnedWeights
 from .protocols import ModelStrategyComponent, SlotOwnership
 from .slots import canonical_param_name, iter_buffer_slots, iter_param_slots, walk_attr_path
@@ -33,6 +33,11 @@ logger = logging.getLogger(__name__)
 LoraMode = Literal["merge", "routed"]
 _LoraFactorRef = tuple[torch.Tensor, torch.Tensor, float]
 _LoraTargetMap = dict[str, list[_LoraFactorRef]]
+
+
+class _RemovableHook(Protocol):
+    def remove(self) -> None:
+        ...
 
 
 __all__ = [
@@ -299,10 +304,12 @@ class ModelOffloader:
         self._streamers = streamers
         self._teardown_stack: contextlib.ExitStack | None = None
 
-        self._target_to_buffer, self._target_to_parents = self._build_target_index(
-            streamers, layer_paths, non_block,
-        )
-        self._post_copy_hooks: dict[int, Callable[[torch.Tensor], None]] | None = None
+        (
+            self._target_to_buffer,
+            self._target_to_parents,
+            self._target_to_component,
+        ) = self._build_target_index(streamers, layer_paths, non_block)
+        self._lora_hook_handles: list[_RemovableHook] = []
         self._block_groups: list[list[nn.Module]] = block_groups
         self._warned_about_checkpointing: bool = False
         self._stream_trainable_weights: bool = stream_trainable_weights
@@ -419,9 +426,22 @@ class ModelOffloader:
 
         return per_target
 
-    def _activate_merge_loras(
+    def _register_lora_hooks(
         self, active_device: torch.device, targets: _LoraTargetMap,
-    ) -> PostCopyHooks:
+    ) -> None:
+        self._clear_active_lora_hooks()
+        try:
+            if self._lora_mode == "merge":
+                self._register_merge_lora_hooks(active_device, targets)
+            else:
+                self._register_routed_lora_hooks(active_device, targets)
+        except BaseException:
+            self._clear_active_lora_hooks()
+            raise
+
+    def _register_merge_lora_hooks(
+        self, active_device: torch.device, targets: _LoraTargetMap,
+    ) -> None:
         if active_device.type != "cuda":
             raise ValueError(
                 "ModelOffloader merge mode requires CUDA activation; "
@@ -458,19 +478,18 @@ class ModelOffloader:
                     f"PEFT routed mode) for non-float bases."
                 )
 
-        self._clear_post_copy_hooks()
-        hooks: dict[int, Callable[[torch.Tensor], None]] = {}
         for target_key, refs in targets.items():
             buf = self._target_to_buffer[target_key]
-            hooks[id(buf)] = LoRATransform(refs).apply
-        self._post_copy_hooks = hooks
-        return hooks
+            component = self._target_to_component[target_key]
+            handle = component.register_post_copy_hook(
+                buf, LoRATransform(refs).apply,
+            )
+            self._lora_hook_handles.append(handle)
 
-    def _activate_routed_loras(
+    def _register_routed_lora_hooks(
         self,
         active_device: torch.device,
         targets: _LoraTargetMap,
-        stack: contextlib.ExitStack,
     ) -> None:
         for target_key, refs in targets.items():
             parents = self._target_to_parents[target_key]
@@ -498,13 +517,14 @@ class ModelOffloader:
                 parent, refs, active_device,
                 dtype=_routed_factor_dtype(parent),
             )
-            stack.callback(handle.remove)
+            self._lora_hook_handles.append(handle)
 
-    def _clear_post_copy_hooks(self) -> None:
-        self._post_copy_hooks = None
+    def _clear_active_lora_hooks(self) -> None:
+        while self._lora_hook_handles:
+            self._lora_hook_handles.pop().remove()
 
     def _clear_loras(self) -> None:
-        self._clear_post_copy_hooks()
+        self._clear_active_lora_hooks()
         self._loras = []
         self._lora_mode = "merge"
 
@@ -550,36 +570,18 @@ class ModelOffloader:
         self._active_device = active_device
         try:
             with contextlib.ExitStack() as stack:
-                post_copy_hooks: PostCopyHooks | None = None
                 targets = (
                     self._group_loras_by_target(self._loras)
                     if self._loras
                     else None
                 )
-                if targets is not None and self._lora_mode == "merge":
-                    post_copy_hooks = self._activate_merge_loras(active_device, targets)
-                    stack.callback(self._clear_post_copy_hooks)
+                if targets is not None:
+                    self._register_lora_hooks(active_device, targets)
 
                 for component in self._components:
-                    if post_copy_hooks is not None and isinstance(
-                        component, (PinnedWeights, StreamedWeights),
-                    ):
-                        component.set_post_copy_hooks(post_copy_hooks)
-                        stack.callback(component.set_post_copy_hooks, None)
                     stack.callback(component.deactivate)
                     component.activate(active_device)
 
-                # Install routed-mode hooks AFTER components activate
-                # so the LIFO ExitStack unwinds them FIRST on
-                # deactivate — routes come down before component
-                # teardown, which means the hook is gone by the time
-                # streamers reset slot Parameters. Cast factors to the
-                # parent's compute dtype (see _routed_factor_dtype) —
-                # LoRA state-dicts are typically fp32 and the base may
-                # be bf16, fp16, or quantized; the hook math needs
-                # factors in the same dtype the layer outputs.
-                if targets is not None and self._lora_mode == "routed":
-                    self._activate_routed_loras(active_device, targets, stack)
                 self._teardown_stack = stack.pop_all()
         except BaseException:
             self._clear_loras()
@@ -590,6 +592,7 @@ class ModelOffloader:
         stack = self._teardown_stack
         self._teardown_stack = None
         try:
+            self._clear_active_lora_hooks()
             if stack is not None:
                 stack.close()
         finally:
@@ -792,13 +795,17 @@ class ModelOffloader:
         streamers: list[StreamedWeights],
         layer_paths: list[str],
         non_block: PinnedWeights | None,
-    ) -> tuple[dict[str, PinnedParamBuffer], dict[str, tuple[nn.Module, ...]]]:
+    ) -> tuple[
+        dict[str, PinnedParamBuffer],
+        dict[str, tuple[nn.Module, ...]],
+        dict[str, PinnedWeights | StreamedWeights],
+    ]:
         """Map canonical param names to their :class:`PinnedParamBuffer`
         and to the tuple of parent modules where the param is installed.
 
-        Two explicit target dicts: the buffer map drives merge-mode
-        LoRA post-copy hooks, and the parents map drives routed-mode
-        LoRA forward hooks.
+        The buffer map drives merge-mode LoRA post-copy hooks, the
+        component map identifies which component owns the copy loop,
+        and the parents map drives routed-mode LoRA forward hooks.
 
         Keys are normalized to strip PEFT's ``.base_layer.`` segments
         so that LoRA state-dict keys (which use the original model
@@ -816,6 +823,7 @@ class ModelOffloader:
         """
         bufs: dict[str, PinnedParamBuffer] = {}
         parents: dict[str, tuple[nn.Module, ...]] = {}
+        components: dict[str, PinnedWeights | StreamedWeights] = {}
 
         for streamer, layer_path in zip(streamers, layer_paths, strict=True):
             block_bufs_per = streamer.param_bufs_per_block
@@ -838,6 +846,7 @@ class ModelOffloader:
                         key = canonical_param_name(full_name)
                         bufs[key] = buf
                         parents[key] = parent_tuple
+                        components[key] = streamer
 
         if non_block is not None:
             for buf, aliases in non_block.param_aliases:
@@ -856,8 +865,9 @@ class ModelOffloader:
                     key = canonical_param_name(name)
                     bufs[key] = buf
                     parents[key] = parent_tuple
+                    components[key] = non_block
 
-        return bufs, parents
+        return bufs, parents, components
 
 
 # ---------------------------------------------------------------------------

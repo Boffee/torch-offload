@@ -15,7 +15,7 @@ plus the pinned-host state that adapter produced.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, MutableMapping
 from typing import Any
 
 import torch
@@ -28,7 +28,25 @@ from . import (
 from .tensor_adapters import TensorAdapter, select_adapter
 
 PostCopyHook = Callable[[torch.Tensor], None]
-PostCopyHooks = Mapping[int, PostCopyHook]
+
+
+class PostCopyHookHandle:
+    """Removal handle returned by post-copy hook registration."""
+
+    __slots__ = ("_hooks", "_key")
+
+    def __init__(
+        self, hooks: MutableMapping[int, PostCopyHook], key: int,
+    ) -> None:
+        self._hooks: MutableMapping[int, PostCopyHook] | None = hooks
+        self._key = key
+
+    def remove(self) -> None:
+        hooks = self._hooks
+        if hooks is None:
+            return
+        hooks.pop(self._key, None)
+        self._hooks = None
 
 
 def storage_key(t: torch.Tensor) -> tuple[Any, ...]:

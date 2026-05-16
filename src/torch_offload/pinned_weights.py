@@ -66,7 +66,12 @@ import torch
 from torch import nn
 
 from ._devices import canonical_device
-from .pinned_buffer import PinnedParamBuffer, PostCopyHooks, storage_key
+from .pinned_buffer import (
+    PinnedParamBuffer,
+    PostCopyHook,
+    PostCopyHookHandle,
+    storage_key,
+)
 from .protocols import SlotOwnership
 from .slots import BufferSlot, ParamSlot, assert_frozen, iter_buffer_slots, iter_param_slots
 
@@ -137,7 +142,7 @@ class PinnedWeights:
         self._include_buffers = include_buffers
         self._skip_slots: set[SlotOwnership] = skip_slots or set()
         self._active_device: torch.device | None = None
-        self._post_copy_hooks: PostCopyHooks | None = None
+        self._post_copy_hooks: dict[int, PostCopyHook] = {}
 
         # Auto-move to CPU so pin_memory() succeeds. Matches the
         # behavior of ModelOffloader — caller doesn't need to
@@ -306,14 +311,26 @@ class PinnedWeights:
     def value(self) -> nn.Module:
         return self.model
 
-    def set_post_copy_hooks(self, hooks: PostCopyHooks | None) -> None:
-        """Install activation-scoped hooks run after CPU->GPU weight copies.
+    def register_post_copy_hook(
+        self, buf: PinnedParamBuffer, hook: PostCopyHook,
+    ) -> PostCopyHookHandle:
+        """Register a hook run after this component copies ``buf`` to GPU.
 
         Package-internal: used by :class:`ModelOffloader` for merge-mode
-        LoRA. Hooks are keyed by ``id(PinnedParamBuffer)`` and are not a
-        public extension API.
+        LoRA. Mirrors PyTorch's hook registration pattern by returning a
+        handle whose :meth:`remove` method unregisters the hook.
         """
-        self._post_copy_hooks = hooks
+        if not any(owned is buf for owned, _locs in self._slots):
+            raise ValueError(
+                f"buffer {buf.name!r} is not owned by this PinnedWeights"
+            )
+        key = id(buf)
+        if key in self._post_copy_hooks:
+            raise RuntimeError(
+                f"post-copy hook already registered for buffer {buf.name!r}"
+            )
+        self._post_copy_hooks[key] = hook
+        return PostCopyHookHandle(self._post_copy_hooks, key)
 
     def activate(self, device: torch.device | str | None = None) -> None:
         """Activate the wrapped model on ``device``.
@@ -394,11 +411,7 @@ class PinnedWeights:
         # survives on device.
         for buf, locs in self._slots:
             gpu_param = buf.load_to_gpu(device, non_blocking=True)
-            hook = (
-                self._post_copy_hooks.get(id(buf))
-                if self._post_copy_hooks is not None
-                else None
-            )
+            hook = self._post_copy_hooks.get(id(buf))
             if hook is not None:
                 hook(gpu_param.data)
             for parent, leaf in locs:
