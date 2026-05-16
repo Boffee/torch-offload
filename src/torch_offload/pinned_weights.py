@@ -66,7 +66,7 @@ import torch
 from torch import nn
 
 from ._devices import canonical_device
-from .pinned_buffer import PinnedParamBuffer, storage_key
+from .pinned_buffer import PinnedParamBuffer, PostCopyHooks, storage_key
 from .protocols import SlotOwnership
 from .slots import BufferSlot, ParamSlot, assert_frozen, iter_buffer_slots, iter_param_slots
 
@@ -137,6 +137,7 @@ class PinnedWeights:
         self._include_buffers = include_buffers
         self._skip_slots: set[SlotOwnership] = skip_slots or set()
         self._active_device: torch.device | None = None
+        self._post_copy_hooks: PostCopyHooks | None = None
 
         # Auto-move to CPU so pin_memory() succeeds. Matches the
         # behavior of ModelOffloader — caller doesn't need to
@@ -270,8 +271,8 @@ class PinnedWeights:
     def slots(self) -> list[ParamSlotGroup]:
         """Per-parameter ``(buffer, locations)`` pairs managed by this instance.
 
-        Used by :class:`~torch_offload.ModelOffloader` to build a
-        reverse index from parameter qualified names to their buffers.
+        Used by :class:`~torch_offload.ModelOffloader` to build its
+        target-name to buffer map.
         """
         return self._slots
 
@@ -304,6 +305,15 @@ class PinnedWeights:
     @property
     def value(self) -> nn.Module:
         return self.model
+
+    def set_post_copy_hooks(self, hooks: PostCopyHooks | None) -> None:
+        """Install activation-scoped hooks run after CPU->GPU weight copies.
+
+        Package-internal: used by :class:`ModelOffloader` for merge-mode
+        LoRA. Hooks are keyed by ``id(PinnedParamBuffer)`` and are not a
+        public extension API.
+        """
+        self._post_copy_hooks = hooks
 
     def activate(self, device: torch.device | str | None = None) -> None:
         """Activate the wrapped model on ``device``.
@@ -371,11 +381,6 @@ class PinnedWeights:
 
     def _move_to_device(self, device: torch.device) -> None:
         if device.type == "cpu":
-            if any(buf.transform is not None for buf, _ in self._slots):
-                raise ValueError(
-                    "PinnedWeights transforms require CUDA activation; "
-                    f"got {device}."
-                )
             self._move_to_pinned()
             return
         if device.type != "cuda":
@@ -389,6 +394,13 @@ class PinnedWeights:
         # survives on device.
         for buf, locs in self._slots:
             gpu_param = buf.load_to_gpu(device, non_blocking=True)
+            hook = (
+                self._post_copy_hooks.get(id(buf))
+                if self._post_copy_hooks is not None
+                else None
+            )
+            if hook is not None:
+                hook(gpu_param.data)
             for parent, leaf in locs:
                 parent._parameters[leaf] = gpu_param
         if self._include_buffers:

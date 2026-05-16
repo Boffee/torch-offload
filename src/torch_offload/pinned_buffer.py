@@ -15,6 +15,7 @@ plus the pinned-host state that adapter produced.
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping
 from typing import Any
 
 import torch
@@ -25,6 +26,9 @@ from . import (
     quanto_adapter,  # noqa: F401 — registration side effect
 )
 from .tensor_adapters import TensorAdapter, select_adapter
+
+PostCopyHook = Callable[[torch.Tensor], None]
+PostCopyHooks = Mapping[int, PostCopyHook]
 
 
 def storage_key(t: torch.Tensor) -> tuple[Any, ...]:
@@ -85,7 +89,7 @@ class PinnedParamBuffer:
 
     __slots__ = (
         "adapter", "cpu_param", "name", "pinned_state",
-        "requires_grad", "transform",
+        "requires_grad",
     )
 
     def __init__(self, name: str, param: nn.Parameter) -> None:
@@ -96,7 +100,6 @@ class PinnedParamBuffer:
         self.cpu_param: nn.Parameter = self.adapter.cpu_param(
             self.pinned_state, requires_grad=self.requires_grad,
         )
-        self.transform: Any = None
         # Low-peak construction optimization: release the original
         # pageable storage by repointing the source Parameter at the
         # pinned clone immediately. This is an intentional mutation of
@@ -148,10 +151,7 @@ class PinnedParamBuffer:
         at pool construction and :meth:`copy_to_gpu` on each load."""
         gpu_state = self.allocate_gpu_storage(device)
         self.copy_to_gpu(gpu_state, non_blocking=non_blocking)
-        gpu_param = self.make_gpu_param(gpu_state)
-        if self.transform is not None:
-            self.transform.apply(gpu_param.data)
-        return gpu_param
+        return self.make_gpu_param(gpu_state)
 
     @property
     def cache_bytes(self) -> int:

@@ -78,9 +78,9 @@ def canonical_param_name(name: str) -> str:
 
     PEFT inserts ``.base_layer.`` into wrapped module paths
     (e.g. ``to_q.base_layer.weight`` instead of ``to_q.weight``).
-    LoRA state dicts always use the original names, so any reverse
-    index keyed off named-parameter walks must store canonical keys
-    for matching to work.
+    LoRA state dicts always use the original names, so target maps
+    built from named-parameter walks must store canonical keys for
+    matching to work.
     """
     return name.replace(".base_layer.", ".")
 

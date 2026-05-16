@@ -52,7 +52,7 @@ import torch
 from torch import nn
 
 from ._devices import canonical_device
-from .pinned_buffer import PinnedParamBuffer
+from .pinned_buffer import PinnedParamBuffer, PostCopyHooks
 from .protocols import SlotOwnership
 from .slots import iter_buffer_slots, iter_param_slots
 from .tensor_adapters import RegularAdapter
@@ -131,11 +131,22 @@ class _GpuSlot:
             self._gpu_states[buf.name] = gpu_state
             self._gpu_params[buf.name] = buf.make_gpu_param(gpu_state)
 
-    def copy_from(self, bufs: list[PinnedParamBuffer], non_blocking: bool = False) -> None:
+    def copy_from(
+        self,
+        bufs: list[PinnedParamBuffer],
+        post_copy_hooks: PostCopyHooks | None = None,
+        *,
+        non_blocking: bool = False,
+    ) -> None:
         for buf in bufs:
             buf.copy_to_gpu(self._gpu_states[buf.name], non_blocking=non_blocking)
-            if buf.transform is not None:
-                buf.transform.apply(self._gpu_params[buf.name].data)
+            hook = (
+                post_copy_hooks.get(id(buf))
+                if post_copy_hooks is not None
+                else None
+            )
+            if hook is not None:
+                hook(self._gpu_params[buf.name].data)
 
     def get_param(self, name: str) -> nn.Parameter:
         return self._gpu_params[name]
@@ -404,6 +415,7 @@ class _BlockPinnedStore:
         self._pool: _GpuSlotPool | None = None
         self._block_to_slot: dict[int, int] = {}
         self._pool_config: tuple[int, torch.device] | None = None
+        self._post_copy_hooks: PostCopyHooks | None = None
 
     @property
     def slot_filter(self) -> frozenset[SlotOwnership]:
@@ -485,6 +497,9 @@ class _BlockPinnedStore:
         self._block_to_slot.clear()
         self._pool_config = None
 
+    def set_post_copy_hooks(self, hooks: PostCopyHooks | None) -> None:
+        self._post_copy_hooks = hooks
+
     def load_block(
         self,
         idx: int,
@@ -498,7 +513,11 @@ class _BlockPinnedStore:
             self._block_to_slot[idx] = slot_id
         self._pool.wait_if_needed(slot_id, stream)
         slot = self._pool.slot(slot_id)
-        slot.copy_from(self._param_bufs[idx], non_blocking=non_blocking)
+        slot.copy_from(
+            self._param_bufs[idx],
+            self._post_copy_hooks,
+            non_blocking=non_blocking,
+        )
 
         for buf, (qual_name, submod, local_name) in zip(
             self._param_bufs[idx], self._param_locs[idx], strict=True,
@@ -514,17 +533,6 @@ class _BlockPinnedStore:
                 submod._parameters[local_name] = slot.get_param(qual_name)
         for mod_buf, _sm, _ln, cpu_clone in self._buf_records[idx]:
             mod_buf.data = cpu_clone.to(self._device, non_blocking=non_blocking)
-
-    def validate_cpu_activation_supported(self) -> None:
-        if any(
-            buf.transform is not None
-            for block_bufs in self._param_bufs
-            for buf in block_bufs
-        ):
-            raise ValueError(
-                "StreamedWeights transforms require CUDA activation; "
-                "got cpu."
-            )
 
     def release_slot(self, idx: int) -> None:
         """Return ``idx``'s pool slot for reuse.
@@ -844,8 +852,8 @@ class StreamedWeights:
     def param_bufs_per_block(self) -> list[list[PinnedParamBuffer]]:
         """Per-block lists of :class:`PinnedParamBuffer` objects.
 
-        Used by :class:`~torch_offload.ModelOffloader` to build a
-        reverse index from parameter qualified names to their buffers.
+        Used by :class:`~torch_offload.ModelOffloader` to build its
+        target-name to buffer map.
 
         .. warning::
            Returned list aliases internal store state. Treat it as
@@ -860,10 +868,8 @@ class StreamedWeights:
         """Per-block lists of ``(qualified_name, parent_module, leaf_name)``.
 
         Parallel structure to :attr:`param_bufs_per_block`. Used by the
-        composer to build a reverse index from parameter names to
-        parent modules — needed by routed-mode LoRA (forward hooks) and
-        any future mechanism that has to act on the layer object rather
-        than the weight buffer.
+        composer to build its target-name to parent-module map, needed
+        by routed-mode LoRA forward hooks.
 
         .. warning::
            Returned list aliases internal store state. Treat it as
@@ -891,6 +897,16 @@ class StreamedWeights:
     @property
     def has_trainables(self) -> bool:
         return self._store is not None and self._store.has_trainables()
+
+    def set_post_copy_hooks(self, hooks: PostCopyHooks | None) -> None:
+        """Install activation-scoped hooks run after CPU->GPU weight copies.
+
+        Package-internal: used by :class:`ModelOffloader` for merge-mode
+        LoRA. Hooks are keyed by ``id(PinnedParamBuffer)`` and are not a
+        public extension API.
+        """
+        assert self._store is not None
+        self._store.set_post_copy_hooks(hooks)
 
     def _resolve_device(self, device: torch.device | str | None) -> torch.device:
         if device is not None:
@@ -977,8 +993,6 @@ class StreamedWeights:
         )
 
     def _activate_cpu_resolved(self) -> None:
-        assert self._store is not None
-        self._store.validate_cpu_activation_supported()
         self._active_device = torch.device("cpu")
 
     def deactivate(self) -> None:

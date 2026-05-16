@@ -192,10 +192,11 @@ def _make_strategy(
     )
 
 
-def _has_transform(strategy: ModelOffloader, target_key: str) -> bool:
-    """Check whether a transform is attached for the given target."""
-    buf = strategy._reverse_index.get(target_key)
-    return buf is not None and buf.transform is not None
+def _has_post_copy_hook(strategy: ModelOffloader, target_key: str) -> bool:
+    """Check whether a merge hook is installed for the given target."""
+    buf = strategy._target_to_buffer.get(target_key)
+    hooks = strategy._post_copy_hooks
+    return buf is not None and hooks is not None and id(buf) in hooks
 
 
 def _activate_loras_for_test(
@@ -295,9 +296,9 @@ class TestSetLorasValidation:
             p.requires_grad = False
         s = _make_strategy(m)
         s.set_loras([(_make_lora(4, 16), 1.0)])
-        assert not _has_transform(s, "transformer_blocks.0.attn.weight")
+        assert not _has_post_copy_hook(s, "transformer_blocks.0.attn.weight")
         _activate_loras_for_test(s)
-        assert _has_transform(s, "transformer_blocks.0.attn.weight")
+        assert _has_post_copy_hook(s, "transformer_blocks.0.attn.weight")
 
     def test_non_block_targets_matched(self) -> None:
         m = _make_bf16_model()
@@ -308,7 +309,7 @@ class TestSetLorasValidation:
         }
         s.set_loras([(LoRA(state_dict=sd), 1.0)])
         _activate_loras_for_test(s)
-        assert _has_transform(s, "embed.weight")
+        assert _has_post_copy_hook(s, "embed.weight")
 
     def test_non_block_tied_alias_target_matched(self) -> None:
         m = _make_tied_non_block_model(dtype=torch.bfloat16)
@@ -319,8 +320,8 @@ class TestSetLorasValidation:
         }
         s.set_loras([(LoRA(state_dict=sd), 1.0)], mode="merge")
         _activate_loras_for_test(s)
-        assert _has_transform(s, "head.weight")
-        assert _has_transform(s, "embed.weight")
+        assert _has_post_copy_hook(s, "head.weight")
+        assert _has_post_copy_hook(s, "embed.weight")
 
     def test_rejects_duplicate_tied_alias_targets(self) -> None:
         m = _make_tied_non_block_model(dtype=torch.bfloat16)
@@ -359,8 +360,8 @@ class TestSetLorasValidation:
         }
         s.set_loras([(LoRA(state_dict=sd), 1.0)], mode="merge")
         _activate_loras_for_test(s)
-        assert _has_transform(s, "transformer_blocks.0.b.weight")
-        assert _has_transform(s, "transformer_blocks.0.a.weight")
+        assert _has_post_copy_hook(s, "transformer_blocks.0.b.weight")
+        assert _has_post_copy_hook(s, "transformer_blocks.0.a.weight")
 
     def test_key_transform_strips_prefix(self) -> None:
         m = _make_bf16_model()
@@ -368,7 +369,7 @@ class TestSetLorasValidation:
         lora = _make_lora(4, 16, prefix="diffusion_model.")
         s.set_loras([(lora, 1.0)])
         _activate_loras_for_test(s)
-        assert _has_transform(s, "transformer_blocks.0.attn.weight")
+        assert _has_post_copy_hook(s, "transformer_blocks.0.attn.weight")
 
     def test_key_transform_none_matches_exact_keys(self) -> None:
         m = _make_bf16_model()
@@ -376,7 +377,7 @@ class TestSetLorasValidation:
         lora = _make_lora(4, 16, key_transform=None)
         s.set_loras([(lora, 1.0)])
         _activate_loras_for_test(s)
-        assert _has_transform(s, "transformer_blocks.0.attn.weight")
+        assert _has_post_copy_hook(s, "transformer_blocks.0.attn.weight")
 
     def test_key_transform_none_skips_prefixed_keys(self) -> None:
         m = _make_bf16_model()
@@ -384,7 +385,7 @@ class TestSetLorasValidation:
         lora = _make_lora(4, 16, prefix="diffusion_model.", key_transform=None)
         s.set_loras([(lora, 1.0)])
         _activate_loras_for_test(s)
-        assert not _has_transform(s, "transformer_blocks.0.attn.weight")
+        assert not _has_post_copy_hook(s, "transformer_blocks.0.attn.weight")
 
     def test_merge_mode_activation_rejects_cpu(self) -> None:
         m = _make_bf16_model()
@@ -405,14 +406,14 @@ class TestSetLorasValidation:
         finally:
             s.deactivate()
 
-    def test_clear_loras_clears_previous_merge_transform(self) -> None:
+    def test_clear_loras_clears_previous_merge_hooks(self) -> None:
         m = _make_bf16_model()
         s = _make_strategy(m)
         s.set_loras([(_make_lora(4, 16, rank=4), 1.0)])
         _activate_loras_for_test(s)
-        assert _has_transform(s, "transformer_blocks.0.attn.weight")
+        assert _has_post_copy_hook(s, "transformer_blocks.0.attn.weight")
         s._clear_loras()
-        assert not _has_transform(s, "transformer_blocks.0.attn.weight")
+        assert not _has_post_copy_hook(s, "transformer_blocks.0.attn.weight")
 
     def test_rejects_quanto_target_in_merge_mode(self) -> None:
         # Regression: quanto WeightQBytesTensor advertises the scale's
@@ -458,7 +459,7 @@ class TestSetLorasValidation:
         s = _make_strategy(m)
         for mode in ("merge", "routed"):
             s.set_loras([(_make_lora(4, 16), 1.0)], mode=mode)
-            assert not _has_transform(s, "transformer_blocks.0.attn.weight")
+            assert not _has_post_copy_hook(s, "transformer_blocks.0.attn.weight")
             assert len(s._loras) == 1
             assert s._lora_mode == mode
 
@@ -476,7 +477,7 @@ class TestSetLorasValidation:
             actual = m(x)
             expected = _expected_routed_output(m, x, loras)
             assert torch.allclose(actual, expected, rtol=1e-5, atol=1e-5)
-            assert not _has_transform(s, "transformer_blocks.0.attn.weight")
+            assert not _has_post_copy_hook(s, "transformer_blocks.0.attn.weight")
         finally:
             s.deactivate()
 
@@ -522,6 +523,44 @@ class TestLifecycle:
         s.activate("cuda")
         s.deactivate()
         assert m.embed.weight.is_pinned()
+
+    @CUDA
+    def test_base_only_reactivation_does_not_reuse_previous_merge_hooks(self) -> None:
+        m = _make_bf16_model(num_blocks=4, dim=16)
+        base_embed = m.embed.weight.detach().clone()
+        base_block = m.transformer_blocks[0].attn.weight.detach().clone()
+
+        sd = _make_lora_sd(num_blocks=4, dim=16, seed=3)
+        g = torch.Generator().manual_seed(303)
+        sd["embed.lora_A.weight"] = torch.randn(
+            4, 16, generator=g, dtype=torch.float32,
+        )
+        sd["embed.lora_B.weight"] = torch.randn(
+            16, 4, generator=g, dtype=torch.float32,
+        )
+        s = _make_strategy(m)
+        s.set_loras([(LoRA(state_dict=sd), 1.0)], mode="merge")
+        s.activate("cuda")
+        s.deactivate()
+
+        s.set_loras([])
+        s.activate("cuda")
+        try:
+            torch.cuda.synchronize()
+            torch.testing.assert_close(
+                m.embed.weight.detach().cpu(),
+                base_embed,
+                rtol=0.0,
+                atol=0.0,
+            )
+            torch.testing.assert_close(
+                m.transformer_blocks[0].attn.weight.detach().cpu(),
+                base_block,
+                rtol=0.0,
+                atol=0.0,
+            )
+        finally:
+            s.deactivate()
 
     @CUDA
     def test_activate_with_no_loras_runs_base_only(self) -> None:

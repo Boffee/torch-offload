@@ -146,9 +146,11 @@ Gradients are not streamed; PyTorch owns `param.grad` normally.
 
 `ModelOffloader` supports optional per-weight LoRA merging via
 `set_loras()`. LoRA requests are applied during activation; merge mode
-attaches transforms on `PinnedParamBuffer` objects and applies them
-automatically after DMA — both block-streamed and non-block weights get
-merged for free.
+installs activation-scoped post-copy hooks for matched targets. Each
+hook runs immediately after the owning component copies the base weight
+from pinned CPU storage to GPU, so both block-streamed and non-block
+weights use the same merge path. `PinnedParamBuffer` remains a storage
+primitive; it does not own LoRA-specific behavior.
 `set_loras()` records the replacement request while the offloader is
 inactive. Target matching and mode-specific compatibility are validated
 during activation, so LoRA application follows the same runtime boundary
@@ -387,14 +389,14 @@ with cache.use(spec, device=device) as vae:  # registers if missing, then uses
             │             │  • N × StreamedWeights              │
             │             │                                     │
             │             │  optional LoRA:                     │
-            │             │  • LoRATransform on PinnedParamBuf  │
+            │             │  • post-copy hooks for merge mode   │
             │             └──────────────────────────┬──────────┘
             │                                        │
             └────────────────────┬───────────────────┘
                                  ▼
                        ┌──────────────────┐
                        │ PinnedParamBuffer│  per-tensor pinned-CPU storage
-                       │  (quanto-aware)  │  + optional LoRA transform
+                       │  (quanto-aware)  │  via tensor adapters
                        └──────────────────┘
 ```
 

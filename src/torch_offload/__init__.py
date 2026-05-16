@@ -51,10 +51,11 @@ drop those references and rebuild from a fresh model instance.
   3. One :class:`StreamedWeights` per ``layers_attr`` path.
 
 Optional LoRA merging is requested via :meth:`ModelOffloader.set_loras`
-and resolved on activation by attaching :class:`~torch_offload.LoRATransform`
-objects to individual :class:`~torch_offload.PinnedParamBuffer`
-instances. The transform fires automatically when the buffer copies to
-GPU — no separate merge strategy needed.
+and resolved on activation by installing post-copy hooks for the matched
+targets. The hooks run immediately after the owning component copies a
+base weight from pinned CPU storage to GPU, so block-streamed and
+non-block weights use the same merge path. :class:`PinnedParamBuffer`
+remains a storage primitive; it does not own LoRA-specific behavior.
 
 Cross-region tied parameters (block <-> non-block, cross-block, or
 mixed trainable/frozen across regions) are detected at construction

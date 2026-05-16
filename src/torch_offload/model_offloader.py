@@ -1,7 +1,7 @@
-"""Unified block-streaming strategy with optional LoRA merge.
+"""Unified block-streaming strategy with optional LoRA application.
 
 Composes block streaming, non-block pinning, trainable parameter
-movement, and optional per-weight LoRA transforms into a single
+movement, and optional per-weight LoRA application into a single
 :class:`ModelOffloader` class.
 
 Also provides :func:`detect_streaming_region_ties`
@@ -21,7 +21,7 @@ from torch import nn
 
 from ._devices import canonical_device
 from .lora import _ADDMM_DTYPES, LoRA, LoRARouteHandle, LoRATransform
-from .pinned_buffer import PinnedParamBuffer, storage_key
+from .pinned_buffer import PinnedParamBuffer, PostCopyHooks, storage_key
 from .pinned_weights import PinnedWeights
 from .protocols import ModelStrategyComponent, SlotOwnership
 from .slots import canonical_param_name, iter_buffer_slots, iter_param_slots, walk_attr_path
@@ -84,8 +84,8 @@ class ModelOffloader:
     :class:`TrainableWeights` (LoRA / adapter params), and one or more
     :class:`StreamedWeights`\\ s internally. LoRA requests are recorded via
     :meth:`set_loras` and applied on :meth:`activate`, where merge mode
-    attaches transforms to individual :class:`PinnedParamBuffer` objects
-    so the merge fires automatically during DMA — no separate merge
+    installs activation-scoped post-copy hooks so the merge fires
+    immediately after each CPU->GPU weight copy — no separate merge
     strategy needed.
 
     Training
@@ -299,9 +299,10 @@ class ModelOffloader:
         self._streamers = streamers
         self._teardown_stack: contextlib.ExitStack | None = None
 
-        self._reverse_index, self._reverse_parents = self._build_reverse_index(
+        self._target_to_buffer, self._target_to_parents = self._build_target_index(
             streamers, layer_paths, non_block,
         )
+        self._post_copy_hooks: dict[int, Callable[[torch.Tensor], None]] | None = None
         self._block_groups: list[list[nn.Module]] = block_groups
         self._warned_about_checkpointing: bool = False
         self._stream_trainable_weights: bool = stream_trainable_weights
@@ -334,11 +335,12 @@ class ModelOffloader:
 
         ``mode``:
 
-        - ``"merge"`` (default): on CUDA activation, attaches a
-          :class:`LoRATransform` per matched :class:`PinnedParamBuffer`.
-          The merge fires during DMA via in-place ``addmm_``, so it
-          rides along with the streaming cycle. Requires CUDA activation
-          and base weight dtype bf16, fp16, or fp32.
+        - ``"merge"`` (default): on CUDA activation, installs a
+          post-copy hook per matched target. The hook applies
+          :class:`LoRATransform` via in-place ``addmm_`` immediately
+          after the base weight is copied to GPU, so it rides along
+          with the streaming cycle. Requires CUDA activation and base
+          weight dtype bf16, fp16, or fp32.
         - ``"routed"``: on activation, registers a forward hook on each
           matched parent module. Forward becomes
           ``y = base(x) + alpha * B * A * x``. Doesn't touch the base
@@ -380,7 +382,7 @@ class ModelOffloader:
         for lora, strength in loras:
             for target_key, (a, b) in lora.targets.items():
                 total_targets += 1
-                buf = self._reverse_index.get(target_key)
+                buf = self._target_to_buffer.get(target_key)
                 if buf is None:
                     continue
                 matched_targets += 1
@@ -406,7 +408,7 @@ class ModelOffloader:
 
         if matched_targets < total_targets:
             sample_lora = sorted(next(iter(loras))[0].targets)[:3]
-            sample_index = sorted(self._reverse_index)[:3]
+            sample_index = sorted(self._target_to_buffer)[:3]
             logger.warning(
                 "set_loras matched %d/%d targets. "
                 "Sample LoRA keys: %s ... Sample index keys: %s ...",
@@ -419,7 +421,7 @@ class ModelOffloader:
 
     def _activate_merge_loras(
         self, active_device: torch.device, targets: _LoraTargetMap,
-    ) -> None:
+    ) -> PostCopyHooks:
         if active_device.type != "cuda":
             raise ValueError(
                 "ModelOffloader merge mode requires CUDA activation; "
@@ -428,7 +430,7 @@ class ModelOffloader:
             )
 
         for target_key in targets:
-            buf = self._reverse_index[target_key]
+            buf = self._target_to_buffer[target_key]
             cpu_data = buf.cpu_param.data
             # Two distinct rejection paths for merge mode:
             # - Subclassed tensors (quanto WeightQBytesTensor,
@@ -456,9 +458,13 @@ class ModelOffloader:
                     f"PEFT routed mode) for non-float bases."
                 )
 
-        self._clear_merge_loras()
+        self._clear_post_copy_hooks()
+        hooks: dict[int, Callable[[torch.Tensor], None]] = {}
         for target_key, refs in targets.items():
-            self._reverse_index[target_key].transform = LoRATransform(refs)
+            buf = self._target_to_buffer[target_key]
+            hooks[id(buf)] = LoRATransform(refs).apply
+        self._post_copy_hooks = hooks
+        return hooks
 
     def _activate_routed_loras(
         self,
@@ -467,7 +473,7 @@ class ModelOffloader:
         stack: contextlib.ExitStack,
     ) -> None:
         for target_key, refs in targets.items():
-            parents = self._reverse_parents[target_key]
+            parents = self._target_to_parents[target_key]
             if len(parents) != 1:
                 raise ValueError(
                     f"Routed LoRA mode does not support tied "
@@ -494,12 +500,11 @@ class ModelOffloader:
             )
             stack.callback(handle.remove)
 
-    def _clear_merge_loras(self) -> None:
-        for buf in self._reverse_index.values():
-            buf.transform = None
+    def _clear_post_copy_hooks(self) -> None:
+        self._post_copy_hooks = None
 
     def _clear_loras(self) -> None:
-        self._clear_merge_loras()
+        self._clear_post_copy_hooks()
         self._loras = []
         self._lora_mode = "merge"
 
@@ -545,16 +550,22 @@ class ModelOffloader:
         self._active_device = active_device
         try:
             with contextlib.ExitStack() as stack:
+                post_copy_hooks: PostCopyHooks | None = None
                 targets = (
                     self._group_loras_by_target(self._loras)
                     if self._loras
                     else None
                 )
                 if targets is not None and self._lora_mode == "merge":
-                    self._activate_merge_loras(active_device, targets)
-                    stack.callback(self._clear_merge_loras)
+                    post_copy_hooks = self._activate_merge_loras(active_device, targets)
+                    stack.callback(self._clear_post_copy_hooks)
 
                 for component in self._components:
+                    if post_copy_hooks is not None and isinstance(
+                        component, (PinnedWeights, StreamedWeights),
+                    ):
+                        component.set_post_copy_hooks(post_copy_hooks)
+                        stack.callback(component.set_post_copy_hooks, None)
                     stack.callback(component.deactivate)
                     component.activate(active_device)
 
@@ -777,7 +788,7 @@ class ModelOffloader:
             self._warned_about_checkpointing = True
 
     @staticmethod
-    def _build_reverse_index(
+    def _build_target_index(
         streamers: list[StreamedWeights],
         layer_paths: list[str],
         non_block: PinnedWeights | None,
@@ -785,9 +796,9 @@ class ModelOffloader:
         """Map canonical param names to their :class:`PinnedParamBuffer`
         and to the tuple of parent modules where the param is installed.
 
-        Two parallel dicts: the buffer map drives merge-mode LoRA
-        (transform attached to the buffer), and the parents map drives
-        routed-mode LoRA (forward hook on the parent layer).
+        Two explicit target dicts: the buffer map drives merge-mode
+        LoRA post-copy hooks, and the parents map drives routed-mode
+        LoRA forward hooks.
 
         Keys are normalized to strip PEFT's ``.base_layer.`` segments
         so that LoRA state-dict keys (which use the original model

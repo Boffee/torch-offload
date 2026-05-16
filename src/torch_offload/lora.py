@@ -23,9 +23,10 @@ Two application paths share the same :class:`LoRA` data container:
 
 :class:`~torch_offload.ModelOffloader` is the consumer-facing API; its
 ``set_loras(..., mode=...)`` records the requested path and activation
-applies it once the device is known. The merge path fires during DMA
-via :class:`LoRATransform`; the routed path lives as forward hooks
-installed on activate and removed on deactivate.
+applies it once the device is known. The merge path runs
+:class:`LoRATransform` from an activation-scoped post-copy hook; the
+routed path lives as forward hooks installed on activate and removed
+on deactivate.
 """
 
 from __future__ import annotations
@@ -74,7 +75,7 @@ class LoRA:
     can be registered in :class:`~torch_offload.ModelCache` for budget
     tracking and LRU eviction.  ``activate``/``deactivate`` are no-ops
     — factors stay on pinned CPU and are copied to GPU per-parameter
-    by :class:`LoRATransform` during the merge-on-DMA callback.
+    by :class:`LoRATransform` during the merge-mode post-copy hook.
 
     Strength is extrinsic — specify it when passing the adapter to
     :meth:`ModelOffloader.set_loras` as a ``(LoRA, strength)`` tuple.
