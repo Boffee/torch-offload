@@ -5,7 +5,8 @@ share the same parameter layout (names, shapes, dtypes, and any
 quanto/GGUF wrapper metadata): pins the params to CPU at
 construction time, streams them to GPU on demand via forward-pre
 hooks, and uses a pre-allocated GPU slot pool plus a background
-prefetcher to overlap DMA with compute. Heterogeneous block lists
+prefetcher to overlap DMA with compute. On CPU, the host-backed
+pinned state is used directly without streaming. Heterogeneous block lists
 (e.g. Flux's two block kinds) split into multiple
 :class:`StreamedWeights` instances composed via :class:`ModelOffloader`.
 
@@ -514,6 +515,17 @@ class _BlockPinnedStore:
         for mod_buf, _sm, _ln, cpu_clone in self._buf_records[idx]:
             mod_buf.data = cpu_clone.to(self._device, non_blocking=non_blocking)
 
+    def validate_cpu_activation_supported(self) -> None:
+        if any(
+            buf.transform is not None
+            for block_bufs in self._param_bufs
+            for buf in block_bufs
+        ):
+            raise ValueError(
+                "StreamedWeights transforms require CUDA activation; "
+                "got cpu."
+            )
+
     def release_slot(self, idx: int) -> None:
         """Return ``idx``'s pool slot for reuse.
 
@@ -669,16 +681,16 @@ class _BlockTracker:
 
 
 class StreamedWeights:
-    """Streams a single block list between pinned CPU and GPU.
+    """Streams a single block list between pinned CPU and CUDA.
 
     The sharp, low-level streaming primitive. Manages the block list's
     owned params and buffers: pins them to CPU at construction time,
-    streams them to GPU via forward-pre hooks on :meth:`activate`,
-    releases GPU resources on :meth:`deactivate`. Frozen params use
-    slot replacement; trainable params keep Parameter identity and
-    swap only ``.data``. Does not touch parent modules, sibling
-    modules, or out-of-block trainable parameters — those are the
-    composer's responsibility.
+    streams them to CUDA via forward-pre hooks on :meth:`activate`.
+    CPU activation is pass-through over that pinned host-backed state:
+    no pool, no hooks, no copies. Frozen params use slot replacement;
+    trainable params keep Parameter identity and swap only ``.data``.
+    Does not touch parent modules, sibling modules, or out-of-block
+    trainable parameters — those are the composer's responsibility.
 
     A :class:`StreamedWeights` is a *component* meant to be composed
     inside a :class:`~torch_offload.model_offloader.ModelOffloader`.
@@ -691,7 +703,7 @@ class StreamedWeights:
     Lifecycle is uniform with :class:`PinnedWeights`: ``__init__``
     pins (so ``cache_bytes`` is final at construction time, ready
     for :class:`~torch_offload.model_cache.ModelCache` admission),
-    ``activate`` brings to GPU, ``deactivate`` returns slots to
+    ``activate`` brings to CUDA or marks CPU active, ``deactivate`` returns slots to
     pinned CPU and removes hooks. There is no ``close()``; pinned
     memory in module slots is freed when the caller drops the
     strategy and model references.
@@ -793,8 +805,7 @@ class StreamedWeights:
         store.apply_slot_mutations()
         self._store: _BlockPinnedStore | None = store
 
-        # Active resources allocated on activate(); presence of
-        # ``_executor`` is the de-facto "active" indicator.
+        # Active resources allocated on CUDA activate().
         self._tracker: _BlockTracker | None = None
         self._hooks: list[torch.utils.hooks.RemovableHandle] = []
         self._executor: ThreadPoolExecutor | None = None
@@ -899,10 +910,13 @@ class StreamedWeights:
     # ------------------------------------------------------------------
 
     def activate(self, device: torch.device | str | None = None) -> None:
-        """Allocate per-activation resources (GPU slot pool, CUDA
-        stream/events, prefetch executor, forward hooks). The
-        composite's :meth:`activate` returns the model — this method
-        returns ``None`` because the streamer doesn't own one.
+        """Activate the block list on ``device``.
+
+        CUDA activation uses the streaming path: GPU slot pool, CUDA
+        stream/events, prefetch executor, and forward hooks. CPU
+        activation is pass-through over the pinned host-backed state.
+        The composite's :meth:`activate` returns the model — this
+        method returns ``None`` because the streamer doesn't own one.
 
         **Lifecycle is caller's responsibility.** Calling activate()
         twice without an intervening deactivate() will register
@@ -919,17 +933,20 @@ class StreamedWeights:
         # case. Without this, a double-activate would double-install
         # forward-pre hooks (silent grad doubling) and stack a second
         # slot pool on top of an active one.
-        if self._executor is not None:
+        if self._active_device is not None:
             raise RuntimeError(
                 "StreamedWeights.activate() called while already "
                 "active. Deactivate first, or check for a leaked "
                 "context manager."
             )
         active_device = self._resolve_device(device)
+        if active_device.type == "cpu":
+            self._activate_cpu_resolved()
+            return
         if active_device.type != "cuda":
             raise ValueError(
-                "StreamedWeights.activate() requires a CUDA device; "
-                f"got {active_device}"
+                "StreamedWeights.activate() supports CUDA or CPU; "
+                f"got {active_device}."
             )
 
         num_layers = len(self._blocks)
@@ -960,6 +977,11 @@ class StreamedWeights:
             f"gpu_pool_slots={num_gpu_slots}"
         )
 
+    def _activate_cpu_resolved(self) -> None:
+        assert self._store is not None
+        self._store.validate_cpu_activation_supported()
+        self._active_device = torch.device("cpu")
+
     def deactivate(self) -> None:
         """Tear down active resources idempotently — safe to call
         before activate or multiple times. Every step in
@@ -967,13 +989,16 @@ class StreamedWeights:
         from a failed activate cleans up correctly. Drop the
         strategy reference after deactivate to release pinned
         memory."""
+        if self._active_device == torch.device("cpu"):
+            self._active_device = None
+            return
         prefetch_exc = self._teardown_active_resources()
         if prefetch_exc is not None:
             raise prefetch_exc
 
     @contextlib.contextmanager
     def use(self, device: torch.device | str) -> Iterator[None]:
-        """Activate streaming on ``device`` for the duration of the context."""
+        """Activate on ``device`` for the duration of the context."""
         self.activate(device)
         try:
             yield
@@ -982,16 +1007,21 @@ class StreamedWeights:
 
     @contextlib.contextmanager
     def optimizer_step(self) -> Iterator[None]:
-        """Context manager bringing trainable ``.data`` to GPU around
-        the optimizer-step boundary.
+        """Context manager for the streamed-trainable optimizer boundary.
 
-        Gradients live on GPU throughout backward via PyTorch's
-        native ``AccumulateGrad`` — we don't D2H them inside this
-        context. Only ``.data`` is materialized: streamed trainables are
-        on pinned CPU after backward (the streamer's eviction path
-        restores them) and the optimizer needs them on GPU.
+        On CUDA activation, this brings trainable ``.data`` to GPU
+        around the optimizer-step boundary. On CPU activation, it is a
+        guarded no-op because trainable ``.data`` is already resident in
+        the pinned host-backed module slots.
 
-        Lifecycle:
+        On CUDA, gradients live on GPU throughout backward via
+        PyTorch's native ``AccumulateGrad`` — we don't D2H them inside
+        this context. Only ``.data`` is materialized: streamed
+        trainables are on pinned CPU after backward (the streamer's
+        eviction path restores them) and the optimizer needs them on
+        GPU.
+
+        CUDA lifecycle:
 
         Enter:
           1. Quiesce streaming via :meth:`_drain_and_evict_all`
@@ -1018,7 +1048,7 @@ class StreamedWeights:
              repointed at its pinned clone, releasing the optimizer-step
              GPU allocation.
 
-        Failure modes:
+        CUDA failure modes:
 
         - **Enter raises mid-loop** (e.g., OOM on H2D for one
           trainable): ExitStack unwinds the rollbacks already
@@ -1038,7 +1068,7 @@ class StreamedWeights:
         ``param.grad`` is untouched throughout: autograd manages it
         natively. ``optimizer.zero_grad()``, ``clip_grad_norm_``,
         ``GradScaler.unscale_``, and other grad-walking tools work
-        orthogonally to the optimizer-step materialization window.
+        orthogonally to the CUDA optimizer-step materialization window.
 
         Typical loop::
 
@@ -1047,7 +1077,7 @@ class StreamedWeights:
                 optimizer.step()
             optimizer.zero_grad()  # can be inside or outside
 
-        The slot pool's pre-warmed state is lost (next forward
+        On CUDA, the slot pool's pre-warmed state is lost (next forward
         re-loads from pinned), but that cost is dominated by the
         forward + backward of the next iteration.
         """
@@ -1056,6 +1086,18 @@ class StreamedWeights:
             "have been called and not yet deactivated."
         )
         if self._executor is None:
+            if self._active_device is not None and self._active_device.type == "cpu":
+                if self._optimizer_step_active:
+                    raise RuntimeError(
+                        "StreamedWeights.optimizer_step() does not support "
+                        "reentrant entry."
+                    )
+                self._optimizer_step_active = True
+                try:
+                    yield
+                finally:
+                    self._optimizer_step_active = False
+                return
             raise RuntimeError(
                 "StreamedWeights.optimizer_step() called on inactive "
                 "streamer. Use it inside the offloader's context "
@@ -1239,9 +1281,11 @@ class StreamedWeights:
         # AccumulateGrad — this is the symmetric counterpart to
         # the ``.data`` restoration that already happened in
         # ``evict_allocated_blocks``.
+        active_device = self._active_device
         if self._store is not None:
             self._store.move_trainable_grads_to(torch.device("cpu"))
-            self._store.deactivate_pool()
+            if active_device is None or active_device.type == "cuda":
+                self._store.deactivate_pool()
 
         self._tracker = None
         self._last_idx = -1

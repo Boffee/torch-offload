@@ -5,8 +5,8 @@ Covers ``ModelOffloader`` (the public composite),
 ``TrainableWeights`` (the trainable-param component),
 and the cross-region tied-weight detector.
 
-Most lifecycle tests run on CPU (the machinery is device-agnostic);
-CUDA-only tests gate on availability.
+CUDA-only tests gate on availability. CPU activation is pass-through
+over the host-backed pinned state.
 """
 
 from __future__ import annotations
@@ -187,6 +187,49 @@ class TestLifecycle:
         finally:
             strategy.deactivate()
 
+    def test_activate_cpu_uses_host_backed_weights_without_streaming(self) -> None:
+        torch.manual_seed(42)
+        m_eager = _make_block_model(num_blocks=4, width=8)
+        m_off = _make_block_model(num_blocks=4, width=8)
+        m_off.load_state_dict(m_eager.state_dict())
+
+        x = torch.randn(2, 8)
+        with torch.no_grad():
+            expected = m_eager(x)
+
+        strategy = ModelOffloader(
+            m_off,
+            layers_attr="transformer_blocks", blocks_to_swap=2,
+        )
+        try:
+            pinned_block_params = [
+                block.weight for block in m_off.transformer_blocks
+            ]
+            with strategy.use("cpu") as cpu_model:
+                assert strategy._active_device == torch.device("cpu")
+                assert all(
+                    s._active_device == torch.device("cpu")
+                    for s in strategy._streamers
+                )
+                assert all(s._executor is None for s in strategy._streamers)
+                assert all(
+                    block.weight is pinned
+                    for block, pinned in zip(
+                        m_off.transformer_blocks,
+                        pinned_block_params,
+                        strict=True,
+                    )
+                )
+                with torch.no_grad():
+                    got = cpu_model(x)
+
+            torch.testing.assert_close(got, expected)
+            for p in m_off.parameters():
+                assert p.device == torch.device("cpu")
+                assert p.is_pinned()
+        finally:
+            strategy.deactivate()
+
     @CUDA
     def test_activate_brings_non_block_to_gpu(self) -> None:
         m = _make_block_model()
@@ -246,6 +289,107 @@ class TestLifecycle:
             strategy.deactivate()  # still no error
         finally:
             strategy.deactivate()
+
+
+class TestStreamedWeightsBackendActivation:
+    def test_direct_cpu_activation_uses_host_backed_weights(self) -> None:
+        torch.manual_seed(42)
+        m_eager = _make_block_model(num_blocks=4, width=8)
+        m = _make_block_model(num_blocks=4, width=8)
+        m.load_state_dict(m_eager.state_dict())
+
+        x = torch.randn(2, 8)
+        with torch.no_grad():
+            expected = m_eager(x)
+
+        streamer = StreamedWeights(
+            blocks=list(m.transformer_blocks),
+            blocks_to_swap=2,
+        )
+        try:
+            pinned_params = [block.weight for block in m.transformer_blocks]
+            with streamer.use("cpu"):
+                assert streamer._active_device == torch.device("cpu")
+                assert streamer._executor is None
+                assert all(
+                    block.weight is pinned
+                    for block, pinned in zip(
+                        m.transformer_blocks, pinned_params, strict=True,
+                    )
+                )
+                assert all(
+                    len(block._forward_pre_hooks) == 0
+                    for block in m.transformer_blocks
+                )
+                with torch.no_grad():
+                    got = m(x)
+
+            torch.testing.assert_close(got, expected)
+            for block in m.transformer_blocks:
+                assert block.weight.device == torch.device("cpu")
+                assert block.weight.is_pinned()
+        finally:
+            streamer.deactivate()
+
+    def test_direct_cpu_trainable_step_preserves_updates(self) -> None:
+        torch.manual_seed(0)
+        blocks = nn.ModuleList(
+            [nn.Linear(4, 4, bias=False), nn.Linear(4, 4, bias=False)]
+        )
+        param_ids = {i: id(block.weight) for i, block in enumerate(blocks)}
+        before = {i: block.weight.detach().clone() for i, block in enumerate(blocks)}
+        optimizer = torch.optim.SGD(blocks.parameters(), lr=0.1)
+
+        streamer = StreamedWeights(
+            blocks=list(blocks),
+            blocks_to_swap=1,
+        )
+        try:
+            pinned_data_ptrs = {
+                i: block.weight.data_ptr() for i, block in enumerate(blocks)
+            }
+            with streamer.use("cpu"):
+                assert pinned_data_ptrs == {
+                    i: block.weight.data_ptr()
+                    for i, block in enumerate(blocks)
+                }
+                x = torch.randn(2, 4)
+                target = torch.randn(2, 4)
+                out = x
+                for block in blocks:
+                    out = block(out)
+                ((out - target) ** 2).mean().backward()
+                with streamer.optimizer_step():
+                    optimizer.step()
+                active_after = {
+                    i: block.weight.detach().clone()
+                    for i, block in enumerate(blocks)
+                }
+
+            assert param_ids == {i: id(block.weight) for i, block in enumerate(blocks)}
+            assert any(
+                not torch.allclose(active_after[i], before[i])
+                for i in active_after
+            )
+            for i, block in enumerate(blocks):
+                torch.testing.assert_close(block.weight, active_after[i])
+                assert block.weight.device == torch.device("cpu")
+                assert block.weight.is_pinned()
+        finally:
+            streamer.deactivate()
+
+    def test_direct_cpu_double_activate_raises(self) -> None:
+        m = _make_block_model(num_blocks=2)
+        streamer = StreamedWeights(
+            blocks=list(m.transformer_blocks),
+            blocks_to_swap=1,
+        )
+        try:
+            streamer.activate("cpu")
+            with pytest.raises(RuntimeError, match="already.*active"):
+                streamer.activate("cpu")
+        finally:
+            streamer.deactivate()
 
 
 # ---------------------------------------------------------------------------
@@ -2162,12 +2306,10 @@ def _make_offloader_for_warning_test(model: nn.Module) -> ModelOffloader:
     """Build a CPU-targeted offloader for warning-logic unit tests.
 
     The warning helper is called directly on the constructed offloader
-    rather than via ``activate()`` because ``StreamedWeights.activate()``
-    builds a ``torch.cuda.Stream`` and so requires a real CUDA device.
-    The wiring of ``_warn_if_training_without_checkpointing()`` into
-    ``activate()`` itself is exercised by the CUDA training tests
-    above — these tests pin the helper's *behaviour*, not its
-    invocation site.
+    rather than via ``activate()`` because checkpointing warnings are
+    emitted only for CUDA streaming activation. The CUDA training tests
+    above exercise the actual activation-site wiring; these tests pin
+    the helper's *behaviour*, not its invocation site.
     """
     return ModelOffloader(
         model,
@@ -2666,6 +2808,61 @@ class TestInBlockTrainableStreamingEndToEnd:
                 f"{n} .data should be back on cpu after gather_for_step, "
                 f"got {dev}"
             )
+
+    def test_cpu_pass_through_trainable_step_preserves_updates(self) -> None:
+        torch.manual_seed(0)
+        m = _make_lora_in_block_model(num_blocks=2, width=8, rank=2)
+        param_ids = {
+            n: id(p) for n, p in m.named_parameters() if p.requires_grad
+        }
+        before = {
+            n: p.detach().clone()
+            for n, p in m.named_parameters()
+            if p.requires_grad
+        }
+        optimizer = torch.optim.SGD(
+            [p for p in m.parameters() if p.requires_grad], lr=0.1,
+        )
+
+        offloader = ModelOffloader(
+            m,
+            layers_attr="transformer_blocks",
+            blocks_to_swap=1,
+            stream_trainable_weights=True,
+        )
+        try:
+            with offloader.use("cpu") as cpu_model:
+                x = torch.randn(2, 8)
+                target = torch.randn(2, 8)
+                out = cpu_model(x)
+                ((out - target) ** 2).mean().backward()
+                with offloader.optimizer_step():
+                    optimizer.step()
+                active_after = {
+                    n: p.detach().clone()
+                    for n, p in cpu_model.named_parameters()
+                    if p.requires_grad
+                }
+
+            after_deactivate = {
+                n: p.detach().clone()
+                for n, p in m.named_parameters()
+                if p.requires_grad
+            }
+            assert param_ids == {
+                n: id(p) for n, p in m.named_parameters() if p.requires_grad
+            }
+            assert any(
+                not torch.allclose(active_after[n], before[n])
+                for n in active_after
+            )
+            for name, active_value in active_after.items():
+                torch.testing.assert_close(after_deactivate[name], active_value)
+            for p in m.parameters():
+                assert p.device == torch.device("cpu")
+                assert p.is_pinned()
+        finally:
+            offloader.deactivate()
 
 
 # ---------------------------------------------------------------------------

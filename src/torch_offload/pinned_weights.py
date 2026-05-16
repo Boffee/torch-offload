@@ -299,26 +299,27 @@ class PinnedWeights:
         return self.model
 
     def activate(self, device: torch.device | str | None = None) -> None:
-        """Bulk-DMA pinned weights to GPU.
+        """Activate the wrapped model on ``device``.
 
-        Per-tensor ``.to()`` (non-blocking), then a single
-        ``cuda.synchronize`` to make the writes visible. Tied parameter
-        slots all receive the same GPU Parameter. Reach the wrapped
-        model via :attr:`model` once activated.
+        CUDA activation bulk-DMAs pinned weights to GPU: per-tensor
+        ``.to()`` (non-blocking), then a single ``cuda.synchronize`` to
+        make the writes visible. Tied parameter slots all receive the
+        same GPU Parameter. CPU activation repoints slots back to the
+        pinned CPU Parameters and performs no device copy. Reach the
+        wrapped model via :attr:`model` once activated.
 
-        **Lifecycle is caller's responsibility.** Calling activate()
-        twice without an intervening deactivate() double-allocates
-        GPU storage. Don't.
+        **Lifecycle is caller's responsibility.** Calling CUDA
+        activate() twice without an intervening deactivate()
+        double-allocates GPU storage. Don't.
 
-        **Failure semantics (poison-on-failure):** if activation fails
-        midway, the strategy is left in an undefined state — some
-        slots may be GPU, some pinned-CPU. The caller's only valid
-        next action is :meth:`deactivate` (which forces all slots
-        back to pinned-CPU) followed by dropping the strategy
-        reference.
+        **Failure semantics (poison-on-failure):** if CUDA activation
+        fails midway, the strategy is left in an undefined state —
+        some slots may be GPU, some pinned-CPU. The caller's only valid
+        next action is :meth:`deactivate` (which forces all slots back
+        to pinned-CPU) followed by dropping the strategy reference.
         """
         assert self._model is not None
-        self._move_to_gpu(self._resolve_device(device))
+        self._move_to_device(self._resolve_device(device))
 
     def deactivate(self) -> None:
         """Repoint slots back at pinned-CPU Parameters. Idempotent —
@@ -350,10 +351,24 @@ class PinnedWeights:
             "ModelCache.use(..., device=...)"
         )
 
-    def _move_to_gpu(self, device: torch.device) -> None:
-        # One GPU Parameter per unique buffer. Tied slots all receive
-        # the same Parameter object so the tying invariant survives on
-        # device.
+    def _move_to_device(self, device: torch.device) -> None:
+        if device.type == "cpu":
+            if any(buf.transform is not None for buf, _ in self._slots):
+                raise ValueError(
+                    "PinnedWeights transforms require CUDA activation; "
+                    f"got {device}."
+                )
+            self._move_to_pinned()
+            return
+        if device.type != "cuda":
+            raise ValueError(
+                "PinnedWeights.activate() supports CUDA or CPU; "
+                f"got {device}."
+            )
+
+        # One active-device Parameter per unique buffer. Tied slots
+        # all receive the same Parameter object so the tying invariant
+        # survives on device.
         for buf, locs in self._slots:
             gpu_param = buf.load_to_gpu(device, non_blocking=True)
             for parent, leaf in locs:
@@ -363,8 +378,7 @@ class PinnedWeights:
                 gpu = pinned.to(device, non_blocking=True)
                 for parent, leaf, persistent in locs:
                     parent.register_buffer(leaf, gpu, persistent=persistent)
-        if device.type == "cuda":
-            torch.cuda.synchronize(device)
+        torch.cuda.synchronize(device)
 
     def _move_to_pinned(self) -> None:
         for buf, locs in self._slots:

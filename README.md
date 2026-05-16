@@ -52,7 +52,7 @@ This library gives you:
 | Situation | Use |
 |---|---|
 | Model fits on GPU when active; want fast eviction between calls | **`PinnedWeights`** — bulk DMA, ~200 ms for 12 GB at PCIe Gen5 x16 |
-| Model too big for GPU even when active | **`ModelOffloader`** — streams transformer blocks via forward hooks |
+| Model too big for a CUDA GPU even when active | **`ModelOffloader`** — streams transformer blocks via forward hooks |
 | Multiple models swap in/out across a script | Wrap each in a strategy, hand to **`ModelCache`** |
 
 ## Quick start: PinnedWeights
@@ -110,11 +110,19 @@ with offloader.use(device) as gpu_model:
 del offloader, model  # drop refs to free pinned host memory
 ```
 
+`ModelOffloader` only streams on CUDA. Activating the base offloader on
+`cpu` is a pass-through over the already-installed pinned CPU storage:
+no slot pool, no streaming hooks, no weight copies.
+`set_loras(..., mode="merge")` is CUDA-only; use routed LoRA mode for
+CPU activation. Routed LoRA still installs forward hooks and materializes
+LoRA factors on the activation device.
+
 By default, trainable parameters (e.g. LoRA adapters) move to GPU on
-activate and back to CPU on deactivate via the bundled
-`TrainableWeights` component. This preserves ordinary PyTorch
-optimizer behavior: `optimizer.step()`, gradient accumulation, AMP
-unscale, and grad clipping see normal GPU trainables while the
+CUDA activation and back to CPU on deactivate via the bundled
+`TrainableWeights` component. On CPU activation they stay in the
+host-backed module slots. This preserves ordinary PyTorch optimizer
+behavior: `optimizer.step()`, gradient accumulation, AMP unscale, and
+grad clipping see normal trainables on the activation device while the
 offloader is active.
 
 To reduce trainable-weight residency during training, opt into
@@ -129,9 +137,10 @@ offloader = ModelOffloader(
 )
 ```
 
-In this mode, only the trainable parameter `.data` streams. It is
-GPU-resident while its block is resident, plus during the optimizer
-update. Gradients are not streamed; PyTorch owns `param.grad` normally.
+During CUDA activation in this mode, only the trainable parameter
+`.data` streams. It is GPU-resident while its block is resident, plus
+during the optimizer update. CPU activation remains pass-through.
+Gradients are not streamed; PyTorch owns `param.grad` normally.
 
 ### LoRA merge
 
@@ -423,9 +432,11 @@ constructed → activate ↔ deactivate → drop refs
 
 `activate(device=...)` makes the model usable for compute on the
 requested device. `PinnedWeights`, `ModelOffloader`, `StreamedWeights`,
-and `TrainableWeights` require an explicit device.
-`deactivate()` releases transient GPU resources (the `cache_bytes` worth
-of pinned storage stays held in module slots, ready for fast
+and `TrainableWeights` require an explicit device. CUDA activation uses
+the streaming/DMA path where applicable; CPU activation is pass-through
+over pinned host-backed storage.
+`deactivate()` releases transient device resources (the `cache_bytes`
+worth of pinned storage stays held in module slots, ready for fast
 re-activation).
 **There is no `close()`.** To release pinned host memory, drop the
 strategy reference (and the model reference if you don't need it
@@ -450,10 +461,13 @@ don't guard against caller misuse.
   storage themselves and conflict with the slot-swap pattern.
 - **Single-thread / sequential.** No internal locking; concurrent use
   on the same strategy or cache is undefined behavior.
-- **Buffer mutations during forward are discarded** on `deactivate()`.
-  Suitable for inference of stateless modules; not suitable for models
-  that need persistent buffer state across calls (BatchNorm running
-  stats updated in training mode, RNN/SSM hidden state, KV cache).
+- **Buffer mutations during CUDA activation are discarded** on
+  `deactivate()`. CPU activation is pass-through over host-backed
+  buffers, so CPU buffer mutations behave like ordinary module
+  mutations. Suitable for inference of stateless modules; not suitable
+  for models that need persistent buffer state across calls (BatchNorm
+  running stats updated in training mode, RNN/SSM hidden state, KV
+  cache).
 - **Training requires activation checkpointing** on every streamed
   block (`model.gradient_checkpointing_enable()` for HF models, or
   manual `torch.utils.checkpoint.checkpoint` wrapping). Without it,

@@ -330,6 +330,13 @@ class TestSetLorasValidation:
         s.set_loras([(lora, 1.0)])
         assert not _has_transform(s, "transformer_blocks.0.attn.weight")
 
+    def test_merge_mode_activation_rejects_cpu(self) -> None:
+        m = _make_bf16_model()
+        s = _make_strategy(m)
+        s.set_loras([(_make_lora(4, 16), 1.0)], mode="merge")
+        with pytest.raises(ValueError, match="merge transforms require CUDA"):
+            s.activate("cpu")
+
     @CUDA
     def test_set_loras_raises_while_active(self) -> None:
         m = _make_bf16_model()

@@ -69,8 +69,12 @@ class TestLifecycle:
         m = _make_simple_model()
         pw = PinnedWeights(m)
         try:
+            pinned_params = list(m.parameters())
             with pw.use("cpu") as model:
                 assert model is m
+                assert list(m.parameters()) == pinned_params
+                for p in m.parameters():
+                    assert p.is_pinned()
             for p in m.parameters():
                 assert p.is_pinned()
         finally:

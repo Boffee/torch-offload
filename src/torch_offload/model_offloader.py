@@ -68,8 +68,12 @@ def _routed_factor_dtype(module: nn.Module) -> torch.dtype:
 
 
 class ModelOffloader:
-    """Stream transformer blocks between pinned CPU and GPU with
+    """Stream transformer blocks between pinned CPU and CUDA with
     optional LoRA merge and trainable-parameter support.
+
+    CUDA activation uses block streaming plus component-level device
+    movement. CPU activation is pass-through over the pinned
+    host-backed module slots.
 
     Composes :class:`PinnedWeights` (non-block frozen params),
     :class:`TrainableWeights` (LoRA / adapter params), and one or more
@@ -100,20 +104,21 @@ class ModelOffloader:
     outside that window is then safe.
 
     For **frozen-only** streamed blocks (training touches only
-    out-of-block trainables), :meth:`activate` emits a one-time
+    out-of-block trainables), CUDA :meth:`activate` emits a one-time
     warning if no HuggingFace ``gradient_checkpointing`` flag is
     detected — the failure mode without checkpointing is a loud
-    ``RuntimeError`` from autograd's saved-tensor check, so a
-    warning suffices.
+    ``RuntimeError`` from autograd's saved-tensor check, so a warning
+    suffices.
 
-    By default, trainable params keep the historical behavior: all
-    trainables, including adapters inside streamed blocks, stay GPU-
-    resident while the offloader is active and work with normal
-    PyTorch optimizers.
+    By default, trainable params keep the historical CUDA behavior:
+    all trainables, including adapters inside streamed blocks, stay
+    GPU-resident while the offloader is active on CUDA and work with
+    normal PyTorch optimizers. CPU activation leaves them in the
+    host-backed module slots.
 
     Pass ``stream_trainable_weights=True`` to stream in-block
-    trainable parameter data through the block slot pool. In that
-    mode, :meth:`activate` *raises* during training if no
+    trainable parameter data through the CUDA block slot pool. In that
+    mode, CUDA :meth:`activate` *raises* during training if no
     ``gradient_checkpointing`` flag is detected. The failure mode
     here is **silent gradient corruption** rather than a loud
     error — the ``.data`` swap path used for trainable streaming
@@ -126,13 +131,12 @@ class ModelOffloader:
     for ensuring every streamed block that participates in training
     is wrapped.
 
-    With ``stream_trainable_weights=True``, :meth:`optimizer_step` is
-    the optimizer boundary: it materializes streamed trainable ``.data``
-    on GPU while an arbitrary PyTorch optimizer updates it, then copies
-    the updated data back to pinned CPU. Gradients are not streamed; they
-    live on GPU throughout backward via PyTorch's native
-    ``AccumulateGrad``, so ``optimizer.zero_grad()``, ``clip_grad_norm_``,
-    and AMP's ``GradScaler`` operate on normal grad tensors.
+    With ``stream_trainable_weights=True`` on CUDA,
+    :meth:`optimizer_step` is the optimizer boundary: it materializes
+    streamed trainable ``.data`` on GPU while an arbitrary PyTorch
+    optimizer updates it, then copies the updated data back to pinned
+    CPU. CPU activation makes :meth:`optimizer_step` a guarded no-op.
+    Gradients are not streamed; PyTorch owns ``param.grad`` normally.
 
     Parameters
     ----------
@@ -496,9 +500,17 @@ class ModelOffloader:
         )
 
     def activate(self, device: torch.device | str | None = None) -> None:
-        self._enforce_checkpointing_for_trainable_streaming()
-        self._warn_if_training_without_checkpointing()
         active_device = self._resolve_device(device)
+        if active_device.type == "cpu":
+            self._validate_no_merge_transforms_for_cpu()
+        elif active_device.type == "cuda":
+            self._enforce_checkpointing_for_trainable_streaming()
+            self._warn_if_training_without_checkpointing()
+        else:
+            raise ValueError(
+                "ModelOffloader.activate() supports CUDA or CPU; "
+                f"got {active_device}."
+            )
         self._active_device = active_device
         try:
             with contextlib.ExitStack() as stack:
@@ -545,21 +557,22 @@ class ModelOffloader:
         """Context manager wrapping the optimizer-step boundary for
         streamed trainable weights.
 
-        Brings every streamer-managed trainable's ``.data`` to GPU on
-        enter (force-evicting any currently-loaded blocks first to
-        normalize state), yields, and on exit D2H's the post-step
-        ``.data`` back to the pinned host clones (blocking, to avoid
-        racing the next iteration's prefetch).
+        On CUDA activation, brings every streamer-managed trainable's
+        ``.data`` to GPU on enter (force-evicting any currently-loaded
+        blocks first to normalize state), yields, and on exit D2H's the
+        post-step ``.data`` back to the pinned host clones (blocking, to
+        avoid racing the next iteration's prefetch). On CPU activation,
+        this is a guarded no-op.
 
-        ``param.grad`` is unaffected throughout — it lives on GPU
-        during backward via PyTorch's native ``AccumulateGrad`` and
+        ``param.grad`` is unaffected throughout. On CUDA, it lives on
+        GPU during backward via PyTorch's native ``AccumulateGrad`` and
         is read+modified by the optimizer in place. ``optimizer.zero_grad()``,
         ``clip_grad_norm_``, AMP's ``GradScaler.unscale_`` and other
-        grad-walking tools work as in vanilla PyTorch — they don't
-        need to be inside this context.
+        grad-walking tools work as in vanilla PyTorch — they don't need
+        to be inside this context.
 
         Out-of-block trainables (handled by ``TrainableWeights``) are
-        also unaffected; they're GPU-resident across the whole
+        also unaffected; on CUDA they're GPU-resident across the whole
         activation cycle, just like the default
         ``stream_trainable_weights=False`` path.
 
@@ -570,6 +583,9 @@ class ModelOffloader:
                 optimizer.step()
             optimizer.zero_grad()
         """
+        if self._active_device is not None and self._active_device.type == "cpu":
+            yield
+            return
         with contextlib.ExitStack() as stack:
             for streamer in self._streamers:
                 stack.enter_context(streamer.optimizer_step())
@@ -596,6 +612,14 @@ class ModelOffloader:
             self.deactivate()
 
     # ----------------------------------------------------------- Internals
+
+    def _validate_no_merge_transforms_for_cpu(self) -> None:
+        if any(buf.transform is not None for buf in self._reverse_index.values()):
+            raise ValueError(
+                "ModelOffloader merge transforms require CUDA activation; "
+                "got cpu. Use set_loras(..., mode='routed') for "
+                "CPU activation, or activate on CUDA."
+            )
 
     def _enforce_checkpointing_for_trainable_streaming(self) -> None:
         """Hard-guard: refuse to activate if a streamer manages

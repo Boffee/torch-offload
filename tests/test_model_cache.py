@@ -414,6 +414,17 @@ class TestDeviceSelection:
         assert s.events.count("activate") == 1
         assert s.events.count("deactivate") == 1
 
+    def test_reentrant_indexed_cpu_matches_cpu(self) -> None:
+        cache = ModelCache(200)
+        cache.register(_spec("a", 100))
+
+        with cache.use("a", device="cpu"):
+            with cache.use("a", device="cpu:0"):
+                pass
+
+        s = FakeStrategy.instances[0]
+        assert s.activate_devices == [torch.device("cpu")]
+
     def test_reentrant_omitted_device_inherits_active_lease(self) -> None:
         cache = ModelCache(200)
         cache.register(_spec("a", 100))
