@@ -20,12 +20,13 @@ import torch
 from torch import nn
 
 from ._devices import canonical_device
-from .lora import _ADDMM_DTYPES, LoRA, LoRARouteHandle, LoRATransform
+from .lora import LoRA, LoRARouteHandle, LoRATransform
 from .pinned_buffer import PinnedParamBuffer, storage_key
 from .pinned_weights import PinnedWeights
 from .protocols import ModelStrategyComponent, SlotOwnership
 from .slots import canonical_param_name, iter_buffer_slots, iter_param_slots, walk_attr_path
 from .streamed_weights import StreamedWeights
+from .tensor_adapters import DenseAddmmTensorAdapter, select_adapter
 from .trainable_weights import TrainableWeights
 
 logger = logging.getLogger(__name__)
@@ -56,14 +57,9 @@ def _routed_factor_dtype(module: nn.Module) -> torch.dtype:
 
     - ``module.compute_dtype`` — BitsAndBytes ``Linear4bit`` and
       similar modules that carry an explicit compute-dtype attribute.
-    - ``module.weight.dtype`` — plain fp16/bf16/fp32, plus quanto
-      (``WeightQBytesTensor.dtype`` is the scale dtype, not the int8
-      storage of ``_data``).
-
-    Formats whose ``weight.dtype`` reports the storage int (e.g.,
-    BitsAndBytes ``Linear8bitLt``'s ``Int8Params``, GGUF's packed
-    ``uint8``) and which don't expose ``compute_dtype`` would need a
-    forward probe; not handled here.
+    - ``select_adapter(module.weight.data).compute_dtype(...)`` — plain
+      tensors return ``weight.dtype``; structured/quantized wrappers can
+      return their logical matmul dtype instead of packed storage dtype.
     """
     compute = getattr(module, "compute_dtype", None)
     if compute is not None:
@@ -74,7 +70,21 @@ def _routed_factor_dtype(module: nn.Module) -> torch.dtype:
             f"Routed LoRA mode requires a tensor-like weight on "
             f"{type(module).__name__}; got {type(weight).__name__}"
         )
-    return weight.dtype
+    return select_adapter(weight.data).compute_dtype(weight.data)
+
+
+def _validate_merge_lora_target(buf: PinnedParamBuffer, target_key: str) -> None:
+    """Raise if this LoRA target cannot use activation-scoped merge mode."""
+    adapter = buf.adapter
+    if not isinstance(adapter, DenseAddmmTensorAdapter):
+        raise ValueError(
+            f"LoRA target {target_key!r} uses {adapter.__name__}; "
+            "merge mode requires a dense in-place addmm-capable tensor "
+            "adapter. Use mode='routed' for quantized or structured "
+            "weights, or apply torch_offload.merge_lora() permanently "
+            "when that format supports a dequantize/requantize merge."
+        )
+    adapter.validate_dense_addmm_target(buf.cpu_param.data, target_key)
 
 
 class ModelOffloader:
@@ -347,19 +357,17 @@ class ModelOffloader:
           :class:`LoRATransform` via in-place ``addmm_`` immediately
           after the base weight is copied to GPU, so it rides along
           with the streaming cycle. Requires CUDA activation and base
-          weight dtype bf16, fp16, or fp32.
+          weight adapter that supports dense in-place ``addmm_`` merge.
         - ``"routed"``: on activation, registers a forward hook on each
           matched parent module. Forward becomes
           ``y = base(x) + alpha * B * A * x``. Doesn't touch the base
           weight in place. Restricted to ``nn.Linear`` parents (the math
           assumes ``y = x @ W.T``); tied targets and non-Linear parents
-          raise. Quantized bases work when the compute dtype is probeable via
-          :func:`_routed_factor_dtype` — covers plain fp/bf16/fp16,
-          quanto (``weight.dtype`` already reports scale dtype), and
-          formats that expose ``module.compute_dtype`` (BitsAndBytes
-          ``Linear4bit``). Formats that report storage int via
-          ``weight.dtype`` without a module-level compute dtype
-          (``Linear8bitLt``, GGUF) aren't covered.
+          raise. Quantized bases work when the matched module still
+          exposes the logical ``nn.Linear`` weight shape and either its
+          adapter reports a logical compute dtype or the module exposes
+          ``compute_dtype``. Packed formats whose parameter shape differs
+          from the logical matmul weight need a per-format route layer.
         Routed mode requires activations to reach the hooked layer in
         the layer's compute dtype (or under autocast). Mixed-dtype
         inputs without autocast will error in the hook's matmul.
@@ -450,33 +458,9 @@ class ModelOffloader:
             )
 
         for target_key in targets:
-            buf = self._target_to_buffer[target_key]
-            cpu_data = buf.cpu_param.data
-            # Two distinct rejection paths for merge mode:
-            # - Subclassed tensors (quanto WeightQBytesTensor,
-            #   GGUFWeight, etc.) advertise a float dtype but silently
-            #   drop in-place ops on the wrapper — addmm_ on a quanto
-            #   tensor returns success while leaving the int8 _data
-            #   unchanged.
-            # - Plain float tensors must be in the addmm-capable dtype
-            #   set.
-            if type(cpu_data) is not torch.Tensor:
-                raise ValueError(
-                    f"LoRA target {target_key!r} is wrapped in "
-                    f"{type(cpu_data).__name__}; merge mode "
-                    f"requires a plain torch.Tensor (in-place "
-                    f"addmm_ on subclassed tensors silently "
-                    f"drops the update). Use mode='routed' (or "
-                    f"PEFT routed mode), or apply "
-                    f"torch_offload.merge_lora() permanently."
-                )
-            if cpu_data.dtype not in _ADDMM_DTYPES:
-                raise ValueError(
-                    f"LoRA target {target_key!r} has dtype "
-                    f"{cpu_data.dtype}; addmm_ merge requires "
-                    f"bf16, fp16, or fp32. Use mode='routed' (or "
-                    f"PEFT routed mode) for non-float bases."
-                )
+            _validate_merge_lora_target(
+                self._target_to_buffer[target_key], target_key
+            )
 
         for target_key, refs in targets.items():
             buf = self._target_to_buffer[target_key]

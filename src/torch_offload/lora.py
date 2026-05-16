@@ -13,13 +13,10 @@ Two application paths share the same :class:`LoRA` data container:
   the layer that adds ``alpha * (x @ A.T @ B.T)`` to the layer's output;
   base weight is not touched in place. Restricted to ``nn.Linear``
   parents (other layer types raise) and tied weights are rejected.
-  Compatible with quantized bases whose ``weight.dtype`` reports the
-  compute dtype (quanto ``WeightQBytesTensor``) or that expose
-  ``module.compute_dtype`` (BitsAndBytes ``Linear4bit``); formats
-  that report storage int via ``weight.dtype`` and provide no
-  module-level compute dtype (``Linear8bitLt``, GGUF) need a forward
-  probe and aren't covered here. For richer per-format LoRA coverage,
-  prefer PEFT's per-type LoraLayer subclasses.
+  Compatible with quantized bases whose adapter can report the logical
+  compute dtype, or that expose ``module.compute_dtype``. Formats whose
+  logical shape does not match their packed storage shape still need a
+  richer per-format LoRA layer.
 
 :class:`~torch_offload.ModelOffloader` is the consumer-facing API; its
 ``set_loras(..., mode=...)`` records the requested path and activation
@@ -44,16 +41,6 @@ __all__ = [
     "LoRATransform",
     "default_key_transform",
 ]
-
-
-# Float dtypes that support an in-place ``addmm_`` merge of ``B @ A``
-# into the base weight. Quanto / int8 / packed quant types take a
-# different path (dequant → addmm → requant). Used by upstream
-# validators (:meth:`ModelOffloader.set_loras` and :func:`merge_lora`)
-# to gate the merge-mode path before any :class:`LoRATransform` is
-# built. The transform itself does not re-check — it trusts the
-# upstream gate.
-_ADDMM_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
 
 
 KeyTransformT = Callable[[str], str] | None

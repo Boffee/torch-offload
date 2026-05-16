@@ -54,8 +54,11 @@ Optional LoRA merging is requested via :meth:`ModelOffloader.set_loras`
 and resolved on activation by installing post-copy hooks for the matched
 targets. The hooks run immediately after the owning component copies a
 base weight from pinned CPU storage to GPU, so block-streamed and
-non-block weights use the same merge path. :class:`PinnedParamBuffer`
-remains a storage primitive; it does not own LoRA-specific behavior.
+non-block weights use the same merge path. Merge eligibility is owned by
+the selected tensor adapter: plain dense tensors opt into in-place
+``addmm_``; structured quantized wrappers should use routed LoRA only
+when their module exposes a compatible logical Linear weight shape and
+compute dtype, unless they provide a separate permanent merge path.
 
 Cross-region tied parameters (block <-> non-block, cross-block, or
 mixed trainable/frozen across regions) are detected at construction

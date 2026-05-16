@@ -18,6 +18,9 @@ Memory layout::
 
 The staging + output buffers are pre-allocated once per pool slot and
 reused across block loads, matching the existing pooled streaming path.
+GGUF intentionally does not implement the CPU round-trip adapter
+capability because GPU storage is dequantized bf16; copying back would
+require lossy re-quantization.
 
 Auto-registers when this module is imported.  Import fails silently if
 the ``gguf`` package is not installed — GGUF support is optional.
@@ -244,21 +247,9 @@ class GgufAdapter:
         dst.dequant.copy_(result)
 
     @staticmethod
-    def copy_to_cpu(
-        src: _GgufGpu, dst: _GgufPinned, *, non_blocking: bool = False,
-    ) -> None:
-        # GGUF's GPU representation is the dequantized bf16 weight
-        # (``dst.dequant``), not the original packed quantized bytes.
-        # Round-tripping back to the pinned packed form would require
-        # re-quantization, which is lossy and not currently implemented.
-        # GGUF weights are inference-only by design, so this path
-        # shouldn't fire in practice.
-        raise NotImplementedError(
-            "GgufAdapter.copy_to_cpu is not supported: GGUF weights are "
-            "stored as packed quantized bytes on CPU but dequantized to "
-            "bf16 on GPU, and re-quantization is not implemented. GGUF "
-            "weights are inference-only."
-        )
+    def compute_dtype(t: torch.Tensor) -> torch.dtype:
+        _require_gguf_weight(t)
+        return torch.bfloat16
 
     @staticmethod
     def cache_bytes(state: _GgufPinned) -> int:

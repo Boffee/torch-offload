@@ -16,10 +16,11 @@ across the CPU↔GPU boundary while preserving correctness:
 Each adapter encapsulates the mechanics for one tensor type. The rest
 of the package (:class:`PinnedParamBuffer`, :class:`PinnedWeights`,
 :class:`StreamedWeights`) is type-agnostic and dispatches through
-:func:`select_adapter`. Wrapper builders (:meth:`cpu_param`,
-:meth:`gpu_param`) accept a ``requires_grad`` keyword so consumers can
-opt in to trainable wrappers; D2H is symmetric with H2D via
-:meth:`copy_to_cpu`.
+:func:`select_adapter`. The base adapter contract is intentionally small:
+clone/pin, move to GPU, rebuild wrappers, report cache bytes, and report
+the logical compute dtype. Extra operations are expressed as small
+optional protocols so callers ask for the exact capability they need
+instead of hard-coding tensor classes.
 
 This module is internal to :mod:`torch_offload`. Adapters are registered
 at module import time; new types can be added by writing a new adapter
@@ -35,10 +36,17 @@ import torch
 from torch import nn
 
 __all__ = [
+    "DENSE_ADDMM_DTYPES",
+    "CpuRoundTripTensorAdapter",
+    "DenseAddmmTensorAdapter",
+    "ParameterDataSwapTensorAdapter",
     "TensorAdapter",
     "register_adapter",
     "select_adapter",
 ]
+
+
+DENSE_ADDMM_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
 
 # Adapter-specific opaque state types. The Protocol is generic over
 # them so consumers (PinnedParamBuffer) can stay tensor-type-agnostic
@@ -58,12 +66,9 @@ class TensorAdapter(Protocol[PinnedStateT, GpuStateT]):
     round-trip the opaque types without inspecting them.
 
     The Protocol is methods-only — capability is determined by what an
-    adapter implements, not by declarative flags. If a future workload
-    needs to reject specific adapter/consumer combinations (e.g.,
-    trainable params with adapters whose ``cpu_param`` returns a
-    distinct Parameter each call), express that via interface
-    segregation (a ``TrainableTensorAdapter`` subprotocol checked with
-    ``isinstance``), not by adding a ``supports_trainable: bool``.
+    adapter implements, not by declarative flags. If a workload needs an
+    operation beyond inference movement, it should check one of the
+    smaller capability protocols below.
     """
 
     @staticmethod
@@ -133,6 +138,27 @@ class TensorAdapter(Protocol[PinnedStateT, GpuStateT]):
         ...
 
     @staticmethod
+    def compute_dtype(t: torch.Tensor) -> torch.dtype:
+        """Return the logical compute dtype for operations using ``t``.
+
+        For plain tensors this is simply ``t.dtype``. Quantized wrappers
+        should return their logical matmul/output dtype, not necessarily
+        the dtype of packed inner storage.
+        """
+        ...
+
+    @staticmethod
+    def cache_bytes(state: PinnedStateT) -> int:
+        """Total bytes this state consumes in host memory. Used by
+        :class:`ModelCache` for budget accounting."""
+        ...
+
+
+@runtime_checkable
+class CpuRoundTripTensorAdapter(TensorAdapter[PinnedStateT, GpuStateT], Protocol):
+    """Optional D2H counterpart to the base H2D movement contract."""
+
+    @staticmethod
     def copy_to_cpu(
         src: GpuStateT, dst: PinnedStateT, *, non_blocking: bool = False
     ) -> None:
@@ -143,16 +169,39 @@ class TensorAdapter(Protocol[PinnedStateT, GpuStateT]):
         an optimizer step has written into the GPU param, scatter the
         update back to the pinned state so the next H2D reads it.
 
-        Adapters whose GPU representation is not round-trippable (GGUF
-        dequantizes to bf16 on H2D and would need re-quantization for
-        D2H) should raise :class:`NotImplementedError`.
+        Adapters whose GPU representation is not round-trippable should
+        not implement this capability.
         """
         ...
 
+
+@runtime_checkable
+class DenseAddmmTensorAdapter(TensorAdapter[PinnedStateT, GpuStateT], Protocol):
+    """Optional capability for in-place dense ``addmm_`` updates."""
+
     @staticmethod
-    def cache_bytes(state: PinnedStateT) -> int:
-        """Total bytes this state consumes in host memory. Used by
-        :class:`ModelCache` for budget accounting."""
+    def validate_dense_addmm_target(t: torch.Tensor, name: str) -> None:
+        """Raise if ``t`` cannot safely receive an in-place ``addmm_``.
+
+        Used before installing a post-copy hook that mutates the freshly
+        copied GPU tensor. Adapters that do not implement this capability
+        are treated as non-mergeable by that caller.
+        """
+        ...
+
+
+@runtime_checkable
+class ParameterDataSwapTensorAdapter(TensorAdapter[PinnedStateT, GpuStateT], Protocol):
+    """Optional capability for trainable streaming via ``Parameter.data`` swap."""
+
+    @staticmethod
+    def validate_parameter_data_swap_target(t: torch.Tensor, name: str) -> None:
+        """Raise if ``t`` cannot safely round-trip through ``param.data =``.
+
+        Streamed trainables preserve user Parameter identity by swapping
+        only ``.data``. Tensor subclasses with wrapper metadata generally
+        must not opt into this capability.
+        """
         ...
 
 
@@ -254,6 +303,31 @@ class RegularAdapter:
         src: _RegularGpu, dst: _RegularPinned, *, non_blocking: bool = False
     ) -> None:
         dst.data.copy_(src.data, non_blocking=non_blocking)
+
+    @staticmethod
+    def compute_dtype(t: torch.Tensor) -> torch.dtype:
+        return t.dtype
+
+    @staticmethod
+    def validate_dense_addmm_target(t: torch.Tensor, name: str) -> None:
+        if type(t) is not torch.Tensor:
+            raise ValueError(
+                f"Dense addmm target {name!r} is {type(t).__name__}; "
+                "dense in-place addmm requires a plain torch.Tensor."
+            )
+        if t.dtype not in DENSE_ADDMM_DTYPES:
+            raise ValueError(
+                f"Dense addmm target {name!r} has dtype {t.dtype}; "
+                "dense in-place addmm requires bf16, fp16, or fp32."
+            )
+
+    @staticmethod
+    def validate_parameter_data_swap_target(t: torch.Tensor, name: str) -> None:
+        if type(t) is not torch.Tensor:
+            raise NotImplementedError(
+                f"Trainable streaming slot {name!r} is {type(t).__name__}; "
+                "Parameter.data swap requires a plain torch.Tensor."
+            )
 
     @staticmethod
     def cache_bytes(state: _RegularPinned) -> int:

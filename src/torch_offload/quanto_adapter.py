@@ -186,6 +186,11 @@ class QuantoAdapter:
         dst.scale.copy_(src.scale, non_blocking=non_blocking)
 
     @staticmethod
+    def compute_dtype(t: torch.Tensor) -> torch.dtype:
+        qt = require_qbytes_tensor(t)
+        return qt.dtype
+
+    @staticmethod
     def cache_bytes(state: _QuantoPinned) -> int:
         return (
             state.data.numel() * state.data.element_size()

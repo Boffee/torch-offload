@@ -20,9 +20,10 @@ import torch
 from torch import nn
 
 from ._quanto import is_weight_qbytes_tensor, requantize_with_addmm_delta
-from .lora import _ADDMM_DTYPES, LoRA
+from .lora import LoRA
 from .pinned_buffer import storage_key
 from .slots import canonical_param_name, iter_param_slots
+from .tensor_adapters import DENSE_ADDMM_DTYPES
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +81,7 @@ def merge_lora(
                     f"target shape is {expected}."
                 )
             data = group.param.data
-            if not is_weight_qbytes_tensor(data) and data.dtype not in _ADDMM_DTYPES:
+            if not is_weight_qbytes_tensor(data) and data.dtype not in DENSE_ADDMM_DTYPES:
                 raise ValueError(
                     f"Cannot merge LoRA into {target_key!r} with "
                     f"dtype {data.dtype}. Supported: "
@@ -94,7 +95,7 @@ def merge_lora(
             new_qt = requantize_with_addmm_delta(param.data, a, b, strength)
             new_param = nn.Parameter(new_qt, requires_grad=param.requires_grad)
             group.param = _replace_group_param(group, new_param, target_key)
-        elif param.data.dtype in _ADDMM_DTYPES:
+        elif param.data.dtype in DENSE_ADDMM_DTYPES:
             dev = param.data.device
             param.data.addmm_(
                 b.to(device=dev, dtype=param.data.dtype),

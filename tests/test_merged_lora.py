@@ -448,12 +448,30 @@ class TestSetLorasValidation:
             "embed.lora_B.weight": torch.randn(16, 4),
         }
         s.set_loras([(LoRA(state_dict=sd), 1.0)], mode="merge")
-        with pytest.raises(ValueError, match=r"merge mode|wrapped in|subclass"):
+        with pytest.raises(
+            ValueError,
+            match=r"uses QuantoAdapter|dense in-place addmm-capable",
+        ):
             _activate_loras_for_test(s)
         # routed mode must still accept it.
         s.set_loras([(LoRA(state_dict=sd), 1.0)], mode="routed")
         route_count = _activate_loras_for_test(s)
         assert route_count == 1
+
+    def test_merge_mode_rejects_regular_non_addmm_dtype(self) -> None:
+        m = _make_bf16_model()
+        m.embed.weight = nn.Parameter(
+            torch.zeros(16, 16, dtype=torch.int32),
+            requires_grad=False,
+        )
+        s = _make_strategy(m)
+        sd = {
+            "embed.lora_A.weight": torch.randn(4, 16),
+            "embed.lora_B.weight": torch.randn(16, 4),
+        }
+        s.set_loras([(LoRA(state_dict=sd), 1.0)], mode="merge")
+        with pytest.raises(ValueError, match="dense in-place addmm requires"):
+            _activate_loras_for_test(s)
 
     def test_accepts_fp16_base(self) -> None:
         m = _make_bf16_model().to(torch.float16)
@@ -1175,12 +1193,12 @@ class TestRoutedFactorDtype:
         layer.compute_dtype = torch.float16  # type: ignore[assignment]
         assert _routed_factor_dtype(layer) is torch.float16
 
-    def test_quanto_weight_dtype_is_compute_dtype(self) -> None:
+    def test_quanto_adapter_reports_compute_dtype(self) -> None:
         # quanto's WeightQBytesTensor wraps an int8 _data plus a fp
         # _scale, but the wrapper-subclass dtype is set to scale.dtype
         # (per `_make_wrapper_subclass(... dtype=scale.dtype ...)`).
-        # That means `weight.dtype` already reports the compute dtype —
-        # no special-casing needed for routed mode.
+        # The routed probe now asks the tensor adapter for the logical
+        # compute dtype instead of reading storage internals directly.
         quanto = pytest.importorskip("optimum.quanto")
         from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
 

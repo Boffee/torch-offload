@@ -10,7 +10,9 @@ Per-parameter mechanics live in the tensor adapter
 (:mod:`tensor_adapters` for plain tensors, :mod:`quanto_adapter` for
 quanto). :class:`PinnedParamBuffer` is a thin holder that pairs one
 :class:`nn.Parameter` with the adapter that handles its tensor type
-plus the pinned-host state that adapter produced.
+plus the pinned-host state that adapter produced. Optional operations
+such as D2H round-trip, trainable ``.data`` swap, and dense updates
+are exposed through adapter capability methods.
 """
 
 from __future__ import annotations
@@ -25,7 +27,12 @@ from . import (
     gguf_adapter,  # noqa: F401 — registration side effect
     quanto_adapter,  # noqa: F401 — registration side effect
 )
-from .tensor_adapters import TensorAdapter, select_adapter
+from .tensor_adapters import (
+    CpuRoundTripTensorAdapter,
+    ParameterDataSwapTensorAdapter,
+    TensorAdapter,
+    select_adapter,
+)
 
 PostCopyHook = Callable[[torch.Tensor], None]
 
@@ -78,11 +85,10 @@ class PinnedParamBuffer:
     (:attr:`cpu_param`).
 
     The lifecycle methods (:meth:`allocate_gpu_storage`,
-    :meth:`make_gpu_param`, :meth:`copy_to_gpu`, :meth:`copy_to_cpu`,
-    :meth:`load_to_gpu`) all dispatch through the adapter. Consumers
-    work with the opaque :class:`GpuState` returned by
-    :meth:`allocate_gpu_storage`; the buffer round-trips that opaque
-    handle through subsequent calls.
+    :meth:`make_gpu_param`, :meth:`copy_to_gpu`, :meth:`load_to_gpu`)
+    all dispatch through the adapter. Consumers work with the opaque
+    :class:`GpuState` returned by :meth:`allocate_gpu_storage`; the
+    buffer round-trips that opaque handle through subsequent calls.
 
     The buffer captures the source parameter's ``requires_grad`` at
     construction time and threads it through to the adapter when
@@ -151,13 +157,22 @@ class PinnedParamBuffer:
     def copy_to_cpu(self, gpu_state: object, *, non_blocking: bool = False) -> None:
         """Bulk D2H GPU bytes back into the pinned host state.
 
-        Symmetric counterpart to :meth:`copy_to_gpu`. The pinned state
-        is overwritten in place with the current GPU contents — useful
-        for syncing the host clone after an in-place GPU update (e.g.,
-        an optimizer step). Adapters whose GPU representation is not
-        round-trippable (GGUF) raise :class:`NotImplementedError`.
+        Optional symmetric counterpart to :meth:`copy_to_gpu`. The
+        pinned state is overwritten in place with the current GPU
+        contents — useful for syncing the host clone after an in-place
+        GPU update (e.g., an optimizer step). Adapters whose GPU
+        representation is not round-trippable do not expose this
+        capability and raise :class:`NotImplementedError` here.
         """
-        self.adapter.copy_to_cpu(gpu_state, self.pinned_state, non_blocking=non_blocking)
+        if not isinstance(self.adapter, CpuRoundTripTensorAdapter):
+            raise NotImplementedError(
+                f"{self.adapter.__name__} does not support CPU round-trip: "
+                "its GPU representation cannot be copied back into the "
+                "pinned host state without adapter-specific conversion."
+            )
+        self.adapter.copy_to_cpu(
+            gpu_state, self.pinned_state, non_blocking=non_blocking
+        )
 
     def load_to_gpu(
         self, device: torch.device, non_blocking: bool = False
@@ -170,6 +185,23 @@ class PinnedParamBuffer:
         gpu_state = self.allocate_gpu_storage(device)
         self.copy_to_gpu(gpu_state, non_blocking=non_blocking)
         return self.make_gpu_param(gpu_state)
+
+    @property
+    def compute_dtype(self) -> torch.dtype:
+        """Logical compute dtype reported by this buffer's adapter."""
+        return self.adapter.compute_dtype(self.cpu_param.data)
+
+    def validate_parameter_data_swap_target(self, name: str) -> None:
+        """Raise if this buffer cannot be trainable-streamed via ``.data``."""
+        if not isinstance(self.adapter, ParameterDataSwapTensorAdapter):
+            raise NotImplementedError(
+                f"Trainable streaming requires a Parameter.data-swap-capable "
+                f"tensor adapter; slot {name!r} uses {self.adapter.__name__}. "
+                "Quantized or structured weights are inference-only here — "
+                "keep them frozen, or wrap with PEFT/LoRA so the trainable "
+                "adapter weights are plain tensors."
+            )
+        self.adapter.validate_parameter_data_swap_target(self.cpu_param.data, name)
 
     @property
     def cache_bytes(self) -> int:

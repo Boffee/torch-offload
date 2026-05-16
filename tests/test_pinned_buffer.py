@@ -292,13 +292,13 @@ class TestCopyToCpu:
         assert buf.pinned_state.axis == 0
 
     @CUDA
-    def test_gguf_raises_not_implemented(self) -> None:
+    def test_gguf_lacks_cpu_round_trip_capability(self) -> None:
         # GGUF stores packed quantized bytes on CPU but dequantized
         # bf16 on GPU — D2H would require re-quantization, which isn't
         # implemented. Surface it as NotImplementedError, not a silent
         # corruption of the pinned packed bytes.
         gguf = pytest.importorskip("gguf")
-        from torch_offload.gguf_adapter import GGUFWeight, GgufAdapter
+        from torch_offload.gguf_adapter import GGUFWeight
 
         # Build minimal GGUF state directly via the adapter — avoids
         # needing a real .gguf file to load. Q4_0 has the simplest
@@ -310,8 +310,5 @@ class TestCopyToCpu:
         p = nn.Parameter(gguf_t, requires_grad=False)
         buf = PinnedParamBuffer("w", p)
         gpu_state = buf.allocate_gpu_storage(torch.device("cuda"))
-        with pytest.raises(NotImplementedError, match="re-quantization"):
+        with pytest.raises(NotImplementedError, match="CPU round-trip"):
             buf.copy_to_cpu(gpu_state)
-        # Adapter dispatch path also surfaces it.
-        with pytest.raises(NotImplementedError):
-            GgufAdapter.copy_to_cpu(gpu_state, buf.pinned_state)

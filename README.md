@@ -150,8 +150,14 @@ Gradients are not streamed; PyTorch owns `param.grad` normally.
 installs activation-scoped post-copy hooks for matched targets. Each
 hook runs immediately after the owning component copies the base weight
 from pinned CPU storage to GPU, so both block-streamed and non-block
-weights use the same merge path. `PinnedParamBuffer` remains a storage
-primitive; it does not own LoRA-specific behavior.
+weights use the same merge path. Merge compatibility is adapter-owned:
+plain dense tensors opt into in-place `addmm_`; structured quantized
+wrappers should use routed mode only when the module still exposes a
+compatible logical Linear weight shape and compute dtype, unless they
+provide their own permanent merge path. `PinnedParamBuffer` remains a
+storage primitive; LoRA merge mode asks the selected adapter for the
+dense-update capability.
+
 `set_loras()` records the replacement request while the offloader is
 inactive. Target matching and mode-specific compatibility are validated
 during activation, so LoRA application follows the same runtime boundary
@@ -191,15 +197,17 @@ the previous merge — no explicit unmerge step needed.
 `nn.Linear` parent — `y = base(x) + alpha * B * A * x` — instead of merging
 into the base weight. Use it when:
 
-- The base weight is quantized (quanto): `mode="merge"` rejects on activation
-  subclassed wrappers because in-place `addmm_` silently drops the
-  update on them; `mode="routed"` works because it doesn't touch
-  the base.
+- The base weight is quantized or otherwise structured, but still exposes
+  a logical `nn.Linear` weight shape and compute dtype: `mode="merge"`
+  only accepts adapters that explicitly support dense in-place `addmm_`;
+  `mode="routed"` works because it doesn't touch the base.
 - You want to switch LoRAs frequently without re-streaming the
   underlying base weight.
 
 Routed mode is restricted to `nn.Linear` parents and rejects tied
-weights (the hook would only fire on one alias).
+weights (the hook would only fire on one alias). Packed formats whose
+parameter shape differs from the logical matmul weight need a per-format
+route layer.
 
 For a one-shot **permanent** merge — bake the LoRA into the model
 weights and discard the LoRA — use `merge_lora`:
@@ -409,9 +417,9 @@ from `context.candidates` and enough bytes to satisfy
             │                                        │
             └────────────────────┬───────────────────┘
                                  ▼
-                       ┌──────────────────┐
+                      ┌──────────────────┐
                        │ PinnedParamBuffer│  per-tensor pinned-CPU storage
-                       │  (quanto-aware)  │  via tensor adapters
+                       │ adapter-capable  │  via tensor adapters
                        └──────────────────┘
 ```
 
@@ -438,6 +446,13 @@ A narrower `ModelStrategyComponent` Protocol (just `cache_bytes` +
 `activate` + `deactivate`, no `model`) describes pieces composable
 inside a top-level strategy — `StreamedWeights`, `TrainableWeights`,
 and a `PinnedWeights` used as a non-block sibling all satisfy it.
+
+`TensorAdapter` is the per-parameter extension point. Its base contract
+only covers inference movement: clone/pin, H2D copy, GPU wrapper rebuild,
+cache bytes, and logical compute dtype. Extra behaviors are explicit
+capabilities: CPU round-trip for optimizer-step sync, `Parameter.data`
+swap for trainable streaming, and dense in-place `addmm_` for activation
+LoRA merge.
 
 ## Strategy lifecycle
 

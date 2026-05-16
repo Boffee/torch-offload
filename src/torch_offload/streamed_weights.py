@@ -55,7 +55,6 @@ from ._devices import canonical_device
 from .pinned_buffer import PinnedParamBuffer, PostCopyHook, PostCopyHookHandle
 from .protocols import SlotOwnership
 from .slots import iter_buffer_slots, iter_param_slots
-from .tensor_adapters import RegularAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -384,20 +383,11 @@ class _BlockPinnedStore:
             block_locs: list[tuple[str, nn.Module, str]] = []
             for name, param, parent, leaf in block_params:
                 buf = PinnedParamBuffer(name, param)
-                # Trainable streaming uses ``.data`` swap, which doesn't
-                # preserve quanto's subclass wrapper on assignment.
-                # Trainable quantized weights also aren't a real
-                # workload (PyTorch can't easily train through quanto).
-                # Reject at construction rather than failing later.
-                if buf.requires_grad and buf.adapter is not RegularAdapter:
-                    raise NotImplementedError(
-                        f"Trainable streaming requires plain "
-                        f"torch.Tensor params; slot {name!r} uses "
-                        f"{buf.adapter.__name__}. Quantized weights "
-                        f"are inference-only — keep them frozen, or "
-                        f"wrap with PEFT/LoRA so the trainable "
-                        f"adapter is plain-tensor."
-                    )
+                # Trainable streaming uses ``.data`` swap to preserve
+                # the user's Parameter identity. Only adapters that
+                # explicitly opt into that capability are allowed.
+                if buf.requires_grad:
+                    buf.validate_parameter_data_swap_target(name)
                 block_pinned.append(buf)
                 block_locs.append((name, parent, leaf))
             self._param_bufs.append(block_pinned)
