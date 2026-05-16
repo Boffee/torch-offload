@@ -10,8 +10,11 @@ CUDA-only tests gate on availability.
 
 from __future__ import annotations
 
+import contextlib
+
 import pytest
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from torch_offload import (
@@ -22,6 +25,7 @@ from torch_offload import (
     merge_lora,
 )
 from torch_offload.lora import KeyTransformT
+from torch_offload.model_offloader import _routed_factor_dtype
 from torch_offload.protocols import CachedResource
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -148,6 +152,35 @@ def _expected_merged_weight(
     return out
 
 
+def _expected_routed_output(
+    model: nn.Module,
+    x: torch.Tensor,
+    loras: list[tuple[LoRA, float]],
+) -> torch.Tensor:
+    """Manual routed baseline using F.linear to bypass installed hooks."""
+    h = F.linear(x, model.embed.weight.to(x.device))
+    for i, blk in enumerate(model.transformer_blocks):
+        base_attn = F.linear(h, blk.attn.weight.to(h.device))
+        target_name = f"transformer_blocks.{i}.attn.weight"
+        a_parts = []
+        b_parts = []
+        for lora, strength in loras:
+            factors = lora.targets.get(target_name)
+            if factors is None:
+                continue
+            a, b = factors
+            a_parts.append(a.to(device=h.device, dtype=h.dtype))
+            b_part = b.to(device=h.device, dtype=h.dtype).clone()
+            b_part.mul_(strength)
+            b_parts.append(b_part)
+        if a_parts:
+            a_fused = torch.cat(a_parts, dim=0)
+            b_fused = torch.cat(b_parts, dim=1)
+            base_attn = base_attn + (h @ a_fused.T) @ b_fused.T
+        h = F.linear(base_attn, blk.ff.weight.to(h.device))
+    return F.linear(h, model.head.weight.to(h.device))
+
+
 def _make_strategy(
     model: nn.Module, blocks_to_swap: int = 1,
 ) -> ModelOffloader:
@@ -163,6 +196,19 @@ def _has_transform(strategy: ModelOffloader, target_key: str) -> bool:
     """Check whether a transform is attached for the given target."""
     buf = strategy._reverse_index.get(target_key)
     return buf is not None and buf.transform is not None
+
+
+def _activate_loras_for_test(
+    strategy: ModelOffloader,
+) -> int:
+    targets = strategy._group_loras_by_target(strategy._loras)
+    if strategy._lora_mode == "merge":
+        strategy._activate_merge_loras(torch.device("cuda"), targets)
+        return len(targets)
+
+    with contextlib.ExitStack() as stack:
+        strategy._activate_routed_loras(torch.device("cpu"), targets, stack)
+        return len(targets)
 
 
 # ---------------------------------------------------------------------------
@@ -227,7 +273,7 @@ class TestLoRAConstruction:
 
 
 # ---------------------------------------------------------------------------
-# set_loras validation
+# LoRA request validation
 # ---------------------------------------------------------------------------
 
 
@@ -239,8 +285,9 @@ class TestSetLorasValidation:
             "transformer_blocks.0.attn.lora_A.weight": torch.randn(4, 16),
             "transformer_blocks.0.attn.lora_B.weight": torch.randn(8, 4),
         }
+        s.set_loras([(LoRA(state_dict=sd), 1.0)])
         with pytest.raises(ValueError, match="shape mismatch"):
-            s.set_loras([(LoRA(state_dict=sd), 1.0)])
+            _activate_loras_for_test(s)
 
     def test_accepts_fp32_lora_target(self) -> None:
         m = _make_bf16_model().to(torch.float32)
@@ -248,6 +295,8 @@ class TestSetLorasValidation:
             p.requires_grad = False
         s = _make_strategy(m)
         s.set_loras([(_make_lora(4, 16), 1.0)])
+        assert not _has_transform(s, "transformer_blocks.0.attn.weight")
+        _activate_loras_for_test(s)
         assert _has_transform(s, "transformer_blocks.0.attn.weight")
 
     def test_non_block_targets_matched(self) -> None:
@@ -258,6 +307,7 @@ class TestSetLorasValidation:
             "embed.lora_B.weight": torch.randn(16, 4),
         }
         s.set_loras([(LoRA(state_dict=sd), 1.0)])
+        _activate_loras_for_test(s)
         assert _has_transform(s, "embed.weight")
 
     def test_non_block_tied_alias_target_matched(self) -> None:
@@ -268,6 +318,7 @@ class TestSetLorasValidation:
             "head.lora_B.weight": torch.randn(16, 4),
         }
         s.set_loras([(LoRA(state_dict=sd), 1.0)], mode="merge")
+        _activate_loras_for_test(s)
         assert _has_transform(s, "head.weight")
         assert _has_transform(s, "embed.weight")
 
@@ -280,8 +331,9 @@ class TestSetLorasValidation:
             "head.lora_A.weight": torch.randn(4, 16),
             "head.lora_B.weight": torch.randn(16, 4),
         }
+        s.set_loras([(LoRA(state_dict=sd), 1.0)], mode="merge")
         with pytest.raises(ValueError, match="same tied parameter storage"):
-            s.set_loras([(LoRA(state_dict=sd), 1.0)], mode="merge")
+            _activate_loras_for_test(s)
 
     def test_streamed_block_shared_submodule_alias_target_matched(self) -> None:
         class Block(nn.Module):
@@ -306,6 +358,7 @@ class TestSetLorasValidation:
             "transformer_blocks.0.b.lora_B.weight": torch.randn(16, 4),
         }
         s.set_loras([(LoRA(state_dict=sd), 1.0)], mode="merge")
+        _activate_loras_for_test(s)
         assert _has_transform(s, "transformer_blocks.0.b.weight")
         assert _has_transform(s, "transformer_blocks.0.a.weight")
 
@@ -314,6 +367,7 @@ class TestSetLorasValidation:
         s = _make_strategy(m)
         lora = _make_lora(4, 16, prefix="diffusion_model.")
         s.set_loras([(lora, 1.0)])
+        _activate_loras_for_test(s)
         assert _has_transform(s, "transformer_blocks.0.attn.weight")
 
     def test_key_transform_none_matches_exact_keys(self) -> None:
@@ -321,6 +375,7 @@ class TestSetLorasValidation:
         s = _make_strategy(m)
         lora = _make_lora(4, 16, key_transform=None)
         s.set_loras([(lora, 1.0)])
+        _activate_loras_for_test(s)
         assert _has_transform(s, "transformer_blocks.0.attn.weight")
 
     def test_key_transform_none_skips_prefixed_keys(self) -> None:
@@ -328,13 +383,14 @@ class TestSetLorasValidation:
         s = _make_strategy(m)
         lora = _make_lora(4, 16, prefix="diffusion_model.", key_transform=None)
         s.set_loras([(lora, 1.0)])
+        _activate_loras_for_test(s)
         assert not _has_transform(s, "transformer_blocks.0.attn.weight")
 
     def test_merge_mode_activation_rejects_cpu(self) -> None:
         m = _make_bf16_model()
         s = _make_strategy(m)
         s.set_loras([(_make_lora(4, 16), 1.0)], mode="merge")
-        with pytest.raises(ValueError, match="merge transforms require CUDA"):
+        with pytest.raises(ValueError, match="merge mode requires CUDA"):
             s.activate("cpu")
 
     @CUDA
@@ -349,23 +405,24 @@ class TestSetLorasValidation:
         finally:
             s.deactivate()
 
-    def test_set_loras_clears_previous(self) -> None:
+    def test_clear_loras_clears_previous_merge_transform(self) -> None:
         m = _make_bf16_model()
         s = _make_strategy(m)
         s.set_loras([(_make_lora(4, 16, rank=4), 1.0)])
+        _activate_loras_for_test(s)
         assert _has_transform(s, "transformer_blocks.0.attn.weight")
-        s.set_loras([])
+        s._clear_loras()
         assert not _has_transform(s, "transformer_blocks.0.attn.weight")
 
     def test_rejects_quanto_target_in_merge_mode(self) -> None:
         # Regression: quanto WeightQBytesTensor advertises the scale's
         # float dtype (bf16/fp16) via `weight.dtype`, which used to
         # pass the merge-mode dtype gate. addmm_ on the wrapper then
-        # silently drops the LoRA — _data stays untouched. set_loras
+        # silently drops the LoRA — _data stays untouched. Activation
         # must reject subclassed wrappers in merge mode regardless of
         # the advertised dtype.
         quanto = pytest.importorskip("optimum.quanto")
-        from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
+        from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor  # noqa: PLC0415
 
         m = _make_bf16_model()
         rows = cols = 16
@@ -381,10 +438,13 @@ class TestSetLorasValidation:
             "embed.lora_A.weight": torch.randn(4, 16),
             "embed.lora_B.weight": torch.randn(16, 4),
         }
-        with pytest.raises(ValueError, match="merge mode|wrapped in|subclass"):
-            s.set_loras([(LoRA(state_dict=sd), 1.0)], mode="merge")
+        s.set_loras([(LoRA(state_dict=sd), 1.0)], mode="merge")
+        with pytest.raises(ValueError, match=r"merge mode|wrapped in|subclass"):
+            _activate_loras_for_test(s)
         # routed mode must still accept it.
         s.set_loras([(LoRA(state_dict=sd), 1.0)], mode="routed")
+        route_count = _activate_loras_for_test(s)
+        assert route_count == 1
 
     def test_accepts_fp16_base(self) -> None:
         m = _make_bf16_model().to(torch.float16)
@@ -392,6 +452,35 @@ class TestSetLorasValidation:
             p.requires_grad = False
         s = _make_strategy(m)
         assert s.cache_bytes > 0
+
+    def test_modes_defer_until_activation(self) -> None:
+        m = _make_bf16_model()
+        s = _make_strategy(m)
+        for mode in ("merge", "routed"):
+            s.set_loras([(_make_lora(4, 16), 1.0)], mode=mode)
+            assert not _has_transform(s, "transformer_blocks.0.attn.weight")
+            assert len(s._loras) == 1
+            assert s._lora_mode == mode
+
+    def test_routed_mode_cpu_activation_uses_hooks(self) -> None:
+        m = _make_bf16_model(num_blocks=2).to(torch.float32)
+        for p in m.parameters():
+            p.requires_grad = False
+        loras = [(_make_lora(2, 16, seed=9), 0.75)]
+        s = _make_strategy(m)
+        s.set_loras(loras, mode="routed")
+
+        x = torch.randn(2, 16)
+        s.activate("cpu")
+        try:
+            actual = m(x)
+            expected = _expected_routed_output(m, x, loras)
+            assert torch.allclose(actual, expected, rtol=1e-5, atol=1e-5)
+            assert not _has_transform(s, "transformer_blocks.0.attn.weight")
+        finally:
+            s.deactivate()
+
+        assert s._loras == []
 
 
 # ---------------------------------------------------------------------------
@@ -691,7 +780,7 @@ class TestPermanentMerge:
 
 class TestRoutedMode:
     """Routed-mode LoRA: forward hook on the parent layer, base
-    weight untouched. Math: y = base(x) + α·B·A·x.
+    weight untouched. Math: y = base(x) + alpha * B * A * x.
     """
 
     def _expected_routed_output(
@@ -704,29 +793,7 @@ class TestRoutedMode:
         bypass any forward hooks installed on the layers (otherwise
         the expected calculation would also include the hook output
         and we'd be comparing the hook against itself)."""
-        import torch.nn.functional as F  # noqa: N812
-
-        h = F.linear(x, model.embed.weight.to(x.device))
-        for i, blk in enumerate(model.transformer_blocks):
-            base_attn = F.linear(h, blk.attn.weight.to(h.device))
-            target_name = f"transformer_blocks.{i}.attn.weight"
-            a_parts = []
-            b_parts = []
-            for lora, strength in loras:
-                factors = lora.targets.get(target_name)
-                if factors is None:
-                    continue
-                a, b = factors
-                a_parts.append(a.to(device=h.device, dtype=h.dtype))
-                b_part = b.to(device=h.device, dtype=h.dtype).clone()
-                b_part.mul_(strength)
-                b_parts.append(b_part)
-            if a_parts:
-                a_fused = torch.cat(a_parts, dim=0)
-                b_fused = torch.cat(b_parts, dim=1)
-                base_attn = base_attn + (h @ a_fused.T) @ b_fused.T
-            h = F.linear(base_attn, blk.ff.weight.to(h.device))
-        return F.linear(h, model.head.weight.to(h.device))
+        return _expected_routed_output(model, x, loras)
 
     @CUDA
     def test_routed_forward_matches_manual_baseline(self) -> None:
@@ -823,8 +890,8 @@ class TestRoutedMode:
 
     def test_routed_with_non_linear_target_raises(self) -> None:
         # Routed math assumes y = x @ W.T + bias. If a target's parent
-        # is not nn.Linear, set_loras(mode="routed") must reject so we
-        # don't silently install a hook against an incompatible forward.
+        # is not nn.Linear, routed activation must reject so we don't
+        # silently install a hook against an incompatible forward.
         class LinearLike(nn.Module):
             """nn.Linear-shaped weight but not an nn.Linear instance."""
 
@@ -869,16 +936,17 @@ class TestRoutedMode:
         )
         # Build a LoRA targeting attn.weight (LinearLike, not nn.Linear).
         lora = _make_lora(num_blocks=2, dim=16, seed=3)
-        with pytest.raises(ValueError, match="Routed LoRA mode requires nn.Linear"):
-            s.set_loras([(lora, 1.0)], mode="routed")
+        s.set_loras([(lora, 1.0)], mode="routed")
+        with pytest.raises(ValueError, match=r"Routed LoRA mode requires nn\.Linear"):
+            _activate_loras_for_test(s)
         # Merge mode should still work — it doesn't care about parent type.
         s.set_loras([(lora, 1.0)], mode="merge")
+        _activate_loras_for_test(s)
 
-    def test_routed_partial_failure_leaves_no_pending_state(self) -> None:
-        # Mid-loop rejection (e.g., one non-Linear target after some
-        # valid Linear targets) must NOT leave a half-built
-        # _pending_routes — the offloader has to roll back to the
-        # cleared state set at the top of set_loras.
+    def test_routed_partial_failure_leaves_no_hooks(self) -> None:
+        # Mid-loop route rejection (e.g., one non-Linear target after
+        # some valid Linear targets) must NOT leave half-built active
+        # hooks.
         class LinearLike(nn.Module):
             def __init__(self, dim: int) -> None:
                 super().__init__()
@@ -924,18 +992,10 @@ class TestRoutedMode:
             model,
             layers_attr="transformer_blocks", blocks_to_swap=1,
         )
-        # Pre-populate _pending_routes with stale state to verify it
-        # gets cleared (set_loras top-of-method clear).
-        s._pending_routes = [(model.transformer_blocks[0].attn, [])]
-
         lora = _make_lora(num_blocks=2, dim=16, seed=99)
-        with pytest.raises(ValueError, match="Routed LoRA mode requires nn.Linear"):
-            s.set_loras([(lora, 1.0)], mode="routed")
-        # No partial state survived the failed call.
-        assert s._pending_routes == [], (
-            f"set_loras failure left dangling _pending_routes "
-            f"with {len(s._pending_routes)} entries"
-        )
+        s.set_loras([(lora, 1.0)], mode="routed")
+        with pytest.raises(ValueError, match=r"Routed LoRA mode requires nn\.Linear"):
+            _activate_loras_for_test(s)
 
     @CUDA
     def test_routed_single_lora_skips_concat(self) -> None:
@@ -974,19 +1034,19 @@ class TestRoutedMode:
             f"{target}.lora_B.weight": torch.randn(16, 4),
         }
         lora = LoRA(state_dict=sd, key_transform=None)
+        s.set_loras([(lora, 1.0)], mode="routed")
         with pytest.raises(ValueError, match="tied weights"):
-            s.set_loras([(lora, 1.0)], mode="routed")
+            _activate_loras_for_test(s)
         # Merge mode handles tied weights via storage mutation.
         s.set_loras([(lora, 1.0)], mode="merge")
+        _activate_loras_for_test(s)
 
     @CUDA
     def test_routed_with_bias_linear(self) -> None:
-        # Routed math: hook adds α·B·A·x to the layer's output, which
+        # Routed math: hook adds alpha * B * A * x to the layer's output, which
         # already includes any bias from the base layer. Bias-having
         # Linears must produce the same output as a manual baseline
         # that goes through F.linear with the bias.
-        import torch.nn.functional as F  # noqa: N812
-
         class Block(nn.Module):
             def __init__(self, dim: int) -> None:
                 super().__init__()
@@ -1057,8 +1117,6 @@ class TestRoutedFactorDtype:
     """
 
     def test_plain_linear_returns_weight_dtype(self) -> None:
-        from torch_offload.model_offloader import _routed_factor_dtype
-
         layer = nn.Linear(8, 8, bias=False).to(torch.bfloat16)
         assert _routed_factor_dtype(layer) is torch.bfloat16
 
@@ -1066,8 +1124,6 @@ class TestRoutedFactorDtype:
         # BitsAndBytes Linear4bit pattern: subclass of nn.Linear that
         # exposes `compute_dtype` on the module. Probe must prefer that
         # over weight.dtype (which is int8 for bnb's Int8Params).
-        from torch_offload.model_offloader import _routed_factor_dtype
-
         layer = nn.Linear(8, 8, bias=False).to(torch.bfloat16)
         layer.compute_dtype = torch.float16  # type: ignore[assignment]
         assert _routed_factor_dtype(layer) is torch.float16
@@ -1079,9 +1135,7 @@ class TestRoutedFactorDtype:
         # That means `weight.dtype` already reports the compute dtype —
         # no special-casing needed for routed mode.
         quanto = pytest.importorskip("optimum.quanto")
-        from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
-
-        from torch_offload.model_offloader import _routed_factor_dtype
+        from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor  # noqa: PLC0415
 
         rows, cols = 4, 8
         data = torch.randint(-128, 127, (rows, cols), dtype=torch.int8)

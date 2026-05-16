@@ -10,7 +10,7 @@ Two application paths share the same :class:`LoRA` data container:
   on the GPU weight buffer after DMA; integrates with block streaming.
   Requires the base weight to be float (bf16/fp16/fp32).
 - :class:`LoRARouteHandle` (routed mode) — installs a forward hook on
-  the layer that adds ``α · (x @ A.T @ B.T)`` to the layer's output;
+  the layer that adds ``alpha * (x @ A.T @ B.T)`` to the layer's output;
   base weight is not touched in place. Restricted to ``nn.Linear``
   parents (other layer types raise) and tied weights are rejected.
   Compatible with quantized bases whose ``weight.dtype`` reports the
@@ -22,9 +22,10 @@ Two application paths share the same :class:`LoRA` data container:
   prefer PEFT's per-type LoraLayer subclasses.
 
 :class:`~torch_offload.ModelOffloader` is the consumer-facing API; its
-``set_loras(..., mode=...)`` picks the path. The merge path fires
-during DMA via :class:`LoRATransform`; the routed path lives as
-forward hooks installed on activate and removed on deactivate.
+``set_loras(..., mode=...)`` records the requested path and activation
+applies it once the device is known. The merge path fires during DMA
+via :class:`LoRATransform`; the routed path lives as forward hooks
+installed on activate and removed on deactivate.
 """
 
 from __future__ import annotations
@@ -183,7 +184,7 @@ class LoRARouteHandle:
     LoraLayer subclasses).
     """
 
-    __slots__ = ("_handle", "_a_fused", "_b_fused")
+    __slots__ = ("_a_fused", "_b_fused", "_handle")
 
     def __init__(
         self,
@@ -240,8 +241,6 @@ class LoRARouteHandle:
             output: torch.Tensor,
         ) -> torch.Tensor:
             x = inputs[0]
-            # x: (..., in_dim); A_fused: (R, in_dim); B_fused: (out_dim, R)
-            # where R = sum_i rank_i. Contribution: x @ A.T @ B.T.
             return output + (x @ a_fused.T) @ b_fused.T
 
         self._handle = parent.register_forward_hook(hook)

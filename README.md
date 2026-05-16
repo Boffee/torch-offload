@@ -145,13 +145,14 @@ Gradients are not streamed; PyTorch owns `param.grad` normally.
 ### LoRA merge
 
 `ModelOffloader` supports optional per-weight LoRA merging via
-`set_loras()`. LoRA factors are attached as transforms on
-`PinnedParamBuffer` objects and applied automatically after DMA —
-both block-streamed and non-block weights get merged for free.
-`set_loras()` first clears the currently attached transforms, then
-validates and builds the replacement stack. If the replacement raises,
-the offloader is left in base-only mode; this avoids briefly holding
-both old and new pinned LoRA factors in host memory.
+`set_loras()`. LoRA requests are applied during activation; merge mode
+attaches transforms on `PinnedParamBuffer` objects and applies them
+automatically after DMA — both block-streamed and non-block weights get
+merged for free.
+`set_loras()` records the replacement request while the offloader is
+inactive. Target matching and mode-specific compatibility are validated
+during activation, so LoRA application follows the same runtime boundary
+as device selection.
 
 ```python
 import torch
@@ -166,7 +167,7 @@ offloader = ModelOffloader(
 )
 device = torch.device("cuda")
 
-# Attach LoRAs (must be called while deactivated)
+# Request LoRAs for the next activation (must be called while deactivated)
 offloader.set_loras([
     (LoRA(state_dict=load_file("lora_a.safetensors")), 0.8),
     (LoRA(state_dict=load_file("lora_b.safetensors")), 0.5),
@@ -184,10 +185,10 @@ the previous merge — no explicit unmerge step needed.
 
 `set_loras` accepts `mode="routed"` as an alternative to the default
 `mode="merge"`. Routed mode installs a forward hook on each matched
-`nn.Linear` parent — `y = base(x) + α·B·A·x` — instead of merging
+`nn.Linear` parent — `y = base(x) + alpha * B * A * x` — instead of merging
 into the base weight. Use it when:
 
-- The base weight is quantized (quanto): `mode="merge"` rejects
+- The base weight is quantized (quanto): `mode="merge"` rejects on activation
   subclassed wrappers because in-place `addmm_` silently drops the
   update on them; `mode="routed"` works because it doesn't touch
   the base.
@@ -499,11 +500,11 @@ A naive `param.data.clone()` on a quanto tensor silently
 *dequantizes* it via the dispatch fallback — the explicit decomposition
 is required for correctness.
 
-LoRA on quanto bases: `set_loras(mode="merge")` rejects quanto
-targets (in-place `addmm_` on a `WeightQBytesTensor` returns success
-but silently leaves `_data` untouched). Use `set_loras(mode="routed")`
-for inference-time application, or `merge_lora()` for a permanent
-dequant→addmm→requant bake-in.
+LoRA on quanto bases: merge mode rejects quanto targets on activation
+(in-place `addmm_` on a `WeightQBytesTensor` returns
+success but silently leaves `_data` untouched). Use
+`set_loras(mode="routed")` for inference-time application, or
+`merge_lora()` for a permanent dequant -> addmm -> requant bake-in.
 
 ## Failure modes
 

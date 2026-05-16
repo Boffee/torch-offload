@@ -42,11 +42,11 @@ CPU.
      ``stream_trainable_weights=True``).
   3. One :class:`StreamedWeights` per ``layers_attr`` path.
 
-Optional LoRA merging is handled by attaching
-:class:`~torch_offload.LoRATransform` objects to individual
-:class:`~torch_offload.PinnedParamBuffer` instances via
-:meth:`ModelOffloader.set_loras`. The transform fires automatically
-when the buffer copies to GPU — no separate merge strategy needed.
+Optional LoRA merging is requested via :meth:`ModelOffloader.set_loras`
+and resolved on activation by attaching :class:`~torch_offload.LoRATransform`
+objects to individual :class:`~torch_offload.PinnedParamBuffer`
+instances. The transform fires automatically when the buffer copies to
+GPU — no separate merge strategy needed.
 
 Cross-region tied parameters (block <-> non-block, cross-block, or
 mixed trainable/frozen across regions) are detected at construction

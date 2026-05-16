@@ -30,6 +30,11 @@ from .trainable_weights import TrainableWeights
 
 logger = logging.getLogger(__name__)
 
+LoraMode = Literal["merge", "routed"]
+_LoraFactorRef = tuple[torch.Tensor, torch.Tensor, float]
+_LoraTargetMap = dict[str, list[_LoraFactorRef]]
+
+
 __all__ = [
     "ModelOffloader",
     "detect_streaming_region_ties",
@@ -77,10 +82,11 @@ class ModelOffloader:
 
     Composes :class:`PinnedWeights` (non-block frozen params),
     :class:`TrainableWeights` (LoRA / adapter params), and one or more
-    :class:`StreamedWeights`\\ s internally. LoRA transforms are set via
-    :meth:`set_loras` and attach to individual
-    :class:`PinnedParamBuffer` objects so the merge fires automatically
-    during DMA — no separate merge strategy needed.
+    :class:`StreamedWeights`\\ s internally. LoRA requests are recorded via
+    :meth:`set_loras` and applied on :meth:`activate`, where merge mode
+    attaches transforms to individual :class:`PinnedParamBuffer` objects
+    so the merge fires automatically during DMA — no separate merge
+    strategy needed.
 
     Training
     --------
@@ -305,23 +311,21 @@ class ModelOffloader:
             if is_block_checkpointed is not None
             else _hf_block_has_checkpointing_flag
         )
-        # Pending routed-mode LoRAs: list of (parent_module, refs).
-        # Populated by set_loras(mode="routed"); the actual hooks are
-        # installed on activate() and removed on deactivate(). Cleared
-        # on every set_loras() call (including merge mode and clears).
-        self._pending_routes: list[
-            tuple[nn.Module, list[tuple[torch.Tensor, torch.Tensor, float]]]
-        ] = []
+        # Configured LoRA request. set_loras() only records caller intent;
+        # activate(device) groups targets and validates the requested
+        # application path once the runtime context is known.
+        self._loras: list[tuple[LoRA, float]] = []
+        self._lora_mode: LoraMode = "merge"
 
     # ------------------------------------------------------------------ API
 
-    def set_loras(  # noqa: PLR0912
+    def set_loras(
         self,
         loras: Sequence[tuple[LoRA, float]],
         *,
-        mode: Literal["merge", "routed"] = "merge",
+        mode: LoraMode = "merge",
     ) -> None:
-        """Attach LoRAs for the next activation cycle.
+        """Record LoRAs for the next activation cycle.
 
         Must be called while deactivated. Attachments are cleared
         automatically on :meth:`deactivate`, so callers must call
@@ -330,24 +334,23 @@ class ModelOffloader:
 
         ``mode``:
 
-        - ``"merge"`` (default): attaches a :class:`LoRATransform` per
-          matched :class:`PinnedParamBuffer`. The merge fires during
-          DMA via in-place ``addmm_``, so it rides along with the
-          streaming cycle. Requires base weight dtype to be bf16, fp16,
-          or fp32.
-        - ``"routed"``: registers a forward hook on each matched
-          parent module. Forward becomes ``y = base(x) + alpha * B * A * x``.
-          Doesn't touch the base weight in place. Restricted to
-          ``nn.Linear`` parents (the math assumes ``y = x @ W.T``);
-          tied targets and non-Linear parents raise. Quantized bases
-          work when the compute dtype is probeable via
+        - ``"merge"`` (default): on CUDA activation, attaches a
+          :class:`LoRATransform` per matched :class:`PinnedParamBuffer`.
+          The merge fires during DMA via in-place ``addmm_``, so it
+          rides along with the streaming cycle. Requires CUDA activation
+          and base weight dtype bf16, fp16, or fp32.
+        - ``"routed"``: on activation, registers a forward hook on each
+          matched parent module. Forward becomes
+          ``y = base(x) + alpha * B * A * x``. Doesn't touch the base
+          weight in place. Restricted to ``nn.Linear`` parents (the math
+          assumes ``y = x @ W.T``); tied targets and non-Linear parents
+          raise. Quantized bases work when the compute dtype is probeable via
           :func:`_routed_factor_dtype` — covers plain fp/bf16/fp16,
           quanto (``weight.dtype`` already reports scale dtype), and
           formats that expose ``module.compute_dtype`` (BitsAndBytes
           ``Linear4bit``). Formats that report storage int via
           ``weight.dtype`` without a module-level compute dtype
           (``Linear8bitLt``, GGUF) aren't covered.
-
         Routed mode requires activations to reach the hooked layer in
         the layer's compute dtype (or under autocast). Mixed-dtype
         inputs without autocast will error in the hook's matmul.
@@ -363,15 +366,14 @@ class ModelOffloader:
             raise ValueError(
                 f"set_loras mode must be 'merge' or 'routed', got {mode!r}"
             )
-        # Clear any prior attachments from either mode.
-        for buf in self._reverse_index.values():
-            buf.transform = None
-        self._pending_routes = []
+        configured_loras = list(loras)
+        self._loras = configured_loras
+        self._lora_mode = mode if configured_loras else "merge"
 
-        if not loras:
-            return
-
-        per_target: dict[str, list[tuple[torch.Tensor, torch.Tensor, float]]] = {}
+    def _group_loras_by_target(
+        self, loras: Sequence[tuple[LoRA, float]],
+    ) -> _LoraTargetMap:
+        per_target: _LoraTargetMap = {}
         per_buffer_target: dict[int, str] = {}
         total_targets = 0
         matched_targets = 0
@@ -398,33 +400,6 @@ class ModelOffloader:
                         f"set_loras() call; otherwise the same base weight "
                         f"would receive multiple logical updates."
                     )
-                if mode == "merge":
-                    cpu_data = buf.cpu_param.data
-                    # Two distinct rejection paths for merge mode:
-                    # - Subclassed tensors (quanto WeightQBytesTensor,
-                    #   GGUFWeight, etc.) advertise a float dtype but
-                    #   silently drop in-place ops on the wrapper —
-                    #   addmm_ on a quanto tensor returns success while
-                    #   leaving the int8 _data unchanged.
-                    # - Plain float tensors must be in the addmm-capable
-                    #   dtype set.
-                    if type(cpu_data) is not torch.Tensor:
-                        raise ValueError(
-                            f"LoRA target {target_key!r} is wrapped in "
-                            f"{type(cpu_data).__name__}; merge mode "
-                            f"requires a plain torch.Tensor (in-place "
-                            f"addmm_ on subclassed tensors silently "
-                            f"drops the update). Use mode='routed' (or "
-                            f"PEFT routed mode), or apply "
-                            f"torch_offload.merge_lora() permanently."
-                        )
-                    if cpu_data.dtype not in _ADDMM_DTYPES:
-                        raise ValueError(
-                            f"LoRA target {target_key!r} has dtype "
-                            f"{cpu_data.dtype}; addmm_ merge requires "
-                            f"bf16, fp16, or fp32. Use mode='routed' (or "
-                            f"PEFT routed mode) for non-float bases."
-                        )
                 per_target.setdefault(target_key, []).append(
                     (a, b, strength)
                 )
@@ -440,41 +415,93 @@ class ModelOffloader:
         else:
             logger.debug("set_loras matched %d/%d targets", matched_targets, total_targets)
 
-        if mode == "merge":
-            for target_key, refs in per_target.items():
-                self._reverse_index[target_key].transform = LoRATransform(refs)
-        else:  # routed
-            # Two-pass: validate every parent before mutating state, so
-            # a mid-list rejection (non-Linear, tied weight) leaves the
-            # offloader in the cleared state set above instead of with
-            # a half-built _pending_routes the caller can't see.
-            new_routes: list[
-                tuple[nn.Module, list[tuple[torch.Tensor, torch.Tensor, float]]]
-            ] = []
-            for target_key, refs in per_target.items():
-                parents = self._reverse_parents[target_key]
-                if len(parents) != 1:
-                    raise ValueError(
-                        f"Routed LoRA mode does not support tied "
-                        f"weights; target {target_key!r} has "
-                        f"{len(parents)} parent locations (typically the "
-                        f"tied embed/head pattern). The hook would only "
-                        f"fire on one of them, silently missing the "
-                        f"others. Use mode='merge' for tied targets — "
-                        f"merge mutates the shared storage so all "
-                        f"locations see the LoRA contribution."
-                    )
-                parent = next(iter(parents))
-                if not isinstance(parent, nn.Linear):
-                    raise ValueError(
-                        f"Routed LoRA mode requires nn.Linear targets; "
-                        f"target {target_key!r} has parent module of "
-                        f"type {type(parent).__name__}. Use mode='merge' "
-                        f"for non-Linear targets, or wrap the model with "
-                        f"PEFT for richer per-type routing."
-                    )
-                new_routes.append((parent, refs))
-            self._pending_routes = new_routes
+        return per_target
+
+    def _activate_merge_loras(
+        self, active_device: torch.device, targets: _LoraTargetMap,
+    ) -> None:
+        if active_device.type != "cuda":
+            raise ValueError(
+                "ModelOffloader merge mode requires CUDA activation; "
+                f"got {active_device}. Use set_loras(..., mode='routed') "
+                "for CPU activation."
+            )
+
+        for target_key in targets:
+            buf = self._reverse_index[target_key]
+            cpu_data = buf.cpu_param.data
+            # Two distinct rejection paths for merge mode:
+            # - Subclassed tensors (quanto WeightQBytesTensor,
+            #   GGUFWeight, etc.) advertise a float dtype but silently
+            #   drop in-place ops on the wrapper — addmm_ on a quanto
+            #   tensor returns success while leaving the int8 _data
+            #   unchanged.
+            # - Plain float tensors must be in the addmm-capable dtype
+            #   set.
+            if type(cpu_data) is not torch.Tensor:
+                raise ValueError(
+                    f"LoRA target {target_key!r} is wrapped in "
+                    f"{type(cpu_data).__name__}; merge mode "
+                    f"requires a plain torch.Tensor (in-place "
+                    f"addmm_ on subclassed tensors silently "
+                    f"drops the update). Use mode='routed' (or "
+                    f"PEFT routed mode), or apply "
+                    f"torch_offload.merge_lora() permanently."
+                )
+            if cpu_data.dtype not in _ADDMM_DTYPES:
+                raise ValueError(
+                    f"LoRA target {target_key!r} has dtype "
+                    f"{cpu_data.dtype}; addmm_ merge requires "
+                    f"bf16, fp16, or fp32. Use mode='routed' (or "
+                    f"PEFT routed mode) for non-float bases."
+                )
+
+        self._clear_merge_loras()
+        for target_key, refs in targets.items():
+            self._reverse_index[target_key].transform = LoRATransform(refs)
+
+    def _activate_routed_loras(
+        self,
+        active_device: torch.device,
+        targets: _LoraTargetMap,
+        stack: contextlib.ExitStack,
+    ) -> None:
+        for target_key, refs in targets.items():
+            parents = self._reverse_parents[target_key]
+            if len(parents) != 1:
+                raise ValueError(
+                    f"Routed LoRA mode does not support tied "
+                    f"weights; target {target_key!r} has "
+                    f"{len(parents)} parent locations (typically the "
+                    f"tied embed/head pattern). The hook would only "
+                    f"fire on one of them, silently missing the "
+                    f"others. Use mode='merge' for tied targets — "
+                    f"merge mutates the shared storage so all "
+                    f"locations see the LoRA contribution."
+                )
+            parent = next(iter(parents))
+            if not isinstance(parent, nn.Linear):
+                raise ValueError(
+                    f"Routed LoRA mode requires nn.Linear targets; "
+                    f"target {target_key!r} has parent module of "
+                    f"type {type(parent).__name__}. Use mode='merge' "
+                    f"for non-Linear targets, or wrap the model with "
+                    f"PEFT for richer per-type routing."
+                )
+            handle = LoRARouteHandle(
+                parent, refs, active_device,
+                dtype=_routed_factor_dtype(parent),
+            )
+            stack.callback(handle.remove)
+
+    def _clear_merge_loras(self) -> None:
+        for buf in self._reverse_index.values():
+            buf.transform = None
+
+    def _clear_loras(self) -> None:
+        self._clear_merge_loras()
+        self._loras = []
+        self._lora_mode = "merge"
 
     # ------------------------------------------------- ModelStrategy interface
 
@@ -501,22 +528,30 @@ class ModelOffloader:
 
     def activate(self, device: torch.device | str | None = None) -> None:
         active_device = self._resolve_device(device)
-        if active_device.type == "cpu":
-            self._validate_no_merge_transforms_for_cpu()
-        elif active_device.type == "cuda":
-            self._enforce_checkpointing_for_trainable_streaming()
-            self._warn_if_training_without_checkpointing()
-        else:
+        if active_device.type not in ("cpu", "cuda"):
             raise ValueError(
                 "ModelOffloader.activate() supports CUDA or CPU; "
                 f"got {active_device}."
-            )
+        )
+        if active_device.type == "cuda":
+            self._enforce_checkpointing_for_trainable_streaming()
+            self._warn_if_training_without_checkpointing()
         self._active_device = active_device
         try:
             with contextlib.ExitStack() as stack:
+                targets = (
+                    self._group_loras_by_target(self._loras)
+                    if self._loras
+                    else None
+                )
+                if targets is not None and self._lora_mode == "merge":
+                    self._activate_merge_loras(active_device, targets)
+                    stack.callback(self._clear_merge_loras)
+
                 for component in self._components:
                     stack.callback(component.deactivate)
                     component.activate(active_device)
+
                 # Install routed-mode hooks AFTER components activate
                 # so the LIFO ExitStack unwinds them FIRST on
                 # deactivate — routes come down before component
@@ -526,17 +561,11 @@ class ModelOffloader:
                 # LoRA state-dicts are typically fp32 and the base may
                 # be bf16, fp16, or quantized; the hook math needs
                 # factors in the same dtype the layer outputs.
-                for parent, refs in self._pending_routes:
-                    handle = LoRARouteHandle(
-                        parent, refs, active_device,
-                        dtype=_routed_factor_dtype(parent),
-                    )
-                    stack.callback(handle.remove)
+                if targets is not None and self._lora_mode == "routed":
+                    self._activate_routed_loras(active_device, targets, stack)
                 self._teardown_stack = stack.pop_all()
         except BaseException:
-            for buf in self._reverse_index.values():
-                buf.transform = None
-            self._pending_routes = []
+            self._clear_loras()
             self._active_device = None
             raise
 
@@ -547,9 +576,7 @@ class ModelOffloader:
             if stack is not None:
                 stack.close()
         finally:
-            for buf in self._reverse_index.values():
-                buf.transform = None
-            self._pending_routes = []
+            self._clear_loras()
             self._active_device = None
 
     @contextlib.contextmanager
@@ -612,14 +639,6 @@ class ModelOffloader:
             self.deactivate()
 
     # ----------------------------------------------------------- Internals
-
-    def _validate_no_merge_transforms_for_cpu(self) -> None:
-        if any(buf.transform is not None for buf in self._reverse_index.values()):
-            raise ValueError(
-                "ModelOffloader merge transforms require CUDA activation; "
-                "got cpu. Use set_loras(..., mode='routed') for "
-                "CPU activation, or activate on CUDA."
-            )
 
     def _enforce_checkpointing_for_trainable_streaming(self) -> None:
         """Hard-guard: refuse to activate if a streamer manages
