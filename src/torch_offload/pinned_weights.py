@@ -37,8 +37,11 @@ Class-specific caveats
   suitable for models that need persistent buffer state across calls.
 - **Caller owns lifecycle correctness.** Calling :meth:`activate`
   twice without an intervening :meth:`deactivate` double-allocates
-  GPU storage. After :meth:`activate` raises, the strategy is
-  poisoned — drop the strategy reference and rebuild.
+  GPU storage. Construction optimizes peak host memory by letting
+  :class:`PinnedParamBuffer` repoint plain ``Parameter.data`` at pinned
+  clones as each buffer is created; if construction or activation raises
+  after that point, the model/strategy is poisoned — drop references and
+  rebuild from a fresh model instance.
 - There is no ``close()``. Pinned memory is freed when the caller
   drops the strategy AND model references; Python's refcount-based
   GC reclaims the pinned tensors immediately. The strategy releases
@@ -138,19 +141,21 @@ class PinnedWeights:
         # remember the build-time device dance.
         model.to("cpu")
 
-        # Phase 1: build all pinned templates without mutating slots. A
-        # collection failure leaves the user's model untouched.
+        # Phase 1: build all pinned templates without replacing module
+        # slots. PinnedParamBuffer intentionally repoints plain
+        # Parameter.data at each pinned clone during this phase to keep
+        # construction peak memory low. If a later pin fails, the caller
+        # must treat the partially constructed model/strategy as
+        # poisoned and rebuild from a fresh model instance.
         self._slots, self._param_aliases = self._collect_param_slots(model)
         self._buffer_slots = (
             self._collect_buffer_slots(model) if include_buffers else []
         )
 
-        # Phase 2: apply ALL slot mutations together, AFTER all
-        # pinning succeeded. This makes __init__ strong-exception-safe
-        # — a failure during buffer pinning above leaves the user's
-        # model untouched (the local pinned tensors get GC'd as we
-        # propagate). ModelCache cannot close a factory that never
-        # returned, so constructor mutation must be all-or-nothing.
+        # Phase 2: apply slot replacement/register_buffer mutations after
+        # all pinning succeeded. This keeps module slot identity changes
+        # grouped, but construction is not fully rollback-safe because of
+        # the low-peak Parameter.data repointing described above.
         for buf, locs in self._slots:
             for parent, leaf in locs:
                 parent._parameters[leaf] = buf.cpu_param

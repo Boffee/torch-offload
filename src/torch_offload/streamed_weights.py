@@ -217,7 +217,8 @@ def _check_block_layouts_match(
     param_specs: list[list[_ParamSpec]],
 ) -> None:
     """Raise if blocks have mismatched param layouts. Called before
-    pinning so failures leave the model untouched.
+    pinning so layout failures leave parameter slots and storage
+    untouched.
 
     See :func:`_layout_signature` for what counts as "matched."
     """
@@ -297,8 +298,8 @@ def _collect_block_slot_specs(
 class _BlockPinnedStore:
     """Per-block pinned CPU + (when activated) per-slot GPU storage.
 
-    Construction is three-phase so an invalid configuration **does
-    not pin and does not mutate the model's slot identities**:
+    Construction is three-phase. Pre-pin validation failures do not pin
+    and do not mutate model slots:
 
     1. ``__init__`` first walks each block to collect param/buffer
        slot specs (no pinning) and verifies that every block shares
@@ -306,25 +307,23 @@ class _BlockPinnedStore:
        before any pin or slot mutation.
     2. Then it pins every managed param/buffer into a fresh
        :class:`PinnedParamBuffer` / pinned clone and records the
-       slot locations they'll be installed at. ``__init__`` does NOT
-       install those pinned objects into the model's slots.
+       slot locations they'll be installed at. For plain
+       ``torch.Tensor`` parameters, :class:`PinnedParamBuffer`
+       immediately repoints the source ``Parameter.data`` at the
+       pinned clone as a low-peak memory optimization. ``__init__`` does
+       NOT install pinned Parameter wrappers into the model's slots.
     3. :meth:`apply_slot_mutations` swaps the model's slots to point
        at the pinned objects. After this point the store owns slot
        state and :meth:`evict_block` is needed to restore CPU params.
 
-    Scope of the "no pin / no slot mutation" guarantee on
-    validation failure: callers (``StreamedWeights.__init__`` and
-    ``ModelOffloader.__init__``) move the model to CPU *before*
-    invoking this constructor — that placement change is not
-    undone by the validator. The guarantee covers ``pin_memory()``
-    and ``submod._parameters[leaf] = ...`` mutations only.
-
-    Note also that ``PinnedParamBuffer.__init__`` opportunistically
-    repoints the user's Parameter ``.data`` at the pinned clone as a
-    memory optimization (see ``pinned_buffer.py``). That mutation
-    happens during phase 2 and isn't undoable, but phase 1 has
-    already validated the configuration so it only fires for
-    configs that are about to succeed.
+    Scope of the pre-pin validation guarantee: callers
+    (``StreamedWeights.__init__`` and ``ModelOffloader.__init__``) move
+    the model to CPU *before* invoking this constructor — that placement
+    change is not undone by the validator. Once phase 2 starts, pinning
+    uses the low-peak ``Parameter.data`` repointing described above. A
+    pin-time failure after that point can leave the model partially
+    repointed to pinned storage; treat the partially constructed
+    strategy/model as poisoned and rebuild from a fresh model instance.
     """
 
     def __init__(
@@ -361,8 +360,8 @@ class _BlockPinnedStore:
         # and silently broadcasts compatible shapes, so any block N with
         # mismatched dtype, name, or wrapper metadata would otherwise
         # load into block 0's pool slot without raising and corrupt
-        # forward. Run before pinning so an invalid config leaves the
-        # model untouched.
+        # forward. Run before pinning so layout failures happen before
+        # low-peak Parameter.data repointing starts.
         _check_block_layouts_match(param_specs)
 
         # Pass 2: pin params + buffers.

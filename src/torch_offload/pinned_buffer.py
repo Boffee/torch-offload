@@ -70,6 +70,16 @@ class PinnedParamBuffer:
     callers can either request the wrapper preserve ``requires_grad``
     or skip the wrapper entirely and ``.data``-swap into their own
     persistent Parameter — both are supported.
+
+    Low-peak construction behavior: for plain ``torch.Tensor`` parameters,
+    construction immediately repoints the source ``Parameter.data`` at the
+    pinned clone. This releases the original pageable CPU storage before the
+    owning strategy finishes constructing every buffer, avoiding a temporary
+    2x host-memory peak for large models. It also means construction is not
+    rollback-safe after pinning has started: if a later buffer fails to pin,
+    the caller should treat the partially constructed strategy/model as
+    poisoned and rebuild from a fresh model instance. Tensor subclasses skip
+    this optimization because ``.data =`` can drop wrapper state.
     """
 
     __slots__ = (
@@ -86,12 +96,13 @@ class PinnedParamBuffer:
             self.pinned_state, requires_grad=self.requires_grad,
         )
         self.transform: Any = None
-        # Release the original (non-pinned) storage by repointing the
-        # model parameter at the pinned cpu_param data. Without this,
-        # both the original and the pinned clone coexist until
-        # activate() — doubling peak CPU memory for the model.
-        # Only safe for plain tensors; quanto uses a subclass wrapper
-        # that .data= would strip, so those skip this optimization.
+        # Low-peak construction optimization: release the original
+        # pageable storage by repointing the source Parameter at the
+        # pinned clone immediately. This is an intentional mutation of
+        # the caller's model before the owning strategy has finished
+        # construction; see the class docstring for failure semantics.
+        # Only safe for plain tensors; subclass wrappers can lose
+        # metadata or ignore .data assignment.
         if type(param.data) is torch.Tensor:
             param.data = self.cpu_param.data
 

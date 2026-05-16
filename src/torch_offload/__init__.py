@@ -34,6 +34,14 @@ factory-side ``prepare()`` dance. ``activate(device)`` then brings
 everything to the requested device; ``deactivate()`` returns to pinned
 CPU.
 
+Construction intentionally optimizes peak host memory. For plain
+``torch.Tensor`` parameters, pinning clones into pinned CPU storage and
+may immediately repoint the source ``Parameter.data`` at that pinned
+clone so the original pageable storage can be freed before all buffers
+finish pinning. If construction raises after pinning has started, treat
+the partially constructed strategy/model as poisoned and rebuild from a
+fresh model instance.
+
 :class:`ModelOffloader` composes (in order):
   1. A non-block :class:`PinnedWeights` with a :class:`SlotOwnership`
      skip filter for everything outside the block list.

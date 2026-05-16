@@ -65,8 +65,8 @@ model = build_my_model()  # any nn.Module with frozen params
 strategy = PinnedWeights(model)
 device = torch.device("cuda")
 
-# First use pays the pinning cost (clone + pin_memory).
-# Subsequent uses skip pinning — bulk-DMA only.
+# Construction pays the pinning cost (clone + pin_memory).
+# Each use is bulk-DMA only.
 with strategy.use(device) as gpu_model:
     output = gpu_model(input_tensor)
 
@@ -439,16 +439,29 @@ over pinned host-backed storage.
 `deactivate()` releases transient device resources (the `cache_bytes`
 worth of pinned storage stays held in module slots, ready for fast
 re-activation).
+
+Construction optimizes peak host memory. Pinning clones managed tensors
+into pinned CPU storage. For plain `torch.Tensor` parameters, the source
+`Parameter.data` may be immediately repointed at the pinned clone as soon
+as that buffer is created. This releases the original pageable CPU
+storage early and avoids temporarily holding both pageable and pinned
+copies of large weights. It is a clone-to-pinned plus storage swap, not
+true in-place pinning. Tensor subclasses such as quanto/GGUF do not use
+this `.data` swap when it would lose wrapper state.
+
 **There is no `close()`.** To release pinned host memory, drop the
 strategy reference (and the model reference if you don't need it
 anymore). Python's refcount-based GC frees pinned tensors
 immediately. Strategies release what they own; ownership of the
 user's model is the user's concern.
 
-**Failure semantics.** If `activate()` raises midway, the strategy
-is poisoned — drop the strategy reference and rebuild. Don't retry
-`activate()` on a failed strategy. This is a low-level library; we
-don't guard against caller misuse.
+**Failure semantics.** If construction raises after pinning has started,
+the model may already be partially repointed to pinned storage. Treat the
+partially constructed strategy/model as poisoned and rebuild from a fresh
+model instance. If `activate()` raises midway, the strategy is likewise
+poisoned — drop the strategy reference and rebuild. Don't retry
+`activate()` on a failed strategy. This is a low-level library; we don't
+guard against caller misuse.
 
 ## Compatibility
 

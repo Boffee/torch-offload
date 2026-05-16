@@ -36,6 +36,11 @@ for :class:`~torch_offload.model_cache.ModelCache` admission →
 ``activate(device=...)`` (make resource usable, on the caller-selected
 device when the resource has device placement) → ``deactivate()``
 (release transient compute resources, keep ``cache_bytes`` resident).
+Package strategies optimize construction peak memory: plain
+``torch.Tensor`` parameters may be repointed to pinned storage while
+pinning is still in progress. If construction raises after pinning has
+started, treat the partially constructed model/resource as poisoned and
+rebuild from a fresh model instance.
 
 ``activate()/deactivate()`` may be repeated as many times as you
 want. Device-aware package strategies provide ``use(device)`` for
