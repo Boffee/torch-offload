@@ -70,7 +70,10 @@ Compatibility
 -------------
 - **``torch.compile`` is not supported** for managed modules.
 - **Wrap before DDP/FSDP**, not after.
-- **Single-thread / sequential.** No internal locking.
+- **Coarse cache concurrency.** :class:`ModelCache` serializes cache
+  metadata/lifecycle operations and releases its lock while caller code
+  runs inside a lease. Individual yielded model objects are not made
+  safe for concurrent same-key execution by the cache.
 """
 
 from .gguf_adapter import GGUFWeight
@@ -79,6 +82,7 @@ from .merge import merge_lora
 from .model_cache import (
     ActivationError,
     DuplicateModelKeyError,
+    GpuDeviceOccupiedError,
     ModelCache,
     ModelCacheError,
     ModelInUseError,
@@ -98,6 +102,7 @@ __all__ = [
     "CachedResource",
     "DuplicateModelKeyError",
     "GGUFWeight",
+    "GpuDeviceOccupiedError",
     "LoRA",
     "LoRATransform",
     "ModelCache",

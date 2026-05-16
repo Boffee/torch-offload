@@ -29,9 +29,13 @@ Design highlights
   allocator). The cache stays internally consistent; the cost is
   some warm cached entries disappearing.
 - **No GPU budget.** The cache only enforces ``max_cache_bytes``
-  (typically pinned host memory). Concurrent active models share the
-  GPU at the caller's risk.
-- **Single-thread.** No locking. Sequential callers only.
+  (typically pinned host memory). It has a deliberately simple GPU
+  placement guard: when callers pass a CUDA ``device``, at most one
+  active key may occupy that CUDA device at a time.
+- **Coarse thread-safety.** Public cache operations are protected by an
+  instance lock. Factory/build, activation, and deactivation are
+  serialized; the lock is released while caller code runs inside the
+  ``use()`` context.
 
 Instance-owned (not global) so it's library-friendly and embeddable.
 """
@@ -41,6 +45,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import logging
+import threading
 from collections import OrderedDict
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -192,6 +197,20 @@ class ModelInUseError(ModelCacheError):
     are active."""
 
 
+class GpuDeviceOccupiedError(ModelCacheError):
+    """A CUDA device already has an active model under the cache's
+    one-active-key-per-GPU placement policy."""
+
+    def __init__(self, *, device: torch.device, key: str, active_key: str) -> None:
+        super().__init__(
+            f"cannot activate {key!r} on {device}: device is already occupied "
+            f"by active model {active_key!r}"
+        )
+        self.device = device
+        self.key = key
+        self.active_key = active_key
+
+
 class ActivationError(ModelCacheError):
     """A strategy's ``activate()`` (or the ``pre_activate`` hook
     passed to :meth:`ModelCache.use`) raised. The cache discards the
@@ -266,6 +285,11 @@ class ModelCache:
         self._entries: dict[str, _Entry] = {}
         # Inactive entries only. MRU at the right end.
         self._lru: OrderedDict[str, None] = OrderedDict()
+        self._lock = threading.RLock()
+        # Naive GPU placement budget: one active model key per CUDA
+        # device. Only cache-visible devices passed to use(..., device=...)
+        # participate; CPU and unspecified-device activation are ignored.
+        self._gpu_active: dict[torch.device, str] = {}
         self._used_bytes = 0
         self._stats = ModelCacheStats()
 
@@ -290,7 +314,8 @@ class ModelCache:
 
     @property
     def used_cache_bytes(self) -> int:
-        return self._used_bytes
+        with self._lock:
+            return self._used_bytes
 
     def register(self, spec: ResourceSpec, *, replace: bool = False) -> None:
         """Register a lazy model factory without building it.
@@ -301,41 +326,43 @@ class ModelCache:
         existing cached entry is evicted first (which raises
         :class:`ModelInUseError` if the key is active).
         """
-        if spec.estimated_cache_bytes < 0:
-            raise ValueError(
-                f"spec.estimated_cache_bytes must be >= 0, got {spec.estimated_cache_bytes}"
-            )
-        existing = self._entries.get(spec.key)
-        if existing is not None:
-            if not replace:
-                raise DuplicateModelKeyError(f"{spec.key!r} is already registered")
-            if existing.active_count > 0:
-                raise ModelInUseError(
-                    f"cannot replace active registration {spec.key!r} "
-                    f"(refcount={existing.active_count})"
+        with self._lock:
+            if spec.estimated_cache_bytes < 0:
+                raise ValueError(
+                    f"spec.estimated_cache_bytes must be >= 0, got {spec.estimated_cache_bytes}"
                 )
-            if existing.strategy is not None:
-                self._evict_inactive(spec.key)
-        self._entries[spec.key] = _Entry(spec=spec)
+            existing = self._entries.get(spec.key)
+            if existing is not None:
+                if not replace:
+                    raise DuplicateModelKeyError(f"{spec.key!r} is already registered")
+                if existing.active_count > 0:
+                    raise ModelInUseError(
+                        f"cannot replace active registration {spec.key!r} "
+                        f"(refcount={existing.active_count})"
+                    )
+                if existing.strategy is not None:
+                    self._evict_inactive(spec.key)
+            self._entries[spec.key] = _Entry(spec=spec)
 
     def unregister(self, key: str, *, evict: bool = True) -> None:
         """Drop a registration. If a built strategy exists and
         ``evict=True`` (default), evict it; otherwise raise
         :class:`ModelInUseError` if it's cached or active."""
-        entry = self._entries.get(key)
-        if entry is None:
-            return
-        if entry.active_count > 0:
-            raise ModelInUseError(
-                f"cannot unregister active model {key!r} (refcount={entry.active_count})"
-            )
-        if entry.strategy is not None:
-            if not evict:
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is None:
+                return
+            if entry.active_count > 0:
                 raise ModelInUseError(
-                    f"{key!r} has a built strategy; pass evict=True to release it"
+                    f"cannot unregister active model {key!r} (refcount={entry.active_count})"
                 )
-            self._evict_inactive(key)
-        del self._entries[key]
+            if entry.strategy is not None:
+                if not evict:
+                    raise ModelInUseError(
+                        f"{key!r} has a built strategy; pass evict=True to release it"
+                    )
+                self._evict_inactive(key)
+            del self._entries[key]
 
     @overload
     def use(
@@ -373,7 +400,9 @@ class ModelCache:
         passed to the strategy's :meth:`~CachedResource.activate` on the
         first lease. Re-entrant same-key acquires may omit ``device`` or
         must pass the same device; simultaneous activation of one cached
-        entry on multiple devices is rejected.
+        entry on multiple devices is rejected. CUDA devices also
+        participate in a simple placement guard: at most one active key
+        may occupy a given CUDA device at a time.
 
         Re-entrant for the same key: nested ``use()`` calls bump a
         per-key refcount and share the already-active value (the
@@ -393,58 +422,63 @@ class ModelCache:
         key = spec.key if spec is not None else model
         assert isinstance(key, str)
 
-        entry = self._entries.get(key)
-        if entry is None:
-            if spec is None:
-                raise ModelNotRegisteredError(
-                    f"{key!r} is not registered; pass a ResourceSpec to use() or call register() first"
-                )
-            self.register(spec)
-            entry = self._entries[key]
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is None:
+                if spec is None:
+                    raise ModelNotRegisteredError(
+                        f"{key!r} is not registered; pass a ResourceSpec to use() or call register() first"
+                    )
+                self.register(spec)
+                entry = self._entries[key]
 
-        value = self._acquire(
-            entry,
-            device=canonical_device(device) if device is not None else None,
-            pre_activate=pre_activate,
-        )
+            value = self._acquire(
+                entry,
+                device=canonical_device(device) if device is not None else None,
+                pre_activate=pre_activate,
+            )
         try:
             yield value
         finally:
-            self._release(entry)
+            with self._lock:
+                self._release(entry)
 
     def evict(self, key: str) -> None:
         """Manually evict one inactive cached entry. Raises
         :class:`ModelInUseError` if active, no-op if not cached."""
-        entry = self._entries.get(key)
-        if entry is None or entry.strategy is None:
-            return
-        if entry.active_count > 0:
-            raise ModelInUseError(f"cannot evict active model {key!r}")
-        self._evict_inactive(key)
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is None or entry.strategy is None:
+                return
+            if entry.active_count > 0:
+                raise ModelInUseError(f"cannot evict active model {key!r}")
+            self._evict_inactive(key)
 
     def clear(self) -> None:
         """Evict all inactive entries. Registrations are preserved.
         Raises :class:`ModelInUseError` if any entry is active."""
-        active = [k for k, e in self._entries.items() if e.active_count > 0]
-        if active:
-            raise ModelInUseError(f"cannot clear while models are active: {active}")
-        for key in list(self._lru):
-            self._evict_inactive(key)
+        with self._lock:
+            active = [k for k, e in self._entries.items() if e.active_count > 0]
+            if active:
+                raise ModelInUseError(f"cannot clear while models are active: {active}")
+            for key in list(self._lru):
+                self._evict_inactive(key)
 
     def info(self, key: str) -> ModelInfo:
         """Per-key snapshot. Raises :class:`ModelNotRegisteredError` if
         unknown."""
-        entry = self._entries.get(key)
-        if entry is None:
-            raise ModelNotRegisteredError(f"{key!r} is not registered")
-        return ModelInfo(
-            key=entry.spec.key,
-            label=entry.spec.label,
-            estimated_cache_bytes=entry.spec.estimated_cache_bytes,
-            cache_bytes=entry.cache_bytes if entry.strategy is not None else None,
-            cached=entry.strategy is not None,
-            active_count=entry.active_count,
-        )
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is None:
+                raise ModelNotRegisteredError(f"{key!r} is not registered")
+            return ModelInfo(
+                key=entry.spec.key,
+                label=entry.spec.label,
+                estimated_cache_bytes=entry.spec.estimated_cache_bytes,
+                cache_bytes=entry.cache_bytes if entry.strategy is not None else None,
+                cached=entry.strategy is not None,
+                active_count=entry.active_count,
+            )
 
     def snapshot(self) -> ModelCacheSnapshot:
         """Whole-cache point-in-time view. ``stats`` is copied at
@@ -452,18 +486,19 @@ class ModelCache:
         snapshot; the dataclass itself is frozen and
         ``active_refcounts`` is a tuple. See
         :class:`ModelCacheSnapshot` for the immutability nuances."""
-        return ModelCacheSnapshot(
-            max_cache_bytes=self._max_cache_bytes,
-            used_cache_bytes=self._used_bytes,
-            registered_keys=tuple(self._entries.keys()),
-            cached_keys_lru_to_mru=tuple(self._lru.keys()),
-            active_refcounts=tuple(
-                (k, e.active_count)
-                for k, e in self._entries.items()
-                if e.active_count > 0
-            ),
-            stats=dataclasses.replace(self._stats),
-        )
+        with self._lock:
+            return ModelCacheSnapshot(
+                max_cache_bytes=self._max_cache_bytes,
+                used_cache_bytes=self._used_bytes,
+                registered_keys=tuple(self._entries.keys()),
+                cached_keys_lru_to_mru=tuple(self._lru.keys()),
+                active_refcounts=tuple(
+                    (k, e.active_count)
+                    for k, e in self._entries.items()
+                    if e.active_count > 0
+                ),
+                stats=dataclasses.replace(self._stats),
+            )
 
     # ------------------------------------------------------------------
     # Lease lifecycle
@@ -502,33 +537,52 @@ class ModelCache:
                 "hook; the strategy is already available as the hook argument"
             )
 
-        # Re-entrant lease: strategy is already active. The protocol
-        # contract guarantees `value` is stable across activation
-        # cycles, so re-reading it is safe. pre_activate is skipped —
-        # the strategy is active, can't be reconfigured, and the
-        # caller's hook would either fail or silently violate
-        # invariants.
         if entry.active_count > 0:
-            if device is not None and entry.active_device is None:
-                raise ModelCacheError(
-                    f"cannot acquire active {key!r} with device {device}: "
-                    "the existing lease was activated without a cache-visible device"
-                )
-            if (
-                device is not None
-                and entry.active_device is not None
-                and device != entry.active_device
-            ):
-                raise ModelCacheError(
-                    f"cannot acquire active {key!r} on {device}: "
-                    f"already active on {entry.active_device}"
-                )
-            strategy = entry.strategy
-            assert strategy is not None
-            value = strategy.value
-            entry.active_count += 1
-            return value
+            return self._acquire_reentrant(entry, device)
 
+        reserved_device = self._reserve_gpu_slot(key, device)
+        try:
+            strategy = self._prepare_strategy_for_activation(entry, pre_activate)
+            value = self._activate_strategy(entry, strategy, device)
+        except BaseException:
+            if reserved_device is not None:
+                self._release_gpu_slot(reserved_device, key)
+            raise
+
+        entry.active_count = 1
+        entry.active_device = device
+        return value
+
+    def _acquire_reentrant(self, entry: _Entry, device: torch.device | None) -> object:
+        """Bump a same-key active lease without reactivating the strategy."""
+        key = entry.spec.key
+        if device is not None and entry.active_device is None:
+            raise ModelCacheError(
+                f"cannot acquire active {key!r} with device {device}: "
+                "the existing lease was activated without a cache-visible device"
+            )
+        if (
+            device is not None
+            and entry.active_device is not None
+            and device != entry.active_device
+        ):
+            raise ModelCacheError(
+                f"cannot acquire active {key!r} on {device}: "
+                f"already active on {entry.active_device}"
+            )
+        strategy = entry.strategy
+        assert strategy is not None
+        value = strategy.value
+        entry.active_count += 1
+        return value
+
+    def _prepare_strategy_for_activation(
+        self,
+        entry: _Entry,
+        pre_activate: Callable[[CachedResource[Any]], None] | None,
+    ) -> CachedResource[Any]:
+        """Build or un-LRU an inactive strategy, then run pre-activation config."""
+        key = entry.spec.key
         if entry.strategy is None:
             self._build_into_entry(entry)
         else:
@@ -537,31 +591,35 @@ class ModelCache:
 
         strategy = entry.strategy
         assert strategy is not None
-
-        # pre_activate runs while the strategy is still deactivated —
-        # this is the user's hook for per-acquire configuration that
-        # requires the deactivated state (e.g., set_loras). A raising
-        # hook leaves the strategy in an unknown state, so the cache
-        # discards the entry. The `configuring` flag locks out same-key
-        # re-entry through user code calling back into `cache.use()`.
         if pre_activate is not None:
-            entry.configuring = True
-            try:
-                pre_activate(strategy)
-            except BaseException as exc:
-                entry.configuring = False
-                self._stats.activation_errors += 1
-                self._release_strategy(entry, evicted=False)
-                raise ActivationError(
-                    f"pre_activate() failed for {key!r}"
-                ) from exc
-            entry.configuring = False
+            self._run_pre_activate(entry, strategy, pre_activate)
+        return strategy
 
-        # Read value BEFORE activate. The protocol says `value` is
-        # available regardless of activation state; reading first
-        # eliminates a post-activate exception window where a raising
-        # `value` getter would skip the deactivate path on the now-
-        # active strategy.
+    def _run_pre_activate(
+        self,
+        entry: _Entry,
+        strategy: CachedResource[Any],
+        pre_activate: Callable[[CachedResource[Any]], None],
+    ) -> None:
+        entry.configuring = True
+        try:
+            pre_activate(strategy)
+        except BaseException as exc:
+            entry.configuring = False
+            self._stats.activation_errors += 1
+            self._release_strategy(entry, evicted=False)
+            raise ActivationError(
+                f"pre_activate() failed for {entry.spec.key!r}"
+            ) from exc
+        entry.configuring = False
+
+    def _activate_strategy(
+        self,
+        entry: _Entry,
+        strategy: CachedResource[Any],
+        device: torch.device | None,
+    ) -> object:
+        """Activate an inactive strategy and reconcile its budget accounting."""
         value = strategy.value
         try:
             if device is None:
@@ -569,9 +627,10 @@ class ModelCache:
             else:
                 strategy.activate(device)
         except BaseException as exc:
+            entry.configuring = False
             self._stats.activation_errors += 1
             self._release_strategy(entry, evicted=False)
-            raise ActivationError(f"activate() failed for {key!r}") from exc
+            raise ActivationError(f"activate() failed for {entry.spec.key!r}") from exc
 
         try:
             self._reconcile_bytes(entry, strategy.cache_bytes, phase="activate")
@@ -581,9 +640,6 @@ class ModelCache:
             self._stats.activation_errors += 1
             self._release_strategy(entry, evicted=False)
             raise
-
-        entry.active_count = 1
-        entry.active_device = device
         return value
 
     def _release(self, entry: _Entry) -> None:
@@ -596,12 +652,15 @@ class ModelCache:
             return
         strategy = entry.strategy
         assert strategy is not None
+        active_device = entry.active_device
         try:
             strategy.deactivate()
         except BaseException:
             self._release_strategy(entry, evicted=False)
+            self._release_gpu_slot(active_device, entry.spec.key)
             raise
         entry.active_device = None
+        self._release_gpu_slot(active_device, entry.spec.key)
         self._lru[entry.spec.key] = None
 
     # ------------------------------------------------------------------
@@ -690,6 +749,36 @@ class ModelCache:
     # ------------------------------------------------------------------
     # Eviction & release
     # ------------------------------------------------------------------
+
+    def _reserve_gpu_slot(self, key: str, device: torch.device | None) -> torch.device | None:
+        """Reserve a cache-visible CUDA device for ``key``.
+
+        This is intentionally not byte accounting. It enforces the
+        initial multi-GPU serving policy: one active model key per CUDA
+        device. The caller releases the reservation if acquire fails or
+        on final lease release.
+        """
+        if device is None or device.type != "cuda":
+            return None
+        active_key = self._gpu_active.get(device)
+        if active_key is not None and active_key != key:
+            raise GpuDeviceOccupiedError(device=device, key=key, active_key=active_key)
+        self._gpu_active[device] = key
+        return device
+
+    def _release_gpu_slot(self, device: torch.device | None, key: str) -> None:
+        if device is None or device.type != "cuda":
+            return
+        active_key = self._gpu_active.get(device)
+        if active_key is None:
+            return
+        if active_key != key:
+            logger.warning(
+                "GPU slot bookkeeping mismatch for %s: expected %r, found %r; leaving slot unchanged",
+                device, key, active_key,
+            )
+            return
+        del self._gpu_active[device]
 
     def _evict_until_room(self, incoming_key: str, required: int) -> None:
         """Evict inactive LRU entries until ``required`` bytes fit.

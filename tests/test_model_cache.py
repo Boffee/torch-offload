@@ -7,6 +7,8 @@ every lifecycle call so tests can assert ordering and counts.
 
 from __future__ import annotations
 
+import queue
+import threading
 from collections.abc import Callable
 
 import pytest
@@ -16,6 +18,7 @@ from torch import nn
 from torch_offload import (
     ActivationError,
     DuplicateModelKeyError,
+    GpuDeviceOccupiedError,
     ModelCache,
     ModelCacheError,
     ModelInUseError,
@@ -384,6 +387,110 @@ class TestActiveSet:
         with cache.use("a"):
             pass
         assert cache.snapshot().cached_keys_lru_to_mru == ("b", "c", "a")
+
+
+# ---------------------------------------------------------------------------
+# Naive GPU placement + thread-safe cache leases
+# ---------------------------------------------------------------------------
+
+
+class TestGpuPlacementAndConcurrency:
+    def test_different_cuda_devices_can_be_active_together(self) -> None:
+        cache = ModelCache(300)
+        cache.register(_spec("a", 100))
+        cache.register(_spec("b", 100))
+
+        with cache.use("a", device="cuda:0"):
+            with cache.use("b", device="cuda:1"):
+                snap = cache.snapshot()
+                assert dict(snap.active_refcounts) == {"a": 1, "b": 1}
+
+        assert FakeStrategy.instances[0].activate_devices == [torch.device("cuda:0")]
+        assert FakeStrategy.instances[1].activate_devices == [torch.device("cuda:1")]
+
+    def test_different_key_same_cuda_device_is_rejected_before_build(self) -> None:
+        cache = ModelCache(300)
+        cache.register(_spec("a", 100))
+        cache.register(_spec("b", 100))
+
+        with cache.use("a", device="cuda:0"):
+            with pytest.raises(GpuDeviceOccupiedError) as excinfo:
+                with cache.use("b", device="cuda:0"):
+                    pass
+
+        err = excinfo.value
+        assert err.device == torch.device("cuda:0")
+        assert err.key == "b"
+        assert err.active_key == "a"
+        # The rejected key never built its strategy.
+        assert len(FakeStrategy.instances) == 1
+
+    def test_final_release_frees_cuda_device_for_another_key(self) -> None:
+        cache = ModelCache(300)
+        cache.register(_spec("a", 100))
+        cache.register(_spec("b", 100))
+
+        with cache.use("a", device="cuda:0"):
+            pass
+        with cache.use("b", device="cuda:0"):
+            pass
+
+        assert FakeStrategy.instances[0].activate_devices == [torch.device("cuda:0")]
+        assert FakeStrategy.instances[1].activate_devices == [torch.device("cuda:0")]
+
+    def test_activation_failure_releases_cuda_device(self) -> None:
+        cache = ModelCache(300)
+        cache.register(_spec("a", 100, activate_raises=RuntimeError("gpu boom")))
+        cache.register(_spec("b", 100))
+
+        with pytest.raises(ActivationError):
+            with cache.use("a", device="cuda:0"):
+                pass
+
+        with cache.use("b", device="cuda:0"):
+            pass
+
+        assert FakeStrategy.instances[1].activate_devices == [torch.device("cuda:0")]
+
+    def test_different_keys_on_different_cuda_devices_can_overlap_across_threads(self) -> None:
+        cache = ModelCache(300)
+        cache.register(_spec("a", 100))
+        cache.register(_spec("b", 100))
+
+        entered = threading.Barrier(3)
+        release = threading.Event()
+        errors = queue.SimpleQueue()
+
+        def worker(key: str, device: str) -> None:
+            try:
+                with cache.use(key, device=device):
+                    entered.wait(timeout=2)
+                    if not release.wait(timeout=2):
+                        raise TimeoutError("release event was not set")
+            except BaseException as exc:
+                errors.put(exc)
+
+        threads = [
+            threading.Thread(target=worker, args=("a", "cuda:0")),
+            threading.Thread(target=worker, args=("b", "cuda:1")),
+        ]
+        for thread in threads:
+            thread.start()
+
+        try:
+            entered.wait(timeout=2)
+            snap = cache.snapshot()
+            assert dict(snap.active_refcounts) == {"a": 1, "b": 1}
+        finally:
+            release.set()
+            for thread in threads:
+                thread.join(timeout=2)
+
+        assert all(not thread.is_alive() for thread in threads)
+        captured = []
+        while not errors.empty():
+            captured.append(errors.get())
+        assert captured == []
 
 
 # ---------------------------------------------------------------------------

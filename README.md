@@ -346,6 +346,8 @@ with cache.use("diffusion_model", device=device) as t:
 # Active entries (currently inside `cache.use(...)`) are never evicted.
 # Re-entrant use of the same key must use the same device; simultaneous
 # activation of one cached strategy on multiple devices is rejected.
+# CUDA devices use a simple placement guard: one active model key per
+# cache-visible CUDA device passed to `cache.use(..., device=...)`.
 ```
 
 You can also auto-register at acquire time:
@@ -475,8 +477,12 @@ This is a low-level library; we don't guard against caller misuse.
   about its trace.
 - **Wrap before DDP/FSDP**, not after. Those wrappers manage parameter
   storage themselves and conflict with the slot-swap pattern.
-- **Single-thread / sequential.** No internal locking; concurrent use
-  on the same strategy or cache is undefined behavior.
+- **Coarse cache concurrency.** `ModelCache` protects cache metadata,
+  LRU admission, leases, and the simple one-key-per-CUDA-device
+  placement table with an internal lock. Factory/build, activation, and
+  deactivation are serialized, but the lock is released while caller
+  code runs inside `cache.use(...)`. The cache does not make a yielded
+  model object safe for concurrent same-key execution.
 - **Buffer mutations during CUDA activation are discarded** on
   `deactivate()`. CPU activation is pass-through over host-backed
   buffers, so CPU buffer mutations behave like ordinary module
@@ -530,6 +536,7 @@ than silent corruption.
 |---|---|
 | `ModelTooLargeError` | Cache miss can't fit even after evicting all inactive entries (active entries blocking) |
 | `ActivationError` | Strategy's `activate()` raised — the cache discards the entry; next acquire rebuilds |
+| `GpuDeviceOccupiedError` | A CUDA device already has a different active model key under the simple placement guard |
 | `ModelInUseError` | `evict()` / `clear()` / `unregister()` called while entry is active |
 | `DuplicateModelKeyError` | `register()` called for an existing key without `replace=True` |
 | `ModelNotRegisteredError` | `use(str)` called for an unknown key |
