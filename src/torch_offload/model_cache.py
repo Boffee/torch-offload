@@ -18,7 +18,7 @@ Design highlights
   same call), and the same key can be acquired re-entrantly (refcount
   bump, the underlying strategy is not re-activated).
 - **Transactional admission, with one caveat.** Activation failures
-  drop the poisoned entry and propagate :class:`ActivationError`.
+  discard the failed entry and propagate :class:`ActivationError`.
   Eviction is just a reference drop (no failure path) — pinned memory
   is freed when GC runs on the dropped strategy. **Factory failure**
   preserves the registration but leaves any pre-eviction *committed*
@@ -244,7 +244,7 @@ class ModelCache:
         cache-held strategy reference — eviction, admission rejection
         (negative or oversized post-build ``cache_bytes``), activation
         failure on freshly-built or previously-cached entries,
-        post-activate contract violations, and deactivate poisoning.
+        post-activate contract violations, and deactivate failures.
         Flushes PyTorch's ``CachingHostAllocator`` so freed pinned
         pages return to the OS. If ``None`` and CUDA is available,
         defaults to ``torch._C._host_emptyCache`` when present. Pass
@@ -385,7 +385,7 @@ class ModelCache:
         for per-acquire configuration that requires the deactivated
         state (e.g., :meth:`ModelOffloader.set_loras`). The hook does
         NOT run on re-entrant nested acquires (the strategy is already
-        active). A raising hook is treated as activation poison: the
+        active). A raising hook leaves the strategy state unknown: the
         entry is discarded and the exception is wrapped in
         :class:`ActivationError`.
         """
@@ -541,8 +541,8 @@ class ModelCache:
         # pre_activate runs while the strategy is still deactivated —
         # this is the user's hook for per-acquire configuration that
         # requires the deactivated state (e.g., set_loras). A raising
-        # hook leaves the strategy in an unknown state; treat as
-        # activation poison. The `configuring` flag locks out same-key
+        # hook leaves the strategy in an unknown state, so the cache
+        # discards the entry. The `configuring` flag locks out same-key
         # re-entry through user code calling back into `cache.use()`.
         if pre_activate is not None:
             entry.configuring = True
@@ -588,8 +588,8 @@ class ModelCache:
 
     def _release(self, entry: _Entry) -> None:
         """End a lease. On the final release, deactivate and re-enter
-        the entry into the LRU at MRU. A raising deactivate poisons
-        the entry — discard and propagate so the caller sees the
+        the entry into the LRU at MRU. A raising deactivate leaves
+        the entry unrecoverable: discard and propagate so the caller sees the
         strategy's failure."""
         entry.active_count -= 1
         if entry.active_count > 0:
@@ -730,7 +730,7 @@ class ModelCache:
         """Drop the strategy reference and update accounting.
 
         Used on three paths: LRU eviction (``evicted=True``), activation
-        or contract failure (``evicted=False``), and deactivate poisoning
+        or contract failure (``evicted=False``), and deactivate failure
         (``evicted=False``). Dropping ``entry.strategy`` triggers
         refcount-GC of pinned tensors when the cache was the sole
         owner; the host-cache flush runs after so freed pages return

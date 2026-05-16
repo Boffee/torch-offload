@@ -39,8 +39,9 @@ device when the resource has device placement) → ``deactivate()``
 Package strategies optimize construction peak memory: plain
 ``torch.Tensor`` parameters may be repointed to pinned storage while
 pinning is still in progress. If construction raises after pinning has
-started, treat the partially constructed model/resource as poisoned and
-rebuild from a fresh model instance.
+started, recovery of the partially constructed model/resource is
+unsupported; drop those references and rebuild from a fresh model
+instance.
 
 ``activate()/deactivate()`` may be repeated as many times as you
 want. Device-aware package strategies provide ``use(device)`` for
@@ -130,11 +131,11 @@ class ModelStrategyComponent(Protocol):
         """Undo :meth:`activate`. ``cache_bytes`` remains held.
 
         Should be infallible under normal use: the cache treats a
-        raising ``deactivate()`` as a poisoned strategy and drops it
-        (without further cleanup attempts) since the strategy's
-        internal state is unknown after the failure. After deactivate,
-        the caller drops the strategy reference to release pinned
-        memory — there is no separate ``close()`` step.
+        raising ``deactivate()`` as unrecoverable and drops the strategy
+        (without further cleanup attempts) since the strategy's internal
+        state is unknown after the failure. After deactivate, the caller
+        drops the strategy reference to release pinned memory — there is
+        no separate ``close()`` step.
         """
         ...
 

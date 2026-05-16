@@ -36,12 +36,13 @@ Class-specific caveats
   :meth:`deactivate`. Suitable for inference of stateless modules; not
   suitable for models that need persistent buffer state across calls.
 - **Caller owns lifecycle correctness.** Calling :meth:`activate`
-  twice without an intervening :meth:`deactivate` double-allocates
-  GPU storage. Construction optimizes peak host memory by letting
-  :class:`PinnedParamBuffer` repoint plain ``Parameter.data`` at pinned
-  clones as each buffer is created; if construction or activation raises
-  after that point, the model/strategy is poisoned — drop references and
-  rebuild from a fresh model instance.
+  twice without an intervening :meth:`deactivate` raises before slot
+  movement or GPU allocation. Construction optimizes peak host memory
+  by letting :class:`PinnedParamBuffer` repoint plain ``Parameter.data``
+  at pinned clones as each buffer is created; if construction or
+  activation raises after that point, retrying the same model/strategy
+  is unsupported — drop references and rebuild from a fresh model
+  instance.
 - There is no ``close()``. Pinned memory is freed when the caller
   drops the strategy AND model references; Python's refcount-based
   GC reclaims the pinned tensors immediately. The strategy releases
@@ -146,8 +147,8 @@ class PinnedWeights:
         # slots. PinnedParamBuffer intentionally repoints plain
         # Parameter.data at each pinned clone during this phase to keep
         # construction peak memory low. If a later pin fails, the caller
-        # must treat the partially constructed model/strategy as
-        # poisoned and rebuild from a fresh model instance.
+        # must drop the partially constructed model/strategy and rebuild
+        # from a fresh model instance.
         self._slots, self._param_aliases = self._collect_param_slots(model)
         self._buffer_slots = (
             self._collect_buffer_slots(model) if include_buffers else []
@@ -317,10 +318,11 @@ class PinnedWeights:
         Calling activate() twice without an intervening deactivate()
         raises before any slot movement or GPU allocation.
 
-        **Failure semantics (poison-on-failure):** if CUDA activation
-        fails midway, the strategy is left in an undefined state —
-        some slots may be GPU, some pinned-CPU. The caller's only valid
-        next action is :meth:`deactivate` (which forces all slots back
+        **Activation failure semantics:** if CUDA activation fails
+        midway, the strategy is left in an undefined partial state —
+        some slots may be GPU, some pinned-CPU. Retrying activation on
+        that strategy is unsupported; the caller's only supported
+        cleanup path is :meth:`deactivate` (which forces all slots back
         to pinned-CPU) followed by dropping the strategy reference.
         """
         assert self._model is not None

@@ -77,9 +77,10 @@ class PinnedParamBuffer:
     owning strategy finishes constructing every buffer, avoiding a temporary
     2x host-memory peak for large models. It also means construction is not
     rollback-safe after pinning has started: if a later buffer fails to pin,
-    the caller should treat the partially constructed strategy/model as
-    poisoned and rebuild from a fresh model instance. Tensor subclasses skip
-    this optimization because ``.data =`` can drop wrapper state.
+    recovery of the partially constructed strategy/model is unsupported.
+    Drop those references and rebuild from a fresh model instance. Tensor
+    subclasses skip this optimization because ``.data =`` can drop wrapper
+    state.
     """
 
     __slots__ = (

@@ -525,8 +525,8 @@ class TestFailureModes:
         # Strategy was constructed and then released.
 
     def test_activation_failure_on_cached_entry_discards_it(self) -> None:
-        # Activation failure on a previously-cached entry is treated
-        # as poisoned (same as freshly-built). Strategies like
+        # Activation failure on a previously-cached entry is handled
+        # the same as on a freshly-built one. Strategies like
         # block-streaming can fail mid-way through activate after
         # partially installing hooks/pool; caching them as
         # "ready to retry" lies about their state.
@@ -543,7 +543,7 @@ class TestFailureModes:
         snap = cache.snapshot()
         assert "a" not in snap.cached_keys_lru_to_mru
         assert snap.used_cache_bytes == 0
-        # The poisoned strategy reference was dropped.
+        # The failed strategy reference was dropped.
         # Registration persisted for retry — but next acquire rebuilds.
         assert "a" in snap.registered_keys
 
@@ -585,16 +585,16 @@ class TestFailureModes:
 
 class TestDeactivateFailure:
     def test_deactivate_failure_discards_entry(self) -> None:
-        # A strategy whose deactivate() raises is treated as poisoned:
+        # A strategy whose deactivate() raises is unrecoverable:
         # the entry is removed from the cache and
         # the original deactivate exception propagates.
-        class PoisonStrategy(FakeStrategy):
+        class FailingDeactivateStrategy(FakeStrategy):
             def deactivate(self) -> None:
                 self.events.append("deactivate")
                 raise RuntimeError("deactivate boom")
 
-        def factory() -> PoisonStrategy:
-            s = PoisonStrategy(100)
+        def factory() -> FailingDeactivateStrategy:
+            s = FailingDeactivateStrategy(100)
             FakeStrategy.instances.append(s)
             return s
 
@@ -609,7 +609,7 @@ class TestDeactivateFailure:
         assert "a" not in snap.cached_keys_lru_to_mru
         assert snap.used_cache_bytes == 0
         assert "a" in snap.registered_keys
-        # The poisoned strategy reference was dropped.
+        # The failed strategy reference was dropped.
 
 
 # ---------------------------------------------------------------------------
@@ -888,7 +888,7 @@ class TestPreActivate:
             pass
         assert calls["n"] == 2
 
-    def test_failure_poisons_entry(self) -> None:
+    def test_failure_discards_entry(self) -> None:
         # A raising hook leaves the strategy in an unknown state — discard
         # the entry, wrap in ActivationError, registration persists for retry.
         def configure(strategy):
@@ -941,7 +941,7 @@ class TestPreActivate:
         with pytest.raises(ModelCacheError, match="pre_activate"):
             with cache.use("a", pre_activate=reenter_same):
                 pass
-        # Failure poisons the entry just like any pre_activate failure.
+        # Failure discards the entry just like any pre_activate failure.
         snap = cache.snapshot()
         assert "a" not in snap.cached_keys_lru_to_mru
         assert snap.used_cache_bytes == 0
@@ -968,7 +968,7 @@ class TestPreActivate:
         assert captured == ["Identity"]
 
     def test_configuring_flag_clears_on_failure_so_retry_works(self) -> None:
-        # If the hook raises, the entry is poisoned but the registration
+        # If the hook raises, the entry is discarded but the registration
         # persists. A subsequent use() with a non-failing hook must succeed
         # — the configuring flag must be reset on the failure path.
         cache = ModelCache(200)

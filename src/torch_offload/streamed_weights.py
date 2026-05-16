@@ -322,8 +322,9 @@ class _BlockPinnedStore:
     change is not undone by the validator. Once phase 2 starts, pinning
     uses the low-peak ``Parameter.data`` repointing described above. A
     pin-time failure after that point can leave the model partially
-    repointed to pinned storage; treat the partially constructed
-    strategy/model as poisoned and rebuild from a fresh model instance.
+    repointed to pinned storage; recovery of the partially constructed
+    strategy/model is unsupported. Drop those references and rebuild from
+    a fresh model instance.
     """
 
     def __init__(
@@ -918,15 +919,14 @@ class StreamedWeights:
         method returns ``None`` because the streamer doesn't own one.
 
         **Lifecycle is caller's responsibility.** Calling activate()
-        twice without an intervening deactivate() will register
-        forward hooks twice, double-stream every block — undefined
-        behavior. Don't.
+        twice without an intervening deactivate() raises before hooks or
+        block pools are installed.
 
-        **Failure semantics (poison-on-failure):** if activation
-        fails midway, the streamer is left in an undefined state with
-        partial resources allocated. The caller's only valid next
-        action is :meth:`deactivate`, which idempotently tears down
-        whatever was allocated."""
+        **Activation failure semantics:** if activation fails midway,
+        the streamer is left in an undefined partial state. Retrying
+        activation on that streamer is unsupported; the caller's only
+        supported cleanup path is :meth:`deactivate`, which idempotently
+        tears down whatever was allocated."""
         assert self._store is not None
         # Hard-guard against the documented "don't activate twice"
         # case. Without this, a double-activate would double-install

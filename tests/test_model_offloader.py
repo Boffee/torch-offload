@@ -881,11 +881,11 @@ class TestModelCacheIntegration:
 
 
 # ---------------------------------------------------------------------------
-# Activate failure → poison contract
+# Activate failure cleanup contract
 # ---------------------------------------------------------------------------
 
 
-class TestActivateFailurePoison:
+class TestActivateFailureCleanup:
     @CUDA
     def test_partial_activate_failure_rolls_back_other_components(self, monkeypatch) -> None:
         # If a streamer's activate raises, the composite's `with stack:`

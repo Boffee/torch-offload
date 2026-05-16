@@ -457,11 +457,11 @@ user's model is the user's concern.
 
 **Failure semantics.** If construction raises after pinning has started,
 the model may already be partially repointed to pinned storage. Treat the
-partially constructed strategy/model as poisoned and rebuild from a fresh
-model instance. If `activate()` raises midway, the strategy is likewise
-poisoned — drop the strategy reference and rebuild. Don't retry
-`activate()` on a failed strategy. This is a low-level library; we don't
-guard against caller misuse.
+partially constructed strategy/model as unrecoverable: drop those
+references and rebuild from a fresh model instance. If `activate()`
+raises midway, the strategy may contain partial device state; don't retry
+`activate()` on that strategy. Drop the strategy reference and rebuild.
+This is a low-level library; we don't guard against caller misuse.
 
 ## Compatibility
 
