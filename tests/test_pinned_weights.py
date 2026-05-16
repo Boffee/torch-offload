@@ -88,6 +88,15 @@ class TestLifecycle:
         finally:
             pw.deactivate()
 
+    def test_double_activate_raises(self) -> None:
+        pw = PinnedWeights(_make_simple_model())
+        try:
+            pw.activate("cpu")
+            with pytest.raises(RuntimeError, match=r"already.*active"):
+                pw.activate("cpu")
+        finally:
+            pw.deactivate()
+
     def test_repeated_activate_deactivate_cycle(self) -> None:
         pw = PinnedWeights(_make_simple_model())
         try:

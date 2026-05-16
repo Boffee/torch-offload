@@ -527,6 +527,12 @@ class ModelOffloader:
         )
 
     def activate(self, device: torch.device | str | None = None) -> None:
+        if self._active_device is not None:
+            raise RuntimeError(
+                "ModelOffloader.activate() called while already active "
+                f"on {self._active_device}. Deactivate first, or check "
+                "for a leaked context manager."
+            )
         active_device = self._resolve_device(device)
         if active_device.type not in ("cpu", "cuda"):
             raise ValueError(

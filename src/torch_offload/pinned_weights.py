@@ -135,6 +135,7 @@ class PinnedWeights:
         self._model: nn.Module | None = model
         self._include_buffers = include_buffers
         self._skip_slots: set[SlotOwnership] = skip_slots or set()
+        self._active_device: torch.device | None = None
 
         # Auto-move to CPU so pin_memory() succeeds. Matches the
         # behavior of ModelOffloader — caller doesn't need to
@@ -313,9 +314,8 @@ class PinnedWeights:
         pinned CPU Parameters and performs no device copy. Reach the
         wrapped model via :attr:`model` once activated.
 
-        **Lifecycle is caller's responsibility.** Calling CUDA
-        activate() twice without an intervening deactivate()
-        double-allocates GPU storage. Don't.
+        Calling activate() twice without an intervening deactivate()
+        raises before any slot movement or GPU allocation.
 
         **Failure semantics (poison-on-failure):** if CUDA activation
         fails midway, the strategy is left in an undefined state —
@@ -324,7 +324,15 @@ class PinnedWeights:
         to pinned-CPU) followed by dropping the strategy reference.
         """
         assert self._model is not None
-        self._move_to_device(self._resolve_device(device))
+        if self._active_device is not None:
+            raise RuntimeError(
+                "PinnedWeights.activate() called while already active "
+                f"on {self._active_device}. Deactivate first, or check "
+                "for a leaked context manager."
+            )
+        active_device = self._resolve_device(device)
+        self._move_to_device(active_device)
+        self._active_device = active_device
 
     def deactivate(self) -> None:
         """Repoint slots back at pinned-CPU Parameters. Idempotent —
@@ -332,7 +340,10 @@ class PinnedWeights:
         deactivate, drop the strategy reference to release pinned
         memory (and the model reference too if you don't need it
         anymore)."""
-        self._move_to_pinned()
+        try:
+            self._move_to_pinned()
+        finally:
+            self._active_device = None
 
     @contextlib.contextmanager
     def use(self, device: torch.device | str) -> Iterator[nn.Module]:

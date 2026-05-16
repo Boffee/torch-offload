@@ -290,6 +290,27 @@ class TestLifecycle:
         finally:
             strategy.deactivate()
 
+    def test_double_activate_raises_before_component_activation(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        m = _make_block_model()
+        strategy = ModelOffloader(
+            m,
+            layers_attr="transformer_blocks", blocks_to_swap=2,
+        )
+        try:
+            strategy.activate("cpu")
+
+            def fail_activate(device: torch.device | str | None = None) -> None:
+                del device
+                raise AssertionError("component activation should not run")
+
+            monkeypatch.setattr(strategy._components[0], "activate", fail_activate)
+            with pytest.raises(RuntimeError, match=r"already.*active"):
+                strategy.activate("cpu")
+        finally:
+            strategy.deactivate()
+
 
 class TestStreamedWeightsBackendActivation:
     def test_direct_cpu_activation_uses_host_backed_weights(self) -> None:
