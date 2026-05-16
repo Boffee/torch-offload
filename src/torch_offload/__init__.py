@@ -63,8 +63,11 @@ and raise — slot-local block streaming cannot preserve such ties; use
 whole-model :class:`PinnedWeights` instead.
 
 :class:`ModelCache` manages the cached backing storage of multiple
-strategies with LRU eviction, an active-set with refcounted leases, and
-transactional admission. See its docstring for design notes.
+strategies with policy-driven eviction, an active-set with refcounted
+leases, and transactional admission. Custom :class:`EvictionPolicy`
+and :class:`PlacementPolicy` implementations can replace the default
+LRU and one-model-per-CUDA-device policies. See its docstring for
+design notes.
 
 Compatibility
 -------------
@@ -82,13 +85,21 @@ from .merge import merge_lora
 from .model_cache import (
     ActivationError,
     DuplicateModelKeyError,
+    EvictionCandidate,
+    EvictionContext,
+    EvictionPolicy,
+    EvictionPolicyError,
     GpuDeviceOccupiedError,
+    LRUEvictionPolicy,
     ModelCache,
     ModelCacheError,
     ModelInUseError,
     ModelNotRegisteredError,
     ModelSpec,
     ModelTooLargeError,
+    OneModelPerCudaDevicePolicy,
+    PlacementLease,
+    PlacementPolicy,
     ResourceSpec,
 )
 from .model_offloader import ModelOffloader, detect_streaming_region_ties
@@ -101,8 +112,13 @@ __all__ = [
     "ActivationError",
     "CachedResource",
     "DuplicateModelKeyError",
+    "EvictionCandidate",
+    "EvictionContext",
+    "EvictionPolicy",
+    "EvictionPolicyError",
     "GGUFWeight",
     "GpuDeviceOccupiedError",
+    "LRUEvictionPolicy",
     "LoRA",
     "LoRATransform",
     "ModelCache",
@@ -114,7 +130,10 @@ __all__ = [
     "ModelStrategy",
     "ModelStrategyComponent",
     "ModelTooLargeError",
+    "OneModelPerCudaDevicePolicy",
     "PinnedWeights",
+    "PlacementLease",
+    "PlacementPolicy",
     "ResourceSpec",
     "SlotOwnership",
     "StreamedWeights",

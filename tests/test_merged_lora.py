@@ -1263,6 +1263,3 @@ class TestLoRACachedResource:
             assert len(lora.targets) == 2
         with cache.use("lora:test") as lora2:
             assert lora2 is lora
-        snap = cache.snapshot()
-        assert snap.stats.builds == 1
-        assert snap.stats.hits == 1

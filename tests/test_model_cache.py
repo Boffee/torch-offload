@@ -18,6 +18,9 @@ from torch import nn
 from torch_offload import (
     ActivationError,
     DuplicateModelKeyError,
+    EvictionContext,
+    EvictionPolicy,
+    EvictionPolicyError,
     GpuDeviceOccupiedError,
     ModelCache,
     ModelCacheError,
@@ -25,6 +28,8 @@ from torch_offload import (
     ModelNotRegisteredError,
     ModelSpec,
     ModelTooLargeError,
+    PlacementLease,
+    PlacementPolicy,
 )
 from torch_offload.protocols import ModelStrategy
 
@@ -110,6 +115,129 @@ def _spec(key: str, bytes_: int, **kwargs) -> ModelSpec:
     return ModelSpec(key=key, estimated_cache_bytes=bytes_, factory=_make_factory(bytes_, **kwargs))
 
 
+def _is_registered(cache: ModelCache, key: str) -> bool:
+    try:
+        cache.info(key)
+    except ModelNotRegisteredError:
+        return False
+    return True
+
+
+def _is_cached(cache: ModelCache, key: str) -> bool:
+    return cache.info(key).cached
+
+
+def _active_refcounts(cache: ModelCache, *keys: str) -> dict[str, int]:
+    return {key: info.active_count for key in keys if (info := cache.info(key)).active_count > 0}
+
+
+class MRUEvictionPolicy:
+    """Test policy that evicts the most-recently inactive key first."""
+
+    def __init__(self) -> None:
+        self.inactive: list[str] = []
+
+    def mark_active(self, key: str) -> None:
+        self.discard(key)
+
+    def mark_inactive(self, key: str) -> None:
+        self.discard(key)
+        self.inactive.append(key)
+
+    def discard(self, key: str) -> None:
+        self.inactive = [existing for existing in self.inactive if existing != key]
+
+    def choose_victims(self, context: EvictionContext) -> tuple[str, ...]:
+        if context.bytes_to_free <= 0:
+            return ()
+        chosen: list[str] = []
+        freed = 0
+        candidate_bytes = {candidate.key: candidate.cache_bytes for candidate in context.candidates}
+        ordered = [key for key in self.inactive if key in candidate_bytes]
+        ordered_set = set(ordered)
+        ordered.extend(candidate.key for candidate in context.candidates if candidate.key not in ordered_set)
+        for key in reversed(ordered):
+            chosen.append(key)
+            freed += candidate_bytes[key]
+            if freed >= context.bytes_to_free:
+                break
+        return tuple(chosen)
+
+
+class LargestFirstEvictionPolicy:
+    """Test policy that uses candidate sizes from EvictionContext."""
+
+    def mark_active(self, key: str) -> None:
+        del key
+
+    def mark_inactive(self, key: str) -> None:
+        del key
+
+    def discard(self, key: str) -> None:
+        del key
+
+    def choose_victims(self, context: EvictionContext) -> tuple[str, ...]:
+        if context.bytes_to_free <= 0:
+            return ()
+        ordered = sorted(
+            context.candidates,
+            key=lambda candidate: candidate.cache_bytes,
+            reverse=True,
+        )
+        chosen: list[str] = []
+        freed = 0
+        for candidate in ordered:
+            chosen.append(candidate.key)
+            freed += candidate.cache_bytes
+            if freed >= context.bytes_to_free:
+                break
+        return tuple(chosen)
+
+
+class BadEvictionPolicy(MRUEvictionPolicy):
+    """Test policy that returns an invalid victim."""
+
+    def choose_victims(self, context: EvictionContext) -> tuple[str, ...]:
+        del context
+        return ("missing",)
+
+
+class DuplicateVictimEvictionPolicy(MRUEvictionPolicy):
+    """Test policy that returns the same victim more than once."""
+
+    def choose_victims(self, context: EvictionContext) -> tuple[str, ...]:
+        return (context.candidates[0].key, context.candidates[0].key)
+
+
+class UnderSelectingEvictionPolicy(MRUEvictionPolicy):
+    """Test policy that returns valid but insufficient victims."""
+
+    def choose_victims(self, context: EvictionContext) -> tuple[str, ...]:
+        return tuple(candidate.key for candidate in context.candidates[:1])
+
+
+class SharingPlacementPolicy:
+    """Test policy that allows different keys to share a CUDA device."""
+
+    def reserve(self, *, key: str, requested_device: torch.device | str | None) -> PlacementLease:
+        device = torch.device(requested_device) if requested_device is not None else None
+        return PlacementLease(key=key, device=device)
+
+    def validate_reentrant(
+        self,
+        *,
+        key: str,
+        active_device: torch.device | None,
+        requested_device: torch.device | str | None,
+    ) -> None:
+        device = torch.device(requested_device) if requested_device is not None else None
+        if device is not None and active_device != device:
+            raise ModelCacheError(f"{key!r} active on {active_device}, requested {device}")
+
+    def release(self, lease: PlacementLease) -> None:
+        del lease
+
+
 @pytest.fixture(autouse=True)
 def _clear_instances():
     FakeStrategy.instances.clear()
@@ -133,6 +261,7 @@ class TestConstruction:
         cache = ModelCache(0)
         assert cache.max_cache_bytes == 0
         assert cache.used_cache_bytes == 0
+        assert cache.available_cache_bytes == 0
 
 
 # ---------------------------------------------------------------------------
@@ -146,29 +275,27 @@ class TestHitMiss:
         cache.register(_spec("a", 100))
         with cache.use("a"):
             pass
-        s = cache.snapshot()
-        assert s.stats.builds == 1
-        assert s.stats.hits == 0
-        assert s.stats.misses == 1
-        assert s.used_cache_bytes == 100
+        assert len(FakeStrategy.instances) == 1
+        assert cache.info("a").cached
+        assert cache.used_cache_bytes == 100
+        assert cache.available_cache_bytes == 900
 
     def test_second_use_hits_cache(self) -> None:
         cache = ModelCache(1000)
         cache.register(_spec("a", 100))
         with cache.use("a"):
             pass
+        strategy = FakeStrategy.instances[0]
         with cache.use("a"):
             pass
-        s = cache.snapshot()
-        assert s.stats.builds == 1
-        assert s.stats.hits == 1
-        assert s.stats.misses == 1
+        assert len(FakeStrategy.instances) == 1
+        assert strategy.events == ["activate", "deactivate", "activate", "deactivate"]
 
     def test_use_with_spec_auto_registers(self) -> None:
         cache = ModelCache(1000)
         with cache.use(_spec("a", 100)):
             pass
-        assert "a" in cache.snapshot().registered_keys
+        assert _is_registered(cache, "a")
 
     def test_use_with_string_key_requires_registration(self) -> None:
         cache = ModelCache(1000)
@@ -194,10 +321,9 @@ class TestRegistration:
         cache.register(_spec("a", 100))
         with cache.use("a"):
             pass
-        first = FakeStrategy.instances[0]
         cache.register(_spec("a", 200), replace=True)
         # The freshly-replaced entry has not been built yet.
-        assert cache.snapshot().used_cache_bytes == 0
+        assert cache.used_cache_bytes == 0
         # The previous strategy was released during replace.
 
     def test_replace_active_raises(self) -> None:
@@ -213,7 +339,7 @@ class TestRegistration:
         with cache.use("a"):
             pass
         cache.unregister("a")
-        assert "a" not in cache.snapshot().registered_keys
+        assert not _is_registered(cache, "a")
 
     def test_unregister_active_raises(self) -> None:
         cache = ModelCache(1000)
@@ -244,9 +370,10 @@ class TestEviction:
         cache.register(_spec("d", 100))
         with cache.use("d"):
             pass
-        snap = cache.snapshot()
-        assert snap.stats.evictions >= 1
-        assert "a" not in snap.cached_keys_lru_to_mru
+        assert not _is_cached(cache, "a")
+        assert _is_cached(cache, "b")
+        assert _is_cached(cache, "c")
+        assert _is_cached(cache, "d")
 
     def test_multi_evict_for_one_admit(self) -> None:
         cache = ModelCache(300)
@@ -259,9 +386,92 @@ class TestEviction:
         cache.register(_spec("big", 250))
         with cache.use("big"):
             pass
-        snap = cache.snapshot()
-        # Need to free at least 250-(300-300)=250, evicting 3*100=300.
-        assert snap.stats.bytes_evicted >= 250
+        assert cache.used_cache_bytes == 250
+        assert not _is_cached(cache, "a")
+        assert not _is_cached(cache, "b")
+        assert not _is_cached(cache, "c")
+        assert _is_cached(cache, "big")
+
+    def test_custom_eviction_policy_controls_victim_selection(self) -> None:
+        policy: EvictionPolicy = MRUEvictionPolicy()
+        cache = ModelCache(200, eviction_policy=policy)
+        cache.register(_spec("a", 100))
+        cache.register(_spec("b", 100))
+        with cache.use("a"):
+            pass
+        with cache.use("b"):
+            pass
+
+        # MRU policy evicts "b" rather than the default LRU victim "a".
+        cache.register(_spec("c", 100))
+        with cache.use("c"):
+            pass
+
+        assert _is_cached(cache, "a")
+        assert not _is_cached(cache, "b")
+        assert _is_cached(cache, "c")
+
+    def test_custom_eviction_policy_can_use_candidate_sizes(self) -> None:
+        policy: EvictionPolicy = LargestFirstEvictionPolicy()
+        cache = ModelCache(200, eviction_policy=policy)
+        cache.register(_spec("small", 80))
+        cache.register(_spec("large", 120))
+        with cache.use("small"):
+            pass
+        with cache.use("large"):
+            pass
+
+        cache.register(_spec("incoming", 100))
+        with cache.use("incoming"):
+            pass
+
+        assert _is_cached(cache, "small")
+        assert not _is_cached(cache, "large")
+        assert _is_cached(cache, "incoming")
+        assert cache.used_cache_bytes == 180
+
+    def test_eviction_policy_cannot_choose_non_candidate(self) -> None:
+        policy: EvictionPolicy = BadEvictionPolicy()
+        cache = ModelCache(200, eviction_policy=policy)
+        cache.register(_spec("a", 100))
+        cache.register(_spec("b", 100))
+        with cache.use("a"):
+            pass
+        with cache.use("b"):
+            pass
+
+        with pytest.raises(EvictionPolicyError, match="invalid victims"):
+            with cache.use(_spec("c", 100)):
+                pass
+
+    def test_eviction_policy_cannot_choose_duplicate_victims(self) -> None:
+        policy: EvictionPolicy = DuplicateVictimEvictionPolicy()
+        cache = ModelCache(200, eviction_policy=policy)
+        cache.register(_spec("a", 100))
+        cache.register(_spec("b", 100))
+        with cache.use("a"):
+            pass
+        with cache.use("b"):
+            pass
+
+        with pytest.raises(EvictionPolicyError, match="invalid victims"):
+            with cache.use(_spec("c", 100)):
+                pass
+
+    def test_eviction_policy_must_choose_enough_victims(self) -> None:
+        policy: EvictionPolicy = UnderSelectingEvictionPolicy()
+        cache = ModelCache(300, eviction_policy=policy)
+        for key in ("a", "b", "c"):
+            cache.register(_spec(key, 100))
+            with cache.use(key):
+                pass
+
+        with pytest.raises(EvictionPolicyError, match="insufficient victims"):
+            with cache.use(_spec("big", 250)):
+                pass
+
+        assert cache.used_cache_bytes == 300
+        assert all(_is_cached(cache, key) for key in ("a", "b", "c"))
 
     def test_too_large_raises(self) -> None:
         cache = ModelCache(100)
@@ -272,18 +482,21 @@ class TestEviction:
         assert err.required == 200
         assert err.limit == 100
 
-    def test_too_large_due_to_active_blockers_lists_them(self) -> None:
+    def test_too_large_due_to_active_blockers_raises(self) -> None:
         cache = ModelCache(200)
         cache.register(_spec("a", 100))
         with cache.use("a"):
             # "a" is active and uses 100/200; "a" cannot be evicted.
             # Trying to admit a 150-byte "b" needs 50 more bytes than
             # currently free, but the only entry that could be evicted
-            # is the active one. Should raise with "a" as the blocker.
+            # is the active one.
             with pytest.raises(ModelTooLargeError) as excinfo:
                 with cache.use(_spec("b", 150)):
                     pass
-            assert "a" in excinfo.value.active_refcounts
+            err = excinfo.value
+            assert err.required == 150
+            assert err.used == 100
+            assert err.limit == 200
 
     def test_active_entries_are_not_evicted(self) -> None:
         cache = ModelCache(200)
@@ -292,15 +505,12 @@ class TestEviction:
         with cache.use("a"):
             with cache.use("b"):
                 pass
-        # "a" was active for the duration; only "b" became evictable.
-        # Adding a third 100-byte while "a" still inactive should evict
-        # whatever's at LRU.
         cache.register(_spec("c", 100))
         with cache.use("c"):
             pass
-        # All three eventually built; "a" should still be one of the cached keys.
-        snap = cache.snapshot()
-        assert snap.stats.evictions >= 1
+        assert _is_cached(cache, "a")
+        assert not _is_cached(cache, "b")
+        assert _is_cached(cache, "c")
 
     def test_manual_evict(self) -> None:
         cache = ModelCache(200)
@@ -308,7 +518,7 @@ class TestEviction:
         with cache.use("a"):
             pass
         cache.evict("a")
-        assert cache.snapshot().used_cache_bytes == 0
+        assert cache.used_cache_bytes == 0
 
     def test_evict_active_raises(self) -> None:
         cache = ModelCache(200)
@@ -330,9 +540,10 @@ class TestEviction:
             with cache.use(k):
                 pass
         cache.clear()
-        assert cache.snapshot().used_cache_bytes == 0
+        assert cache.used_cache_bytes == 0
         # Registrations preserved.
-        assert set(cache.snapshot().registered_keys) == {"a", "b", "c"}
+        assert all(_is_registered(cache, key) for key in ("a", "b", "c"))
+        assert not any(_is_cached(cache, key) for key in ("a", "b", "c"))
 
     def test_clear_with_active_raises(self) -> None:
         cache = ModelCache(200)
@@ -372,8 +583,7 @@ class TestActiveSet:
             with cache.use("dec") as d:
                 assert isinstance(e, nn.Module)
                 assert isinstance(d, nn.Module)
-                snap = cache.snapshot()
-                assert dict(snap.active_refcounts) == {"enc": 1, "dec": 1}
+                assert _active_refcounts(cache, "enc", "dec") == {"enc": 1, "dec": 1}
 
     def test_deactivate_returns_to_lru_at_mru(self) -> None:
         cache = ModelCache(300)
@@ -381,12 +591,16 @@ class TestActiveSet:
             cache.register(_spec(k, 100))
             with cache.use(k):
                 pass
-        # After all uses, LRU order is a, b, c (oldest first).
-        assert cache.snapshot().cached_keys_lru_to_mru == ("a", "b", "c")
-        # Touching "a" makes it MRU.
+        # Touching "a" makes it MRU, so admitting "d" evicts "b".
         with cache.use("a"):
             pass
-        assert cache.snapshot().cached_keys_lru_to_mru == ("b", "c", "a")
+        cache.register(_spec("d", 100))
+        with cache.use("d"):
+            pass
+        assert _is_cached(cache, "a")
+        assert not _is_cached(cache, "b")
+        assert _is_cached(cache, "c")
+        assert _is_cached(cache, "d")
 
 
 # ---------------------------------------------------------------------------
@@ -402,8 +616,7 @@ class TestGpuPlacementAndConcurrency:
 
         with cache.use("a", device="cuda:0"):
             with cache.use("b", device="cuda:1"):
-                snap = cache.snapshot()
-                assert dict(snap.active_refcounts) == {"a": 1, "b": 1}
+                assert _active_refcounts(cache, "a", "b") == {"a": 1, "b": 1}
 
         assert FakeStrategy.instances[0].activate_devices == [torch.device("cuda:0")]
         assert FakeStrategy.instances[1].activate_devices == [torch.device("cuda:1")]
@@ -424,6 +637,19 @@ class TestGpuPlacementAndConcurrency:
         assert err.active_key == "a"
         # The rejected key never built its strategy.
         assert len(FakeStrategy.instances) == 1
+
+    def test_custom_placement_policy_can_allow_cuda_device_sharing(self) -> None:
+        policy: PlacementPolicy = SharingPlacementPolicy()
+        cache = ModelCache(300, placement_policy=policy)
+        cache.register(_spec("a", 100))
+        cache.register(_spec("b", 100))
+
+        with cache.use("a", device="cuda:0"):
+            with cache.use("b", device="cuda:0"):
+                assert _active_refcounts(cache, "a", "b") == {"a": 1, "b": 1}
+
+        assert FakeStrategy.instances[0].activate_devices == [torch.device("cuda:0")]
+        assert FakeStrategy.instances[1].activate_devices == [torch.device("cuda:0")]
 
     def test_final_release_frees_cuda_device_for_another_key(self) -> None:
         cache = ModelCache(300)
@@ -479,8 +705,7 @@ class TestGpuPlacementAndConcurrency:
 
         try:
             entered.wait(timeout=2)
-            snap = cache.snapshot()
-            assert dict(snap.active_refcounts) == {"a": 1, "b": 1}
+            assert _active_refcounts(cache, "a", "b") == {"a": 1, "b": 1}
         finally:
             release.set()
             for thread in threads:
@@ -607,11 +832,10 @@ class TestFailureModes:
         with pytest.raises(RuntimeError, match="boom"):
             with cache.use(spec):
                 pass
-        snap = cache.snapshot()
-        assert snap.used_cache_bytes == 0
-        assert snap.stats.factory_errors == 1
+        assert cache.used_cache_bytes == 0
         # Registration persisted (but no built strategy).
-        assert "bad" in snap.registered_keys
+        assert _is_registered(cache, "bad")
+        assert not _is_cached(cache, "bad")
 
     def test_activation_failure_on_fresh_build_drops_entry(self) -> None:
         # Activation failure on a freshly-built strategy: discard it
@@ -626,9 +850,9 @@ class TestFailureModes:
         with pytest.raises(ActivationError):
             with cache.use(spec):
                 pass
-        snap = cache.snapshot()
-        assert snap.used_cache_bytes == 0
-        assert snap.stats.activation_errors == 1
+        assert cache.used_cache_bytes == 0
+        assert _is_registered(cache, "bad")
+        assert not _is_cached(cache, "bad")
         # Strategy was constructed and then released.
 
     def test_activation_failure_on_cached_entry_discards_it(self) -> None:
@@ -647,12 +871,11 @@ class TestFailureModes:
             with cache.use("a"):
                 pass
         # Entry was discarded — released and removed from cache state.
-        snap = cache.snapshot()
-        assert "a" not in snap.cached_keys_lru_to_mru
-        assert snap.used_cache_bytes == 0
+        assert not _is_cached(cache, "a")
+        assert cache.used_cache_bytes == 0
         # The failed strategy reference was dropped.
         # Registration persisted for retry — but next acquire rebuilds.
-        assert "a" in snap.registered_keys
+        assert _is_registered(cache, "a")
 
     def test_factory_failure_after_pre_eviction_keeps_evictions(self) -> None:
         # Documented behavior: the cache pre-evicts to make room for
@@ -665,7 +888,7 @@ class TestFailureModes:
         cache.register(_spec("warm", 100))
         with cache.use("warm"):
             pass
-        assert cache.snapshot().used_cache_bytes == 100
+        assert cache.used_cache_bytes == 100
         # Adding a 100-byte "bad" forces eviction of "warm" before
         # the factory runs. Factory then raises.
         bad_spec = ModelSpec(
@@ -676,14 +899,14 @@ class TestFailureModes:
         with pytest.raises(RuntimeError, match="build boom"):
             with cache.use(bad_spec):
                 pass
-        snap = cache.snapshot()
         # warm was evicted to make room — that eviction is committed.
-        assert "warm" not in snap.cached_keys_lru_to_mru
-        assert snap.used_cache_bytes == 0
+        assert not _is_cached(cache, "warm")
+        assert cache.used_cache_bytes == 0
         # bad's registration persists for retry; warm's also.
-        assert "warm" in snap.registered_keys
-        assert "bad" in snap.registered_keys
-        assert snap.stats.factory_errors == 1
+        assert _is_registered(cache, "warm")
+        assert _is_registered(cache, "bad")
+        assert not _is_cached(cache, "bad")
+
 
 # ---------------------------------------------------------------------------
 # Deactivate failure
@@ -710,12 +933,11 @@ class TestDeactivateFailure:
         with pytest.raises(RuntimeError, match="deactivate boom"):
             with cache.use("a"):
                 pass
-        snap = cache.snapshot()
         # Entry removed from cache, bytes reclaimed in accounting,
         # registration preserved for retry.
-        assert "a" not in snap.cached_keys_lru_to_mru
-        assert snap.used_cache_bytes == 0
-        assert "a" in snap.registered_keys
+        assert not _is_cached(cache, "a")
+        assert cache.used_cache_bytes == 0
+        assert _is_registered(cache, "a")
         # The failed strategy reference was dropped.
 
 
@@ -734,8 +956,9 @@ class TestCacheBytesValidation:
         with pytest.raises(Exception, match="cache_bytes"):
             with cache.use(spec):
                 pass
-        snap = cache.snapshot()
-        assert snap.used_cache_bytes == 0
+        assert cache.used_cache_bytes == 0
+        assert _is_registered(cache, "bad")
+        assert not _is_cached(cache, "bad")
         # Strategy was constructed and then released.
 
     def test_negative_post_activate_rejected(self) -> None:
@@ -755,37 +978,8 @@ class TestCacheBytesValidation:
         with pytest.raises(Exception, match="cache_bytes"):
             with cache.use(spec):
                 pass
-        snap = cache.snapshot()
-        assert snap.used_cache_bytes == 0
-        assert snap.stats.activation_errors == 1
-        assert "bad" not in snap.cached_keys_lru_to_mru
-
-
-# ---------------------------------------------------------------------------
-# Snapshot is immutable
-# ---------------------------------------------------------------------------
-
-
-class TestSnapshotImmutability:
-    def test_stats_in_snapshot_do_not_change_after_capture(self) -> None:
-        cache = ModelCache(200)
-        cache.register(_spec("a", 100))
-        with cache.use("a"):
-            pass
-        snap_before = cache.snapshot()
-        captured_hits = snap_before.stats.hits
-        captured_builds = snap_before.stats.builds
-        # Trigger more activity.
-        with cache.use("a"):
-            pass
-        with cache.use("a"):
-            pass
-        # Captured snapshot's stats must not have changed.
-        assert snap_before.stats.hits == captured_hits
-        assert snap_before.stats.builds == captured_builds
-        # But a new snapshot reflects current activity.
-        snap_after = cache.snapshot()
-        assert snap_after.stats.hits > captured_hits
+        assert cache.used_cache_bytes == 0
+        assert not _is_cached(cache, "bad")
 
 
 # ---------------------------------------------------------------------------
@@ -805,7 +999,7 @@ class TestActualVsEstimate:
         with cache.use("a"):
             pass
         # Bytes accounting reflects actual.
-        assert cache.snapshot().used_cache_bytes == 50
+        assert cache.used_cache_bytes == 50
 
     def test_actual_exceeds_estimate_evicts_more(self) -> None:
         cache = ModelCache(300)
@@ -822,9 +1016,8 @@ class TestActualVsEstimate:
         with cache.use("big"):
             pass
         # "filler" must have been evicted to make room for the actual 250.
-        snap = cache.snapshot()
-        assert snap.used_cache_bytes == 250
-        assert "filler" not in snap.cached_keys_lru_to_mru
+        assert cache.used_cache_bytes == 250
+        assert not _is_cached(cache, "filler")
 
     def test_cache_bytes_reconciled_after_activate(self) -> None:
         # A strategy that reports 0 bytes pre-activate but pins memory
@@ -865,11 +1058,11 @@ class TestActualVsEstimate:
             with cache.use(spec):
                 pass
         # The constructed strategy reference was dropped.
-        assert cache.snapshot().used_cache_bytes == 0
+        assert cache.used_cache_bytes == 0
 
 
 # ---------------------------------------------------------------------------
-# Snapshot / info
+# Info
 # ---------------------------------------------------------------------------
 
 
@@ -909,15 +1102,6 @@ class TestObservability:
             ModelSpec(key="a", estimated_cache_bytes=100, factory=_make_factory(100), label="text encoder"),
         )
         assert cache.info("a").label == "text encoder"
-
-    def test_peak_cache_bytes_tracked(self) -> None:
-        cache = ModelCache(500)
-        for k, b in [("a", 100), ("b", 200), ("c", 150)]:
-            cache.register(_spec(k, b))
-            with cache.use(k):
-                pass
-        peak = cache.snapshot().stats.peak_cache_bytes
-        assert peak == 100 + 200 + 150
 
 
 # ---------------------------------------------------------------------------
@@ -979,7 +1163,7 @@ class TestPreActivate:
         assert s.events == ["activate", "deactivate"]
 
     def test_runs_on_cache_hit_too(self) -> None:
-        # First use builds + activates; second use hits the LRU. The hook
+        # First use builds + activates; second use hits the cache. The hook
         # must run on both paths (anything keyed off activation state needs
         # per-acquire reconfiguration).
         calls = {"n": 0}
@@ -1006,11 +1190,9 @@ class TestPreActivate:
         with pytest.raises(ActivationError, match="pre_activate"):
             with cache.use("a", pre_activate=configure):
                 pass
-        snap = cache.snapshot()
-        assert "a" not in snap.cached_keys_lru_to_mru
-        assert snap.used_cache_bytes == 0
-        assert snap.stats.activation_errors == 1
-        assert "a" in snap.registered_keys
+        assert not _is_cached(cache, "a")
+        assert cache.used_cache_bytes == 0
+        assert _is_registered(cache, "a")
         # Strategy must NOT have been activated (hook ran before activate
         # and raised, so activate never fired).
         s = FakeStrategy.instances[0]
@@ -1034,10 +1216,10 @@ class TestPreActivate:
 
     def test_same_key_reentry_from_inside_hook_raises(self) -> None:
         # A hook that re-enters cache.use() for the SAME key would
-        # otherwise corrupt the LRU invariant: active_count is still 0
-        # during the hook, so the inner acquire treats it as a fresh
-        # lease and runs a full activate/deactivate cycle, leaving the
-        # key in LRU when the outer continues to activate.
+        # otherwise corrupt eviction-policy inactive state: active_count
+        # is still 0 during the hook, so the inner acquire treats it as
+        # a fresh lease and runs a full activate/deactivate cycle,
+        # leaving the key marked inactive when the outer continues.
         cache = ModelCache(200)
         cache.register(_spec("a", 100))
 
@@ -1049,13 +1231,12 @@ class TestPreActivate:
             with cache.use("a", pre_activate=reenter_same):
                 pass
         # Failure discards the entry just like any pre_activate failure.
-        snap = cache.snapshot()
-        assert "a" not in snap.cached_keys_lru_to_mru
-        assert snap.used_cache_bytes == 0
+        assert not _is_cached(cache, "a")
+        assert cache.used_cache_bytes == 0
 
     def test_different_key_reentry_from_inside_hook_works(self) -> None:
         # Re-entering the cache for a DIFFERENT key during the hook is
-        # legitimate — different entries don't share the LRU slot.
+        # legitimate: different entries don't share active state.
         cache = ModelCache(300)
         cache.register(_spec("a", 100))
         cache.register(_spec("b", 100))
@@ -1068,10 +1249,9 @@ class TestPreActivate:
 
         with cache.use("a", pre_activate=use_other) as m_a:
             assert m_a is not None
-        # Both keys present; "a" is in LRU at MRU, "b" was used during
-        # "a"'s hook so it's at the older end.
-        snap = cache.snapshot()
-        assert set(snap.cached_keys_lru_to_mru) == {"a", "b"}
+        # Both keys remain cached and inactive after the outer lease exits.
+        assert _is_cached(cache, "a")
+        assert _is_cached(cache, "b")
         assert captured == ["Identity"]
 
     def test_configuring_flag_clears_on_failure_so_retry_works(self) -> None:

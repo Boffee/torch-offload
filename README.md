@@ -1,8 +1,9 @@
 # Memory
 
 A model-agnostic GPU/CPU memory manager for PyTorch. Two pluggable
-strategies for moving model weights between host and GPU, plus an LRU
-cache that swaps multiple independent models in and out of GPU memory.
+strategies for moving model weights between host and GPU, plus a
+policy-driven cache that swaps multiple independent models in and out
+of GPU memory.
 
 Self-contained, library-friendly: no dependencies beyond `torch` (plus
 optional `optimum.quanto` and `gguf` for quantized models). Designed
@@ -23,7 +24,7 @@ to be lifted into its own package when a second consumer appears.
 | `tensor_adapters.py`, `quanto_adapter.py`, `gguf_adapter.py`, `gguf_dequant.py` | Tensor-type adapter registry and optional optimum-quanto / gguf support |
 | `_quanto.py` | Internal: optimum-quanto optional-import + layout validation; consumed by `quanto_adapter.py` and `merge.py` |
 | `slots.py` | Slot-resolution helpers: `iter_param_slots`, `iter_buffer_slots`, `assert_frozen`, `canonical_param_name`, dotted-path walkers |
-| `model_cache.py` | `ModelCache` — LRU pool over `CachedResource` instances with active-set leases |
+| `model_cache.py` | `ModelCache` — policy-driven pool over `CachedResource` instances with active-set leases |
 
 ## Why use this
 
@@ -34,8 +35,8 @@ across many calls. Re-loading from disk every call is too slow
 expensive. `torch.cuda.empty_cache()` plus `.to("meta")` gets you the
 basics but leaves significant performance on the table — pinned host
 memory does CPU↔GPU DMA at full PCIe bandwidth (~30 GB/s vs.
-~3 GB/s from disk), and a single LRU cache lets multiple models
-share the same host-memory budget.
+~3 GB/s from disk), and a shared cache lets multiple models use the
+same host-memory budget.
 
 This library gives you:
 
@@ -342,7 +343,8 @@ with cache.use("text_encoder", device=device) as enc:
 with cache.use("diffusion_model", device=device) as t:
     latent = t(...)
 
-# When budget pressure forces eviction, LRU inactive entries go first.
+# When budget pressure forces eviction, the eviction policy chooses
+# from inactive cached entries. The default policy is LRU.
 # Active entries (currently inside `cache.use(...)`) are never evicted.
 # Re-entrant use of the same key must use the same device; simultaneous
 # activation of one cached strategy on multiple devices is rejected.
@@ -367,11 +369,22 @@ with cache.use(spec, device=device) as vae:  # registers if missing, then uses
 > will lie about freed memory. Always have the factory build the
 > model itself.
 
+`ModelCache` accepts custom `EvictionPolicy` and `PlacementPolicy`
+implementations. Defaults are `LRUEvictionPolicy` for inactive host
+cache eviction and `OneModelPerCudaDevicePolicy` for CUDA placement.
+The cache builds the eviction candidate set and byte context, then asks
+the eviction policy to choose victims; `ModelCache` still owns
+validation, accounting, activation, rollback, and release. Policies are
+called under the cache lock. `choose_victims()` must return unique keys
+from `context.candidates` and enough bytes to satisfy
+`context.bytes_to_free`; otherwise `ModelCache` raises
+`EvictionPolicyError` without evicting anything.
+
 ## Architecture
 
 ```
                        ┌──────────────────┐
-                       │   ModelCache     │  LRU pool, active-set leases,
+                       │   ModelCache     │  policy eviction, leases,
                        │                  │  transactional admission
                        └────────┬─────────┘
                                 │ uses (via ModelStrategy protocol)
@@ -478,7 +491,7 @@ This is a low-level library; we don't guard against caller misuse.
 - **Wrap before DDP/FSDP**, not after. Those wrappers manage parameter
   storage themselves and conflict with the slot-swap pattern.
 - **Coarse cache concurrency.** `ModelCache` protects cache metadata,
-  LRU admission, leases, and the simple one-key-per-CUDA-device
+  admission, leases, and the simple one-key-per-CUDA-device
   placement table with an internal lock. Factory/build, activation, and
   deactivation are serialized, but the lock is released while caller
   code runs inside `cache.use(...)`. The cache does not make a yielded
@@ -534,26 +547,18 @@ than silent corruption.
 
 | Exception | When |
 |---|---|
-| `ModelTooLargeError` | Cache miss can't fit even after evicting all inactive entries (active entries blocking) |
+| `ModelTooLargeError` | Cache miss can't fit even after evicting all inactive entries. Exposes `required`, `used`, and `limit`. |
+| `EvictionPolicyError` | Custom eviction policy returned duplicate/non-candidate victims or too few bytes |
 | `ActivationError` | Strategy's `activate()` raised — the cache discards the entry; next acquire rebuilds |
 | `GpuDeviceOccupiedError` | A CUDA device already has a different active model key under the simple placement guard |
 | `ModelInUseError` | `evict()` / `clear()` / `unregister()` called while entry is active |
 | `DuplicateModelKeyError` | `register()` called for an existing key without `replace=True` |
 | `ModelNotRegisteredError` | `use(str)` called for an unknown key |
 
-## Observability
+## State Inspection
 
-```python
-snap = cache.snapshot()
-snap.used_cache_bytes        # current pinned-host bytes
-snap.cached_keys_lru_to_mru  # tuple of currently-cached keys
-snap.active_refcounts        # tuple of (key, refcount) for active entries
-snap.stats.hits              # cache hit count
-snap.stats.evictions         # total evictions
-snap.stats.peak_cache_bytes  # high-water mark
-```
-
-`ModelCacheSnapshot`, `ModelCacheStats`, and `ModelInfo` are direct
-imports from `torch_offload.model_cache` (not re-exported at the
-package level — they're observability types, not the typical
-acquire/use path).
+Use `cache.used_cache_bytes` and `cache.available_cache_bytes` for
+current cache accounting. `available_cache_bytes` is signed; negative
+means a strategy reported growth after admission and the cache is
+currently over budget. Use `cache.info(key)` for per-key state when
+needed.

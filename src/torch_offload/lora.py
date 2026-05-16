@@ -73,9 +73,10 @@ class LoRA:
 
     Implements :class:`~torch_offload.protocols.CachedResource` so it
     can be registered in :class:`~torch_offload.ModelCache` for budget
-    tracking and LRU eviction.  ``activate``/``deactivate`` are no-ops
-    — factors stay on pinned CPU and are copied to GPU per-parameter
-    by :class:`LoRATransform` during the merge-mode post-copy hook.
+    tracking and policy-driven eviction.  ``activate``/``deactivate``
+    are no-ops — factors stay on pinned CPU and are copied to GPU
+    per-parameter by :class:`LoRATransform` during the merge-mode
+    post-copy hook.
 
     Strength is extrinsic — specify it when passing the adapter to
     :meth:`ModelOffloader.set_loras` as a ``(LoRA, strength)`` tuple.

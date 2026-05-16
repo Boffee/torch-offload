@@ -847,8 +847,11 @@ class TestModelCacheIntegration:
         from torch_offload import ModelCache, ModelSpec
 
         device = torch.device("cuda")
+        factory_calls = 0
 
         def factory():
+            nonlocal factory_calls
+            factory_calls += 1
             m = _make_block_model(num_blocks=4, width=8)
             return ModelOffloader(
                 m, layers_attr="transformer_blocks", blocks_to_swap=2,
@@ -873,9 +876,7 @@ class TestModelCacheIntegration:
         # Second use is a cache hit — no rebuild.
         with cache.use("xformer", device=device):
             pass
-        snap = cache.snapshot()
-        assert snap.stats.builds == 1
-        assert snap.stats.hits == 1
+        assert factory_calls == 1
 
         cache.clear()
 
