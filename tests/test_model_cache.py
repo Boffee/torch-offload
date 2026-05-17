@@ -21,15 +21,12 @@ from torch_offload import (
     EvictionContext,
     EvictionPolicy,
     EvictionPolicyError,
-    GpuDeviceOccupiedError,
     ModelCache,
     ModelCacheError,
     ModelInUseError,
     ModelNotRegisteredError,
     ModelSpec,
     ModelTooLargeError,
-    PlacementLease,
-    PlacementPolicy,
 )
 from torch_offload.protocols import ModelStrategy
 
@@ -214,28 +211,6 @@ class UnderSelectingEvictionPolicy(MRUEvictionPolicy):
 
     def choose_victims(self, context: EvictionContext) -> tuple[str, ...]:
         return tuple(candidate.key for candidate in context.candidates[:1])
-
-
-class SharingPlacementPolicy:
-    """Test policy that allows different keys to share a CUDA device."""
-
-    def reserve(self, *, key: str, requested_device: torch.device | str | None) -> PlacementLease:
-        device = torch.device(requested_device) if requested_device is not None else None
-        return PlacementLease(key=key, device=device)
-
-    def validate_reentrant(
-        self,
-        *,
-        key: str,
-        active_device: torch.device | None,
-        requested_device: torch.device | str | None,
-    ) -> None:
-        device = torch.device(requested_device) if requested_device is not None else None
-        if device is not None and active_device != device:
-            raise ModelCacheError(f"{key!r} active on {active_device}, requested {device}")
-
-    def release(self, lease: PlacementLease) -> None:
-        del lease
 
 
 @pytest.fixture(autouse=True)
@@ -604,11 +579,11 @@ class TestActiveSet:
 
 
 # ---------------------------------------------------------------------------
-# Naive GPU placement + thread-safe cache leases
+# Device activation + thread-safe cache leases
 # ---------------------------------------------------------------------------
 
 
-class TestGpuPlacementAndConcurrency:
+class TestDeviceActivationAndConcurrency:
     def test_different_cuda_devices_can_be_active_together(self) -> None:
         cache = ModelCache(300)
         cache.register(_spec("a", 100))
@@ -621,26 +596,8 @@ class TestGpuPlacementAndConcurrency:
         assert FakeStrategy.instances[0].activate_devices == [torch.device("cuda:0")]
         assert FakeStrategy.instances[1].activate_devices == [torch.device("cuda:1")]
 
-    def test_different_key_same_cuda_device_is_rejected_before_build(self) -> None:
+    def test_different_keys_can_share_same_cuda_device(self) -> None:
         cache = ModelCache(300)
-        cache.register(_spec("a", 100))
-        cache.register(_spec("b", 100))
-
-        with cache.use("a", device="cuda:0"):
-            with pytest.raises(GpuDeviceOccupiedError) as excinfo:
-                with cache.use("b", device="cuda:0"):
-                    pass
-
-        err = excinfo.value
-        assert err.device == torch.device("cuda:0")
-        assert err.key == "b"
-        assert err.active_key == "a"
-        # The rejected key never built its strategy.
-        assert len(FakeStrategy.instances) == 1
-
-    def test_custom_placement_policy_can_allow_cuda_device_sharing(self) -> None:
-        policy: PlacementPolicy = SharingPlacementPolicy()
-        cache = ModelCache(300, placement_policy=policy)
         cache.register(_spec("a", 100))
         cache.register(_spec("b", 100))
 
@@ -651,7 +608,7 @@ class TestGpuPlacementAndConcurrency:
         assert FakeStrategy.instances[0].activate_devices == [torch.device("cuda:0")]
         assert FakeStrategy.instances[1].activate_devices == [torch.device("cuda:0")]
 
-    def test_final_release_frees_cuda_device_for_another_key(self) -> None:
+    def test_different_key_can_reactivate_on_same_cuda_device_after_release(self) -> None:
         cache = ModelCache(300)
         cache.register(_spec("a", 100))
         cache.register(_spec("b", 100))
@@ -664,7 +621,7 @@ class TestGpuPlacementAndConcurrency:
         assert FakeStrategy.instances[0].activate_devices == [torch.device("cuda:0")]
         assert FakeStrategy.instances[1].activate_devices == [torch.device("cuda:0")]
 
-    def test_activation_failure_releases_cuda_device(self) -> None:
+    def test_activation_failure_does_not_block_same_device_for_other_key(self) -> None:
         cache = ModelCache(300)
         cache.register(_spec("a", 100, activate_raises=RuntimeError("gpu boom")))
         cache.register(_spec("b", 100))
@@ -678,7 +635,7 @@ class TestGpuPlacementAndConcurrency:
 
         assert FakeStrategy.instances[1].activate_devices == [torch.device("cuda:0")]
 
-    def test_different_keys_on_different_cuda_devices_can_overlap_across_threads(self) -> None:
+    def test_different_keys_on_same_cuda_device_can_overlap_across_threads(self) -> None:
         cache = ModelCache(300)
         cache.register(_spec("a", 100))
         cache.register(_spec("b", 100))
@@ -698,7 +655,7 @@ class TestGpuPlacementAndConcurrency:
 
         threads = [
             threading.Thread(target=worker, args=("a", "cuda:0")),
-            threading.Thread(target=worker, args=("b", "cuda:1")),
+            threading.Thread(target=worker, args=("b", "cuda:0")),
         ]
         for thread in threads:
             thread.start()
@@ -786,7 +743,7 @@ class TestDeviceSelection:
         cache.register(_spec("a", 100))
 
         with cache.use("a"):
-            with pytest.raises(ModelCacheError, match="without a cache-visible device"):
+            with pytest.raises(ModelCacheError, match="without a device"):
                 with cache.use("a", device="cpu"):
                     pass
 

@@ -34,7 +34,7 @@ Lifecycle
 ``cache_bytes`` is final immediately and a top-level resource is ready
 for :class:`~torch_offload.model_cache.ModelCache` admission →
 ``activate(device=...)`` (make resource usable, on the caller-selected
-device when the resource has device placement) → ``deactivate()``
+device when the resource is device-aware) → ``deactivate()``
 (release transient compute resources, keep ``cache_bytes`` resident).
 Package strategies optimize construction peak memory: plain
 ``torch.Tensor`` parameters may be repointed to pinned storage while
@@ -122,8 +122,9 @@ class ModelStrategyComponent(Protocol):
         register forward hooks, install an mmap, or do nothing for
         always-resident pieces. Not necessarily re-entrant — call
         :meth:`deactivate` before activating again. ``device`` lets a
-        top-level cache choose placement at acquire time; resources that
-        require placement should raise when it is omitted.
+        top-level cache pass through the caller's acquire-time device;
+        resources that require an explicit device should raise when it
+        is omitted.
         """
         ...
 
@@ -175,7 +176,7 @@ class CachedResource(Protocol[T_co]):
 
         ``device`` is optional at the protocol boundary so device-neutral
         resources can ignore it. Device-aware resources should require an
-        explicit placement and raise when it is omitted.
+        explicit device and raise when it is omitted.
         """
         ...
 

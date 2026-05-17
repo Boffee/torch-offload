@@ -27,7 +27,7 @@ with either.
 
 Both :class:`PinnedWeights` and :class:`ModelOffloader` implement the
 :class:`ModelStrategy` Protocol — the plug-in contract for
-storage/placement strategies that :class:`ModelCache` consumes.
+storage strategies that :class:`ModelCache` consumes.
 
 All strategies pin in their constructor, so ``cache_bytes`` is final
 immediately and :class:`ModelCache` can admit them without a
@@ -69,9 +69,8 @@ whole-model :class:`PinnedWeights` instead.
 :class:`ModelCache` manages the cached backing storage of multiple
 strategies with policy-driven eviction, an active-set with refcounted
 leases, and transactional admission. Custom :class:`EvictionPolicy`
-and :class:`PlacementPolicy` implementations can replace the default
-LRU and one-model-per-CUDA-device policies. See its docstring for
-design notes.
+implementations can replace the default LRU behavior. See its docstring
+for design notes.
 
 Compatibility
 -------------
@@ -93,7 +92,6 @@ from .model_cache import (
     EvictionContext,
     EvictionPolicy,
     EvictionPolicyError,
-    GpuDeviceOccupiedError,
     LRUEvictionPolicy,
     ModelCache,
     ModelCacheError,
@@ -101,9 +99,6 @@ from .model_cache import (
     ModelNotRegisteredError,
     ModelSpec,
     ModelTooLargeError,
-    OneModelPerCudaDevicePolicy,
-    PlacementLease,
-    PlacementPolicy,
     ResourceSpec,
 )
 from .model_offloader import ModelOffloader, detect_streaming_region_ties
@@ -121,7 +116,6 @@ __all__ = [
     "EvictionPolicy",
     "EvictionPolicyError",
     "GGUFWeight",
-    "GpuDeviceOccupiedError",
     "LRUEvictionPolicy",
     "LoRA",
     "LoRATransform",
@@ -134,10 +128,7 @@ __all__ = [
     "ModelStrategy",
     "ModelStrategyComponent",
     "ModelTooLargeError",
-    "OneModelPerCudaDevicePolicy",
     "PinnedWeights",
-    "PlacementLease",
-    "PlacementPolicy",
     "ResourceSpec",
     "SlotOwnership",
     "StreamedWeights",

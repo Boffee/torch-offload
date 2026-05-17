@@ -30,13 +30,11 @@ Design highlights
   allocator). The cache stays internally consistent; the cost is
   some warm cached entries disappearing.
 - **No GPU budget.** The cache only enforces ``max_cache_bytes``
-  (typically pinned host memory). It has a deliberately simple GPU
-  placement guard: when callers pass a CUDA ``device``, at most one
-  active key may occupy that CUDA device at a time.
-- **Policy interfaces.** Host-cache eviction and active-lease placement
-  are delegated to :class:`EvictionPolicy` and :class:`PlacementPolicy`
-  instances; defaults preserve LRU eviction and one-key-per-CUDA-device
-  placement.
+  (typically pinned host memory). GPU residency is caller-managed:
+  multiple active keys may target the same device when the caller knows
+  they fit.
+- **Policy interface.** Host-cache eviction is delegated to an
+  :class:`EvictionPolicy`; the default preserves LRU eviction.
 - **Coarse thread-safety.** Public cache operations are protected by an
   instance lock. Factory/build, activation, and deactivation are
   serialized; the lock is released while caller code runs inside the
@@ -145,21 +143,6 @@ class EvictionContext:
         )
 
 
-@dataclass(frozen=True, slots=True)
-class PlacementLease:
-    """Placement reservation returned by a :class:`PlacementPolicy`.
-
-    ``device`` is the concrete device passed to the resource's
-    ``activate(device)`` call. It may be ``None`` for device-less
-    resources. ``token`` is policy-private state returned unchanged to
-    :meth:`PlacementPolicy.release`.
-    """
-
-    key: str
-    device: torch.device | None
-    token: object | None = None
-
-
 class EvictionPolicy(Protocol):
     """Policy interface for inactive cached-entry eviction.
 
@@ -186,35 +169,6 @@ class EvictionPolicy(Protocol):
 
     def choose_victims(self, context: EvictionContext) -> tuple[str, ...]:
         """Return unique candidate keys totaling enough bytes to admit the entry."""
-        ...
-
-
-class PlacementPolicy(Protocol):
-    """Policy interface for active-lease placement.
-
-    ``reserve`` may reject placement by raising :class:`ModelCacheError`
-    or a subclass. The returned lease's ``device`` is used for
-    activation and stored as the active device for re-entrant checks.
-    ``requested_device`` is the raw caller request so custom policies
-    may support sentinels such as ``"cuda:auto"``.
-    """
-
-    def reserve(self, *, key: str, requested_device: torch.device | str | None) -> PlacementLease:
-        """Reserve placement for ``key`` and return the activation lease."""
-        ...
-
-    def validate_reentrant(
-        self,
-        *,
-        key: str,
-        active_device: torch.device | None,
-        requested_device: torch.device | str | None,
-    ) -> None:
-        """Validate a nested same-key acquire on an already-active entry."""
-        ...
-
-    def release(self, lease: PlacementLease) -> None:
-        """Release a lease returned by :meth:`reserve`."""
         ...
 
 
@@ -263,19 +217,6 @@ class ModelInUseError(ModelCacheError):
 
 class EvictionPolicyError(ModelCacheError):
     """An :class:`EvictionPolicy` returned invalid or insufficient victims."""
-
-
-class GpuDeviceOccupiedError(ModelCacheError):
-    """A CUDA device already has an active model under the cache's
-    one-active-key-per-GPU placement policy."""
-
-    def __init__(self, *, device: torch.device, key: str, active_key: str) -> None:
-        super().__init__(
-            f"cannot activate {key!r} on {device}: device is already occupied by active model {active_key!r}"
-        )
-        self.device = device
-        self.key = key
-        self.active_key = active_key
 
 
 class ActivationError(ModelCacheError):
@@ -329,60 +270,6 @@ class LRUEvictionPolicy:
         return tuple(chosen)
 
 
-class OneModelPerCudaDevicePolicy:
-    """Default placement policy: one active model key per CUDA device."""
-
-    def __init__(self) -> None:
-        self._active_by_device: dict[torch.device, str] = {}
-
-    def reserve(self, *, key: str, requested_device: torch.device | str | None) -> PlacementLease:
-        device = canonical_device(requested_device) if requested_device is not None else None
-        if device is None or device.type != "cuda":
-            return PlacementLease(key=key, device=device)
-        active_key = self._active_by_device.get(device)
-        if active_key is not None and active_key != key:
-            raise GpuDeviceOccupiedError(device=device, key=key, active_key=active_key)
-        self._active_by_device[device] = key
-        return PlacementLease(
-            key=key,
-            device=device,
-            token=device,
-        )
-
-    def validate_reentrant(
-        self,
-        *,
-        key: str,
-        active_device: torch.device | None,
-        requested_device: torch.device | str | None,
-    ) -> None:
-        device = canonical_device(requested_device) if requested_device is not None else None
-        if device is not None and active_device is None:
-            raise ModelCacheError(
-                f"cannot acquire active {key!r} with device {device}: "
-                "the existing lease was activated without a cache-visible device"
-            )
-        if device is not None and active_device is not None and device != active_device:
-            raise ModelCacheError(f"cannot acquire active {key!r} on {device}: already active on {active_device}")
-
-    def release(self, lease: PlacementLease) -> None:
-        if lease.token is None:
-            return
-        device = cast(torch.device, lease.token)
-        active_key = self._active_by_device.get(device)
-        if active_key is None:
-            return
-        if active_key != lease.key:
-            logger.warning(
-                "GPU slot bookkeeping mismatch for %s: expected %r, found %r; leaving slot unchanged",
-                device,
-                lease.key,
-                active_key,
-            )
-            return
-        del self._active_by_device[device]
-
-
 # ---------------------------------------------------------------------------
 # Internal entry state
 # ---------------------------------------------------------------------------
@@ -394,10 +281,9 @@ class _Entry:
     strategy: CachedResource | None = None
     cache_bytes: int = 0  # actual, post-build
     active_count: int = 0
-    # Acquire-time placement for the current active lease. ``None`` means
-    # the cache did not select a device for this resource.
+    # Normalized device for the current active lease. ``None`` means the
+    # caller did not request one.
     active_device: torch.device | None = None
-    placement: PlacementLease | None = None
     # True while `pre_activate` is running. Guards against same-key
     # re-entry from inside the hook, which would otherwise activate
     # the strategy while we're still in the deactivated-config phase
@@ -433,10 +319,6 @@ class ModelCache:
         Optional inactive-entry eviction policy. Defaults to
         :class:`LRUEvictionPolicy`. The cache owns the policy instance
         and calls it while holding the cache lock.
-    placement_policy:
-        Optional active-lease placement policy. Defaults to
-        :class:`OneModelPerCudaDevicePolicy`. The cache owns the policy
-        instance and calls it while holding the cache lock.
     """
 
     def __init__(
@@ -445,7 +327,6 @@ class ModelCache:
         *,
         empty_host_cache: Callable[[], None] | None = None,
         eviction_policy: EvictionPolicy | None = None,
-        placement_policy: PlacementPolicy | None = None,
     ) -> None:
         if max_cache_bytes < 0:
             raise ValueError(f"max_cache_bytes must be >= 0, got {max_cache_bytes}")
@@ -454,7 +335,6 @@ class ModelCache:
         self._entries: dict[str, _Entry] = {}
         self._eviction = eviction_policy if eviction_policy is not None else LRUEvictionPolicy()
         self._lock = threading.RLock()
-        self._placement = placement_policy if placement_policy is not None else OneModelPerCudaDevicePolicy()
         self._used_bytes = 0
 
     @staticmethod
@@ -567,13 +447,13 @@ class ModelCache:
         resource's :attr:`~CachedResource.value` for use; on context
         exit, releases the lease.
 
-        ``device`` optionally selects placement for this acquire. It is
-        passed to the strategy's :meth:`~CachedResource.activate` on the
-        first lease. Re-entrant same-key acquires may omit ``device`` or
-        must pass the same device; simultaneous activation of one cached
-        entry on multiple devices is rejected. CUDA devices also
-        participate in a simple placement guard: at most one active key
-        may occupy a given CUDA device at a time.
+        ``device`` optionally selects the activation device for this
+        acquire. It is normalized and passed to the strategy's
+        :meth:`~CachedResource.activate` on the first lease. Re-entrant
+        same-key acquires may omit ``device`` or must pass the same
+        device; simultaneous activation of one cached entry on multiple
+        devices is rejected. Different keys may be active on the same
+        device at the same time; caller code owns GPU memory planning.
 
         Re-entrant for the same key: nested ``use()`` calls bump a
         per-key refcount and share the already-active value (the
@@ -692,32 +572,36 @@ class ModelCache:
         if entry.active_count > 0:
             return self._acquire_reentrant(entry, device)
 
-        placement = self._placement.reserve(key=key, requested_device=device)
-        try:
-            strategy = self._prepare_strategy_for_activation(entry, pre_activate)
-            value = self._activate_strategy(entry, strategy, placement.device)
-        except BaseException:
-            self._placement.release(placement)
-            raise
+        active_device = self._normalize_device(device)
+        strategy = self._prepare_strategy_for_activation(entry, pre_activate)
+        value = self._activate_strategy(entry, strategy, active_device)
 
         entry.active_count = 1
-        entry.active_device = placement.device
-        entry.placement = placement
+        entry.active_device = active_device
         return value
 
     def _acquire_reentrant(self, entry: _Entry, device: torch.device | str | None) -> object:
         """Bump a same-key active lease without reactivating the strategy."""
         key = entry.spec.key
-        self._placement.validate_reentrant(
-            key=key,
-            active_device=entry.active_device,
-            requested_device=device,
-        )
+        requested_device = self._normalize_device(device)
+        if requested_device is not None and entry.active_device is None:
+            raise ModelCacheError(
+                f"cannot acquire active {key!r} with device {requested_device}: "
+                "the existing lease was activated without a device"
+            )
+        if requested_device is not None and entry.active_device is not None and requested_device != entry.active_device:
+            raise ModelCacheError(
+                f"cannot acquire active {key!r} on {requested_device}: already active on {entry.active_device}"
+            )
         strategy = entry.strategy
         assert strategy is not None
         value = strategy.value
         entry.active_count += 1
         return value
+
+    @staticmethod
+    def _normalize_device(device: torch.device | str | None) -> torch.device | None:
+        return canonical_device(device) if device is not None else None
 
     def _prepare_strategy_for_activation(
         self,
@@ -789,17 +673,12 @@ class ModelCache:
             return
         strategy = entry.strategy
         assert strategy is not None
-        placement = entry.placement
-        assert placement is not None
         try:
             strategy.deactivate()
         except BaseException:
             self._release_strategy(entry)
-            self._placement.release(placement)
             raise
         entry.active_device = None
-        entry.placement = None
-        self._placement.release(placement)
         self._eviction.mark_inactive(entry.spec.key)
 
     # ------------------------------------------------------------------
@@ -962,7 +841,6 @@ class ModelCache:
         entry.strategy = None
         entry.cache_bytes = 0
         entry.active_device = None
-        entry.placement = None
         self._eviction.discard(entry.spec.key)
         self._used_bytes -= bytes_freed
         self._after_release()

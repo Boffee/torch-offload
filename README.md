@@ -357,8 +357,8 @@ with cache.use("diffusion_model", device=device) as t:
 # Active entries (currently inside `cache.use(...)`) are never evicted.
 # Re-entrant use of the same key must use the same device; simultaneous
 # activation of one cached strategy on multiple devices is rejected.
-# CUDA devices use a simple placement guard: one active model key per
-# cache-visible CUDA device passed to `cache.use(..., device=...)`.
+# Different keys may be active on the same device at the same time;
+# caller code owns VRAM planning.
 ```
 
 You can also auto-register at acquire time:
@@ -378,14 +378,13 @@ with cache.use(spec, device=device) as vae:  # registers if missing, then uses
 > will lie about freed memory. Always have the factory build the
 > model itself.
 
-`ModelCache` accepts custom `EvictionPolicy` and `PlacementPolicy`
-implementations. Defaults are `LRUEvictionPolicy` for inactive host
-cache eviction and `OneModelPerCudaDevicePolicy` for CUDA placement.
-The cache builds the eviction candidate set and byte context, then asks
-the eviction policy to choose victims; `ModelCache` still owns
-validation, accounting, activation, rollback, and release. Policies are
-called under the cache lock. `choose_victims()` must return unique keys
-from `context.candidates` and enough bytes to satisfy
+`ModelCache` accepts custom `EvictionPolicy` implementations. The
+default is `LRUEvictionPolicy` for inactive host-cache eviction. The
+cache builds the eviction candidate set and byte context, then asks the
+eviction policy to choose victims; `ModelCache` still owns validation,
+accounting, activation, rollback, and release. Policies are called under
+the cache lock. `choose_victims()` must return unique keys from
+`context.candidates` and enough bytes to satisfy
 `context.bytes_to_free`; otherwise `ModelCache` raises
 `EvictionPolicyError` without evicting anything.
 
@@ -507,11 +506,11 @@ This is a low-level library; we don't guard against caller misuse.
 - **Wrap before DDP/FSDP**, not after. Those wrappers manage parameter
   storage themselves and conflict with the slot-swap pattern.
 - **Coarse cache concurrency.** `ModelCache` protects cache metadata,
-  admission, leases, and the simple one-key-per-CUDA-device
-  placement table with an internal lock. Factory/build, activation, and
-  deactivation are serialized, but the lock is released while caller
-  code runs inside `cache.use(...)`. The cache does not make a yielded
-  model object safe for concurrent same-key execution.
+  admission, leases, and per-key active device state with an internal
+  lock. Factory/build, activation, and deactivation are serialized, but
+  the lock is released while caller code runs inside `cache.use(...)`.
+  The cache does not make a yielded model object safe for concurrent
+  same-key execution.
 - **Buffer mutations during CUDA activation are discarded** on
   `deactivate()`. CPU activation is pass-through over host-backed
   buffers, so CPU buffer mutations behave like ordinary module
@@ -584,7 +583,6 @@ than silent corruption.
 | `ModelTooLargeError` | Cache miss can't fit even after evicting all inactive entries. Exposes `required`, `used`, and `limit`. |
 | `EvictionPolicyError` | Custom eviction policy returned duplicate/non-candidate victims or too few bytes |
 | `ActivationError` | Strategy's `activate()` raised — the cache discards the entry; next acquire rebuilds |
-| `GpuDeviceOccupiedError` | A CUDA device already has a different active model key under the simple placement guard |
 | `ModelInUseError` | `evict()` / `clear()` / `unregister()` called while entry is active |
 | `DuplicateModelKeyError` | `register()` called for an existing key without `replace=True` |
 | `ModelNotRegisteredError` | `use(str)` called for an unknown key |
