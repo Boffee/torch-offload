@@ -142,7 +142,7 @@ class TestCleanup:
 
         m = _make_simple_model()
         pw = PinnedWeights(m)
-        first_parent, first_leaf = pw._slots[0][1][0]
+        first_parent, first_leaf = pw._slots[0].locations[0]
         slot_param_ref = weakref.ref(first_parent._parameters[first_leaf])
         pw.deactivate()
         assert slot_param_ref() is not None  # still alive via model slot
@@ -232,14 +232,14 @@ class TestTiedWeightDedup:
         try:
             # Exactly one unique pinned buffer for the tied weight.
             assert len(pw._slots) == 1
-            buf, locs = pw._slots[0]
-            leaves = {leaf for _, leaf in locs}
+            group = pw._slots[0]
+            leaves = {loc.leaf for loc in group.locations}
             assert leaves == {"weight"}  # both 'embed.weight' and 'head.weight'
-            assert len(locs) == 2
+            assert len(group.locations) == 2
             # After construction, both slots reference the same Parameter
             # (the buf's cpu_param), preserving tying at the strongest level.
             assert m.embed._parameters["weight"] is m.head._parameters["weight"]
-            assert m.embed.weight is buf.cpu_param
+            assert m.embed.weight is group.buffer.cpu_param
         finally:
             pw.deactivate()
 
@@ -248,8 +248,7 @@ class TestTiedWeightDedup:
         pw = PinnedWeights(m)
         try:
             assert len(pw._slots) == 1
-            _, locs = pw._slots[0]
-            assert {leaf for _, leaf in locs} == {"a", "b"}
+            assert {loc.leaf for loc in pw._slots[0].locations} == {"a", "b"}
             # Both module slots now reference the same Parameter object.
             assert m._parameters["a"] is m._parameters["b"]
         finally:
@@ -329,10 +328,10 @@ class TestSharedSubmoduleAlias:
         try:
             # One pinned buffer (same Parameter via aliased module).
             assert len(pw._slots) == 1
-            _, locs = pw._slots[0]
+            group = pw._slots[0]
             # Slots deduped by (id(parent), leaf) — only one physical
             # location even though there are two attribute paths.
-            assert len(locs) == 1
+            assert len(group.locations) == 1
         finally:
             pw.deactivate()
 
@@ -356,12 +355,12 @@ class TestSharedSubmoduleAlias:
         try:
             # One pinned buffer covers both alias paths.
             assert len(pw._buffer_slots) == 1
-            pinned, locs = pw._buffer_slots[0]
-            assert pinned.is_pinned()
-            assert len(locs) == 2
+            group = pw._buffer_slots[0]
+            assert group.pinned.is_pinned()
+            assert len(group.locations) == 2
             # Both module slots reference the SAME pinned tensor.
-            assert m.a.buf is pinned
-            assert m.b.buf is pinned
+            assert m.a.buf is group.pinned
+            assert m.b.buf is group.pinned
         finally:
             pw.deactivate()
 
@@ -380,9 +379,9 @@ class TestSharedSubmoduleAlias:
         pw = PinnedWeights(m)
         try:
             assert len(pw._buffer_slots) == 1
-            pinned, _locs = pw._buffer_slots[0]
-            assert m.a.buf is pinned
-            assert m.b.buf is pinned
+            group = pw._buffer_slots[0]
+            assert m.a.buf is group.pinned
+            assert m.b.buf is group.pinned
         finally:
             pw.deactivate()
 

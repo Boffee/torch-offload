@@ -1708,9 +1708,9 @@ class TestSlotOwnershipFilter:
                 # PinnedWeights; block slots are skipped (already
                 # owned by streamer).
                 slots_managed_by_pinned = {
-                    SlotOwnership(id(parent), leaf, "param")
-                    for _, locs in non_block.slots
-                    for parent, leaf in locs
+                    SlotOwnership(id(loc.parent), loc.leaf, "param")
+                    for group in non_block.slots
+                    for loc in group.locations
                 }
                 # Block-owned slots NOT in the PinnedWeights set.
                 for s in skip_slots:
@@ -2202,9 +2202,9 @@ class TestLoRAInBlockRouting:
             # PinnedWeights manages frozen_head.weight only — block content
             # routed to StreamedWeights, trainable_bias to TrainableWeights.
             managed_slot_ids = {
-                (id(parent), leaf)
-                for _buf, locs in pinned.slots
-                for parent, leaf in locs
+                (id(loc.parent), loc.leaf)
+                for group in pinned.slots
+                for loc in group.locations
             }
             for s in iter_param_slots(m):
                 key = (id(s.parent), s.leaf)

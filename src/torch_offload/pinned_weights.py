@@ -60,6 +60,7 @@ from __future__ import annotations
 
 import contextlib
 from collections.abc import Iterator
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -83,8 +84,78 @@ from .slots import (
     set_param_slot,
 )
 
-ParamSlotGroup = tuple[PinnedParamBuffer, list[tuple[nn.Module, str]]]
-ParamAliasGroup = tuple[PinnedParamBuffer, list[tuple[str, nn.Module, str]]]
+
+@dataclass(slots=True, frozen=True)
+class ParamLocation:
+    parent: nn.Module
+    leaf: str
+
+    def __iter__(self) -> Iterator[object]:
+        yield self.parent
+        yield self.leaf
+
+
+@dataclass(slots=True, frozen=True)
+class ParamAlias:
+    name: str
+    parent: nn.Module
+    leaf: str
+
+    def __iter__(self) -> Iterator[object]:
+        yield self.name
+        yield self.parent
+        yield self.leaf
+
+
+@dataclass(slots=True, frozen=True)
+class BufferLocation:
+    parent: nn.Module
+    leaf: str
+    persistent: bool
+
+    def __iter__(self) -> Iterator[object]:
+        yield self.parent
+        yield self.leaf
+        yield self.persistent
+
+
+@dataclass(slots=True)
+class ParamSlotGroup:
+    buffer: PinnedParamBuffer
+    locations: list[ParamLocation]
+
+    def __iter__(self) -> Iterator[object]:
+        yield self.buffer
+        yield self.locations
+
+    def __getitem__(self, index: int) -> object:
+        return (self.buffer, self.locations)[index]
+
+
+@dataclass(slots=True)
+class ParamAliasGroup:
+    buffer: PinnedParamBuffer
+    aliases: list[ParamAlias]
+
+    def __iter__(self) -> Iterator[object]:
+        yield self.buffer
+        yield self.aliases
+
+    def __getitem__(self, index: int) -> object:
+        return (self.buffer, self.aliases)[index]
+
+
+@dataclass(slots=True)
+class BufferSlotGroup:
+    pinned: torch.Tensor
+    locations: list[BufferLocation]
+
+    def __iter__(self) -> Iterator[object]:
+        yield self.pinned
+        yield self.locations
+
+    def __getitem__(self, index: int) -> object:
+        return (self.pinned, self.locations)[index]
 
 
 class PinnedWeights:
@@ -172,12 +243,14 @@ class PinnedWeights:
         # all pinning succeeded. This keeps module slot identity changes
         # grouped, but construction is not fully rollback-safe because of
         # the low-peak Parameter.data repointing described above.
-        for buf, locs in self._slots:
-            for parent, leaf in locs:
-                set_param_slot(parent, leaf, buf.cpu_param)
-        for pinned, locs in self._buffer_slots:
-            for parent, leaf, persistent in locs:
-                set_buffer_slot(parent, leaf, pinned, persistent=persistent)
+        for group in self._slots:
+            for loc in group.locations:
+                set_param_slot(loc.parent, loc.leaf, group.buffer.cpu_param)
+        for group in self._buffer_slots:
+            for loc in group.locations:
+                set_buffer_slot(
+                    loc.parent, loc.leaf, group.pinned, persistent=loc.persistent
+                )
 
         # Reject only if there is nothing at all to manage — neither
         # frozen params nor (when include_buffers=True) registered
@@ -225,28 +298,25 @@ class PinnedWeights:
             buf = PinnedParamBuffer(first_name, first_p)
             seen_locs: set[tuple[int, str]] = set()
             seen_aliases: set[str] = set()
-            locs: list[tuple[nn.Module, str]] = []
-            alias_locs: list[tuple[str, nn.Module, str]] = []
+            locs: list[ParamLocation] = []
+            alias_locs: list[ParamAlias] = []
             for name, _, parent, leaf in members:
                 if name not in seen_aliases:
                     seen_aliases.add(name)
-                    alias_locs.append((name, parent, leaf))
+                    alias_locs.append(ParamAlias(name, parent, leaf))
                 key = (id(parent), leaf)
                 if key in seen_locs:
                     continue
                 seen_locs.add(key)
-                locs.append((parent, leaf))
-            slots.append((buf, locs))
-            aliases.append((buf, alias_locs))
+                locs.append(ParamLocation(parent, leaf))
+            slots.append(ParamSlotGroup(buf, locs))
+            aliases.append(ParamAliasGroup(buf, alias_locs))
         return slots, aliases
 
     def _collect_buffer_slots(
         self, model: nn.Module
-    ) -> list[tuple[torch.Tensor, list[tuple[nn.Module, str, bool]]]]:
-        buf_groups: dict[
-            tuple[Any, ...],
-            tuple[torch.Tensor, list[tuple[nn.Module, str, bool]]],
-        ] = {}
+    ) -> list[BufferSlotGroup]:
+        buf_groups: dict[tuple[Any, ...], BufferSlotGroup] = {}
         for s in iter_buffer_slots(model):
             if s.slot in self._skip_slots:
                 continue
@@ -255,11 +325,17 @@ class PinnedWeights:
             existing = buf_groups.get(skey)
             if existing is None:
                 pinned = s.buffer.detach().clone(memory_format=torch.contiguous_format).pin_memory()
-                buf_groups[skey] = (pinned, [(s.parent, s.leaf, persistent)])
+                buf_groups[skey] = BufferSlotGroup(
+                    pinned, [BufferLocation(s.parent, s.leaf, persistent)]
+                )
             else:
-                seen_locs = {(id(p), leaf) for p, leaf, _ in existing[1]}
+                seen_locs = {
+                    (id(loc.parent), loc.leaf) for loc in existing.locations
+                }
                 if (id(s.parent), s.leaf) not in seen_locs:
-                    existing[1].append((s.parent, s.leaf, persistent))
+                    existing.locations.append(
+                        BufferLocation(s.parent, s.leaf, persistent)
+                    )
         return list(buf_groups.values())
 
     @staticmethod
@@ -303,10 +379,10 @@ class PinnedWeights:
     def cache_bytes(self) -> int:
         """Total pinned host bytes held. Tied weights counted once."""
         total = 0
-        for buf, _ in self._slots:
-            total += buf.cache_bytes
-        for pinned, _ in self._buffer_slots:
-            total += pinned.numel() * pinned.element_size()
+        for group in self._slots:
+            total += group.buffer.cache_bytes
+        for group in self._buffer_slots:
+            total += group.pinned.numel() * group.pinned.element_size()
         return total
 
     @property
@@ -328,7 +404,7 @@ class PinnedWeights:
         LoRA. Mirrors PyTorch's hook registration pattern by returning a
         handle whose :meth:`remove` method unregisters the hook.
         """
-        if not any(owned is buf for owned, _locs in self._slots):
+        if not any(group.buffer is buf for group in self._slots):
             raise ValueError(
                 f"buffer {buf.name!r} is not owned by this PinnedWeights"
             )
@@ -417,25 +493,32 @@ class PinnedWeights:
         # One active-device Parameter per unique buffer. Tied slots
         # all receive the same Parameter object so the tying invariant
         # survives on device.
-        for buf, locs in self._slots:
-            gpu_param = buf.load_to_gpu(device, non_blocking=True)
-            hook = self._post_copy_hooks.get(id(buf))
+        for group in self._slots:
+            gpu_param = group.buffer.load_to_gpu(device, non_blocking=True)
+            hook = self._post_copy_hooks.get(id(group.buffer))
             if hook is not None:
                 hook(gpu_param.data)
-            for parent, leaf in locs:
-                set_param_slot(parent, leaf, gpu_param)
+            for loc in group.locations:
+                set_param_slot(loc.parent, loc.leaf, gpu_param)
         if self._include_buffers:
-            for pinned, locs in self._buffer_slots:
-                gpu = pinned.to(device, non_blocking=True)
-                for parent, leaf, persistent in locs:
-                    set_buffer_slot(parent, leaf, gpu, persistent=persistent)
+            for group in self._buffer_slots:
+                gpu = group.pinned.to(device, non_blocking=True)
+                for loc in group.locations:
+                    set_buffer_slot(
+                        loc.parent, loc.leaf, gpu, persistent=loc.persistent
+                    )
         torch.cuda.synchronize(device)
 
     def _move_to_pinned(self) -> None:
-        for buf, locs in self._slots:
-            for parent, leaf in locs:
-                set_param_slot(parent, leaf, buf.cpu_param)
+        for group in self._slots:
+            for loc in group.locations:
+                set_param_slot(loc.parent, loc.leaf, group.buffer.cpu_param)
         if self._include_buffers:
-            for pinned, locs in self._buffer_slots:
-                for parent, leaf, persistent in locs:
-                    set_buffer_slot(parent, leaf, pinned, persistent=persistent)
+            for group in self._buffer_slots:
+                for loc in group.locations:
+                    set_buffer_slot(
+                        loc.parent,
+                        loc.leaf,
+                        group.pinned,
+                        persistent=loc.persistent,
+                    )

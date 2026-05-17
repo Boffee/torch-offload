@@ -833,21 +833,21 @@ class ModelOffloader:
                         components[key] = streamer
 
         if non_block is not None:
-            for buf, aliases in non_block.param_aliases:
-                if not aliases:
+            for group in non_block.param_aliases:
+                if not group.aliases:
                     continue
                 seen_parent_ids: set[int] = set()
                 alias_parents: list[nn.Module] = []
-                for _name, parent, _leaf in aliases:
-                    parent_id = id(parent)
+                for alias in group.aliases:
+                    parent_id = id(alias.parent)
                     if parent_id in seen_parent_ids:
                         continue
                     seen_parent_ids.add(parent_id)
-                    alias_parents.append(parent)
+                    alias_parents.append(alias.parent)
                 parent_tuple = tuple(alias_parents)
-                for name, _parent, _leaf in aliases:
-                    key = canonical_param_name(name)
-                    bufs[key] = buf
+                for alias in group.aliases:
+                    key = canonical_param_name(alias.name)
+                    bufs[key] = group.buffer
                     parents[key] = parent_tuple
                     components[key] = non_block
 
