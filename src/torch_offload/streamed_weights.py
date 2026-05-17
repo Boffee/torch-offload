@@ -54,7 +54,14 @@ from torch import nn
 from ._devices import canonical_device
 from .pinned_buffer import PinnedParamBuffer, PostCopyHook, PostCopyHookHandle
 from .protocols import SlotOwnership
-from .slots import iter_buffer_slots, iter_param_slots
+from .slots import (
+    get_param_slot,
+    iter_buffer_slots,
+    iter_param_slots,
+    set_param_data,
+    set_param_slot,
+    set_tensor_data,
+)
 from .tensor_adapters import select_adapter
 
 logger = logging.getLogger(__name__)
@@ -74,14 +81,7 @@ def _repoint_data_to_pinned(
     on enter. Defined at module scope so the closure registered with
     ``ExitStack.callback`` doesn't capture a streamer reference.
     """
-    param.data = buf.cpu_param.data
-
-
-def _slot_param(parent: nn.Module, leaf: str) -> nn.Parameter:
-    param = parent._parameters[leaf]
-    if param is None:
-        raise RuntimeError(f"Parameter slot {leaf!r} is unexpectedly empty")
-    return param
+    set_param_data(param, buf.cpu_param.data)
 
 
 def _release_cuda_cache_on_drop(is_cuda: bool) -> None:
@@ -429,10 +429,10 @@ class _BlockPinnedStore:
                     continue
                 # _parameters[leaf] swap (rather than .data) is required
                 # for quanto correctness — see PinnedWeights for details.
-                submod._parameters[local_name] = buf.cpu_param
+                set_param_slot(submod, local_name, buf.cpu_param)
         for buf_records in self._buf_records:
             for mod_buf, _submod, _leaf, cpu_clone in buf_records:
-                mod_buf.data = cpu_clone
+                set_tensor_data(mod_buf, cpu_clone)
         self._slots_applied = True
 
     @property
@@ -516,11 +516,16 @@ class _BlockPinnedStore:
                 # autograd and optimizer state survive across cycles.
                 # Reuses ``slot.get_param`` purely for its ``.data``
                 # storage; the wrapper itself isn't installed.
-                _slot_param(submod, local_name).data = slot.get_param(qual_name).data
+                set_param_data(
+                    get_param_slot(submod, local_name),
+                    slot.get_param(qual_name).data,
+                )
             else:
-                submod._parameters[local_name] = slot.get_param(qual_name)
+                set_param_slot(submod, local_name, slot.get_param(qual_name))
         for mod_buf, _sm, _ln, cpu_clone in self._buf_records[idx]:
-            mod_buf.data = cpu_clone.to(self._device, non_blocking=non_blocking)
+            set_tensor_data(
+                mod_buf, cpu_clone.to(self._device, non_blocking=non_blocking)
+            )
 
     def release_slot(self, idx: int) -> None:
         """Return ``idx``'s pool slot for reuse.
@@ -546,11 +551,13 @@ class _BlockPinnedStore:
             self._param_bufs[idx], self._param_locs[idx], strict=True,
         ):
             if buf.requires_grad:
-                _slot_param(submod, local_name).data = buf.cpu_param.data
+                set_param_data(
+                    get_param_slot(submod, local_name), buf.cpu_param.data
+                )
             else:
-                submod._parameters[local_name] = buf.cpu_param
+                set_param_slot(submod, local_name, buf.cpu_param)
         for mod_buf, _sm, _ln, cpu_clone in self._buf_records[idx]:
-            mod_buf.data = cpu_clone
+            set_tensor_data(mod_buf, cpu_clone)
         if self._pool is not None:
             slot_id = self._block_to_slot.pop(idx, None)
             if slot_id is not None:
@@ -589,7 +596,7 @@ class _BlockPinnedStore:
         to honor the documented "model on CPU" contract.
         """
         for _buf, parent, leaf in self.iter_trainables():
-            param = _slot_param(parent, leaf)
+            param = get_param_slot(parent, leaf)
             if param.grad is not None and param.grad.device != device:
                 moved = param.grad.to(device)
                 if param.data.device == device:
@@ -600,7 +607,7 @@ class _BlockPinnedStore:
                     # data and GPU grads while active between block loads,
                     # so move the grad storage in place when the data is
                     # currently offloaded.
-                    param.grad.data = moved.data
+                    set_tensor_data(param.grad, moved.data)
 
     def mark_compute_done(self, idx: int, event: torch.cuda.Event) -> None:
         assert self._pool is not None, "activate_pool not called"
@@ -1149,9 +1156,10 @@ class StreamedWeights:
                 materialized: list[tuple[nn.Parameter, PinnedParamBuffer]] = []
                 with torch.cuda.stream(step_stream):
                     for buf, parent, leaf in self._store.iter_trainables():
-                        param = _slot_param(parent, leaf)
-                        param.data = buf.cpu_param.data.to(
-                            target, non_blocking=True,
+                        param = get_param_slot(parent, leaf)
+                        set_param_data(
+                            param,
+                            buf.cpu_param.data.to(target, non_blocking=True),
                         )
                         if param.grad is not None and param.grad.device != target:
                             param.grad = param.grad.to(target, non_blocking=True)

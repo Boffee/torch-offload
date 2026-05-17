@@ -9,7 +9,13 @@ import torch
 from torch import nn
 
 from ._devices import canonical_device
-from .slots import assert_frozen, iter_buffer_slots, iter_param_slots
+from .slots import (
+    assert_frozen,
+    iter_buffer_slots,
+    iter_param_slots,
+    set_buffer_slot,
+    set_param_slot,
+)
 
 __all__ = ["MpsWeights"]
 
@@ -96,9 +102,13 @@ class MpsWeights:
             if param.requires_grad:
                 raise RuntimeError("MpsWeights is frozen-only, but a managed parameter became trainable.")
             if param.device != device:
-                slot.parent._parameters[slot.leaf] = nn.Parameter(
-                    self._copy_tensor(param.detach(), device),
-                    requires_grad=False,
+                set_param_slot(
+                    slot.parent,
+                    slot.leaf,
+                    nn.Parameter(
+                        self._copy_tensor(param.detach(), device),
+                        requires_grad=False,
+                    ),
                 )
 
         if self._include_buffers:
@@ -107,7 +117,8 @@ class MpsWeights:
                 if buffer.device == device:
                     continue
                 persistent = slot.leaf not in slot.parent._non_persistent_buffers_set
-                slot.parent.register_buffer(
+                set_buffer_slot(
+                    slot.parent,
                     slot.leaf,
                     self._copy_tensor(buffer.detach(), device),
                     persistent=persistent,

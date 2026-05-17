@@ -73,7 +73,15 @@ from .pinned_buffer import (
     storage_key,
 )
 from .protocols import SlotOwnership
-from .slots import BufferSlot, ParamSlot, assert_frozen, iter_buffer_slots, iter_param_slots
+from .slots import (
+    BufferSlot,
+    ParamSlot,
+    assert_frozen,
+    iter_buffer_slots,
+    iter_param_slots,
+    set_buffer_slot,
+    set_param_slot,
+)
 
 ParamSlotGroup = tuple[PinnedParamBuffer, list[tuple[nn.Module, str]]]
 ParamAliasGroup = tuple[PinnedParamBuffer, list[tuple[str, nn.Module, str]]]
@@ -166,10 +174,10 @@ class PinnedWeights:
         # the low-peak Parameter.data repointing described above.
         for buf, locs in self._slots:
             for parent, leaf in locs:
-                parent._parameters[leaf] = buf.cpu_param
+                set_param_slot(parent, leaf, buf.cpu_param)
         for pinned, locs in self._buffer_slots:
             for parent, leaf, persistent in locs:
-                parent.register_buffer(leaf, pinned, persistent=persistent)
+                set_buffer_slot(parent, leaf, pinned, persistent=persistent)
 
         # Reject only if there is nothing at all to manage — neither
         # frozen params nor (when include_buffers=True) registered
@@ -415,19 +423,19 @@ class PinnedWeights:
             if hook is not None:
                 hook(gpu_param.data)
             for parent, leaf in locs:
-                parent._parameters[leaf] = gpu_param
+                set_param_slot(parent, leaf, gpu_param)
         if self._include_buffers:
             for pinned, locs in self._buffer_slots:
                 gpu = pinned.to(device, non_blocking=True)
                 for parent, leaf, persistent in locs:
-                    parent.register_buffer(leaf, gpu, persistent=persistent)
+                    set_buffer_slot(parent, leaf, gpu, persistent=persistent)
         torch.cuda.synchronize(device)
 
     def _move_to_pinned(self) -> None:
         for buf, locs in self._slots:
             for parent, leaf in locs:
-                parent._parameters[leaf] = buf.cpu_param
+                set_param_slot(parent, leaf, buf.cpu_param)
         if self._include_buffers:
             for pinned, locs in self._buffer_slots:
                 for parent, leaf, persistent in locs:
-                    parent.register_buffer(leaf, pinned, persistent=persistent)
+                    set_buffer_slot(parent, leaf, pinned, persistent=persistent)

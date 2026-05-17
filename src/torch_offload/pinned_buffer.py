@@ -34,6 +34,7 @@ from .tensor_adapters import (
     TensorAdapter,
     select_adapter,
 )
+from .slots import set_param_data
 
 PostCopyHook = Callable[[torch.Tensor], None]
 
@@ -133,7 +134,7 @@ class PinnedParamBuffer:
         # Only safe for plain tensors; subclass wrappers can lose
         # metadata or ignore .data assignment.
         if type(param.data) is torch.Tensor:
-            param.data = self.cpu_param.data
+            set_param_data(param, self.cpu_param.data)
 
     def allocate_gpu_storage(self, device: torch.device) -> object:
         """Allocate empty GPU storage mirroring this buffer's layout.

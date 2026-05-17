@@ -15,7 +15,7 @@ from torch import nn
 
 from ._devices import canonical_device
 from .protocols import SlotOwnership
-from .slots import iter_param_slots
+from .slots import iter_param_slots, set_param_data
 
 __all__ = ["TrainableWeights"]
 
@@ -87,7 +87,7 @@ class TrainableWeights:
             if not p.requires_grad:
                 continue
             if p.data.device != device:
-                p.data = p.data.to(device)
+                set_param_data(p, p.data.to(device))
             if p.grad is not None and p.grad.device != device:
                 p.grad = p.grad.to(device)
 

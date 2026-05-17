@@ -31,8 +31,13 @@ __all__ = [
     "ParamSlot",
     "assert_frozen",
     "canonical_param_name",
+    "get_param_slot",
     "iter_buffer_slots",
     "iter_param_slots",
+    "set_buffer_slot",
+    "set_param_data",
+    "set_param_slot",
+    "set_tensor_data",
     "split_attr_path",
     "walk_attr_path",
 ]
@@ -115,6 +120,50 @@ def assert_frozen(
     if extra:
         msg = f"{msg} {extra}"
     raise ValueError(msg)
+
+
+def get_param_slot(parent: nn.Module, leaf: str) -> nn.Parameter:
+    """Return the live Parameter registered at ``parent._parameters[leaf]``.
+
+    Slot-mutating strategies call this before identity-preserving
+    ``.data`` swaps. A missing/empty slot means strategy bookkeeping has
+    drifted from the module tree, so fail with a clear internal error.
+    """
+    param = parent._parameters[leaf]
+    if param is None:
+        raise RuntimeError(f"Parameter slot {leaf!r} is unexpectedly empty")
+    return param
+
+
+def set_param_slot(parent: nn.Module, leaf: str, param: nn.Parameter) -> None:
+    """Replace a module parameter slot with ``param``.
+
+    This intentionally uses ``module._parameters`` rather than
+    ``setattr`` so tensor subclasses keep their wrapper state and tied
+    slots can be assigned the same ``Parameter`` object.
+    """
+    parent._parameters[leaf] = param
+
+
+def set_buffer_slot(
+    parent: nn.Module,
+    leaf: str,
+    buffer: torch.Tensor,
+    *,
+    persistent: bool,
+) -> None:
+    """Replace a registered buffer while preserving its persistence flag."""
+    parent.register_buffer(leaf, buffer, persistent=persistent)
+
+
+def set_param_data(param: nn.Parameter, data: torch.Tensor) -> None:
+    """Repoint a Parameter's storage while preserving object identity."""
+    param.data = data
+
+
+def set_tensor_data(tensor: torch.Tensor, data: torch.Tensor) -> None:
+    """Repoint a Tensor-like buffer's storage while preserving object identity."""
+    tensor.data = data
 
 
 @dataclass(slots=True, frozen=True)
