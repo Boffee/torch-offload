@@ -17,6 +17,8 @@ def canonical_device(device: torch.device | str) -> torch.device:
     resolved = torch.device(device)
     if resolved.type == "cpu":
         return torch.device("cpu")
+    if resolved.type == "mps":
+        return torch.device("mps")
     if (
         resolved.type == "cuda"
         and resolved.index is None

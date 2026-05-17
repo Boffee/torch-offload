@@ -1,6 +1,6 @@
 """GPU memory management utilities — model-agnostic, torch-only.
 
-Two complementary offload strategies:
+Top-level offload strategies:
 
 - :class:`ModelOffloader` — per-block streaming with optional LoRA
   merge and trainable-parameter support. Use for models whose
@@ -19,23 +19,32 @@ Two complementary offload strategies:
   per use; on deactivate, parameter slots are repointed at pinned
   CPU storage and the GPU storage is released by refcount.
 
-Both classes share the underlying per-parameter pinned storage from
+- :class:`MpsWeights` — whole-model CPU->MPS materializer. Use for
+  frozen models that should become MPS-resident without retaining a
+  separate CPU cache. Construction copies one managed tensor at a time
+  and immediately replaces its module slot to keep peak host memory
+  close to one model plus the current tensor.
+
+The CUDA-oriented :class:`PinnedWeights` and :class:`ModelOffloader`
+share the underlying per-parameter pinned storage from
 :class:`~torch_offload.pinned_buffer.PinnedParamBuffer` (clone + pin
 + optional quanto ``WeightQBytesTensor`` decomposition, GGUF packed
-weights, and TorchAO NVFP4 packed weights), so quantized models work
-with either.
+weights, and TorchAO NVFP4 packed weights).
 
-Both :class:`PinnedWeights` and :class:`ModelOffloader` implement the
-:class:`ModelStrategy` Protocol — the plug-in contract for
-storage strategies that :class:`ModelCache` consumes.
+:class:`PinnedWeights`, :class:`MpsWeights`, and
+:class:`ModelOffloader` implement the :class:`ModelStrategy` Protocol —
+the plug-in contract for storage strategies that :class:`ModelCache`
+consumes.
 
-All strategies pin in their constructor, so ``cache_bytes`` is final
-immediately and :class:`ModelCache` can admit them without a
-factory-side ``prepare()`` dance. ``activate(device)`` then brings
-everything to the requested device; ``deactivate()`` returns to pinned
-CPU.
+Package strategies make ``cache_bytes`` final in their constructor, so
+:class:`ModelCache` can admit them without a factory-side ``prepare()``
+dance. ``activate(device)`` then makes the resource usable on the
+requested device. For :class:`PinnedWeights` and :class:`ModelOffloader`,
+``deactivate()`` returns slots to pinned CPU. For :class:`MpsWeights`,
+construction has already materialized the model on MPS, so
+``activate('mps')`` and ``deactivate()`` are lifecycle-only.
 
-Construction intentionally optimizes peak host memory. For plain
+Pinned construction intentionally optimizes peak host memory. For plain
 ``torch.Tensor`` parameters, pinning clones into pinned CPU storage and
 may immediately repoint the source ``Parameter.data`` at that pinned
 clone so the original pageable storage can be freed before all buffers
@@ -102,6 +111,7 @@ from .model_cache import (
     ResourceSpec,
 )
 from .model_offloader import ModelOffloader, detect_streaming_region_ties
+from .mps_weights import MpsWeights
 from .pinned_weights import PinnedWeights
 from .protocols import CachedResource, ModelStrategy, ModelStrategyComponent, SlotOwnership
 from .streamed_weights import StreamedWeights
@@ -128,6 +138,7 @@ __all__ = [
     "ModelStrategy",
     "ModelStrategyComponent",
     "ModelTooLargeError",
+    "MpsWeights",
     "PinnedWeights",
     "ResourceSpec",
     "SlotOwnership",
