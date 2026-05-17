@@ -6,7 +6,7 @@ policy-driven cache that swaps multiple independent models in and out
 of GPU memory.
 
 Self-contained, library-friendly: no dependencies beyond `torch` (plus
-optional `optimum.quanto` and `gguf` for quantized models). Designed
+optional `optimum.quanto`, `gguf`, and `torchao` for quantized models). Designed
 to be lifted into its own package when a second consumer appears.
 
 ## What's in here
@@ -20,9 +20,10 @@ to be lifted into its own package when a second consumer appears.
 | `trainable_weights.py` | `TrainableWeights` — identity-preserving trainable parameter mover |
 | `lora.py` | `LoRA`, `LoRATransform`, `LoRARouteHandle` — pinned factor storage + merge / routed-hook application |
 | `merge.py` | `merge_lora()` — permanent in-place LoRA merge into base weights (alternative to `set_loras`) |
-| `pinned_buffer.py` | `PinnedParamBuffer` — per-tensor pinning primitive (handles quanto + GGUF via adapters) |
-| `tensor_adapters.py`, `quanto_adapter.py`, `gguf_adapter.py`, `gguf_dequant.py` | Tensor-type adapter registry and optional optimum-quanto / gguf support |
+| `pinned_buffer.py` | `PinnedParamBuffer` — per-tensor pinning primitive (handles quanto, GGUF, and TorchAO NVFP4 via adapters) |
+| `tensor_adapters.py`, `quanto_adapter.py`, `gguf_adapter.py`, `nvfp4_adapter.py`, `gguf_dequant.py` | Tensor-type adapter registry and optional optimum-quanto / gguf / torchao support |
 | `_quanto.py` | Internal: optimum-quanto optional-import + layout validation; consumed by `quanto_adapter.py` and `merge.py` |
+| `_torchao_nvfp4.py` | Internal: TorchAO NVFP4 optional-import + layout validation; consumed by `nvfp4_adapter.py` |
 | `slots.py` | Slot-resolution helpers: `iter_param_slots`, `iter_buffer_slots`, `assert_frozen`, `canonical_param_name`, dotted-path walkers |
 | `model_cache.py` | `ModelCache` — policy-driven pool over `CachedResource` instances with active-set leases |
 
@@ -449,10 +450,10 @@ and a `PinnedWeights` used as a non-block sibling all satisfy it.
 
 `TensorAdapter` is the per-parameter extension point. Its base contract
 only covers inference movement: clone/pin, H2D copy, GPU wrapper rebuild,
-cache bytes, and logical compute dtype. Extra behaviors are explicit
-capabilities: CPU round-trip for optimizer-step sync, `Parameter.data`
-swap for trainable streaming, and dense in-place `addmm_` for activation
-LoRA merge.
+cache bytes, logical compute dtype, and block-layout signatures. Extra
+behaviors are explicit capabilities: CPU round-trip for optimizer-step
+sync, `Parameter.data` swap for trainable streaming, and dense in-place
+`addmm_` for activation LoRA merge.
 
 ## Strategy lifecycle
 
@@ -478,8 +479,8 @@ into pinned CPU storage. For plain `torch.Tensor` parameters, the source
 as that buffer is created. This releases the original pageable CPU
 storage early and avoids temporarily holding both pageable and pinned
 copies of large weights. It is a clone-to-pinned plus storage swap, not
-true in-place pinning. Tensor subclasses such as quanto/GGUF do not use
-this `.data` swap when it would lose wrapper state.
+true in-place pinning. Tensor subclasses such as quanto, GGUF, and NVFP4
+do not use this `.data` swap when it would lose wrapper state.
 
 **There is no `close()`.** To release pinned host memory, drop the
 strategy reference (and the model reference if you don't need it
@@ -554,6 +555,24 @@ LoRA on quanto bases: merge mode rejects quanto targets on activation
 success but silently leaves `_data` untouched). Use
 `set_loras(mode="routed")` for inference-time application, or
 `merge_lora()` for a permanent dequant -> addmm -> requant bake-in.
+
+## TorchAO NVFP4 support
+
+TorchAO NVFP4 weights
+(`torchao.prototype.mx_formats.nvfp4_tensor.NVFP4Tensor`) are handled as
+frozen inference weights when the `nvfp4` optional extra is installed.
+`PinnedParamBuffer` pins the packed FP4 `qdata`, FP8 block `scale`,
+optional per-tensor scales, and the TorchAO dispatch metadata, then
+rebuilds the `NVFP4Tensor` wrapper around GPU slot storage on activation.
+The optional extra requires TorchAO plus PyTorch 2.8+; dynamic NVFP4
+matmul execution still depends on Blackwell-class CUDA hardware and the
+matching PyTorch CUDA stack.
+
+NVFP4 support is intentionally model-weight only. The adapter does not
+opt into CPU round-trip, trainable `Parameter.data` swap, or activation
+merge-mode LoRA. Use routed LoRA when the target module is a logical
+`nn.Linear` with compatible shape and compute dtype. Permanent
+`merge_lora()` does not bake into NVFP4 weights.
 
 ## Failure modes
 

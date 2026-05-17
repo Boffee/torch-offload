@@ -14,7 +14,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 import torch
 from torch import nn
@@ -23,11 +23,13 @@ from ._quanto import is_weight_qbytes_tensor, requantize_with_addmm_delta
 from .lora import LoRA
 from .pinned_buffer import storage_key
 from .slots import canonical_param_name, iter_param_slots
-from .tensor_adapters import DENSE_ADDMM_DTYPES
+from .tensor_adapters import DenseAddmmTensorAdapter, select_adapter
 
 logger = logging.getLogger(__name__)
 
 __all__ = ["merge_lora"]
+
+_MergePath = Literal["quanto", "dense"]
 
 
 @dataclass(slots=True)
@@ -55,7 +57,9 @@ def merge_lora(
     """
     param_index, aliases = _build_param_index(model)
 
-    ops: list[tuple[str, _ParamGroup, torch.Tensor, torch.Tensor, float]] = []
+    ops: list[
+        tuple[str, _ParamGroup, torch.Tensor, torch.Tensor, float, _MergePath]
+    ] = []
     groups: dict[tuple[Any, ...], _ParamGroup] = {}
     seen_storage: dict[tuple[Any, ...], str] = {}
     for lora, strength in loras:
@@ -81,37 +85,52 @@ def merge_lora(
                     f"target shape is {expected}."
                 )
             data = group.param.data
-            if not is_weight_qbytes_tensor(data) and data.dtype not in DENSE_ADDMM_DTYPES:
-                raise ValueError(
-                    f"Cannot merge LoRA into {target_key!r} with "
-                    f"dtype {data.dtype}. Supported: "
-                    f"bf16/fp16/fp32 or quanto WeightQBytesTensor."
-                )
-            ops.append((target_key, group, a, b, strength))
+            merge_path = _merge_path(data, target_key)
+            ops.append((target_key, group, a, b, strength, merge_path))
 
-    for target_key, group, a, b, strength in ops:
+    for target_key, group, a, b, strength, merge_path in ops:
         param = group.param
-        if is_weight_qbytes_tensor(param.data):
+        if merge_path == "quanto":
             new_qt = requantize_with_addmm_delta(param.data, a, b, strength)
             new_param = nn.Parameter(new_qt, requires_grad=param.requires_grad)
             group.param = _replace_group_param(group, new_param, target_key)
-        elif param.data.dtype in DENSE_ADDMM_DTYPES:
+        else:
             dev = param.data.device
             param.data.addmm_(
                 b.to(device=dev, dtype=param.data.dtype),
                 a.to(device=dev, dtype=param.data.dtype),
                 alpha=strength,
             )
-        else:
-            raise ValueError(
-                f"Cannot merge LoRA into {target_key!r} with "
-                f"dtype {param.data.dtype}. Supported: "
-                f"bf16/fp16/fp32 or quanto WeightQBytesTensor."
-            )
 
     logger.info("merge_lora: merged %d/%d targets", len(ops),
                 sum(len(lora.targets) for lora, _ in loras))
     return len(ops)
+
+
+def _merge_path(data: torch.Tensor, target_key: str) -> _MergePath:
+    if is_weight_qbytes_tensor(data):
+        return "quanto"
+
+    try:
+        adapter = select_adapter(data)
+    except NotImplementedError as exc:
+        raise ValueError(
+            f"Cannot permanently merge LoRA into {target_key!r}: "
+            f"tensor type {type(data).__name__} has no registered tensor adapter. "
+            "Permanent merge supports plain bf16/fp16/fp32 tensors and "
+            "quanto WeightQBytesTensor weights."
+        ) from exc
+
+    if not isinstance(adapter, DenseAddmmTensorAdapter):
+        raise ValueError(
+            f"Cannot permanently merge LoRA into {target_key!r}: "
+            f"{adapter.__name__} does not support dense in-place addmm or a "
+            "dequantize/requantize merge path. Use routed LoRA for this "
+            "tensor type."
+        )
+
+    adapter.validate_dense_addmm_target(data, target_key)
+    return "dense"
 
 
 def _build_param_index(model: nn.Module) -> tuple[

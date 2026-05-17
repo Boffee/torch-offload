@@ -21,8 +21,9 @@ Two complementary offload strategies:
 
 Both classes share the underlying per-parameter pinned storage from
 :class:`~torch_offload.pinned_buffer.PinnedParamBuffer` (clone + pin
-+ optional quanto ``WeightQBytesTensor`` decomposition), so quantized
-models work with either.
++ optional quanto ``WeightQBytesTensor`` decomposition, GGUF packed
+weights, and TorchAO NVFP4 packed weights), so quantized models work
+with either.
 
 Both :class:`PinnedWeights` and :class:`ModelOffloader` implement the
 :class:`ModelStrategy` Protocol — the plug-in contract for

@@ -123,6 +123,20 @@ class QuantoAdapter:
         )
 
     @staticmethod
+    def layout_signature(t: torch.Tensor) -> tuple[object, ...]:
+        qt = require_qbytes_tensor(t)
+        return (
+            tuple(qt.shape),
+            qt.dtype,
+            qt.stride(),
+            qt.qtype,
+            qt.axis,
+            qbytes_activation_qtype(qt),
+            ("_data", tuple(qt._data.shape), qt._data.dtype),
+            ("_scale", tuple(qt._scale.shape), qt._scale.dtype),
+        )
+
+    @staticmethod
     def clone_pin(t: torch.Tensor) -> _QuantoPinned:
         qt = require_qbytes_tensor(t)
         # contiguous_format clone: fp8-quanto leaves some _data buffers

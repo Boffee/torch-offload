@@ -2,7 +2,7 @@
 
 A :class:`StreamedWeights` manages a single block list whose blocks
 share the same parameter layout (names, shapes, dtypes, and any
-quanto/GGUF wrapper metadata): pins the params to CPU at
+tensor-adapter wrapper metadata): pins the params to CPU at
 construction time, streams them to GPU on demand via forward-pre
 hooks, and uses a pre-allocated GPU slot pool plus a background
 prefetcher to overlap DMA with compute. On CPU, the host-backed
@@ -55,6 +55,7 @@ from ._devices import canonical_device
 from .pinned_buffer import PinnedParamBuffer, PostCopyHook, PostCopyHookHandle
 from .protocols import SlotOwnership
 from .slots import iter_buffer_slots, iter_param_slots
+from .tensor_adapters import select_adapter
 
 logger = logging.getLogger(__name__)
 
@@ -197,30 +198,15 @@ def _layout_signature(p: nn.Parameter) -> tuple:
     silently corrupt a load. Wrapper metadata (qtype, axis,
     activation_qtype, quant_type) is similarly invisible to copy_.
 
-    For plain tensors, stride is normalized to contiguous by
-    ``clone_pin`` so it's not part of the signature — including it
-    would falsely reject transposed inputs that pinning normalizes.
-    For subclassed wrappers (quanto, GGUF), the wrapper's logical
-    stride is captured by ``clone_pin`` into ``state.stride`` and
-    survives pinning (the GPU param is rebuilt with that stride),
-    so it IS load-bearing and goes in the signature. Inner storage
-    shapes/dtypes (``_data``, ``_scale``) are also captured for
-    subclassed wrappers — they're mostly determined by the other
-    fields, but explicit is cheap and forecloses any wrapper-class
-    edge case.
+    The selected tensor adapter owns the layout signature because
+    wrapper metadata is type-specific. For example, quanto needs its
+    qtype/axis and inner storage layouts, GGUF needs the packed quant
+    type, and TorchAO NVFP4 needs qdata/scale layouts plus scale
+    metadata. The signature intentionally excludes storage identity so
+    distinct block instances with the same layout can share one pool
+    template.
     """
-    t = p.data
-    parts: list = [tuple(t.shape), t.dtype]
-    for attr in ("qtype", "axis", "activation_qtype", "quant_type"):
-        if hasattr(t, attr):
-            parts.append((attr, getattr(t, attr)))
-    if type(t) is not torch.Tensor:
-        parts.append(("wrapper_stride", tuple(t.stride())))
-        for inner_attr in ("_data", "_scale"):
-            inner = getattr(t, inner_attr, None)
-            if inner is not None:
-                parts.append((inner_attr, tuple(inner.shape), inner.dtype))
-    return tuple(parts)
+    return select_adapter(p.data).layout_signature(p.data)
 
 
 def _check_block_layouts_match(
@@ -245,7 +231,7 @@ def _check_block_layouts_match(
                 f"Block {i} param layout differs from block 0. "
                 "All blocks in a StreamedWeights group must share the "
                 "same param structure (names, shapes, dtypes, and any "
-                "quanto/GGUF wrapper metadata). Split heterogeneous "
+                "tensor-adapter wrapper metadata). Split heterogeneous "
                 "block lists across separate `layers_attr=[...]` "
                 "groups in ModelOffloader."
             )

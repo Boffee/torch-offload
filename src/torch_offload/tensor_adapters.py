@@ -18,7 +18,8 @@ of the package (:class:`PinnedParamBuffer`, :class:`PinnedWeights`,
 :class:`StreamedWeights`) is type-agnostic and dispatches through
 :func:`select_adapter`. The base adapter contract is intentionally small:
 clone/pin, move to GPU, rebuild wrappers, report cache bytes, and report
-the logical compute dtype. Extra operations are expressed as small
+the logical compute dtype. Adapters also provide a layout signature for
+block-pool compatibility checks. Extra operations are expressed as small
 optional protocols so callers ask for the exact capability they need
 instead of hard-coding tensor classes.
 
@@ -85,6 +86,16 @@ class TensorAdapter(Protocol[PinnedStateT, GpuStateT]):
         with the same key share storage and quant metadata; different
         keys must not be deduped. Includes view layout (shape/stride/
         offset) so distinct views into the same buffer don't collapse."""
+        ...
+
+    @staticmethod
+    def layout_signature(t: torch.Tensor) -> tuple:
+        """Hashable tensor layout metadata for block-pool compatibility.
+
+        Unlike :meth:`storage_key`, this must not include storage
+        identity. It captures only fields that must match for one GPU
+        pool slot to safely receive bytes from multiple block instances.
+        """
         ...
 
     @staticmethod
@@ -262,6 +273,10 @@ class RegularAdapter:
             t.stride(),
             t.storage_offset(),
         )
+
+    @staticmethod
+    def layout_signature(t: torch.Tensor) -> tuple:
+        return (tuple(t.shape), t.dtype)
 
     @staticmethod
     def clone_pin(t: torch.Tensor) -> _RegularPinned:

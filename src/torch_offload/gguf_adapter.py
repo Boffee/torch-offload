@@ -187,6 +187,18 @@ class GgufAdapter:
         )
 
     @staticmethod
+    def layout_signature(t: torch.Tensor) -> tuple[object, ...]:
+        weight = _require_gguf_weight(t)
+        raw = weight.as_subclass(torch.Tensor)
+        return (
+            tuple(weight.shape),
+            weight.dtype,
+            weight.stride(),
+            ("packed", tuple(raw.shape), raw.dtype, raw.stride()),
+            weight.quant_type,
+        )
+
+    @staticmethod
     def clone_pin(t: torch.Tensor) -> _GgufPinned:
         weight = _require_gguf_weight(t)
         raw = weight.as_subclass(torch.Tensor)

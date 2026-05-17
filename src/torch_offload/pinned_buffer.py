@@ -25,6 +25,7 @@ from torch import nn
 
 from . import (
     gguf_adapter,  # noqa: F401 — registration side effect
+    nvfp4_adapter,  # noqa: F401 — registration side effect
     quanto_adapter,  # noqa: F401 — registration side effect
 )
 from .tensor_adapters import (

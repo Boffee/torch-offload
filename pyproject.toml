@@ -10,8 +10,9 @@ dependencies = [
 
 [project.optional-dependencies]
 gguf = ["gguf"]
+nvfp4 = ["numpy", "torch>=2.8", "torchao>=0.17"]
 quanto = ["optimum-quanto"]
-all = ["gguf", "optimum-quanto"]
+all = ["gguf", "numpy", "optimum-quanto", "torch>=2.8", "torchao>=0.17"]
 
 [build-system]
 requires = ["uv_build>=0.9.8,<0.10.0"]
