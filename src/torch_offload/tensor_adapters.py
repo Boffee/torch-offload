@@ -40,6 +40,7 @@ __all__ = [
     "DENSE_ADDMM_DTYPES",
     "CpuRoundTripTensorAdapter",
     "DenseAddmmTensorAdapter",
+    "DequantRequantTensorAdapter",
     "ParameterDataSwapTensorAdapter",
     "TensorAdapter",
     "register_adapter",
@@ -198,6 +199,28 @@ class DenseAddmmTensorAdapter(TensorAdapter[PinnedStateT, GpuStateT], Protocol):
         copied GPU tensor. Adapters that do not implement this capability
         are treated as non-mergeable by that caller.
         """
+        ...
+
+
+@runtime_checkable
+class DequantRequantTensorAdapter(TensorAdapter[PinnedStateT, GpuStateT], Protocol):
+    """Optional capability for shape-preserving dequantize/requantize updates.
+
+    ``dequantize(t)`` returns a dense logical tensor for ``t``. The
+    adapter owns the compute dtype choice. ``requantize(t, like=...)``
+    converts a shape-compatible dense tensor back into the same
+    representation/layout as ``like``. Device follows the dense input
+    tensor; callers can move tensors explicitly before calling.
+    """
+
+    @staticmethod
+    def dequantize(t: torch.Tensor) -> torch.Tensor:
+        """Return a dense logical tensor for ``t``."""
+        ...
+
+    @staticmethod
+    def requantize(t: torch.Tensor, *, like: torch.Tensor) -> torch.Tensor:
+        """Return ``t`` encoded in the same representation as ``like``."""
         ...
 
 

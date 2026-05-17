@@ -770,6 +770,49 @@ class TestMergeCorrectness:
 
 
 class TestPermanentMerge:
+    def test_quanto_target_uses_dequant_requant_strategy(self) -> None:
+        quanto = pytest.importorskip("optimum.quanto")
+        from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
+
+        class M(nn.Module):
+            def __init__(self, weight: torch.Tensor) -> None:
+                super().__init__()
+                self.target = nn.Linear(8, 4, bias=False)
+                self.target.weight = nn.Parameter(weight, requires_grad=False)
+
+        rows, cols, rank = 4, 8, 2
+        data = torch.randint(-32, 32, (rows, cols), dtype=torch.int8)
+        scale = torch.rand(rows, 1, dtype=torch.bfloat16).add_(0.25)
+        qt = WeightQBytesTensor.create(
+            quanto.qint8, 0, (rows, cols), (cols, 1), data, scale, None,
+        )
+        m = M(qt)
+        original_param = m.target.weight
+        sd = {
+            "target.lora_A.weight": torch.randn(rank, cols),
+            "target.lora_B.weight": torch.randn(rows, rank),
+        }
+        lora = LoRA(state_dict=sd, key_transform=None)
+        a, b = lora.targets["target.weight"]
+
+        expected_dense = qt.dequantize().to(torch.float32)
+        expected_dense.addmm_(b.to(torch.float32), a.to(torch.float32), alpha=0.5)
+        expected_packed = (
+            expected_dense / scale.to(torch.float32)
+        ).round().clamp(-128, 127).to(torch.int8)
+
+        merged = merge_lora(m, [(lora, 0.5)])
+
+        assert merged == 1
+        assert m.target.weight is not original_param
+        merged_qt = m.target.weight.data
+        assert isinstance(merged_qt, WeightQBytesTensor)
+        assert merged_qt.qtype is quanto.qint8
+        assert merged_qt.axis == 0
+        assert tuple(merged_qt.size()) == (rows, cols)
+        torch.testing.assert_close(merged_qt._data, expected_packed)
+        torch.testing.assert_close(merged_qt._scale, scale)
+
     def test_tied_alias_target_merges_shared_storage(self) -> None:
         m = _make_tied_non_block_model(dtype=torch.float32)
         base = m.embed.weight.detach().clone()

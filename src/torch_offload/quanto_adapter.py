@@ -35,8 +35,10 @@ from torch import nn
 from ._quanto import (
     QUANTO_AVAILABLE,
     create_qbytes_tensor,
+    dequantize_qbytes_tensor,
     is_weight_qbytes_tensor,
     qbytes_activation_qtype,
+    requantize_qbytes_tensor,
     require_qbytes_tensor,
     validate_layout,
 )
@@ -203,6 +205,14 @@ class QuantoAdapter:
     def compute_dtype(t: torch.Tensor) -> torch.dtype:
         qt = require_qbytes_tensor(t)
         return qt.dtype
+
+    @staticmethod
+    def dequantize(t: torch.Tensor) -> torch.Tensor:
+        return dequantize_qbytes_tensor(t)
+
+    @staticmethod
+    def requantize(t: torch.Tensor, *, like: torch.Tensor) -> torch.Tensor:
+        return requantize_qbytes_tensor(t, like=like)
 
     @staticmethod
     def cache_bytes(state: _QuantoPinned) -> int:

@@ -7,13 +7,14 @@ optimum-quanto:
   optional import and the ``QUANTO_AVAILABLE`` flag.
 - :data:`LAYOUT_ATTRS` — the private-attr names this repo reads on a
   ``WeightQBytesTensor``.
-- :func:`requantize_with_addmm_delta` — the dequant→addmm→requant cycle
-  used by :func:`~torch_offload.merge.merge_lora` to apply a permanent
-  LoRA delta to a quantized weight.
+- :func:`dequantize_qbytes_tensor` and
+  :func:`requantize_qbytes_tensor` — the pieces used by
+  :class:`~torch_offload.quanto_adapter.QuantoAdapter` to expose a
+  dequantize/requantize adapter capability.
 
-Both :mod:`quanto_adapter` (pin/move/wrap during streaming) and
-:mod:`merge` (permanent merge) consume from here so the layout assumption
-only has to be updated once when optimum-quanto refactors.
+Both pin/move/wrap and dequantize/requantize support consume from here
+through :mod:`quanto_adapter`, so the layout assumption only has to be
+updated once when optimum-quanto refactors.
 
 Pinned to optimum-quanto's internal layout. Not part of the public API.
 """
@@ -79,12 +80,11 @@ def create_qbytes_tensor(
 def validate_layout(qt: torch.Tensor) -> None:
     """Raise if ``qt`` is missing any of :data:`LAYOUT_ATTRS`.
 
-    Both the streaming adapter (:meth:`QuantoAdapter.matches`) and the
-    permanent-merge path (:func:`requantize_with_addmm_delta`) call
-    this so a layout drift in optimum-quanto is reported uniformly
-    rather than as a generic ``AttributeError`` partway through the
-    dispatch. The check itself is four ``hasattr`` calls — cheap to
-    run on every dispatch, no caching.
+    The streaming adapter (:meth:`QuantoAdapter.matches`) calls this so
+    a layout drift in optimum-quanto is reported uniformly rather than
+    as a generic ``AttributeError`` partway through the dispatch. The
+    check itself is four ``hasattr`` calls — cheap to run on every
+    dispatch, no caching.
     """
     missing = [a for a in LAYOUT_ATTRS if not hasattr(qt, a)]
     if not missing:
@@ -97,39 +97,37 @@ def validate_layout(qt: torch.Tensor) -> None:
     )
 
 
-def requantize_with_addmm_delta(
-    qt: torch.Tensor,
-    a: torch.Tensor,
-    b: torch.Tensor,
-    strength: float,
-) -> torch.Tensor:
-    """Apply ``W += strength * B @ A`` to a quanto-quantized weight.
-
-    Dequantizes to fp32, applies the addmm, requantizes using the
-    original scale, and returns a fresh :class:`WeightQBytesTensor`.
-    Lossy but standard for permanent LoRA merges into quantized bases.
-    """
+def dequantize_qbytes_tensor(qt: torch.Tensor) -> torch.Tensor:
+    """Return the dense logical value of a quanto tensor as fp32."""
     qbytes = require_qbytes_tensor(qt)
-    dev = qbytes.device
-    float_data = qbytes.dequantize().to(device=dev, dtype=torch.float32)
-    float_data.addmm_(
-        b.to(device=dev, dtype=torch.float32),
-        a.to(device=dev, dtype=torch.float32),
-        alpha=strength,
-    )
+    return qbytes.dequantize().to(device=qbytes.device, dtype=torch.float32)
+
+
+def requantize_qbytes_tensor(
+    t: torch.Tensor, *, like: torch.Tensor,
+) -> torch.Tensor:
+    """Encode dense ``t`` using the quanto layout and scale from ``like``."""
+    qbytes = require_qbytes_tensor(like)
+    if tuple(t.shape) != tuple(qbytes.size()):
+        raise ValueError(
+            f"Cannot requantize tensor with shape {tuple(t.shape)} like "
+            f"WeightQBytesTensor with shape {tuple(qbytes.size())}."
+        )
+    scale = qbytes._scale.to(device=t.device).clone()
     return create_qbytes_tensor(
         qbytes.qtype, qbytes.axis, qbytes.size(), qbytes.stride(),
-        _quantize_to_qbytes(float_data, qbytes),
-        qbytes._scale.clone(),
+        _quantize_to_qbytes(t, qbytes, scale),
+        scale,
         qbytes_activation_qtype(qbytes),
     )
 
 
 def _quantize_to_qbytes(
-    float_data: torch.Tensor, reference: Any,  # noqa: ANN401
+    float_data: torch.Tensor,
+    reference: Any,  # noqa: ANN401
+    scale: torch.Tensor,
 ) -> torch.Tensor:
     """Quantize float data using the same scale as ``reference``."""
-    scale = reference._scale
     axis = reference.axis
     scaled = (
         float_data / scale.view(-1, *([1] * (float_data.dim() - 1)))

@@ -7,6 +7,7 @@ import torch
 from torch import nn
 
 from torch_offload.pinned_param import PinnedParam
+from torch_offload.tensor_adapters import DequantRequantTensorAdapter, select_adapter
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -107,6 +108,32 @@ class TestPinnedParam:
 
 
 class TestPinnedParamQuanto:
+    def test_quanto_adapter_dequant_requant_capability(self) -> None:
+        quanto = pytest.importorskip("optimum.quanto")
+        from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
+
+        rows, cols = 4, 8
+        data = torch.randint(-32, 32, (rows, cols), dtype=torch.int8)
+        scale = torch.rand(rows, 1, dtype=torch.bfloat16).add_(0.25)
+        qt = WeightQBytesTensor.create(
+            quanto.qint8, 0, (rows, cols), (cols, 1), data, scale, None,
+        )
+
+        adapter = select_adapter(qt)
+        assert isinstance(adapter, DequantRequantTensorAdapter)
+        dense = adapter.dequantize(qt)
+        assert type(dense) is torch.Tensor
+        assert dense.dtype == torch.float32
+        assert dense.shape == qt.shape
+
+        requantized = adapter.requantize(dense, like=qt)
+        assert isinstance(requantized, WeightQBytesTensor)
+        assert requantized.qtype is quanto.qint8
+        assert requantized.axis == 0
+        assert tuple(requantized.size()) == (rows, cols)
+        torch.testing.assert_close(requantized._data, data)
+        torch.testing.assert_close(requantized._scale, scale)
+
     def test_pin_decomposes_data_and_scale(self) -> None:
         # Quanto WeightQBytesTensor must be decomposed into _data + _scale
         # and the cpu_param wrapper reconstructed from the pinned tensors.
