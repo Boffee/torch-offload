@@ -66,18 +66,14 @@ from torch import nn
 
 
 @dataclass(frozen=True, slots=True)
-class SlotOwnership:
-    """Identifies a parameter or buffer slot in the model tree by
-    ``(parent_module, leaf_name, kind)``.
+class SlotKey:
+    """Hashable identity for a parameter or buffer slot.
 
-    Used as a slot-skip filter when one strategy manages a subset of
-    a model's slots and a second strategy needs to ignore them. Unlike
-    ``id(param)`` / ``id(buffer)``, this identity survives
-    ``module._parameters[leaf] = new_param`` swaps — the parent module
-    and leaf name are stable even when the Parameter/buffer object at
-    that slot changes. That decouples filter consumers from
-    construction order: a strategy can be built with the filter at any
-    time, before or after the producing strategy has mutated slots.
+    Used as a skip filter when one strategy manages a subset of a
+    model's slots and a second strategy needs to ignore them. Unlike
+    ``id(param)`` / ``id(buffer)``, this key survives
+    ``module._parameters[leaf] = new_param`` swaps: the parent module
+    and leaf name are stable even when the object at that slot changes.
 
     ``parent_id`` is ``id()`` of the parent module, which is stable for
     the module's lifetime and unique per submodule (Python guarantee

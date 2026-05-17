@@ -14,7 +14,7 @@ import torch
 from torch import nn
 
 from ._devices import canonical_device
-from .protocols import SlotOwnership
+from .protocols import SlotKey
 from .slots import iter_param_slots, set_param_data
 
 __all__ = ["TrainableWeights"]
@@ -48,7 +48,7 @@ class TrainableWeights:
     model:
         The model whose trainable params should be moved.
     skip_slots:
-        Optional set of :class:`SlotOwnership` tuples identifying
+        Optional set of :class:`SlotKey` values identifying
         ``(parent_module, leaf, kind)`` slots to skip — used by
         composers that route some trainables to a different mover
         (e.g., :class:`ModelOffloader` routes in-block trainables to
@@ -60,7 +60,7 @@ class TrainableWeights:
         self,
         model: nn.Module,
         *,
-        skip_slots: set[SlotOwnership] | None = None,
+        skip_slots: set[SlotKey] | None = None,
     ) -> None:
         self._model = model
         self._skip_slots = frozenset(skip_slots) if skip_slots is not None else None
@@ -98,11 +98,12 @@ class TrainableWeights:
 
         seen_ids: set[int] = set()
         for s in iter_param_slots(self._model):
-            if s.slot in self._skip_slots:
+            if s.key in self._skip_slots:
                 continue
-            if not s.param.requires_grad:
+            param = s.get()
+            if not param.requires_grad:
                 continue
-            if id(s.param) in seen_ids:
+            if id(param) in seen_ids:
                 continue
-            seen_ids.add(id(s.param))
-            yield s.param
+            seen_ids.add(id(param))
+            yield param

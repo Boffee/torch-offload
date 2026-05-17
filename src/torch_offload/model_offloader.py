@@ -23,7 +23,7 @@ from ._devices import canonical_device
 from .lora import LoRA, LoRARouteHandle, LoRATransform
 from .pinned_buffer import PinnedParamBuffer, storage_key
 from .pinned_weights import PinnedWeights
-from .protocols import ModelStrategyComponent, SlotOwnership
+from .protocols import ModelStrategyComponent, SlotKey
 from .slots import canonical_param_name, iter_buffer_slots, iter_param_slots, walk_attr_path
 from .streamed_weights import StreamedWeights
 from .tensor_adapters import DenseAddmmTensorAdapter, select_adapter
@@ -245,8 +245,8 @@ class ModelOffloader:
         )
         model.to("cpu")
 
-        trainable_slots: set[SlotOwnership] = {
-            s.slot for s in iter_param_slots(model) if s.param.requires_grad
+        trainable_slots: set[SlotKey] = {
+            s.key for s in iter_param_slots(model) if s.get().requires_grad
         }
 
         # By default, streamers skip trainables and TrainableWeights keeps
@@ -269,7 +269,7 @@ class ModelOffloader:
                 )
             )
 
-        streamer_slots: set[SlotOwnership] = set()
+        streamer_slots: set[SlotKey] = set()
         for s in streamers:
             streamer_slots |= s.slot_filter
 
@@ -283,9 +283,9 @@ class ModelOffloader:
 
         non_block: PinnedWeights | None = None
         has_pinnable = any(
-            s.slot not in pinned_skip_slots for s in iter_param_slots(model)
+            s.key not in pinned_skip_slots for s in iter_param_slots(model)
         ) or any(
-            s.slot not in pinned_skip_slots for s in iter_buffer_slots(model)
+            s.key not in pinned_skip_slots for s in iter_buffer_slots(model)
         )
         if has_pinnable:
             non_block = PinnedWeights(
@@ -413,7 +413,7 @@ class ModelOffloader:
                     raise ValueError(
                         f"LoRA targets {existing_target!r} and {target_key!r} "
                         f"resolve to the same tied parameter storage. Apply "
-                        f"only one alias for a tied weight in a single "
+                        f"only one name for a tied weight in a single "
                         f"set_loras() call; otherwise the same base weight "
                         f"would receive multiple logical updates."
                     )
@@ -481,12 +481,12 @@ class ModelOffloader:
                 raise ValueError(
                     f"Routed LoRA mode does not support tied "
                     f"weights; target {target_key!r} has "
-                    f"{len(parents)} parent locations (typically the "
+                    f"{len(parents)} parent modules (typically the "
                     f"tied embed/head pattern). The hook would only "
                     f"fire on one of them, silently missing the "
                     f"others. Use mode='merge' for tied targets — "
                     f"merge mutates the shared storage so all "
-                    f"locations see the LoRA contribution."
+                    f"tied slots see the LoRA contribution."
                 )
             parent = next(iter(parents))
             if not isinstance(parent, nn.Linear):
@@ -810,44 +810,40 @@ class ModelOffloader:
         components: dict[str, PinnedWeights | StreamedWeights] = {}
 
         for streamer, layer_path in zip(streamers, layer_paths, strict=True):
-            block_bufs_per = streamer.param_bufs_per_block
-            block_aliases_per = streamer.param_aliases_per_block
-            for block_idx, (block_bufs, block_aliases) in enumerate(
-                zip(block_bufs_per, block_aliases_per, strict=True)
-            ):
-                for buf, aliases in zip(block_bufs, block_aliases, strict=True):
+            for block_idx, block_params in enumerate(streamer.params_per_block):
+                for param in block_params:
                     seen_parent_ids: set[int] = set()
-                    alias_parents: list[nn.Module] = []
-                    for _qual_name, parent, _leaf in aliases:
-                        parent_id = id(parent)
+                    slot_parents: list[nn.Module] = []
+                    for slot in param.slots:
+                        parent_id = id(slot.parent)
                         if parent_id in seen_parent_ids:
                             continue
                         seen_parent_ids.add(parent_id)
-                        alias_parents.append(parent)
-                    parent_tuple = tuple(alias_parents)
-                    for qual_name, _parent, _leaf in aliases:
-                        full_name = f"{layer_path}.{block_idx}.{qual_name}"
+                        slot_parents.append(slot.parent)
+                    parent_tuple = tuple(slot_parents)
+                    for slot in param.slots:
+                        full_name = f"{layer_path}.{block_idx}.{slot.name}"
                         key = canonical_param_name(full_name)
-                        bufs[key] = buf
+                        bufs[key] = param.pinned
                         parents[key] = parent_tuple
                         components[key] = streamer
 
         if non_block is not None:
-            for group in non_block.param_aliases:
-                if not group.aliases:
+            for param in non_block.params:
+                if not param.slots:
                     continue
                 seen_parent_ids: set[int] = set()
-                alias_parents: list[nn.Module] = []
-                for alias in group.aliases:
-                    parent_id = id(alias.parent)
+                slot_parents: list[nn.Module] = []
+                for slot in param.slots:
+                    parent_id = id(slot.parent)
                     if parent_id in seen_parent_ids:
                         continue
                     seen_parent_ids.add(parent_id)
-                    alias_parents.append(alias.parent)
-                parent_tuple = tuple(alias_parents)
-                for alias in group.aliases:
-                    key = canonical_param_name(alias.name)
-                    bufs[key] = group.buffer
+                    slot_parents.append(slot.parent)
+                parent_tuple = tuple(slot_parents)
+                for slot in param.slots:
+                    key = canonical_param_name(slot.name)
+                    bufs[key] = param.pinned
                     parents[key] = parent_tuple
                     components[key] = non_block
 
@@ -897,7 +893,7 @@ def _hf_block_has_checkpointing_flag(block: nn.Module) -> bool:
 def _check_block_groups_disjoint(
     block_groups: Sequence[Sequence[nn.Module]], layer_paths: Sequence[str]
 ) -> None:
-    """Reject configurations where any :class:`SlotOwnership` is owned
+    """Reject configurations where any :class:`SlotKey` is owned
     by more than one streamer region (or appears twice in a single
     region).
 
@@ -911,7 +907,7 @@ def _check_block_groups_disjoint(
     - **Parent/child blocks across groups** (group A has a parent
       module, group B has one of its children): different
       ``id(parent)`` block instances, but their per-leaf
-      ``SlotOwnership`` tuples coincide on the child's slots.
+      ``SlotKey`` values coincide on the child's slots.
     - **Within a single group, the same nn.Module appearing twice**:
       the streamer would create per-index pinned clones for the same
       slots and swap ``.data`` redundantly.
@@ -922,16 +918,16 @@ def _check_block_groups_disjoint(
     at the composer because it is about how the caller composed
     ``layers_attr`` paths, not about parameter aliasing.
     """
-    slot_owner: dict[SlotOwnership, str] = {}
-    duplicates: dict[SlotOwnership, list[str]] = {}
+    slot_owner: dict[SlotKey, str] = {}
+    duplicates: dict[SlotKey, list[str]] = {}
     for group_idx, blocks in enumerate(block_groups):
         for block_idx, layer in enumerate(blocks):
             label = f"{layer_paths[group_idx]}[{block_idx}]"
-            slots: set[SlotOwnership] = set()
+            slots: set[SlotKey] = set()
             for s in iter_param_slots(layer):
-                slots.add(s.slot)
+                slots.add(s.key)
             for s in iter_buffer_slots(layer):
-                slots.add(s.slot)
+                slots.add(s.key)
             for slot in slots:
                 if slot in slot_owner:
                     duplicates.setdefault(slot, [slot_owner[slot]]).append(label)
@@ -942,7 +938,7 @@ def _check_block_groups_disjoint(
         raise ValueError(
             f"Streamer block groups must own disjoint module slots, "
             f"but {len(duplicates)} slot(s) are claimed by multiple "
-            f"block locations. Example: leaf {sample[0].leaf!r} is "
+            f"block entries. Example: leaf {sample[0].leaf!r} is "
             f"owned by {sample[1]}. Likely causes: the same block is "
             f"listed in two `layers_attr` paths, a path resolves to a "
             f"module that contains another resolved path, or a block "
@@ -1006,12 +1002,13 @@ def detect_streaming_region_ties(  # noqa: PLR0912
 
     groups: dict[tuple, list[tuple[str, str, bool, int, str, int]]] = {}
     for s in iter_param_slots(model):
-        if s.param.numel() == 0:
+        param = s.get()
+        if param.numel() == 0:
             continue
         region = slot_to_region.get((id(s.parent), s.leaf), "non_block")
-        skey = storage_key(s.param.data)
+        skey = storage_key(param.data)
         groups.setdefault(skey, []).append(
-            (region, s.name, s.param.requires_grad, id(s.parent), s.leaf, id(s.param))
+            (region, s.name, param.requires_grad, id(s.parent), s.leaf, id(param))
         )
 
     for members in groups.values():
@@ -1089,12 +1086,13 @@ def detect_streaming_region_ties(  # noqa: PLR0912
 
     buf_groups: dict[tuple, list[tuple[str, str, int]]] = {}
     for s in iter_buffer_slots(model):
-        if s.buffer.numel() == 0:
+        buffer = s.get()
+        if buffer.numel() == 0:
             continue
         regions = block_buffer_slot_regions.get((id(s.parent), s.leaf), {"non_block"})
         for region in regions:
-            buf_groups.setdefault(storage_key(s.buffer), []).append(
-                (region, s.name, id(s.buffer))
+            buf_groups.setdefault(storage_key(buffer), []).append(
+                (region, s.name, id(buffer))
             )
 
     for members in buf_groups.values():

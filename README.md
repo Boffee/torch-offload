@@ -13,7 +13,7 @@ to be lifted into its own package when a second consumer appears.
 
 | Module | Role |
 |---|---|
-| `protocols.py` | `CachedResource` (generic), `ModelStrategy` / `ModelStrategyComponent` plug-in contracts; `SlotOwnership` skip-filter type |
+| `protocols.py` | `CachedResource` (generic), `ModelStrategy` / `ModelStrategyComponent` plug-in contracts; `SlotKey` skip-filter type |
 | `pinned_weights.py` | `PinnedWeights` — whole-model bulk pinned-CPU↔GPU strategy |
 | `streamed_weights.py` | `StreamedWeights` — sharp per-block-list streaming primitive (component) |
 | `model_offloader.py` | `ModelOffloader` — unified composite: block streaming + non-block pinning + trainable params + optional LoRA merge |

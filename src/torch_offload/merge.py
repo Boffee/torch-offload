@@ -22,7 +22,7 @@ from torch import nn
 from ._quanto import is_weight_qbytes_tensor, requantize_with_addmm_delta
 from .lora import LoRA
 from .pinned_buffer import storage_key
-from .slots import canonical_param_name, iter_param_slots
+from .slots import ParamSlot, canonical_param_name, iter_param_slots
 from .tensor_adapters import DenseAddmmTensorAdapter, select_adapter
 
 logger = logging.getLogger(__name__)
@@ -33,18 +33,16 @@ _MergePath = Literal["quanto", "dense"]
 
 
 @dataclass(slots=True)
-class _ParamAlias:
-    name: str
+class _ParamEntry:
+    slot: ParamSlot
     param: nn.Parameter
-    parent: nn.Module
-    leaf: str
 
 
 @dataclass(slots=True)
 class _ParamGroup:
     param: nn.Parameter
     storage: tuple[Any, ...]
-    aliases: list[_ParamAlias]
+    entries: list[_ParamEntry]
 
 
 def merge_lora(
@@ -55,7 +53,7 @@ def merge_lora(
 
     Returns the number of parameters that were modified.
     """
-    param_index, aliases = _build_param_index(model)
+    param_index, entries = _build_param_index(model)
 
     ops: list[
         tuple[str, _ParamGroup, torch.Tensor, torch.Tensor, float, _MergePath]
@@ -64,16 +62,16 @@ def merge_lora(
     seen_storage: dict[tuple[Any, ...], str] = {}
     for lora, strength in loras:
         for target_key, (a, b) in lora.targets.items():
-            alias = param_index.get(target_key)
-            if alias is None:
+            entry = param_index.get(target_key)
+            if entry is None:
                 continue
-            group = _resolve_group(alias, aliases, groups)
+            group = _resolve_group(entry, entries, groups)
             existing_target = seen_storage.setdefault(group.storage, target_key)
             if existing_target != target_key:
                 raise ValueError(
                     f"LoRA targets {existing_target!r} and {target_key!r} "
                     f"resolve to the same tied parameter storage. Apply "
-                    f"only one alias for a tied weight in a single "
+                    f"only one name for a tied weight in a single "
                     f"merge_lora() call; otherwise the same base weight "
                     f"would receive multiple logical updates."
                 )
@@ -134,21 +132,21 @@ def _merge_path(data: torch.Tensor, target_key: str) -> _MergePath:
 
 
 def _build_param_index(model: nn.Module) -> tuple[
-    dict[str, _ParamAlias],
-    list[_ParamAlias],
+    dict[str, _ParamEntry],
+    list[_ParamEntry],
 ]:
-    aliases: list[_ParamAlias] = []
-    index: dict[str, _ParamAlias] = {}
+    entries: list[_ParamEntry] = []
+    index: dict[str, _ParamEntry] = {}
     for slot in iter_param_slots(model):
-        alias = _ParamAlias(slot.name, slot.param, slot.parent, slot.leaf)
-        aliases.append(alias)
-        index[canonical_param_name(slot.name)] = alias
-    return index, aliases
+        entry = _ParamEntry(slot, slot.get())
+        entries.append(entry)
+        index[canonical_param_name(slot.name)] = entry
+    return index, entries
 
 
 def _resolve_group(
-    target: _ParamAlias,
-    aliases: list[_ParamAlias],
+    target: _ParamEntry,
+    entries: list[_ParamEntry],
     groups: dict[tuple[Any, ...], _ParamGroup],
 ) -> _ParamGroup:
     storage = _param_storage_key(target.param)
@@ -156,19 +154,19 @@ def _resolve_group(
     if group is not None:
         return group
 
-    group_aliases: list[_ParamAlias] = []
-    for alias in aliases:
-        if alias.param is target.param:
-            group_aliases.append(alias)
+    group_entries: list[_ParamEntry] = []
+    for entry in entries:
+        if entry.param is target.param:
+            group_entries.append(entry)
             continue
         try:
-            alias_storage = _param_storage_key(alias.param)
+            entry_storage = _param_storage_key(entry.param)
         except NotImplementedError:
             continue
-        if alias_storage == storage:
-            group_aliases.append(alias)
+        if entry_storage == storage:
+            group_entries.append(entry)
 
-    group = _ParamGroup(target.param, storage, group_aliases)
+    group = _ParamGroup(target.param, storage, group_entries)
     groups[storage] = group
     return group
 
@@ -184,17 +182,17 @@ def _replace_group_param(
 ) -> nn.Parameter:
     installed: nn.Parameter | None = None
     seen_slots: set[tuple[int, str]] = set()
-    for alias in group.aliases:
-        slot_key = (id(alias.parent), alias.leaf)
+    for entry in group.entries:
+        slot_key = (id(entry.slot.parent), entry.slot.leaf)
         if slot_key in seen_slots:
             continue
         seen_slots.add(slot_key)
-        setattr(alias.parent, alias.leaf, new_param)
-        reread = getattr(alias.parent, alias.leaf)
+        setattr(entry.slot.parent, entry.slot.leaf, new_param)
+        reread = getattr(entry.slot.parent, entry.slot.leaf)
         if not isinstance(reread, nn.Parameter):
             raise RuntimeError(
                 f"After merging into quanto target {target_key!r}, reading "
-                f"{alias.name!r} from the model returned "
+                f"{entry.slot.name!r} from the model returned "
                 f"{type(reread).__name__} instead of nn.Parameter. "
                 "merge_lora doesn't support parametrize / custom "
                 "__setattr__ hooks on quanto-quantized weights."
@@ -204,7 +202,7 @@ def _replace_group_param(
         elif reread is not installed:
             raise RuntimeError(
                 f"After merging into quanto target {target_key!r}, tied "
-                "aliases did not resolve to the same installed Parameter. "
+                "parameter names did not resolve to the same installed Parameter. "
                 "merge_lora doesn't support parametrize / custom "
                 "__setattr__ hooks that break tied parameter replacement."
             )

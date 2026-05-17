@@ -1085,8 +1085,8 @@ class TestRoutedMode:
     def test_routed_tied_weight_target_raises(self, target: str) -> None:
         # Standard tied embed/head pattern: one Parameter aliased at
         # multiple slots. PinnedWeights dedups them into one buffer
-        # with multiple parent locations. Routed mode would only hook
-        # one location and silently miss the others — reject explicitly.
+        # with multiple parent modules. Routed mode would only hook
+        # one module and silently miss the others — reject explicitly.
         model = _make_tied_non_block_model(dtype=torch.bfloat16)
 
         s = ModelOffloader(

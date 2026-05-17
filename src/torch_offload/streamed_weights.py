@@ -46,6 +46,7 @@ import weakref
 from collections import OrderedDict
 from collections.abc import Iterator, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 from typing import cast
 
 import torch
@@ -53,22 +54,30 @@ from torch import nn
 
 from ._devices import canonical_device
 from .pinned_buffer import PinnedParamBuffer, PostCopyHook, PostCopyHookHandle
-from .protocols import SlotOwnership
+from .protocols import SlotKey
 from .slots import (
+    BufferSlot,
+    ParamSlot,
     get_param_slot,
     iter_buffer_slots,
     iter_param_slots,
     set_param_data,
-    set_param_slot,
     set_tensor_data,
+    unique_slots,
 )
 from .tensor_adapters import select_adapter
 
 logger = logging.getLogger(__name__)
 
-_ParamSpec = tuple[str, nn.Parameter, nn.Module, str]
-_ParamAliasSpec = list[tuple[str, nn.Module, str]]
-_BufferSpec = tuple[torch.Tensor, nn.Module, str]
+
+@dataclass(slots=True)
+class StreamedParam:
+    pinned: PinnedParamBuffer
+    slots: list[ParamSlot]
+
+    @property
+    def unique_slots(self) -> list[ParamSlot]:
+        return unique_slots(self.slots)
 
 
 def _repoint_data_to_pinned(
@@ -210,7 +219,7 @@ def _layout_signature(p: nn.Parameter) -> tuple:
 
 
 def _check_block_layouts_match(
-    param_specs: list[list[_ParamSpec]],
+    block_param_slots: list[list[list[ParamSlot]]],
 ) -> None:
     """Raise if blocks have mismatched param layouts. Called before
     pinning so layout failures leave parameter slots and storage
@@ -218,15 +227,18 @@ def _check_block_layouts_match(
 
     See :func:`_layout_signature` for what counts as "matched."
     """
-    if len(param_specs) <= 1:
+    if len(block_param_slots) <= 1:
         return
 
-    def sig(specs: list[_ParamSpec]) -> tuple:
-        return tuple((name, _layout_signature(param)) for name, param, _, _ in specs)
+    def sig(slot_groups: list[list[ParamSlot]]) -> tuple:
+        return tuple(
+            (slots[0].name, _layout_signature(slots[0].get()))
+            for slots in slot_groups
+        )
 
-    ref = sig(param_specs[0])
-    for i in range(1, len(param_specs)):
-        if sig(param_specs[i]) != ref:
+    ref = sig(block_param_slots[0])
+    for i in range(1, len(block_param_slots)):
+        if sig(block_param_slots[i]) != ref:
             raise ValueError(
                 f"Block {i} param layout differs from block 0. "
                 "All blocks in a StreamedWeights group must share the "
@@ -237,58 +249,51 @@ def _check_block_layouts_match(
             )
 
 
-def _collect_block_slot_specs(
+def _collect_block_slots(
     layers: list[nn.Module],
-    skip: set[SlotOwnership],
+    skip: set[SlotKey],
 ) -> tuple[
-    list[list[_ParamSpec]],
-    list[list[_ParamAliasSpec]],
-    list[list[_BufferSpec]],
-    frozenset[SlotOwnership],
+    list[list[list[ParamSlot]]],
+    list[list[BufferSlot]],
+    frozenset[SlotKey],
 ]:
-    param_specs: list[list[_ParamSpec]] = []
-    param_alias_specs: list[list[_ParamAliasSpec]] = []
-    buffer_specs: list[list[_BufferSpec]] = []
-    slot_filter: set[SlotOwnership] = set()
+    param_slots: list[list[list[ParamSlot]]] = []
+    buffer_slots: list[list[BufferSlot]] = []
+    slot_filter: set[SlotKey] = set()
 
     for layer in layers:
-        block_params: list[_ParamSpec] = []
-        block_aliases_by_id: dict[int, _ParamAliasSpec] = {}
+        block_slots_by_id: dict[int, list[ParamSlot]] = {}
         block_param_order: list[int] = []
-        seen_param_ids: set[int] = set()
         for s in iter_param_slots(layer):
-            if s.slot in skip:
+            if s.key in skip:
                 continue
-            slot_filter.add(s.slot)
-            param_id = id(s.param)
-            aliases = block_aliases_by_id.get(param_id)
-            if aliases is None:
-                aliases = []
-                block_aliases_by_id[param_id] = aliases
+            slot_filter.add(s.key)
+            param = s.get()
+            param_id = id(param)
+            slots = block_slots_by_id.get(param_id)
+            if slots is None:
+                slots = []
+                block_slots_by_id[param_id] = slots
                 block_param_order.append(param_id)
-            aliases.append((s.name, s.parent, s.leaf))
-            if param_id in seen_param_ids:
-                continue
-            seen_param_ids.add(param_id)
-            block_params.append((s.name, s.param, s.parent, s.leaf))
-        param_specs.append(block_params)
-        param_alias_specs.append(
-            [block_aliases_by_id[param_id] for param_id in block_param_order]
+            slots.append(s)
+        param_slots.append(
+            [block_slots_by_id[param_id] for param_id in block_param_order]
         )
 
-        block_bufs: list[_BufferSpec] = []
+        block_buffer_slots: list[BufferSlot] = []
         seen_buffer_ids: set[int] = set()
         for s in iter_buffer_slots(layer):
-            if s.slot in skip:
+            if s.key in skip:
                 continue
-            slot_filter.add(s.slot)
-            if id(s.buffer) in seen_buffer_ids:
+            slot_filter.add(s.key)
+            buffer = s.get()
+            if id(buffer) in seen_buffer_ids:
                 continue
-            seen_buffer_ids.add(id(s.buffer))
-            block_bufs.append((s.buffer, s.parent, s.leaf))
-        buffer_specs.append(block_bufs)
+            seen_buffer_ids.add(id(buffer))
+            block_buffer_slots.append(s)
+        buffer_slots.append(block_buffer_slots)
 
-    return param_specs, param_alias_specs, buffer_specs, frozenset(slot_filter)
+    return param_slots, buffer_slots, frozenset(slot_filter)
 
 
 class _BlockPinnedStore:
@@ -298,12 +303,12 @@ class _BlockPinnedStore:
     and do not mutate model slots:
 
     1. ``__init__`` first walks each block to collect param/buffer
-       slot specs (no pinning) and verifies that every block shares
+       slots (no pinning) and verifies that every block shares
        the same layout signature. A mismatch raises ``ValueError``
        before any pin or slot mutation.
     2. Then it pins every managed param/buffer into a fresh
        :class:`PinnedParamBuffer` / pinned clone and records the
-       slot locations they'll be installed at. For plain
+       named slots they'll be installed at. For plain
        ``torch.Tensor`` parameters, :class:`PinnedParamBuffer`
        immediately repoints the source ``Parameter.data`` at the
        pinned clone as a low-peak memory optimization. ``__init__`` does
@@ -327,31 +332,28 @@ class _BlockPinnedStore:
         self,
         layers: Sequence[nn.Module],
         *,
-        skip_slots: set[SlotOwnership] | None = None,
+        skip_slots: set[SlotKey] | None = None,
     ) -> None:
         self._layers = list(layers)
-        self._param_bufs: list[list[PinnedParamBuffer]] = []
-        self._param_locs: list[list[tuple[str, nn.Module, str]]] = []
-        self._param_aliases: list[list[list[tuple[str, nn.Module, str]]]] = []
-        # Per-block list of (buffer_obj, parent_module, leaf_name, cpu_clone)
-        # pending installation. apply_slot_mutations() does the
-        # `mod_buf.data = cpu_clone` swaps.
+        self._params: list[list[StreamedParam]] = []
+        # Per-block list of (buffer_slot, buffer_obj, cpu_clone) pending
+        # installation. apply_slot_mutations() does the
+        # `buffer_obj.data = cpu_clone` swaps.
         self._buf_records: list[
-            list[tuple[torch.Tensor, nn.Module, str, torch.Tensor]]
+            list[tuple[BufferSlot, torch.Tensor, torch.Tensor]]
         ] = []
         self._slots_applied = False
-        skip: set[SlotOwnership] = skip_slots or set()
+        skip: set[SlotKey] = skip_slots or set()
 
-        # Pass 1: walk each block to collect param/buffer slot specs
+        # Pass 1: walk each block to collect param/buffer slots
         # WITHOUT pinning anything. Pinning runs in pass 2 only after
         # the layout-signature check passes, so invalid configurations
         # raise before any model mutation.
         (
-            param_specs,
-            param_alias_specs,
-            buffer_specs,
+            block_param_slots,
+            buffer_slots,
             self._slot_filter,
-        ) = _collect_block_slot_specs(self._layers, skip)
+        ) = _collect_block_slots(self._layers, skip)
 
         # Validate before pinning. ``Tensor.copy_`` silently casts dtype
         # and silently broadcasts compatible shapes, so any block N with
@@ -359,32 +361,29 @@ class _BlockPinnedStore:
         # load into block 0's pool slot without raising and corrupt
         # forward. Run before pinning so layout failures happen before
         # low-peak Parameter.data repointing starts.
-        _check_block_layouts_match(param_specs)
+        _check_block_layouts_match(block_param_slots)
 
         # Pass 2: pin params + buffers.
-        for block_params, block_aliases in zip(
-            param_specs, param_alias_specs, strict=True,
-        ):
-            block_pinned: list[PinnedParamBuffer] = []
-            block_locs: list[tuple[str, nn.Module, str]] = []
-            for name, param, parent, leaf in block_params:
-                buf = PinnedParamBuffer(name, param)
+        for block_slot_groups in block_param_slots:
+            block_params: list[StreamedParam] = []
+            for slots in block_slot_groups:
+                primary_slot = slots[0]
+                param = primary_slot.get()
+                pinned = PinnedParamBuffer(primary_slot.name, param)
                 # Trainable streaming uses ``.data`` swap to preserve
                 # the user's Parameter identity. Only adapters that
                 # explicitly opt into that capability are allowed.
-                if buf.requires_grad:
-                    buf.validate_parameter_data_swap_target(name)
-                block_pinned.append(buf)
-                block_locs.append((name, parent, leaf))
-            self._param_bufs.append(block_pinned)
-            self._param_locs.append(block_locs)
-            self._param_aliases.append(block_aliases)
+                if pinned.requires_grad:
+                    pinned.validate_parameter_data_swap_target(primary_slot.name)
+                block_params.append(StreamedParam(pinned, slots))
+            self._params.append(block_params)
 
-        for block_bufs in buffer_specs:
-            buf_records: list[tuple[torch.Tensor, nn.Module, str, torch.Tensor]] = []
-            for buf, parent, leaf in block_bufs:
+        for block_buffer_slots in buffer_slots:
+            buf_records: list[tuple[BufferSlot, torch.Tensor, torch.Tensor]] = []
+            for slot in block_buffer_slots:
+                buf = slot.get()
                 cpu_clone = buf.data.clone(memory_format=torch.contiguous_format).pin_memory()
-                buf_records.append((buf, parent, leaf, cpu_clone))
+                buf_records.append((slot, buf, cpu_clone))
             self._buf_records.append(buf_records)
 
         self._device: torch.device | None = None
@@ -394,8 +393,8 @@ class _BlockPinnedStore:
         self._post_copy_hooks: dict[int, PostCopyHook] = {}
 
     @property
-    def slot_filter(self) -> frozenset[SlotOwnership]:
-        """``SlotOwnership`` set covering every slot the store manages.
+    def slot_filter(self) -> frozenset[SlotKey]:
+        """``SlotKey`` set covering every slot the store manages.
         Stable across the store's lifetime."""
         return self._slot_filter
 
@@ -418,31 +417,28 @@ class _BlockPinnedStore:
         """
         if self._slots_applied:
             return
-        for block_bufs, block_locs in zip(
-            self._param_bufs, self._param_locs, strict=True,
-        ):
-            for buf, (_qn, submod, local_name) in zip(
-                block_bufs, block_locs, strict=True,
-            ):
-                if buf.requires_grad:
+        for block_params in self._params:
+            for param in block_params:
+                if param.pinned.requires_grad:
                     # Trainable: keep user's Parameter, .data is already pinned.
                     continue
                 # _parameters[leaf] swap (rather than .data) is required
                 # for quanto correctness — see PinnedWeights for details.
-                set_param_slot(submod, local_name, buf.cpu_param)
+                for slot in param.unique_slots:
+                    slot.set(param.pinned.cpu_param)
         for buf_records in self._buf_records:
-            for mod_buf, _submod, _leaf, cpu_clone in buf_records:
+            for _slot, mod_buf, cpu_clone in buf_records:
                 set_tensor_data(mod_buf, cpu_clone)
         self._slots_applied = True
 
     @property
     def cache_bytes(self) -> int:
         total = 0
-        for block in self._param_bufs:
-            for buf in block:
-                total += buf.cache_bytes
+        for block in self._params:
+            for param in block:
+                total += param.pinned.cache_bytes
         for buf_records in self._buf_records:
-            for _mb, _sm, _ln, cpu_clone in buf_records:
+            for _slot, _mod_buf, cpu_clone in buf_records:
                 total += cpu_clone.numel() * cpu_clone.element_size()
         return total
 
@@ -466,7 +462,11 @@ class _BlockPinnedStore:
         self._pool_config = (num_gpu_slots, device)
         # Pool template comes from block 0. The constructor's layout
         # check has already verified every other block matches.
-        self._pool = _GpuSlotPool(self._param_bufs[0], num_gpu_slots, device)
+        self._pool = _GpuSlotPool(
+            [param.pinned for param in self._params[0]],
+            num_gpu_slots,
+            device,
+        )
 
     def deactivate_pool(self) -> None:
         self._pool = None
@@ -476,7 +476,7 @@ class _BlockPinnedStore:
     def register_post_copy_hook(
         self, buf: PinnedParamBuffer, hook: PostCopyHook,
     ) -> PostCopyHookHandle:
-        if not any(owned is buf for block in self._param_bufs for owned in block):
+        if not any(param.pinned is buf for block in self._params for param in block):
             raise ValueError(
                 f"buffer {buf.name!r} is not owned by this StreamedWeights store"
             )
@@ -502,27 +502,25 @@ class _BlockPinnedStore:
         self._pool.wait_if_needed(slot_id, stream)
         slot = self._pool.slot(slot_id)
         slot.copy_from(
-            self._param_bufs[idx],
+            [param.pinned for param in self._params[idx]],
             self._post_copy_hooks,
             non_blocking=non_blocking,
         )
 
-        for buf, (qual_name, submod, local_name) in zip(
-            self._param_bufs[idx], self._param_locs[idx], strict=True,
-        ):
-            if buf.requires_grad:
+        for param in self._params[idx]:
+            gpu_param = slot.get_param(param.pinned.name)
+            if param.pinned.requires_grad:
                 # Trainable: .data swap into the slot's GPU storage.
                 # Preserves the user's Parameter object identity — so
                 # autograd and optimizer state survive across cycles.
                 # Reuses ``slot.get_param`` purely for its ``.data``
                 # storage; the wrapper itself isn't installed.
-                set_param_data(
-                    get_param_slot(submod, local_name),
-                    slot.get_param(qual_name).data,
-                )
+                for param_slot in param.unique_slots:
+                    set_param_data(param_slot.get(), gpu_param.data)
             else:
-                set_param_slot(submod, local_name, slot.get_param(qual_name))
-        for mod_buf, _sm, _ln, cpu_clone in self._buf_records[idx]:
+                for param_slot in param.unique_slots:
+                    param_slot.set(gpu_param)
+        for _buffer_slot, mod_buf, cpu_clone in self._buf_records[idx]:
             set_tensor_data(
                 mod_buf, cpu_clone.to(self._device, non_blocking=non_blocking)
             )
@@ -547,16 +545,14 @@ class _BlockPinnedStore:
         Trainable: ``submod._parameters[leaf].data = buf.cpu_param.data``
         (preserve the user's Parameter object).
         """
-        for buf, (_qn, submod, local_name) in zip(
-            self._param_bufs[idx], self._param_locs[idx], strict=True,
-        ):
-            if buf.requires_grad:
-                set_param_data(
-                    get_param_slot(submod, local_name), buf.cpu_param.data
-                )
+        for param in self._params[idx]:
+            if param.pinned.requires_grad:
+                for param_slot in param.unique_slots:
+                    set_param_data(param_slot.get(), param.pinned.cpu_param.data)
             else:
-                set_param_slot(submod, local_name, buf.cpu_param)
-        for mod_buf, _sm, _ln, cpu_clone in self._buf_records[idx]:
+                for param_slot in param.unique_slots:
+                    param_slot.set(param.pinned.cpu_param)
+        for _buffer_slot, mod_buf, cpu_clone in self._buf_records[idx]:
             set_tensor_data(mod_buf, cpu_clone)
         if self._pool is not None:
             slot_id = self._block_to_slot.pop(idx, None)
@@ -622,21 +618,20 @@ class _BlockPinnedStore:
         across all blocks. Used by ``StreamedWeights.optimizer_step``
         to walk all trainables when bringing them to GPU around the
         optimizer-step boundary."""
-        for block_bufs, block_locs in zip(
-            self._param_bufs, self._param_locs, strict=True,
-        ):
-            for buf, (_qn, parent, leaf) in zip(block_bufs, block_locs, strict=True):
-                if buf.requires_grad:
-                    yield buf, parent, leaf
+        for block_params in self._params:
+            for param in block_params:
+                if param.pinned.requires_grad:
+                    slot = param.unique_slots[0]
+                    yield param.pinned, slot.parent, slot.leaf
 
     def has_trainables(self) -> bool:
         """True if any block contains a trainable param. Used by the
         composer to decide whether to enforce checkpointing as a
         precondition for ``activate``."""
         return any(
-            buf.requires_grad
-            for block_bufs in self._param_bufs
-            for buf in block_bufs
+            param.pinned.requires_grad
+            for block_params in self._params
+            for param in block_params
         )
 
 
@@ -753,7 +748,7 @@ class StreamedWeights:
     name:
         Optional human-readable label for log messages.
     skip_slots:
-        Optional set of :class:`SlotOwnership` tuples identifying
+        Optional set of :class:`SlotKey` values identifying
         ``(parent_module, leaf, kind)`` slots inside the blocks that
         the streamer should not pin / stream. Used by composers
         (typically :class:`ModelOffloader`) to surgically exclude
@@ -776,7 +771,7 @@ class StreamedWeights:
         prefetch_count: int = 2,
         cyclic: bool = False,
         name: str | None = None,
-        skip_slots: set[SlotOwnership] | None = None,
+        skip_slots: set[SlotKey] | None = None,
     ) -> None:
         self._blocks: list[nn.Module] = list(blocks)
         self._active_device: torch.device | None = None
@@ -833,8 +828,8 @@ class StreamedWeights:
         )
 
     @property
-    def slot_filter(self) -> frozenset[SlotOwnership]:
-        """``SlotOwnership`` set covering every (parent, leaf, kind)
+    def slot_filter(self) -> frozenset[SlotKey]:
+        """``SlotKey`` set covering every (parent, leaf, kind)
         slot the streamer owns. Stable across the streamer's
         lifetime — safe to read at any point and survives slot
         mutation, so a consumer can construct a
@@ -844,46 +839,21 @@ class StreamedWeights:
         return self._store.slot_filter
 
     @property
-    def param_bufs_per_block(self) -> list[list[PinnedParamBuffer]]:
-        """Per-block lists of :class:`PinnedParamBuffer` objects.
+    def params_per_block(self) -> list[list[StreamedParam]]:
+        """Per-block streamed parameter records.
 
-        Used by :class:`~torch_offload.ModelOffloader` to build its
-        target-name to buffer map.
+        Each record pairs one :class:`PinnedParamBuffer` with every
+        named :class:`ParamSlot` that should use it. Used by
+        :class:`~torch_offload.ModelOffloader` to build its target-name
+        index.
 
         .. warning::
-           Returned list aliases internal store state. Treat it as
+           Returned list shares internal store state. Treat it as
            read-only — mutating the outer list, inner lists, or
-           buffer objects will corrupt streaming bookkeeping.
+           records will corrupt streaming bookkeeping.
         """
         assert self._store is not None
-        return self._store._param_bufs
-
-    @property
-    def param_locs_per_block(self) -> list[list[tuple[str, nn.Module, str]]]:
-        """Per-block lists of ``(qualified_name, parent_module, leaf_name)``.
-
-        Parallel structure to :attr:`param_bufs_per_block`. Used by the
-        composer to build its target-name to parent-module map, needed
-        by routed-mode LoRA forward hooks.
-
-        .. warning::
-           Returned list aliases internal store state. Treat it as
-           read-only — mutating it will corrupt streaming bookkeeping.
-        """
-        assert self._store is not None
-        return self._store._param_locs
-
-    @property
-    def param_aliases_per_block(
-        self,
-    ) -> list[list[list[tuple[str, nn.Module, str]]]]:
-        """Per-block/per-buffer alias lists from the duplicate-aware walk.
-
-        Parallel structure to :attr:`param_bufs_per_block`: each buffer has
-        one or more ``(qualified_name, parent_module, leaf_name)`` aliases.
-        """
-        assert self._store is not None
-        return self._store._param_aliases
+        return self._store._params
 
     @property
     def cache_bytes(self) -> int:

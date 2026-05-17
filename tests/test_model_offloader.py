@@ -23,7 +23,7 @@ from torch_offload import (
     ModelOffloader,
     ModelStrategy,
     PinnedWeights,
-    SlotOwnership,
+    SlotKey,
     StreamedWeights,
     TrainableWeights,
 )
@@ -1003,7 +1003,7 @@ class TestPrefetchFailureOnDeactivate:
 
 class TestConstructedStateIsInactive:
     """Verifies the 'constructed but not active' state has no GPU
-    footprint — the payoff of the SlotOwnership-based composition.
+    footprint — the payoff of the SlotKey-based composition.
     Without it, non-block siblings (embed, head, norms) would sit on
     the activation device permanently, defeating ModelCache eviction."""
 
@@ -1308,13 +1308,13 @@ class TestCrossRegionTiedDetection:
             non_block = next(
                 c for c in strategy._components if isinstance(c, PinnedWeights)
             )
-            assert len(non_block.slots) == 1  # tie deduped
+            assert len(non_block.params) == 1  # tie deduped
         finally:
             strategy.deactivate()
 
 
 # ---------------------------------------------------------------------------
-# Direct-parent state handling — via SlotOwnership skip filter
+# Direct-parent state handling — via SlotKey skip filter
 # ---------------------------------------------------------------------------
 
 
@@ -1511,7 +1511,7 @@ class TestBlockLayoutSignature:
 
     def test_failure_leaves_model_unpinned_and_unmutated(self) -> None:
         # Strong-exception-safety: the validator runs in pass 1
-        # (collect specs) before pass 2 (pin) and pass 3 (apply slot
+        # (collect slots) before pass 2 (pin) and pass 3 (apply slot
         # mutations). On a layout mismatch, the user's Parameter
         # objects must be the same identities and not pinned —
         # neither pin_memory() nor _parameters[leaf] = ... fires.
@@ -1644,7 +1644,7 @@ class TestTrainableWeights:
         from torch_offload.slots import iter_param_slots
 
         skip_slots = {
-            s.slot for s in iter_param_slots(m.streamed)
+            s.key for s in iter_param_slots(m.streamed)
         }
         mover = TrainableWeights(m, skip_slots=skip_slots)
 
@@ -1656,17 +1656,17 @@ class TestTrainableWeights:
 
 
 # ---------------------------------------------------------------------------
-# SlotOwnership-based filter survives slot mutation
+# SlotKey-based filter survives slot mutation
 # ---------------------------------------------------------------------------
 
 
-class TestSlotOwnershipFilter:
-    """The SlotOwnership skip filter is the design fix that decouples
+class TestSlotKeyFilter:
+    """The SlotKey skip filter is the design fix that decouples
     construction order. It identifies slots by (id(parent), leaf, kind)
     so PinnedWeights's skip check still matches even after a streamer
     has swapped the Parameter object at that slot."""
 
-    def test_streamed_weights_slot_filter_is_slot_ownership_set(self) -> None:
+    def test_streamed_weights_slot_filter_is_slot_key_set(self) -> None:
         m = _make_block_model()
         streamer = StreamedWeights(
             blocks=list(m.transformer_blocks),
@@ -1676,7 +1676,7 @@ class TestSlotOwnershipFilter:
             sf = streamer.slot_filter
             assert isinstance(sf, frozenset)
             for s in sf:
-                assert isinstance(s, SlotOwnership)
+                assert isinstance(s, SlotKey)
                 assert s.kind in ("param", "buffer")
         finally:
             streamer.deactivate()
@@ -1685,7 +1685,7 @@ class TestSlotOwnershipFilter:
         # Constructor order independence: build PinnedWeights AFTER
         # the streamer has already mutated slots. With id()-based
         # filter, this would fail (the original Parameter ids no
-        # longer match what's in the slots). With SlotOwnership it
+        # longer match what's in the slots). With SlotKey it
         # works because (parent, leaf) is stable.
         m = _make_block_model()
         # Build the streamer first — this swaps block slots to pinned
@@ -1708,9 +1708,9 @@ class TestSlotOwnershipFilter:
                 # PinnedWeights; block slots are skipped (already
                 # owned by streamer).
                 slots_managed_by_pinned = {
-                    SlotOwnership(id(loc.parent), loc.leaf, "param")
-                    for group in non_block.slots
-                    for loc in group.locations
+                    slot.key
+                    for param in non_block.params
+                    for slot in param.unique_slots
                 }
                 # Block-owned slots NOT in the PinnedWeights set.
                 for s in skip_slots:
@@ -1718,7 +1718,7 @@ class TestSlotOwnershipFilter:
                         f"PinnedWeights tried to manage block-owned slot {s}"
                     )
                 # Non-block slots present.
-                non_block_slot = SlotOwnership(id(m.embed), "weight", "param")
+                non_block_slot = SlotKey(id(m.embed), "weight", "param")
                 assert non_block_slot in slots_managed_by_pinned
             finally:
                 non_block.deactivate()
@@ -1784,9 +1784,9 @@ class TestStreamedWeightsContractGuard:
         block_0 = nn.Linear(4, 4, bias=False)  # default requires_grad=True
         block_1 = nn.Linear(4, 4, bias=False)
         trainable_slots = {
-            s.slot for s in iter_param_slots(block_0) if s.param.requires_grad
+            s.key for s in iter_param_slots(block_0) if s.get().requires_grad
         } | {
-            s.slot for s in iter_param_slots(block_1) if s.param.requires_grad
+            s.key for s in iter_param_slots(block_1) if s.get().requires_grad
         }
         streamer = StreamedWeights(
             blocks=[block_0, block_1],
@@ -1808,9 +1808,9 @@ class TestStreamedWeightsContractGuard:
         block_1 = nn.Linear(4, 4, bias=False)  # trainable
         # Snapshot trainable slots before StreamedWeights construction.
         trainable_slots = {
-            s.slot for s in iter_param_slots(block_0) if s.param.requires_grad
+            s.key for s in iter_param_slots(block_0) if s.get().requires_grad
         } | {
-            s.slot for s in iter_param_slots(block_1) if s.param.requires_grad
+            s.key for s in iter_param_slots(block_1) if s.get().requires_grad
         }
         # No frozen content remains, so the streamer's pinning walk
         # produces empty buffers but no contract violation.
@@ -1830,7 +1830,7 @@ class TestStreamedWeightsContractGuard:
 
         blocks = [BufferBlock(), BufferBlock()]
         buffer_slots = {
-            s.slot for block in blocks for s in iter_buffer_slots(block)
+            s.key for block in blocks for s in iter_buffer_slots(block)
         }
         buffer_ptrs = [block.table.data_ptr() for block in blocks]
 
@@ -2127,12 +2127,12 @@ class TestLoRAInBlockRouting:
             from torch_offload.slots import iter_param_slots
             for s in iter_param_slots(m):
                 if "transformer_blocks" in s.name:
-                    assert s.slot in streamer.slot_filter, (
-                        f"in-block slot {s.name} (trainable={s.param.requires_grad}) "
+                    assert s.key in streamer.slot_filter, (
+                        f"in-block slot {s.name} (trainable={s.get().requires_grad}) "
                         f"missing from streamer's slot_filter"
                     )
                 else:
-                    assert s.slot not in streamer.slot_filter, (
+                    assert s.key not in streamer.slot_filter, (
                         f"out-of-block slot {s.name} leaked into streamer's "
                         f"slot_filter"
                     )
@@ -2161,10 +2161,10 @@ class TestLoRAInBlockRouting:
             streamer = streamers[0]
             from torch_offload.slots import iter_param_slots
             for s in iter_param_slots(m):
-                if "transformer_blocks" in s.name and s.param.requires_grad:
-                    assert s.slot not in streamer.slot_filter
+                if "transformer_blocks" in s.name and s.get().requires_grad:
+                    assert s.key not in streamer.slot_filter
                 elif "transformer_blocks" in s.name:
-                    assert s.slot in streamer.slot_filter
+                    assert s.key in streamer.slot_filter
         finally:
             strat.deactivate()
 
@@ -2202,9 +2202,9 @@ class TestLoRAInBlockRouting:
             # PinnedWeights manages frozen_head.weight only — block content
             # routed to StreamedWeights, trainable_bias to TrainableWeights.
             managed_slot_ids = {
-                (id(loc.parent), loc.leaf)
-                for group in pinned.slots
-                for loc in group.locations
+                (id(slot.parent), slot.leaf)
+                for param in pinned.params
+                for slot in param.unique_slots
             }
             for s in iter_param_slots(m):
                 key = (id(s.parent), s.leaf)
@@ -2212,7 +2212,7 @@ class TestLoRAInBlockRouting:
                     assert key in managed_slot_ids
                 else:
                     assert key not in managed_slot_ids, (
-                        f"slot {s.name} (requires_grad={s.param.requires_grad}) "
+                        f"slot {s.name} (requires_grad={s.get().requires_grad}) "
                         f"leaked into PinnedWeights"
                     )
         finally:
@@ -2925,7 +2925,7 @@ class TestBlockGroupsDisjoint:
 
     def test_parent_child_overlap_raises(self) -> None:
         # group_a has a parent block whose child is also referenced
-        # directly by group_b. Different block ids; same SlotOwnership
+        # directly by group_b. Different block ids; same SlotKey
         # for the child's slots in both regions.
         child = nn.Linear(4, 4, bias=False)
 

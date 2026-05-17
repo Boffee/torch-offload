@@ -13,8 +13,6 @@ from .slots import (
     assert_frozen,
     iter_buffer_slots,
     iter_param_slots,
-    set_buffer_slot,
-    set_param_slot,
 )
 
 __all__ = ["MpsWeights"]
@@ -87,24 +85,24 @@ class MpsWeights:
         total = 0
         for slot in iter_param_slots(self._model):
             assert_frozen(slot, owner="MpsWeights")
-            self._require_cpu(slot.param.data, slot.name)
-            total += slot.param.numel() * slot.param.element_size()
+            param = slot.get()
+            self._require_cpu(param.data, slot.name)
+            total += param.numel() * param.element_size()
         if self._include_buffers:
             for slot in iter_buffer_slots(self._model):
-                self._require_cpu(slot.buffer, slot.name)
-                total += slot.buffer.numel() * slot.buffer.element_size()
+                buffer = slot.get()
+                self._require_cpu(buffer, slot.name)
+                total += buffer.numel() * buffer.element_size()
         return total
 
     def _move_to_mps(self) -> None:
         device = torch.device("mps")
         for slot in iter_param_slots(self._model):
-            param = slot.param
+            param = slot.get()
             if param.requires_grad:
                 raise RuntimeError("MpsWeights is frozen-only, but a managed parameter became trainable.")
             if param.device != device:
-                set_param_slot(
-                    slot.parent,
-                    slot.leaf,
+                slot.set(
                     nn.Parameter(
                         self._copy_tensor(param.detach(), device),
                         requires_grad=False,
@@ -113,15 +111,11 @@ class MpsWeights:
 
         if self._include_buffers:
             for slot in iter_buffer_slots(self._model):
-                buffer = slot.buffer
+                buffer = slot.get()
                 if buffer.device == device:
                     continue
-                persistent = slot.leaf not in slot.parent._non_persistent_buffers_set
-                set_buffer_slot(
-                    slot.parent,
-                    slot.leaf,
+                slot.set(
                     self._copy_tensor(buffer.detach(), device),
-                    persistent=persistent,
                 )
 
     def _copy_tensor(self, source: torch.Tensor, device: torch.device) -> torch.Tensor:

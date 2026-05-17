@@ -53,7 +53,7 @@ recovery of the partially constructed strategy/model is unsupported;
 drop those references and rebuild from a fresh model instance.
 
 :class:`ModelOffloader` composes (in order):
-  1. A non-block :class:`PinnedWeights` with a :class:`SlotOwnership`
+  1. A non-block :class:`PinnedWeights` with a :class:`SlotKey`
      skip filter for everything outside the block list.
   2. A :class:`TrainableWeights` for LoRA / adapter weights
      (or only out-of-block trainables when
@@ -113,7 +113,7 @@ from .model_cache import (
 from .model_offloader import ModelOffloader, detect_streaming_region_ties
 from .mps_weights import MpsWeights
 from .pinned_weights import PinnedWeights
-from .protocols import CachedResource, ModelStrategy, ModelStrategyComponent, SlotOwnership
+from .protocols import CachedResource, ModelStrategy, ModelStrategyComponent, SlotKey
 from .streamed_weights import StreamedWeights
 from .trainable_weights import TrainableWeights
 
@@ -141,7 +141,7 @@ __all__ = [
     "MpsWeights",
     "PinnedWeights",
     "ResourceSpec",
-    "SlotOwnership",
+    "SlotKey",
     "StreamedWeights",
     "TrainableWeights",
     "detect_streaming_region_ties",

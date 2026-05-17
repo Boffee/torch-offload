@@ -1,13 +1,13 @@
 """Slot resolution helpers — the single source of truth for walking a
-model and producing :class:`SlotOwnership` identities.
+model and producing stable slot records.
 
 A "slot" is a ``(parent_module, leaf_name, kind)`` triple identifying
-where a parameter or buffer lives in a module tree (see
-:class:`~torch_offload.protocols.SlotOwnership`). The streaming and
+where a parameter or buffer lives in a module tree. The streaming and
 pinning components in this package all need to walk a model and resolve
-each named parameter/buffer back to its slot. This module owns that walk
-so the duplication across ``pinned_weights``, ``streamed_weights``,
-and ``model_offloader`` collapses to a single implementation.
+each named parameter/buffer back to its owning module slot. This module
+owns that walk so the duplication across ``pinned_weights``,
+``streamed_weights``, and ``model_offloader`` collapses to a single
+implementation.
 
 The walk uses ``remove_duplicate=False`` throughout: a Parameter or
 buffer that's aliased under multiple names yields one row per alias.
@@ -18,13 +18,14 @@ themselves; callers that need every slot covered (e.g. building a
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
+from typing import TypeVar
 
 import torch
 from torch import nn
 
-from .protocols import SlotOwnership
+from .protocols import SlotKey
 
 __all__ = [
     "BufferSlot",
@@ -39,8 +40,11 @@ __all__ = [
     "set_param_slot",
     "set_tensor_data",
     "split_attr_path",
+    "unique_slots",
     "walk_attr_path",
 ]
+
+_SlotT = TypeVar("_SlotT", "ParamSlot", "BufferSlot")
 
 
 def walk_attr_path(root: nn.Module, dotted_path: str) -> object:
@@ -107,7 +111,7 @@ def assert_frozen(
     ``"PinnedWeights"``, ``"StreamedWeights"``). ``extra`` is appended
     verbatim for owner-specific recovery guidance.
     """
-    if not slot.param.requires_grad:
+    if not slot.get().requires_grad:
         return
     msg = (
         f"{owner} cannot manage trainable slot {slot.name!r}: slot "
@@ -166,34 +170,76 @@ def set_tensor_data(tensor: torch.Tensor, data: torch.Tensor) -> None:
     tensor.data = data
 
 
+def unique_slots(slots: Iterable[_SlotT]) -> list[_SlotT]:
+    """Deduplicate alias-aware slot records by physical module slot.
+
+    Duplicate-aware PyTorch walks can yield multiple names for the same
+    ``(parent_module, leaf_name)`` slot when a submodule is reachable
+    through more than one attribute path. Slot mutation should touch
+    that physical slot once; target-name indexing should keep every
+    named slot.
+    """
+    unique: list[_SlotT] = []
+    seen: set[tuple[int, str]] = set()
+    for slot in slots:
+        key = (id(slot.parent), slot.leaf)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(slot)
+    return unique
+
+
 @dataclass(slots=True, frozen=True)
 class ParamSlot:
-    """One row from :func:`iter_param_slots`.
+    """One named parameter slot from :func:`iter_param_slots`.
 
-    ``slot`` is the stable identity (survives slot mutation). ``name`` is
-    the qualified name from ``named_parameters()`` (may differ across
-    aliases of the same Parameter). ``parent`` and ``leaf`` are the live
-    references to where the slot lives — useful for callers that mutate
-    ``parent._parameters[leaf]`` directly or look up siblings.
+    ``name`` is the qualified name from ``named_parameters()``. ``parent``
+    and ``leaf`` identify the live module registry entry, so the slot
+    remains useful after the Parameter object installed there changes.
     """
 
-    slot: SlotOwnership
     name: str
-    param: nn.Parameter
     parent: nn.Module
     leaf: str
+
+    @property
+    def key(self) -> SlotKey:
+        return SlotKey(id(self.parent), self.leaf, "param")
+
+    def get(self) -> nn.Parameter:
+        return get_param_slot(self.parent, self.leaf)
+
+    def set(self, param: nn.Parameter) -> None:
+        set_param_slot(self.parent, self.leaf, param)
 
 
 @dataclass(slots=True, frozen=True)
 class BufferSlot:
-    """One row from :func:`iter_buffer_slots`. Mirrors :class:`ParamSlot`
-    for the buffer namespace, with ``slot.kind == "buffer"``."""
+    """One named buffer slot from :func:`iter_buffer_slots`."""
 
-    slot: SlotOwnership
     name: str
-    buffer: torch.Tensor
     parent: nn.Module
     leaf: str
+    persistent: bool
+
+    @property
+    def key(self) -> SlotKey:
+        return SlotKey(id(self.parent), self.leaf, "buffer")
+
+    def get(self) -> torch.Tensor:
+        buffer = self.parent._buffers[self.leaf]
+        if buffer is None:
+            raise RuntimeError(f"Buffer slot {self.leaf!r} is unexpectedly empty")
+        return buffer
+
+    def set(self, buffer: torch.Tensor) -> None:
+        set_buffer_slot(
+            self.parent,
+            self.leaf,
+            buffer,
+            persistent=self.persistent,
+        )
 
 
 def iter_param_slots(module: nn.Module) -> Iterator[ParamSlot]:
@@ -201,15 +247,13 @@ def iter_param_slots(module: nn.Module) -> Iterator[ParamSlot]:
 
     Uses ``remove_duplicate=False``: a Parameter shared across multiple
     submodule paths yields one :class:`ParamSlot` per name. To dedupe by
-    Parameter identity, track ``id(row.param)`` in the consumer.
+    Parameter identity, track ``id(row.get())`` in the consumer.
     """
     modules_map = dict(module.named_modules(remove_duplicate=False))
-    for name, p in module.named_parameters(remove_duplicate=False):
+    for name, _p in module.named_parameters(remove_duplicate=False):
         parent, leaf = _resolve_parent_leaf(module, modules_map, name)
         yield ParamSlot(
-            slot=SlotOwnership(id(parent), leaf, "param"),
             name=name,
-            param=p,
             parent=parent,
             leaf=leaf,
         )
@@ -221,14 +265,13 @@ def iter_buffer_slots(module: nn.Module) -> Iterator[BufferSlot]:
     Mirrors :func:`iter_param_slots` for the buffer namespace.
     """
     modules_map = dict(module.named_modules(remove_duplicate=False))
-    for name, b in module.named_buffers(remove_duplicate=False):
+    for name, _b in module.named_buffers(remove_duplicate=False):
         parent, leaf = _resolve_parent_leaf(module, modules_map, name)
         yield BufferSlot(
-            slot=SlotOwnership(id(parent), leaf, "buffer"),
             name=name,
-            buffer=b,
             parent=parent,
             leaf=leaf,
+            persistent=leaf not in parent._non_persistent_buffers_set,
         )
 
 
