@@ -20,7 +20,8 @@ to be lifted into its own package when a second consumer appears.
 | `trainable_weights.py` | `TrainableWeights` — identity-preserving trainable parameter mover |
 | `lora.py` | `LoRA`, `LoRATransform`, `LoRARouteHandle` — pinned factor storage + merge / routed-hook application |
 | `merge.py` | `merge_lora()` — permanent in-place LoRA merge into base weights (alternative to `set_loras`) |
-| `pinned_buffer.py` | `PinnedParamBuffer` — per-tensor pinning primitive (handles quanto, GGUF, and TorchAO NVFP4 via adapters) |
+| `pinned_param.py` | `PinnedParam` — per-parameter pinning primitive (handles quanto, GGUF, and TorchAO NVFP4 via adapters) |
+| `pinned_groups.py` | `PinnedParamGroup`, `PinnedBufferGroup` — shared pinned value plus module slots |
 | `tensor_adapters.py`, `quanto_adapter.py`, `gguf_adapter.py`, `nvfp4_adapter.py`, `gguf_dequant.py` | Tensor-type adapter registry and optional optimum-quanto / gguf / torchao support |
 | `_quanto.py` | Internal: optimum-quanto optional-import + layout validation; consumed by `quanto_adapter.py` and `merge.py` |
 | `_torchao_nvfp4.py` | Internal: TorchAO NVFP4 optional-import + layout validation; consumed by `nvfp4_adapter.py` |
@@ -155,7 +156,7 @@ weights use the same merge path. Merge compatibility is adapter-owned:
 plain dense tensors opt into in-place `addmm_`; structured quantized
 wrappers should use routed mode only when the module still exposes a
 compatible logical Linear weight shape and compute dtype, unless they
-provide their own permanent merge path. `PinnedParamBuffer` remains a
+provide their own permanent merge path. `PinnedParam` remains a
 storage primitive; LoRA merge mode asks the selected adapter for the
 dense-update capability.
 
@@ -418,9 +419,9 @@ the cache lock. `choose_victims()` must return unique keys from
             └────────────────────┬───────────────────┘
                                  ▼
                       ┌──────────────────┐
-                       │ PinnedParamBuffer│  per-tensor pinned-CPU storage
-                       │ adapter-capable  │  via tensor adapters
-                       └──────────────────┘
+                      │ PinnedParam      │  per-parameter pinned-CPU state
+                      │ adapter-capable  │  via tensor adapters
+                      └──────────────────┘
 ```
 
 `ModelStrategy` is the protocol every top-level strategy implements:
@@ -475,7 +476,7 @@ re-activation).
 Construction optimizes peak host memory. Pinning clones managed tensors
 into pinned CPU storage. For plain `torch.Tensor` parameters, the source
 `Parameter.data` may be immediately repointed at the pinned clone as soon
-as that buffer is created. This releases the original pageable CPU
+as that pinned parameter is created. This releases the original pageable CPU
 storage early and avoids temporarily holding both pageable and pinned
 copies of large weights. It is a clone-to-pinned plus storage swap, not
 true in-place pinning. Tensor subclasses such as quanto, GGUF, and NVFP4
@@ -540,7 +541,7 @@ those models instead.
 ## Quanto support
 
 Quanto-quantized models (`optimum.quanto.WeightQBytesTensor`) are
-handled correctly by both strategies. `PinnedParamBuffer` decomposes
+handled correctly by both strategies. `PinnedParam` decomposes
 the wrapper into its inner `_data` (int8/fp8) and `_scale` (fp16/fp32)
 tensors, pins each, and reconstructs the quanto wrapper around the GPU
 storage on activation.
@@ -560,7 +561,7 @@ success but silently leaves `_data` untouched). Use
 TorchAO NVFP4 weights
 (`torchao.prototype.mx_formats.nvfp4_tensor.NVFP4Tensor`) are handled as
 frozen inference weights when the `nvfp4` optional extra is installed.
-`PinnedParamBuffer` pins the packed FP4 `qdata`, FP8 block `scale`,
+`PinnedParam` pins the packed FP4 `qdata`, FP8 block `scale`,
 optional per-tensor scales, and the TorchAO dispatch metadata, then
 rebuilds the `NVFP4Tensor` wrapper around GPU slot storage on activation.
 The optional extra requires TorchAO plus PyTorch 2.8+; dynamic NVFP4

@@ -142,7 +142,7 @@ class TestCleanup:
 
         m = _make_simple_model()
         pw = PinnedWeights(m)
-        first = pw.params[0].unique_slots[0]
+        first = pw.param_groups[0].unique_slots[0]
         first_parent, first_leaf = first.parent, first.leaf
         slot_param_ref = weakref.ref(first_parent._parameters[first_leaf])
         pw.deactivate()
@@ -231,16 +231,17 @@ class TestTiedWeightDedup:
         m, embed, head = self._make_tied_model()
         pw = PinnedWeights(m)
         try:
-            # Exactly one unique pinned buffer for the tied weight.
-            assert len(pw.params) == 1
-            param = pw.params[0]
-            leaves = {slot.leaf for slot in param.unique_slots}
+            # Exactly one unique pinned parameter for the tied weight.
+            assert len(pw.param_groups) == 1
+            param_group = pw.param_groups[0]
+            leaves = {slot.leaf for slot in param_group.unique_slots}
             assert leaves == {"weight"}  # both 'embed.weight' and 'head.weight'
-            assert len(param.unique_slots) == 2
+            assert len(param_group.unique_slots) == 2
             # After construction, both slots reference the same Parameter
-            # (the buf's cpu_param), preserving tying at the strongest level.
+            # (the pinned param's cpu_param), preserving tying at the
+            # strongest level.
             assert m.embed._parameters["weight"] is m.head._parameters["weight"]
-            assert m.embed.weight is param.pinned.cpu_param
+            assert m.embed.weight is param_group.pinned.cpu_param
         finally:
             pw.deactivate()
 
@@ -248,8 +249,8 @@ class TestTiedWeightDedup:
         m, _, _ = self._make_distinct_param_tied_model()
         pw = PinnedWeights(m)
         try:
-            assert len(pw.params) == 1
-            assert {slot.leaf for slot in pw.params[0].unique_slots} == {"a", "b"}
+            assert len(pw.param_groups) == 1
+            assert {slot.leaf for slot in pw.param_groups[0].unique_slots} == {"a", "b"}
             # Both module slots now reference the same Parameter object.
             assert m._parameters["a"] is m._parameters["b"]
         finally:
@@ -263,7 +264,7 @@ class TestTiedWeightDedup:
 
         pw = PinnedWeights(m)
         try:
-            assert len(pw.params) == 1
+            assert len(pw.param_groups) == 1
             assert m._parameters["a"] is m._parameters["b"]
         finally:
             pw.deactivate()
@@ -272,7 +273,7 @@ class TestTiedWeightDedup:
         m, _, _ = self._make_tied_model()
         pw = PinnedWeights(m)
         try:
-            # 32 * 16 * 4 (float32 default) = 2048 bytes for one buffer.
+            # 32 * 16 * 4 (float32 default) = 2048 bytes for one pinned param.
             # If the dedup were broken this would double.
             assert pw.cache_bytes == 32 * 16 * 4
         finally:
@@ -327,20 +328,23 @@ class TestSharedSubmoduleAlias:
         m.b = shared
         pw = PinnedWeights(m)
         try:
-            # One pinned buffer (same Parameter via aliased module).
-            assert len(pw.params) == 1
-            param = pw.params[0]
+            # One pinned param group (same Parameter via aliased module).
+            assert len(pw.param_groups) == 1
+            param_group = pw.param_groups[0]
             # Slots deduped by (id(parent), leaf) — only one physical
             # slot even though there are two attribute paths.
-            assert len(param.unique_slots) == 1
-            assert {slot.name for slot in param.slots} == {
+            assert len(param_group.unique_slots) == 1
+            assert {slot.name for slot in param_group.slots} == {
                 "a.weight",
                 "b.weight",
             }
             assert all(
                 (slot.parent, slot.leaf)
-                == (param.unique_slots[0].parent, param.unique_slots[0].leaf)
-                for slot in param.slots
+                == (
+                    param_group.unique_slots[0].parent,
+                    param_group.unique_slots[0].leaf,
+                )
+                for slot in param_group.slots
             )
         finally:
             pw.deactivate()
@@ -363,14 +367,14 @@ class TestSharedSubmoduleAlias:
         m.b = Inner(shared_buf)
         pw = PinnedWeights(m)
         try:
-            # One pinned buffer covers both alias paths.
-            assert len(pw.buffers) == 1
-            buffer = pw.buffers[0]
-            assert buffer.pinned.is_pinned()
-            assert len(buffer.unique_slots) == 2
+            # One pinned buffer group covers both alias paths.
+            assert len(pw.buffer_groups) == 1
+            buffer_group = pw.buffer_groups[0]
+            assert buffer_group.pinned.is_pinned()
+            assert len(buffer_group.unique_slots) == 2
             # Both module slots reference the SAME pinned tensor.
-            assert m.a.buf is buffer.pinned
-            assert m.b.buf is buffer.pinned
+            assert m.a.buf is buffer_group.pinned
+            assert m.b.buf is buffer_group.pinned
         finally:
             pw.deactivate()
 
@@ -388,10 +392,10 @@ class TestSharedSubmoduleAlias:
         m.b = Inner(shared_buf)
         pw = PinnedWeights(m)
         try:
-            assert len(pw.buffers) == 1
-            buffer = pw.buffers[0]
-            assert m.a.buf is buffer.pinned
-            assert m.b.buf is buffer.pinned
+            assert len(pw.buffer_groups) == 1
+            buffer_group = pw.buffer_groups[0]
+            assert m.a.buf is buffer_group.pinned
+            assert m.b.buf is buffer_group.pinned
         finally:
             pw.deactivate()
 
@@ -416,8 +420,8 @@ class TestMixedTrainableFrozenTied:
 
 class TestZeroSizedParams:
     def test_zero_sized_params_do_not_collapse(self) -> None:
-        # Empty tensors all share data_ptr()==0; they must not dedup
-        # into one buffer.
+        # Empty tensors all share data_ptr()==0; they must not dedupe
+        # into one pinned param group.
         m = nn.Module()
         m.a = nn.Parameter(torch.empty(0), requires_grad=False)
         m.b = nn.Parameter(torch.empty(0), requires_grad=False)
@@ -427,7 +431,7 @@ class TestZeroSizedParams:
         pw = PinnedWeights(m)
         try:
             # 3 slots: a, b, c — empties did not collapse.
-            assert len(pw.params) == 3
+            assert len(pw.param_groups) == 3
         finally:
             pw.deactivate()
 
@@ -458,8 +462,8 @@ class TestQuanto:
 
     def test_quanto_constructor_repoints_to_pinned(self) -> None:
         # The bug Codex found: the original PinnedWeights did
-        # `p.data = buf.cpu_param.data` which is a no-op for quanto.
-        # The fix: swap module._parameters[leaf] = buf.cpu_param.
+        # `p.data = pinned.cpu_param.data` which is a no-op for quanto.
+        # The fix: swap module._parameters[leaf] = pinned.cpu_param.
         # Verify the model now references pinned _data storage.
         m = self._make_quanto_model()
         original_data_ptr = m.weight._data.data_ptr()

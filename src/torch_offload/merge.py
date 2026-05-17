@@ -21,7 +21,7 @@ from torch import nn
 
 from ._quanto import is_weight_qbytes_tensor, requantize_with_addmm_delta
 from .lora import LoRA
-from .pinned_buffer import storage_key
+from .pinned_param import storage_key
 from .slots import ParamSlot, canonical_param_name, iter_param_slots
 from .tensor_adapters import DenseAddmmTensorAdapter, select_adapter
 

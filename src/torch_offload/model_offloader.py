@@ -21,7 +21,7 @@ from torch import nn
 
 from ._devices import canonical_device
 from .lora import LoRA, LoRARouteHandle, LoRATransform
-from .pinned_buffer import PinnedParamBuffer, storage_key
+from .pinned_param import PinnedParam, storage_key
 from .pinned_weights import PinnedWeights
 from .protocols import ModelStrategyComponent, SlotKey
 from .slots import canonical_param_name, iter_buffer_slots, iter_param_slots, walk_attr_path
@@ -73,9 +73,9 @@ def _routed_factor_dtype(module: nn.Module) -> torch.dtype:
     return select_adapter(weight.data).compute_dtype(weight.data)
 
 
-def _validate_merge_lora_target(buf: PinnedParamBuffer, target_key: str) -> None:
+def _validate_merge_lora_target(pinned: PinnedParam, target_key: str) -> None:
     """Raise if this LoRA target cannot use activation-scoped merge mode."""
-    adapter = buf.adapter
+    adapter = pinned.adapter
     if not isinstance(adapter, DenseAddmmTensorAdapter):
         raise ValueError(
             f"LoRA target {target_key!r} uses {adapter.__name__}; "
@@ -84,7 +84,7 @@ def _validate_merge_lora_target(buf: PinnedParamBuffer, target_key: str) -> None
             "weights, or apply torch_offload.merge_lora() permanently "
             "when that format supports a dequantize/requantize merge."
         )
-    adapter.validate_dense_addmm_target(buf.cpu_param.data, target_key)
+    adapter.validate_dense_addmm_target(pinned.cpu_param.data, target_key)
 
 
 class ModelOffloader:
@@ -315,7 +315,7 @@ class ModelOffloader:
         self._teardown_stack: contextlib.ExitStack | None = None
 
         (
-            self._target_to_buffer,
+            self._target_to_pinned_param,
             self._target_to_parents,
             self._target_to_component,
         ) = self._build_target_index(streamers, layer_paths, non_block)
@@ -391,24 +391,26 @@ class ModelOffloader:
         self, loras: Sequence[tuple[LoRA, float]],
     ) -> _LoraTargetMap:
         per_target: _LoraTargetMap = {}
-        per_buffer_target: dict[int, str] = {}
+        per_pinned_param_target: dict[int, str] = {}
         total_targets = 0
         matched_targets = 0
         for lora, strength in loras:
             for target_key, (a, b) in lora.targets.items():
                 total_targets += 1
-                buf = self._target_to_buffer.get(target_key)
-                if buf is None:
+                pinned = self._target_to_pinned_param.get(target_key)
+                if pinned is None:
                     continue
                 matched_targets += 1
-                expected = tuple(buf.cpu_param.shape)
+                expected = tuple(pinned.cpu_param.shape)
                 if expected != (b.shape[0], a.shape[1]):
                     raise ValueError(
                         f"LoRA factor shape mismatch for {target_key!r}: "
                         f"B@A produces ({b.shape[0]}, {a.shape[1]}), "
                         f"target shape is {expected}."
                     )
-                existing_target = per_buffer_target.setdefault(id(buf), target_key)
+                existing_target = per_pinned_param_target.setdefault(
+                    id(pinned), target_key
+                )
                 if existing_target != target_key:
                     raise ValueError(
                         f"LoRA targets {existing_target!r} and {target_key!r} "
@@ -423,7 +425,7 @@ class ModelOffloader:
 
         if matched_targets < total_targets:
             sample_lora = sorted(next(iter(loras))[0].targets)[:3]
-            sample_index = sorted(self._target_to_buffer)[:3]
+            sample_index = sorted(self._target_to_pinned_param)[:3]
             logger.warning(
                 "set_loras matched %d/%d targets. "
                 "Sample LoRA keys: %s ... Sample index keys: %s ...",
@@ -459,14 +461,14 @@ class ModelOffloader:
 
         for target_key in targets:
             _validate_merge_lora_target(
-                self._target_to_buffer[target_key], target_key
+                self._target_to_pinned_param[target_key], target_key
             )
 
         for target_key, refs in targets.items():
-            buf = self._target_to_buffer[target_key]
+            pinned = self._target_to_pinned_param[target_key]
             component = self._target_to_component[target_key]
             handle = component.register_post_copy_hook(
-                buf, LoRATransform(refs).apply,
+                pinned, LoRATransform(refs).apply,
             )
             self._lora_hook_handles.append(handle)
 
@@ -780,14 +782,14 @@ class ModelOffloader:
         layer_paths: list[str],
         non_block: PinnedWeights | None,
     ) -> tuple[
-        dict[str, PinnedParamBuffer],
+        dict[str, PinnedParam],
         dict[str, tuple[nn.Module, ...]],
         dict[str, PinnedWeights | StreamedWeights],
     ]:
-        """Map canonical param names to their :class:`PinnedParamBuffer`
+        """Map canonical param names to their :class:`PinnedParam`
         and to the tuple of parent modules where the param is installed.
 
-        The buffer map drives merge-mode LoRA post-copy hooks, the
+        The pinned-param map drives merge-mode LoRA post-copy hooks, the
         component map identifies which component owns the copy loop,
         and the parents map drives routed-mode LoRA forward hooks.
 
@@ -805,49 +807,51 @@ class ModelOffloader:
         handles tied storage uniformly because it mutates the shared
         bytes).
         """
-        bufs: dict[str, PinnedParamBuffer] = {}
+        pinned_params: dict[str, PinnedParam] = {}
         parents: dict[str, tuple[nn.Module, ...]] = {}
         components: dict[str, PinnedWeights | StreamedWeights] = {}
 
         for streamer, layer_path in zip(streamers, layer_paths, strict=True):
-            for block_idx, block_params in enumerate(streamer.params_per_block):
-                for param in block_params:
+            for block_idx, block_param_groups in enumerate(
+                streamer.param_groups_per_block
+            ):
+                for param_group in block_param_groups:
                     seen_parent_ids: set[int] = set()
                     slot_parents: list[nn.Module] = []
-                    for slot in param.slots:
+                    for slot in param_group.slots:
                         parent_id = id(slot.parent)
                         if parent_id in seen_parent_ids:
                             continue
                         seen_parent_ids.add(parent_id)
                         slot_parents.append(slot.parent)
                     parent_tuple = tuple(slot_parents)
-                    for slot in param.slots:
+                    for slot in param_group.slots:
                         full_name = f"{layer_path}.{block_idx}.{slot.name}"
                         key = canonical_param_name(full_name)
-                        bufs[key] = param.pinned
+                        pinned_params[key] = param_group.pinned
                         parents[key] = parent_tuple
                         components[key] = streamer
 
         if non_block is not None:
-            for param in non_block.params:
-                if not param.slots:
+            for param_group in non_block.param_groups:
+                if not param_group.slots:
                     continue
                 seen_parent_ids: set[int] = set()
                 slot_parents: list[nn.Module] = []
-                for slot in param.slots:
+                for slot in param_group.slots:
                     parent_id = id(slot.parent)
                     if parent_id in seen_parent_ids:
                         continue
                     seen_parent_ids.add(parent_id)
                     slot_parents.append(slot.parent)
                 parent_tuple = tuple(slot_parents)
-                for slot in param.slots:
+                for slot in param_group.slots:
                     key = canonical_param_name(slot.name)
-                    bufs[key] = param.pinned
+                    pinned_params[key] = param_group.pinned
                     parents[key] = parent_tuple
                     components[key] = non_block
 
-        return bufs, parents, components
+        return pinned_params, parents, components
 
 
 # ---------------------------------------------------------------------------
@@ -1084,18 +1088,18 @@ def detect_streaming_region_ties(  # noqa: PLR0912
                     (id(s.parent), s.leaf), set()
                 ).add(f"block:{group_idx}:{block_idx}")
 
-    buf_groups: dict[tuple, list[tuple[str, str, int]]] = {}
+    buffer_groups: dict[tuple, list[tuple[str, str, int]]] = {}
     for s in iter_buffer_slots(model):
         buffer = s.get()
         if buffer.numel() == 0:
             continue
         regions = block_buffer_slot_regions.get((id(s.parent), s.leaf), {"non_block"})
         for region in regions:
-            buf_groups.setdefault(storage_key(buffer), []).append(
+            buffer_groups.setdefault(storage_key(buffer), []).append(
                 (region, s.name, id(buffer))
             )
 
-    for members in buf_groups.values():
+    for members in buffer_groups.values():
         regions = {region for region, _, _ in members}
         names = sorted({name for _, name, _ in members})
         if len(regions) > 1:

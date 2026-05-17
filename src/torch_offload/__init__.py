@@ -27,7 +27,7 @@ Top-level offload strategies:
 
 The CUDA-oriented :class:`PinnedWeights` and :class:`ModelOffloader`
 share the underlying per-parameter pinned storage from
-:class:`~torch_offload.pinned_buffer.PinnedParamBuffer` (clone + pin
+:class:`~torch_offload.pinned_param.PinnedParam` (clone + pin
 + optional quanto ``WeightQBytesTensor`` decomposition, GGUF packed
 weights, and TorchAO NVFP4 packed weights).
 

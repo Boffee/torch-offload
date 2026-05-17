@@ -1308,7 +1308,7 @@ class TestCrossRegionTiedDetection:
             non_block = next(
                 c for c in strategy._components if isinstance(c, PinnedWeights)
             )
-            assert len(non_block.params) == 1  # tie deduped
+            assert len(non_block.param_groups) == 1  # tie deduped
         finally:
             strategy.deactivate()
 
@@ -1709,8 +1709,8 @@ class TestSlotKeyFilter:
                 # owned by streamer).
                 slots_managed_by_pinned = {
                     slot.key
-                    for param in non_block.params
-                    for slot in param.unique_slots
+                    for param_group in non_block.param_groups
+                    for slot in param_group.unique_slots
                 }
                 # Block-owned slots NOT in the PinnedWeights set.
                 for s in skip_slots:
@@ -2203,8 +2203,8 @@ class TestLoRAInBlockRouting:
             # routed to StreamedWeights, trainable_bias to TrainableWeights.
             managed_slot_ids = {
                 (id(slot.parent), slot.leaf)
-                for param in pinned.params
-                for slot in param.unique_slots
+                for param_group in pinned.param_groups
+                for slot in param_group.unique_slots
             }
             for s in iter_param_slots(m):
                 key = (id(s.parent), s.leaf)

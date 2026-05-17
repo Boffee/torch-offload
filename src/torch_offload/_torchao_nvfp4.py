@@ -1,7 +1,7 @@
 """Internal optional-import module for TorchAO NVFP4 support.
 
 Single source of truth for the private-ish TorchAO NVFP4 layout this
-repo needs to move packed weights through :class:`PinnedParamBuffer`.
+repo needs to move packed weights through :class:`PinnedParam`.
 TorchAO's public workflow creates ``NVFP4Tensor`` weights via
 ``quantize_(..., NVFP4WeightOnlyConfig/NVFP4DynamicActivation...)``;
 the adapter only preserves and moves those already-quantized tensors.

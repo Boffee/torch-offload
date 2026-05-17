@@ -1,7 +1,7 @@
 """GGUF tensor adapter for the memory subsystem.
 
 Registers :class:`GgufAdapter` when the ``gguf`` package is installed,
-enabling :class:`PinnedParamBuffer` to handle GGUF-quantized weights.
+enabling :class:`PinnedParam` to handle GGUF-quantized weights.
 
 Weights are stored in their compact quantized form in pinned CPU
 memory.  On GPU transfer the raw bytes are DMA'd to a GPU staging

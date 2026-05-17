@@ -194,15 +194,15 @@ def _make_strategy(
 
 def _has_post_copy_hook(strategy: ModelOffloader, target_key: str) -> bool:
     """Check whether a merge hook is installed for the given target."""
-    buf = strategy._target_to_buffer.get(target_key)
+    pinned = strategy._target_to_pinned_param.get(target_key)
     component = strategy._target_to_component.get(target_key)
-    if buf is None or component is None:
+    if pinned is None or component is None:
         return False
     if isinstance(component, PinnedWeights):
-        return id(buf) in component._post_copy_hooks
+        return id(pinned) in component._post_copy_hooks
     if isinstance(component, StreamedWeights):
         assert component._store is not None
-        return id(buf) in component._store._post_copy_hooks
+        return id(pinned) in component._store._post_copy_hooks
     return False
 
 
@@ -1084,7 +1084,7 @@ class TestRoutedMode:
     @pytest.mark.parametrize("target", ["embed", "head"])
     def test_routed_tied_weight_target_raises(self, target: str) -> None:
         # Standard tied embed/head pattern: one Parameter aliased at
-        # multiple slots. PinnedWeights dedups them into one buffer
+        # multiple slots. PinnedWeights dedupes them into one group
         # with multiple parent modules. Routed mode would only hook
         # one module and silently miss the others — reject explicitly.
         model = _make_tied_non_block_model(dtype=torch.bfloat16)

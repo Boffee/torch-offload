@@ -14,7 +14,7 @@ across the CPU↔GPU boundary while preserving correctness:
   frozen-only via slot replacement.
 
 Each adapter encapsulates the mechanics for one tensor type. The rest
-of the package (:class:`PinnedParamBuffer`, :class:`PinnedWeights`,
+of the package (:class:`PinnedParam`, :class:`PinnedWeights`,
 :class:`StreamedWeights`) is type-agnostic and dispatches through
 :func:`select_adapter`. The base adapter contract is intentionally small:
 clone/pin, move to GPU, rebuild wrappers, report cache bytes, and report
@@ -50,7 +50,7 @@ __all__ = [
 DENSE_ADDMM_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
 
 # Adapter-specific opaque state types. The Protocol is generic over
-# them so consumers (PinnedParamBuffer) can stay tensor-type-agnostic
+# them so consumers (PinnedParam) can stay tensor-type-agnostic
 # while each adapter pins its own concrete state shape.
 PinnedStateT = TypeVar("PinnedStateT")
 GpuStateT = TypeVar("GpuStateT")
@@ -241,7 +241,7 @@ class RegularAdapter:
     Builds fresh :class:`nn.Parameter` objects wrapping the pinned-CPU
     and GPU storages. The frozen-only callers (:class:`PinnedWeights`,
     ``_BlockPinnedStore``) slot-replace via ``module._parameters[leaf]
-    = ...`` with the buffer's ``cpu_param`` or its pool-slot
+    = ...`` with the pinned parameter's ``cpu_param`` or its pool-slot
     ``gpu_param``; the user's original Parameter object is orphaned,
     so optimizer state keyed on the pre-wrap object is lost. Trainable
     callers can either request ``requires_grad=True`` wrappers or skip

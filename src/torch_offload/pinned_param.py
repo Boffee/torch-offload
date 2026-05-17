@@ -8,7 +8,7 @@ a new :class:`TensorAdapter`, not editing the consumers.
 
 Per-parameter mechanics live in the tensor adapter
 (:mod:`tensor_adapters` for plain tensors, :mod:`quanto_adapter` for
-quanto). :class:`PinnedParamBuffer` is a thin holder that pairs one
+quanto). :class:`PinnedParam` is a thin holder that pairs one
 :class:`nn.Parameter` with the adapter that handles its tensor type
 plus the pinned-host state that adapter produced. Optional operations
 such as D2H round-trip, trainable ``.data`` swap, and dense updates
@@ -28,13 +28,13 @@ from . import (
     nvfp4_adapter,  # noqa: F401 — registration side effect
     quanto_adapter,  # noqa: F401 — registration side effect
 )
+from .slots import set_param_data
 from .tensor_adapters import (
     CpuRoundTripTensorAdapter,
     ParameterDataSwapTensorAdapter,
     TensorAdapter,
     select_adapter,
 )
-from .slots import set_param_data
 
 PostCopyHook = Callable[[torch.Tensor], None]
 
@@ -64,7 +64,7 @@ def storage_key(t: torch.Tensor) -> tuple[Any, ...]:
     Two tensors that produce the same key represent the same logical
     tensor backed by the same storage region with the same view layout
     and (for quanto) the same quant metadata; they can be deduplicated
-    into a single :class:`PinnedParamBuffer`.
+    into a single :class:`PinnedParam`.
 
     Used by :class:`~torch_offload.PinnedWeights` (for handle-level
     dedup of tied frozen params) and
@@ -78,7 +78,7 @@ def storage_key(t: torch.Tensor) -> tuple[Any, ...]:
     return select_adapter(t).storage_key(t)
 
 
-class PinnedParamBuffer:
+class PinnedParam:
     """Pinned host storage for one parameter, with GPU-load helpers.
 
     Construction picks an adapter via :func:`select_adapter` based on
@@ -90,9 +90,10 @@ class PinnedParamBuffer:
     :meth:`make_gpu_param`, :meth:`copy_to_gpu`, :meth:`load_to_gpu`)
     all dispatch through the adapter. Consumers work with the opaque
     :class:`GpuState` returned by :meth:`allocate_gpu_storage`; the
-    buffer round-trips that opaque handle through subsequent calls.
+    pinned parameter round-trips that opaque handle through subsequent
+    calls.
 
-    The buffer captures the source parameter's ``requires_grad`` at
+    The pinned parameter captures the source parameter's ``requires_grad`` at
     construction time and threads it through to the adapter when
     building :attr:`cpu_param` and the pool's ``gpu_param``. Frozen
     callers (:class:`PinnedWeights`, ``_BlockPinnedStore`` for
@@ -104,10 +105,10 @@ class PinnedParamBuffer:
     Low-peak construction behavior: for plain ``torch.Tensor`` parameters,
     construction immediately repoints the source ``Parameter.data`` at the
     pinned clone. This releases the original pageable CPU storage before the
-    owning strategy finishes constructing every buffer, avoiding a temporary
+    owning strategy finishes constructing every pinned parameter, avoiding a temporary
     2x host-memory peak for large models. It also means construction is not
-    rollback-safe after pinning has started: if a later buffer fails to pin,
-    recovery of the partially constructed strategy/model is unsupported.
+    rollback-safe after pinning has started: if a later pinned parameter fails
+    to pin, recovery of the partially constructed strategy/model is unsupported.
     Drop those references and rebuild from a fresh model instance. Tensor
     subclasses skip this optimization because ``.data =`` can drop wrapper
     state.
@@ -137,14 +138,14 @@ class PinnedParamBuffer:
             set_param_data(param, self.cpu_param.data)
 
     def allocate_gpu_storage(self, device: torch.device) -> object:
-        """Allocate empty GPU storage mirroring this buffer's layout.
+        """Allocate empty GPU storage mirroring this pinned parameter's layout.
         Returns an opaque adapter-specific handle; pass it back to
         :meth:`make_gpu_param`, :meth:`copy_to_gpu`, and
         :meth:`copy_to_cpu`."""
         return self.adapter.alloc_gpu(self.pinned_state, device)
 
     def make_gpu_param(self, gpu_state: object) -> nn.Parameter:
-        """Build the GPU-side :class:`nn.Parameter` for this buffer.
+        """Build the GPU-side :class:`nn.Parameter` for this pinned parameter.
         Adapter receives the paired pinned state so structured tensor
         types (quanto) can reconstruct their wrappers. The wrapper's
         ``requires_grad`` matches the source parameter's at pin time."""
@@ -190,11 +191,11 @@ class PinnedParamBuffer:
 
     @property
     def compute_dtype(self) -> torch.dtype:
-        """Logical compute dtype reported by this buffer's adapter."""
+        """Logical compute dtype reported by this pinned parameter's adapter."""
         return self.adapter.compute_dtype(self.cpu_param.data)
 
     def validate_parameter_data_swap_target(self, name: str) -> None:
-        """Raise if this buffer cannot be trainable-streamed via ``.data``."""
+        """Raise if this pinned parameter cannot be trainable-streamed via ``.data``."""
         if not isinstance(self.adapter, ParameterDataSwapTensorAdapter):
             raise NotImplementedError(
                 f"Trainable streaming requires a Parameter.data-swap-capable "
@@ -207,5 +208,5 @@ class PinnedParamBuffer:
 
     @property
     def cache_bytes(self) -> int:
-        """Bytes this buffer consumes in pinned host memory."""
+        """Bytes this pinned parameter consumes in pinned host memory."""
         return self.adapter.cache_bytes(self.pinned_state)
