@@ -58,7 +58,7 @@ class TestNvfp4Adapter:
         p = nn.Parameter(qt, requires_grad=False)
         pinned_param = PinnedParam("w", p)
 
-        pinned = pinned_param.cpu_param.data
+        pinned = pinned_param.make_cpu_param().data
         assert isinstance(pinned, nvfp4_tensor_cls)
         assert pinned.qdata.is_pinned()
         assert pinned.scale.is_pinned()
@@ -77,7 +77,7 @@ class TestNvfp4Adapter:
     def test_transposed_qdata_stride_is_preserved(self) -> None:
         qt = _make_nvfp4(rows=16, cols=32).t()
         pinned_param = PinnedParam("w", nn.Parameter(qt, requires_grad=False))
-        pinned = pinned_param.cpu_param.data
+        pinned = pinned_param.make_cpu_param().data
 
         assert pinned.shape == qt.shape
         assert pinned.qdata.stride() == qt.qdata.stride()
@@ -150,20 +150,21 @@ class TestNvfp4Adapter:
 
         gpu_param = pinned_param.load_to_gpu(torch.device("cuda"))
         torch.cuda.synchronize()
+        pinned = pinned_param.make_cpu_param().data
 
         assert isinstance(gpu_param.data, nvfp4_tensor_cls)
         assert gpu_param.data.qdata.is_cuda
         assert gpu_param.data.scale.is_cuda
         assert gpu_param.data.per_tensor_scale is not None
         assert gpu_param.data.per_tensor_scale.is_cuda
-        assert gpu_param.data.block_size == pinned_param.cpu_param.data.block_size
-        assert gpu_param.data.orig_dtype == pinned_param.cpu_param.data.orig_dtype
-        assert gpu_param.data.is_swizzled_scales == pinned_param.cpu_param.data.is_swizzled_scales
-        assert torch.equal(gpu_param.data.qdata.cpu(), pinned_param.cpu_param.data.qdata)
-        assert torch.equal(gpu_param.data.scale.cpu(), pinned_param.cpu_param.data.scale)
+        assert gpu_param.data.block_size == pinned.block_size
+        assert gpu_param.data.orig_dtype == pinned.orig_dtype
+        assert gpu_param.data.is_swizzled_scales == pinned.is_swizzled_scales
+        assert torch.equal(gpu_param.data.qdata.cpu(), pinned.qdata)
+        assert torch.equal(gpu_param.data.scale.cpu(), pinned.scale)
         assert torch.equal(
             gpu_param.data.per_tensor_scale.cpu(),
-            pinned_param.cpu_param.data.per_tensor_scale,
+            pinned.per_tensor_scale,
         )
 
     @CUDA

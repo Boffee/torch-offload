@@ -238,10 +238,10 @@ class TestTiedWeightDedup:
             assert leaves == {"weight"}  # both 'embed.weight' and 'head.weight'
             assert len(param_binding.unique_slots) == 2
             # After construction, both slots reference the same Parameter
-            # (the pinned param's cpu_param), preserving tying at the
+            # (the binding's cpu_param), preserving tying at the
             # strongest level.
             assert m.embed._parameters["weight"] is m.head._parameters["weight"]
-            assert m.embed.weight is param_binding.pinned.cpu_param
+            assert m.embed.weight is param_binding.cpu_param
         finally:
             pw.deactivate()
 
@@ -462,8 +462,8 @@ class TestQuanto:
 
     def test_quanto_constructor_repoints_to_pinned(self) -> None:
         # The bug Codex found: the original PinnedWeights did
-        # `p.data = pinned.cpu_param.data` which is a no-op for quanto.
-        # The fix: swap module._parameters[leaf] = pinned.cpu_param.
+        # `p.data = binding.cpu_param.data` which is a no-op for quanto.
+        # The fix: swap module._parameters[leaf] = binding.cpu_param.
         # Verify the model now references pinned _data storage.
         m = self._make_quanto_model()
         original_data_ptr = m.weight._data.data_ptr()

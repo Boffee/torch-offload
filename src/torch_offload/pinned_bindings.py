@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
+from torch import nn
 
 from .pinned_param import PinnedParam
 from .slots import BufferSlot, ParamSlot, unique_slots
@@ -16,6 +17,7 @@ class PinnedParamBinding:
 
     pinned: PinnedParam
     slots: list[ParamSlot]
+    cpu_param: nn.Parameter
 
     @property
     def unique_slots(self) -> list[ParamSlot]:

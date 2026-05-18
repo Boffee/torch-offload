@@ -32,14 +32,22 @@ class TestPinnedParam:
     def test_non_quanto_pin_and_load(self) -> None:
         p = nn.Parameter(torch.randn(8, 16, dtype=torch.bfloat16), requires_grad=False)
         pinned_param = PinnedParam("w", p)
-        # cpu_param wraps a plain pinned tensor — no quanto subclass.
-        assert type(pinned_param.cpu_param.data) is torch.Tensor
-        assert pinned_param.cpu_param.data.is_pinned()
-        assert pinned_param.cpu_param.data.shape == p.shape
-        # cpu_param is a zero-copy wrapper around the pinned host buffer,
+        cpu_param = pinned_param.make_cpu_param()
+        other_cpu_param = pinned_param.make_cpu_param()
+
+        # make_cpu_param wraps a plain pinned tensor — no quanto subclass.
+        assert type(cpu_param.data) is torch.Tensor
+        assert cpu_param.data.is_pinned()
+        assert cpu_param.data.shape == p.shape
+        # CPU params are distinct wrappers over the same pinned host buffer,
         # not a second clone — callers slot-replace at this and rely on
         # the storage staying alive for the pinned parameter's lifetime.
-        assert pinned_param.cpu_param.data.data_ptr() == pinned_param.pinned_state.data.data_ptr()
+        assert cpu_param is not other_cpu_param
+        assert cpu_param.data.data_ptr() == pinned_param.pinned_state.data.data_ptr()
+        assert other_cpu_param.data.data_ptr() == pinned_param.pinned_state.data.data_ptr()
+        # Low-peak construction repoints the source Parameter to the
+        # pinned backing without making PinnedParam own that wrapper.
+        assert p.data.data_ptr() == pinned_param.pinned_state.data.data_ptr()
 
     @CUDA
     def test_load_to_gpu_non_quanto(self) -> None:
@@ -49,7 +57,7 @@ class TestPinnedParam:
         assert gpu.is_cuda
         assert gpu.shape == p.shape
         torch.cuda.synchronize()
-        assert torch.equal(gpu.cpu(), pinned_param.cpu_param.data)
+        assert torch.equal(gpu.cpu(), pinned_param.make_cpu_param().data)
 
     @CUDA
     def test_pool_pattern_allocate_and_copy(self) -> None:
@@ -64,10 +72,11 @@ class TestPinnedParam:
         # First copy
         pinned_param.copy_to_gpu(gpu_state, non_blocking=True)
         torch.cuda.synchronize()
-        assert torch.equal(gpu_state.data.cpu(), pinned_param.cpu_param.data)
+        cpu_param = pinned_param.make_cpu_param()
+        assert torch.equal(gpu_state.data.cpu(), cpu_param.data)
         # Mutate pinned source and re-copy — gpu state should track.
         new_vals = torch.randn(16, dtype=torch.bfloat16, pin_memory=True)
-        pinned_param.cpu_param.data.copy_(new_vals)
+        cpu_param.data.copy_(new_vals)
         pinned_param.copy_to_gpu(gpu_state, non_blocking=True)
         torch.cuda.synchronize()
         assert torch.equal(gpu_state.data.cpu(), new_vals)
@@ -85,8 +94,9 @@ class TestPinnedParam:
         assert not non_contig.is_contiguous()
         p = nn.Parameter(non_contig, requires_grad=False)
         pinned_param = PinnedParam("w", p)
-        assert pinned_param.cpu_param.data.is_contiguous()
-        assert pinned_param.cpu_param.data.is_pinned()
+        cpu_param = pinned_param.make_cpu_param()
+        assert cpu_param.data.is_contiguous()
+        assert cpu_param.data.is_pinned()
 
     @CUDA
     def test_slot_param_identity_stable_across_loads(self) -> None:
@@ -128,9 +138,10 @@ class TestPinnedParam:
         slot.copy_from(block, {id(pinned_param): hook}, non_blocking=False)
         torch.cuda.synchronize()
         assert slot.get_param("w") is base_param
+        cpu_param = pinned_param.make_cpu_param()
         torch.testing.assert_close(
             base_param.detach().cpu(),
-            pinned_param.cpu_param.detach() + 1,
+            cpu_param.detach() + 1,
         )
 
         slot.copy_from(block, non_blocking=False)
@@ -138,7 +149,7 @@ class TestPinnedParam:
         assert slot.get_param("w") is base_param
         torch.testing.assert_close(
             base_param.detach().cpu(),
-            pinned_param.cpu_param.detach(),
+            cpu_param.detach(),
         )
 
 
@@ -189,7 +200,7 @@ class TestPinnedParamQuanto:
 
     def test_pin_decomposes_data_and_scale(self) -> None:
         # Quanto WeightQBytesTensor must be decomposed into _data + _scale
-        # and the cpu_param wrapper reconstructed from the pinned tensors.
+        # and the CPU wrapper reconstructed from the pinned tensors.
         # A naive tensor.clone() would silently dequantize via the dispatch
         # fallback — that bug is the reason pinned_param.py exists.
         quanto = pytest.importorskip("optimum.quanto")
@@ -204,10 +215,11 @@ class TestPinnedParamQuanto:
         p = nn.Parameter(qt, requires_grad=False)
         pinned_param = PinnedParam("w", p)
 
-        # cpu_param wraps a quanto tensor whose _data and _scale are
+        # make_cpu_param wraps a quanto tensor whose _data and _scale are
         # pinned, contiguous, and carry the original quant metadata.
-        assert isinstance(pinned_param.cpu_param.data, WeightQBytesTensor)
-        qt_pinned = pinned_param.cpu_param.data
+        cpu_param = pinned_param.make_cpu_param()
+        assert isinstance(cpu_param.data, WeightQBytesTensor)
+        qt_pinned = cpu_param.data
         assert qt_pinned._data.is_pinned()
         assert qt_pinned._data.is_contiguous()
         assert qt_pinned._data.dtype == torch.int8
@@ -241,7 +253,7 @@ class TestPinnedParamQuanto:
         assert isinstance(gpu_param.data, WeightQBytesTensor)
         assert gpu_param.data._data.is_cuda
         assert gpu_param.data._scale.is_cuda
-        qt_pinned = pinned_param.cpu_param.data
+        qt_pinned = pinned_param.make_cpu_param().data
         assert torch.equal(gpu_param.data._data.cpu(), qt_pinned._data)
         assert torch.equal(gpu_param.data._scale.cpu(), qt_pinned._scale)
 
@@ -253,7 +265,7 @@ class TestPinnedParamQuanto:
 
 class TestRequiresGradPropagation:
     """The pinned parameter captures the source param's ``requires_grad`` at
-    construction time and threads it through to ``cpu_param`` /
+    construction time and threads it through to ``make_cpu_param`` /
     ``gpu_param``. Frozen sources get historic ``requires_grad=False``
     wrappers; trainable sources get ``True`` wrappers so consumers
     that DO use the wrapper objects (rather than ``.data``-swapping)
@@ -263,13 +275,13 @@ class TestRequiresGradPropagation:
         p = nn.Parameter(torch.randn(8, dtype=torch.bfloat16), requires_grad=False)
         pinned_param = PinnedParam("w", p)
         assert pinned_param.requires_grad is False
-        assert pinned_param.cpu_param.requires_grad is False
+        assert pinned_param.make_cpu_param().requires_grad is False
 
     def test_trainable_source_yields_trainable_cpu_param(self) -> None:
         p = nn.Parameter(torch.randn(8, dtype=torch.bfloat16), requires_grad=True)
         pinned_param = PinnedParam("w", p)
         assert pinned_param.requires_grad is True
-        assert pinned_param.cpu_param.requires_grad is True
+        assert pinned_param.make_cpu_param().requires_grad is True
 
     @CUDA
     def test_trainable_source_yields_trainable_gpu_param(self) -> None:
@@ -325,7 +337,7 @@ class TestCopyToCpu:
     def test_regular_pinned_storage_identity_preserved(self) -> None:
         # The pinned-host buffer stays at the same address after D2H —
         # we're overwriting in place, not allocating a new tensor.
-        # Callers that hold cpu_param.data references rely on this.
+        # Callers that hold binding cpu_param.data references rely on this.
         p = nn.Parameter(torch.randn(16, dtype=torch.bfloat16), requires_grad=True)
         pinned_param = PinnedParam("w", p)
         original_ptr = pinned_param.pinned_state.data.data_ptr()

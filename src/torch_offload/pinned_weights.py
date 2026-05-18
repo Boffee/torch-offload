@@ -169,7 +169,7 @@ class PinnedWeights:
         # the low-peak Parameter.data repointing described above.
         for param_binding in self._param_bindings:
             for slot in param_binding.unique_slots:
-                slot.set(param_binding.pinned.cpu_param)
+                slot.set(param_binding.cpu_param)
         for buffer_binding in self._buffer_bindings:
             for slot in buffer_binding.unique_slots:
                 slot.set(buffer_binding.pinned)
@@ -213,7 +213,13 @@ class PinnedWeights:
         for slots in groups.values():
             first = slots[0]
             pinned = PinnedParam(first.name, first.get())
-            param_bindings.append(PinnedParamBinding(pinned, slots))
+            param_bindings.append(
+                PinnedParamBinding(
+                    pinned=pinned,
+                    slots=slots,
+                    cpu_param=pinned.make_cpu_param(),
+                )
+            )
         return param_bindings
 
     def _collect_buffer_bindings(
@@ -404,7 +410,7 @@ class PinnedWeights:
     def _move_to_pinned(self) -> None:
         for param_binding in self._param_bindings:
             for slot in param_binding.unique_slots:
-                slot.set(param_binding.pinned.cpu_param)
+                slot.set(param_binding.cpu_param)
         if self._include_buffers:
             for buffer_binding in self._buffer_bindings:
                 for slot in buffer_binding.unique_slots:

@@ -69,8 +69,8 @@ from .tensor_adapters import select_adapter
 logger = logging.getLogger(__name__)
 
 
-def _repoint_data_to_pinned(
-    param: nn.Parameter, pinned: PinnedParam
+def _repoint_data_to_cpu_param(
+    param: nn.Parameter, cpu_param: nn.Parameter
 ) -> None:
     """ExitStack callback used by :meth:`StreamedWeights.optimizer_step`.
 
@@ -79,7 +79,7 @@ def _repoint_data_to_pinned(
     on enter. Defined at module scope so the closure registered with
     ``ExitStack.callback`` doesn't capture a streamer reference.
     """
-    set_param_data(param, pinned.cpu_param.data)
+    set_param_data(param, cpu_param.data)
 
 
 def _release_cuda_cache_on_drop(is_cuda: bool) -> None:
@@ -372,7 +372,13 @@ class _BlockPinnedStore:
                             f"Trainable streaming slot {primary_slot.name!r} "
                             f"cannot be streamed: {exc}"
                         ) from exc
-                block_param_bindings.append(PinnedParamBinding(pinned, slots))
+                block_param_bindings.append(
+                    PinnedParamBinding(
+                        pinned=pinned,
+                        slots=slots,
+                        cpu_param=pinned.make_cpu_param(),
+                    )
+                )
             self._param_bindings.append(block_param_bindings)
 
         for block_buffer_slots in buffer_slots:
@@ -396,10 +402,10 @@ class _BlockPinnedStore:
         return self._slot_filter
 
     def apply_slot_mutations(self) -> None:
-        """Install the pinned cpu_params + buffer clones into the
+        """Install the binding CPU params + buffer clones into the
         model's slots. Idempotent.
 
-        Frozen params: ``submod._parameters[leaf] = pinned.cpu_param``
+        Frozen params: ``submod._parameters[leaf] = binding.cpu_param``
         replaces the slot Parameter with a fresh
         ``Parameter(requires_grad=False)`` wrapping the pinned host
         clone. This orphans the user's pre-pin Parameter — fine for
@@ -422,7 +428,7 @@ class _BlockPinnedStore:
                 # _parameters[leaf] swap (rather than .data) is required
                 # for quanto correctness — see PinnedWeights for details.
                 for slot in param_binding.unique_slots:
-                    slot.set(param_binding.pinned.cpu_param)
+                    slot.set(param_binding.cpu_param)
         for buffer_records in self._buffer_records:
             for _slot, mod_buf, cpu_clone in buffer_records:
                 set_tensor_data(mod_buf, cpu_clone)
@@ -547,19 +553,19 @@ class _BlockPinnedStore:
         forms and release the pool slot. Used for teardown so the
         model can be safely accessed without the streamer.
 
-        Frozen: ``submod._parameters[leaf] = pinned.cpu_param``.
-        Trainable: ``submod._parameters[leaf].data = pinned.cpu_param.data``
+        Frozen: ``submod._parameters[leaf] = binding.cpu_param``.
+        Trainable: ``submod._parameters[leaf].data = binding.cpu_param.data``
         (preserve the user's Parameter object).
         """
         for param_binding in self._param_bindings[idx]:
             if param_binding.pinned.requires_grad:
                 for param_slot in param_binding.unique_slots:
                     set_param_data(
-                        param_slot.get(), param_binding.pinned.cpu_param.data
+                        param_slot.get(), param_binding.cpu_param.data
                     )
             else:
                 for param_slot in param_binding.unique_slots:
-                    param_slot.set(param_binding.pinned.cpu_param)
+                    param_slot.set(param_binding.cpu_param)
         for _buffer_slot, mod_buf, cpu_clone in self._buffer_records[idx]:
             set_tensor_data(mod_buf, cpu_clone)
         if self._pool is not None:
@@ -599,7 +605,7 @@ class _BlockPinnedStore:
         CPU grads back to GPU before accumulation, and on deactivate
         to honor the documented "model on CPU" contract.
         """
-        for _pinned, parent, leaf in self.iter_trainables():
+        for _binding, parent, leaf in self.iter_trainables():
             param = get_param_slot(parent, leaf)
             if param.grad is not None and param.grad.device != device:
                 moved = param.grad.to(device)
@@ -621,8 +627,8 @@ class _BlockPinnedStore:
 
     def iter_trainables(
         self,
-    ) -> "Iterator[tuple[PinnedParam, nn.Module, str]]":
-        """Yield ``(pinned, parent, leaf)`` for every trainable pinned param
+    ) -> "Iterator[tuple[PinnedParamBinding, nn.Module, str]]":
+        """Yield ``(binding, parent, leaf)`` for every trainable pinned param
         across all blocks. Used by ``StreamedWeights.optimizer_step``
         to walk all trainables when bringing them to GPU around the
         optimizer-step boundary."""
@@ -630,7 +636,7 @@ class _BlockPinnedStore:
             for param_binding in block_param_bindings:
                 if param_binding.pinned.requires_grad:
                     slot = param_binding.unique_slots[0]
-                    yield param_binding.pinned, slot.parent, slot.leaf
+                    yield param_binding, slot.parent, slot.leaf
 
     def has_trainables(self) -> bool:
         """True if any block contains a trainable param. Used by the
@@ -1126,24 +1132,26 @@ class StreamedWeights:
         try:
             with contextlib.ExitStack() as stack:
                 # Each materialization registers a rollback that repoints
-                # the user's Parameter's .data back at its pinned
-                # cpu_param. ExitStack unwinds these on the way out
+                # the user's Parameter's .data back at its binding-owned
+                # CPU param. ExitStack unwinds these on the way out
                 # whether enter failed mid-loop (no scatter), the body
                 # exited cleanly (scatter, then rollback), or the body
                 # raised after yield (still scatter, then rollback) —
                 # the rollback is idempotent w.r.t. a successful copy.
-                materialized: list[tuple[nn.Parameter, PinnedParam]] = []
+                materialized: list[tuple[nn.Parameter, PinnedParamBinding]] = []
                 with torch.cuda.stream(step_stream):
-                    for pinned, parent, leaf in self._store.iter_trainables():
+                    for binding, parent, leaf in self._store.iter_trainables():
                         param = get_param_slot(parent, leaf)
                         set_param_data(
                             param,
-                            pinned.cpu_param.data.to(target, non_blocking=True),
+                            binding.cpu_param.data.to(target, non_blocking=True),
                         )
                         if param.grad is not None and param.grad.device != target:
                             param.grad = param.grad.to(target, non_blocking=True)
-                        materialized.append((param, pinned))
-                        stack.callback(_repoint_data_to_pinned, param, pinned)
+                        materialized.append((param, binding))
+                        stack.callback(
+                            _repoint_data_to_cpu_param, param, binding.cpu_param
+                        )
                 # User's current stream now waits for step_stream's
                 # H2D. After this point the optimizer can safely read
                 # param.data on its own stream.
@@ -1160,14 +1168,14 @@ class StreamedWeights:
                     # reads stable bytes.
                     step_stream.wait_stream(torch.cuda.current_stream(target))
                     with torch.cuda.stream(step_stream):
-                        for param, pinned in materialized:
-                            pinned.cpu_param.data.copy_(
+                        for param, binding in materialized:
+                            binding.cpu_param.data.copy_(
                                 param.data, non_blocking=False,
                             )
                     step_stream.synchronize()
                     # ExitStack unwinds on `with` exit: each materialized
-                    # param's .data is repointed at its pinned
-                    # cpu_param.data, releasing the optimizer-step GPU
+                    # param's .data is repointed at its binding-owned
+                    # CPU param data, releasing the optimizer-step GPU
                     # allocation.
         finally:
             self._optimizer_step_active = False
@@ -1347,7 +1355,7 @@ class StreamedWeights:
                 # Strategy was dropped without deactivate. Hook is
                 # orphaned — no-op. Forward through this block uses
                 # whatever the slot currently holds: GPU param if it
-                # was resident at drop-time, pinned cpu_param if it
+                # was resident at drop-time, binding cpu_param if it
                 # had been evicted. Both are functional (CPU forward
                 # is slower but works on pinned tensors).
                 return

@@ -84,11 +84,13 @@ class PinnedParam:
 
     Construction picks an adapter via :func:`select_adapter` based on
     the parameter's tensor type, then uses the adapter to clone-and-pin
-    the bytes and build the deactivated-state :class:`nn.Parameter`
-    (:attr:`cpu_param`).
+    the bytes. Model-bound callers create their own
+    deactivated-state :class:`nn.Parameter` wrappers with
+    :meth:`make_cpu_param`.
 
-    The lifecycle methods (:meth:`allocate_gpu_storage`,
-    :meth:`make_gpu_param`, :meth:`copy_to_gpu`, :meth:`load_to_gpu`)
+    The lifecycle methods (:meth:`make_cpu_param`,
+    :meth:`allocate_gpu_storage`, :meth:`make_gpu_param`,
+    :meth:`copy_to_gpu`, :meth:`load_to_gpu`)
     all dispatch through the adapter. Consumers work with the opaque
     :class:`GpuState` returned by :meth:`allocate_gpu_storage`; the
     pinned parameter round-trips that opaque handle through subsequent
@@ -96,7 +98,7 @@ class PinnedParam:
 
     The pinned parameter captures the source parameter's ``requires_grad`` at
     construction time and threads it through to the adapter when
-    building :attr:`cpu_param` and the pool's ``gpu_param``. Frozen
+    building CPU and GPU parameter wrappers. Frozen
     callers (:class:`PinnedWeights`, ``_BlockPinnedStore`` for
     ``requires_grad=False`` slots) get the historic behavior. Trainable
     callers can either request the wrapper preserve ``requires_grad``
@@ -115,19 +117,13 @@ class PinnedParam:
     state.
     """
 
-    __slots__ = (
-        "adapter", "cpu_param", "name", "pinned_state",
-        "requires_grad",
-    )
+    __slots__ = ("adapter", "name", "pinned_state", "requires_grad")
 
     def __init__(self, name: str, param: nn.Parameter) -> None:
         self.name = name
         self.adapter: TensorAdapter[Any, Any] = select_adapter(param.data)
         self.requires_grad: bool = param.requires_grad
         self.pinned_state = self.adapter.clone_pin(param.data)
-        self.cpu_param: nn.Parameter = self.adapter.cpu_param(
-            self.pinned_state, requires_grad=self.requires_grad,
-        )
         # Low-peak construction optimization: release the original
         # pageable storage by repointing the source Parameter at the
         # pinned clone immediately. This is an intentional mutation of
@@ -136,7 +132,18 @@ class PinnedParam:
         # Only safe for plain tensors; subclass wrappers can lose
         # metadata or ignore .data assignment.
         if type(param.data) is torch.Tensor:
-            set_param_data(param, self.cpu_param.data)
+            set_param_data(param, self.make_cpu_param().data)
+
+    def make_cpu_param(self) -> nn.Parameter:
+        """Build a CPU :class:`nn.Parameter` wrapper over this pinned state.
+
+        Each model-bound binding owns its own wrapper object, while the
+        underlying pinned storage remains shared through this
+        :class:`PinnedParam`.
+        """
+        return self.adapter.cpu_param(
+            self.pinned_state, requires_grad=self.requires_grad,
+        )
 
     def allocate_gpu_storage(self, device: torch.device) -> object:
         """Allocate empty GPU storage mirroring this pinned parameter's layout.
@@ -193,7 +200,7 @@ class PinnedParam:
     @property
     def compute_dtype(self) -> torch.dtype:
         """Logical compute dtype reported by this pinned parameter's adapter."""
-        return self.adapter.compute_dtype(self.cpu_param.data)
+        return self.adapter.compute_dtype(self.make_cpu_param().data)
 
     def validate_parameter_data_swap_target(self) -> None:
         """Raise if this pinned parameter cannot be trainable-streamed via ``.data``."""
@@ -206,7 +213,9 @@ class PinnedParam:
                 "adapter weights are plain tensors."
             )
         try:
-            self.adapter.validate_parameter_data_swap_target(self.cpu_param.data)
+            self.adapter.validate_parameter_data_swap_target(
+                self.make_cpu_param().data
+            )
         except NotImplementedError as exc:
             raise NotImplementedError(
                 f"Trainable streaming cannot use Parameter.data swap: {exc}"
