@@ -63,9 +63,9 @@ def storage_key(t: torch.Tensor) -> tuple[Any, ...]:
     """Identity key for tied-weight detection.
 
     Two tensors that produce the same key represent the same logical
-    tensor backed by the same storage region with the same view layout
-    and (for quanto) the same quant metadata; they can be deduplicated
-    into a single :class:`PinnedParam`.
+    tensor backed by the same device/storage region with the same view
+    layout and (for quanto) the same quant metadata; they can be
+    deduplicated into a single :class:`PinnedParam`.
 
     Used by :class:`~torch_offload.PinnedWeights` (for handle-level
     dedup of tied frozen params) and
@@ -107,9 +107,10 @@ class PinnedParam:
 
     Low-peak construction behavior: for plain ``torch.Tensor`` parameters,
     construction immediately repoints the source ``Parameter.data`` at the
-    pinned clone. This releases the original pageable CPU storage before the
+    pinned clone. This releases the original source storage before the
     owning strategy finishes constructing every pinned parameter, avoiding a temporary
-    2x host-memory peak for large models. It also means construction is not
+    2x peak for large CPU-resident models and promptly freeing GPU storage
+    for CUDA-origin models. It also means construction is not
     rollback-safe after pinning has started: if a later pinned parameter fails
     to pin, recovery of the partially constructed strategy/model is unsupported.
     Drop those references and rebuild from a fresh model instance. Tensor
@@ -124,8 +125,8 @@ class PinnedParam:
         self.adapter: TensorAdapter[Any, Any] = select_adapter(param.data)
         self.requires_grad: bool = param.requires_grad
         self.pinned_state = self.adapter.clone_pin(param.data)
-        # Low-peak construction optimization: release the original
-        # pageable storage by repointing the source Parameter at the
+        # Low-peak construction optimization: release the original source
+        # storage by repointing the source Parameter at the
         # pinned clone immediately. This is an intentional mutation of
         # the caller's model before the owning strategy has finished
         # construction; see the class docstring for failure semantics.

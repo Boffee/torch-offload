@@ -34,7 +34,7 @@ from typing import Any, cast
 import torch
 from torch import nn
 
-from .tensor_adapters import register_adapter
+from .tensor_adapters import clone_to_pinned_cpu, register_adapter
 
 _DEQUANT_SHAPE: Any = None
 _DEQUANTIZE: Any = None
@@ -179,6 +179,7 @@ class GgufAdapter:
         raw = weight.as_subclass(torch.Tensor)
         return (
             "gguf",
+            raw.device,
             raw.untyped_storage().data_ptr(),
             raw.storage_offset(),
             tuple(raw.shape),
@@ -202,11 +203,10 @@ class GgufAdapter:
     def clone_pin(t: torch.Tensor) -> _GgufPinned:
         weight = _require_gguf_weight(t)
         raw = weight.as_subclass(torch.Tensor)
-        if raw.is_cuda:
-            pinned = torch.empty_like(raw, device="cpu").pin_memory()
-            pinned.copy_(raw)
-        else:
-            pinned = raw.contiguous().clone().pin_memory()
+        pinned = clone_to_pinned_cpu(
+            raw,
+            memory_format=torch.contiguous_format,
+        )
         qt = weight.quant_type
         if _DEQUANT_SHAPE is None:
             raise RuntimeError("gguf is required to compute GGUF dequantized shapes")

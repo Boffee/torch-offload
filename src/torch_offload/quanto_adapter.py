@@ -42,7 +42,7 @@ from ._quanto import (
     require_qbytes_tensor,
     validate_layout,
 )
-from .tensor_adapters import register_adapter
+from .tensor_adapters import clone_to_pinned_cpu, register_adapter
 
 
 @dataclass(slots=True)
@@ -107,11 +107,13 @@ class QuantoAdapter:
         qt = require_qbytes_tensor(t)
         return (
             "quanto",
+            qt._data.device,
             qt._data.data_ptr(),
             qt._data.dtype,
             tuple(qt._data.shape),
             qt._data.stride(),
             qt._data.storage_offset(),
+            qt._scale.device,
             qt._scale.data_ptr(),
             qt._scale.dtype,
             tuple(qt._scale.shape),
@@ -148,8 +150,14 @@ class QuantoAdapter:
         # stride is captured separately and reapplied via
         # WeightQBytesTensor.create on the GPU side.
         return _QuantoPinned(
-            data=qt._data.clone(memory_format=torch.contiguous_format).pin_memory(),
-            scale=qt._scale.clone(memory_format=torch.contiguous_format).pin_memory(),
+            data=clone_to_pinned_cpu(
+                qt._data,
+                memory_format=torch.contiguous_format,
+            ),
+            scale=clone_to_pinned_cpu(
+                qt._scale,
+                memory_format=torch.contiguous_format,
+            ),
             qtype=qt.qtype,
             axis=qt.axis,
             size=qt.size(),

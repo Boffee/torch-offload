@@ -73,4 +73,7 @@ class TestAdapter:
         assert not GgufAdapter.matches(w.float())
 
     def test_storage_key_deterministic(self, w: GGUFWeight) -> None:
-        assert GgufAdapter.storage_key(w) == GgufAdapter.storage_key(w)
+        key = GgufAdapter.storage_key(w)
+
+        assert key[1] == w.as_subclass(torch.Tensor).device
+        assert key == GgufAdapter.storage_key(w)

@@ -167,8 +167,8 @@ class PinnedWeights:
     Parameters
     ----------
     model:
-        The model to cache. Auto-moved to CPU at construction so
-        ``pin_memory()`` succeeds.
+        The model to cache. Managed slots may start on CPU or CUDA;
+        construction clones them directly into pinned CPU storage.
     include_buffers:
         Also cache registered buffers (LayerNorm running stats, position
         embeddings stored as buffers, etc.). Default True. Set False
@@ -199,11 +199,6 @@ class PinnedWeights:
         self._skip_slots: set[SlotKey] = skip_slots or set()
         self._active_device: torch.device | None = None
         self._post_copy_hooks: dict[int, PostCopyHook] = {}
-
-        # Auto-move to CPU so pin_memory() succeeds. Matches the
-        # behavior of ModelOffloader — caller doesn't need to
-        # remember the build-time device dance.
-        model.to("cpu")
 
         # Phase 1: collect the model slots to manage without pinning or
         # slot mutation. This keeps skip/empty validation separate from

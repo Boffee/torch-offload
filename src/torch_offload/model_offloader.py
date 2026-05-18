@@ -148,7 +148,9 @@ class ModelOffloader:
     Parameters
     ----------
     model:
-        The model containing the block list(s). Must be on CPU.
+        The model containing the block list(s). Managed slots may start
+        on CPU or CUDA; construction clones them directly into pinned
+        CPU storage before activation.
     layers_attr:
         Dotted attribute path(s) to ``nn.ModuleList`` block list(s).
         Single string or sequence. For PEFT-wrapped models, include
@@ -229,7 +231,6 @@ class ModelOffloader:
         detect_streaming_region_ties(
             model, block_groups, stream_trainables=stream_trainable_weights,
         )
-        model.to("cpu")
 
         trainable_slots: set[SlotKey] = {
             s.key for s in iter_param_slots(model) if s.get().requires_grad
@@ -287,11 +288,11 @@ class ModelOffloader:
         if non_block is not None:
             components.append(non_block)
         if stream_trainable_weights:
-            components.append(
-                TrainableWeights(model, skip_slots=streamer_slots),
-            )
+            trainable_weights = TrainableWeights(model, skip_slots=streamer_slots)
         else:
-            components.append(TrainableWeights(model))
+            trainable_weights = TrainableWeights(model)
+        trainable_weights.deactivate()
+        components.append(trainable_weights)
         components.extend(streamers)
 
         self._model = model
@@ -961,12 +962,6 @@ def detect_streaming_region_ties(  # noqa: PLR0912
       aliases are safe because a single ``.data`` swap reaches every
       alias slot; frozen aliases and distinct-Parameter trainable
       aliases are rejected.
-    - **Unsupported intra-block buffer ties** (two distinct buffer slots in
-      the same block sharing storage). Buffer slot replacement can preserve
-      those aliases after slot collection, but construction still normalizes
-      blocks to CPU before pinning; PyTorch's per-slot buffer conversion can
-      split aliases before the streamer sees them.
-
     Non-block-internal all-frozen ties (the standard ``tie_weights()``
     embed<->head pattern) are handled correctly by
     :class:`PinnedWeights`'s storage-key dedup and are NOT rejected
@@ -1069,7 +1064,7 @@ def detect_streaming_region_ties(  # noqa: PLR0912
                     (id(s.parent), s.leaf), set()
                 ).add(f"block:{group_idx}:{block_idx}")
 
-    buffer_groups: dict[tuple, list[tuple[str, str, int, str]]] = {}
+    buffer_groups: dict[tuple, list[tuple[str, str]]] = {}
     for s in iter_buffer_slots(model):
         buffer = s.get()
         if buffer.numel() == 0:
@@ -1077,12 +1072,12 @@ def detect_streaming_region_ties(  # noqa: PLR0912
         regions = block_buffer_slot_regions.get((id(s.parent), s.leaf), {"non_block"})
         for region in regions:
             buffer_groups.setdefault(storage_key(buffer), []).append(
-                (region, s.name, id(s.parent), s.leaf)
+                (region, s.name)
             )
 
     for members in buffer_groups.values():
-        regions = {region for region, _, _, _ in members}
-        names = sorted({name for _, name, _, _ in members})
+        regions = {region for region, _ in members}
+        names = sorted({name for _, name in members})
         if len(regions) > 1:
             raise ValueError(
                 f"Block streaming does not support tied buffers across "
@@ -1092,15 +1087,3 @@ def detect_streaming_region_ties(  # noqa: PLR0912
                 "Untie the buffers or use whole-model PinnedWeights "
                 "instead."
             )
-        sole_region = next(iter(regions))
-        if sole_region.startswith("block:"):
-            slot_locs = {(parent_id, leaf) for _, _, parent_id, leaf in members}
-            if len(slot_locs) > 1:
-                raise ValueError(
-                    f"Block streaming does not support intra-block tied "
-                    f"buffers: storage shared by {names} within "
-                    f"{sole_region}. Construction still normalizes block "
-                    "buffers to CPU before alias-aware pinning, so PyTorch "
-                    "may split the alias before StreamedWeights can bind it. "
-                    "Untie the buffers or use whole-model PinnedWeights."
-                )

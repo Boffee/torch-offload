@@ -88,6 +88,9 @@ class TestNvfp4Adapter:
         qt = _make_nvfp4()
         key = storage_key(qt)
         assert key[0] == "torchao-nvfp4"
+        assert key[1][0] == qt.qdata.device
+        assert key[2][0] == qt.scale.device
+        assert key[3][0] == qt.per_tensor_scale.device
         assert key == storage_key(qt)
 
     def test_layout_signature_ignores_storage_identity(self) -> None:

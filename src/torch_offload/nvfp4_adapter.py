@@ -28,7 +28,7 @@ from ._torchao_nvfp4 import (
     require_nvfp4_tensor,
     validate_layout,
 )
-from .tensor_adapters import register_adapter
+from .tensor_adapters import clone_to_pinned_cpu, register_adapter
 
 
 @dataclass(slots=True)
@@ -59,7 +59,7 @@ class _Nvfp4Gpu:
 def _clone_pin(t: torch.Tensor) -> torch.Tensor:
     # Preserve qdata/scale strides: TorchAO uses qdata stride ordering to
     # represent transposed NVFP4 tensors.
-    return t.clone().pin_memory()
+    return clone_to_pinned_cpu(t)
 
 
 def _empty_like_strided(t: torch.Tensor, device: torch.device) -> torch.Tensor:
@@ -75,6 +75,7 @@ def _tensor_storage_key(t: torch.Tensor | None) -> tuple[object, ...] | None:
     if t is None:
         return None
     return (
+        t.device,
         t.data_ptr(),
         t.dtype,
         tuple(t.shape),

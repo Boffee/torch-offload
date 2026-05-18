@@ -10,6 +10,7 @@ from torch import nn
 
 from .pinned_param import PinnedParam
 from .slots import BufferSlot, ParamSlot, unique_slots
+from .tensor_adapters import clone_to_pinned_cpu
 
 
 @dataclass(slots=True)
@@ -66,12 +67,9 @@ def pin_buffer_slots(slots: Sequence[BufferSlot]) -> PinnedBufferBinding:
     slot_list = list(slots)
     if not slot_list:
         raise ValueError("pin_buffer_slots requires at least one BufferSlot")
-    pinned = (
-        slot_list[0]
-        .get()
-        .detach()
-        .clone(memory_format=torch.contiguous_format)
-        .pin_memory()
+    pinned = clone_to_pinned_cpu(
+        slot_list[0].get(),
+        memory_format=torch.contiguous_format,
     )
     return PinnedBufferBinding(pinned=pinned, slots=slot_list)
 

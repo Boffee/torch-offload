@@ -47,8 +47,10 @@ construction has already materialized the model on MPS, so
 Pinned construction intentionally optimizes peak host memory. For plain
 ``torch.Tensor`` parameters, pinning clones into pinned CPU storage and
 may immediately repoint the source ``Parameter.data`` at that pinned
-clone so the original pageable storage can be freed before all buffers
-finish pinning. If construction raises after pinning has started,
+clone so the original source storage can be freed before all buffers
+finish pinning. This avoids a temporary 2x host-memory peak for
+CPU-origin models and promptly frees GPU storage for CUDA-origin models.
+If construction raises after pinning has started,
 recovery of the partially constructed strategy/model is unsupported;
 drop those references and rebuild from a fresh model instance.
 

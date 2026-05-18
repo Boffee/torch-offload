@@ -1252,7 +1252,7 @@ class TestCrossRegionTiedDetection:
                 layers_attr="transformer_blocks", blocks_to_swap=1,
             )
 
-    def test_intra_block_tied_buffers_raises(self) -> None:
+    def test_intra_block_tied_buffers_are_preserved(self) -> None:
         class TiedBufBlock(nn.Module):
             def __init__(self):
                 super().__init__()
@@ -1273,13 +1273,18 @@ class TestCrossRegionTiedDetection:
         m = M()
         for p in m.parameters():
             p.requires_grad = False
-        with pytest.raises(ValueError, match="intra-block tied buffers"):
-            ModelOffloader(
-                m,
-                layers_attr="transformer_blocks", blocks_to_swap=1,
-            )
+        strategy = ModelOffloader(
+            m,
+            layers_attr="transformer_blocks", blocks_to_swap=1,
+        )
+        try:
+            for block in m.transformer_blocks:
+                assert block.buf_a is block.buf_b
+                assert block.buf_a.is_pinned()
+        finally:
+            strategy.deactivate()
 
-    def test_intra_block_same_buffer_object_raises(self) -> None:
+    def test_intra_block_same_buffer_object_is_preserved(self) -> None:
         class TiedBufBlock(nn.Module):
             def __init__(self):
                 super().__init__()
@@ -1298,11 +1303,16 @@ class TestCrossRegionTiedDetection:
         m = M()
         for p in m.parameters():
             p.requires_grad = False
-        with pytest.raises(ValueError, match="intra-block tied buffers"):
-            ModelOffloader(
-                m,
-                layers_attr="transformer_blocks", blocks_to_swap=1,
-            )
+        strategy = ModelOffloader(
+            m,
+            layers_attr="transformer_blocks", blocks_to_swap=1,
+        )
+        try:
+            for block in m.transformer_blocks:
+                assert block.buf_a is block.buf_b
+                assert block.buf_a.is_pinned()
+        finally:
+            strategy.deactivate()
 
     def test_non_block_internal_tied_works(self) -> None:
         # Tied embed↔head WITHIN non-block region: PinnedWeights handles
@@ -1414,6 +1424,32 @@ class TestDirectParentStateHandled:
 
 
 class TestBlockBuffersPinned:
+    @staticmethod
+    def _make_tied_buffer_model(
+        num_blocks: int = 2,
+        *,
+        device: torch.device | str = "cpu",
+    ) -> nn.Module:
+        class TiedBufferBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                shared = torch.randn(8, device=device)
+                self.register_buffer("buf_a", shared.view(8))
+                self.register_buffer("buf_b", shared.view(8))
+                self.weight = nn.Parameter(
+                    torch.randn(2, device=device),
+                    requires_grad=False,
+                )
+
+        class M(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.transformer_blocks = nn.ModuleList(
+                    TiedBufferBlock() for _ in range(num_blocks)
+                )
+
+        return M()
+
     def test_block_buffer_clone_is_pinned(self) -> None:
         class BlockWithBuffer(nn.Module):
             def __init__(self):
@@ -1441,6 +1477,62 @@ class TestBlockBuffersPinned:
                     "block buffer must be pinned for honest cache_bytes "
                     "and to avoid silently-synchronous H2D copies"
                 )
+        finally:
+            strategy.deactivate()
+
+    def test_constructor_does_not_call_module_to(self) -> None:
+        class Block(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = nn.Parameter(torch.randn(2), requires_grad=False)
+                self.register_buffer("table", torch.randn(2))
+
+            def to(self, *args, **kwargs):
+                raise AssertionError("constructor must pin slots directly")
+
+        class M(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.transformer_blocks = nn.ModuleList([Block(), Block()])
+
+            def to(self, *args, **kwargs):
+                raise AssertionError("constructor must pin slots directly")
+
+        m = M()
+        strategy = ModelOffloader(
+            m,
+            layers_attr="transformer_blocks",
+            blocks_to_swap=1,
+        )
+        try:
+            for block in m.transformer_blocks:
+                assert block.weight.is_pinned()
+                assert block.table.is_pinned()
+        finally:
+            strategy.deactivate()
+
+    @CUDA
+    def test_cuda_origin_tied_block_buffers_stay_tied(self) -> None:
+        m = self._make_tied_buffer_model(device="cuda")
+        strategy = ModelOffloader(
+            m,
+            layers_attr="transformer_blocks",
+            blocks_to_swap=1,
+        )
+        try:
+            for block in m.transformer_blocks:
+                assert block.buf_a is block.buf_b
+                assert block.buf_a.is_pinned()
+
+            strategy.activate("cuda")
+            resident = m.transformer_blocks[0]
+            assert resident.buf_a is resident.buf_b
+            assert resident.buf_a.is_cuda
+
+            strategy.deactivate()
+            for block in m.transformer_blocks:
+                assert block.buf_a is block.buf_b
+                assert block.buf_a.is_pinned()
         finally:
             strategy.deactivate()
 
@@ -2036,6 +2128,38 @@ class TestMixedGradTieDetection:
         assert m.transformer_blocks[0]._parameters["a"] is shared_0
         assert m.transformer_blocks[0]._parameters["b"] is shared_0
         del strategy
+
+    @CUDA
+    def test_streamed_trainable_constructor_moves_existing_grads_to_cpu(self) -> None:
+        class TrainableBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = nn.Parameter(torch.randn(4, 4, device="cuda"))
+                self.weight.grad = torch.randn_like(self.weight)
+                self.gradient_checkpointing = True
+
+        class M(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.transformer_blocks = nn.ModuleList(
+                    [TrainableBlock(), TrainableBlock()]
+                )
+
+        m = M()
+        strategy = ModelOffloader(
+            m,
+            layers_attr="transformer_blocks",
+            blocks_to_swap=1,
+            stream_trainable_weights=True,
+        )
+        try:
+            for block in m.transformer_blocks:
+                assert block.weight.device.type == "cpu"
+                assert block.weight.is_pinned()
+                assert block.weight.grad is not None
+                assert block.weight.grad.device.type == "cpu"
+        finally:
+            strategy.deactivate()
 
     def test_mixed_grad_cross_region_reports_grad_cause(self) -> None:
         # When a tie is BOTH cross-region AND mixed-grad, the user

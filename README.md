@@ -476,11 +476,12 @@ re-activation).
 Construction optimizes peak host memory. Pinning clones managed tensors
 into pinned CPU storage. For plain `torch.Tensor` parameters, the source
 `Parameter.data` may be immediately repointed at the pinned clone as soon
-as that pinned parameter is created. This releases the original pageable CPU
-storage early and avoids temporarily holding both pageable and pinned
-copies of large weights. It is a clone-to-pinned plus storage swap, not
-true in-place pinning. Tensor subclasses such as quanto, GGUF, and NVFP4
-do not use this `.data` swap when it would lose wrapper state.
+as that pinned parameter is created. This releases the original source
+storage early, avoiding temporarily holding both pageable and pinned
+copies for CPU-origin models and promptly freeing GPU storage for
+CUDA-origin models. It is a clone-to-pinned plus storage swap, not true
+in-place pinning. Tensor subclasses such as quanto, GGUF, and NVFP4 do
+not use this `.data` swap when it would lose wrapper state.
 
 **There is no `close()`.** To release pinned host memory, drop the
 strategy reference (and the model reference if you don't need it

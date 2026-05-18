@@ -373,15 +373,14 @@ class _BlockPinnedStore:
        at the pinned objects. After this point the store owns slot
        state and :meth:`evict_block` is needed to restore CPU params.
 
-    Scope of the pre-pin validation guarantee: callers
-    (``StreamedWeights.__init__`` and ``ModelOffloader.__init__``) move
-    the model to CPU *before* invoking this constructor — that placement
-    change is not undone by the validator. Once phase 2 starts, pinning
-    uses the low-peak ``Parameter.data`` repointing described above. A
-    pin-time failure after that point can leave the model partially
-    repointed to pinned storage; recovery of the partially constructed
-    strategy/model is unsupported. Drop those references and rebuild from
-    a fresh model instance.
+    Scope of the pre-pin validation guarantee: phase 1 inspects the
+    model's current slots before any pinning or device normalization, so
+    alias grouping sees the live module graph. Once phase 2 starts,
+    pinning uses the low-peak ``Parameter.data`` repointing described
+    above. A pin-time failure after that point can leave the model
+    partially repointed to pinned storage; recovery of the partially
+    constructed strategy/model is unsupported. Drop those references and
+    rebuild from a fresh model instance.
     """
 
     def __init__(
@@ -846,15 +845,15 @@ class StreamedWeights:
         # Pin in __init__ — uniform lifecycle with PinnedWeights, and
         # ModelCache integration sees a final `cache_bytes` immediately.
         # _BlockPinnedStore validates that every block shares the same
-        # param-layout signature; mismatched configs raise here, before
-        # any model slot is mutated. Heterogeneous block lists split
-        # across separate `layers_attr=[...]` entries in ModelOffloader.
-        for block in self._blocks:
-            block.to("cpu")
+        # param-layout signature before any model slot is mutated, then
+        # clones directly from the source device into pinned CPU storage.
+        # Heterogeneous block lists split across separate `layers_attr=[...]`
+        # entries in ModelOffloader.
         store = _BlockPinnedStore(
             self._blocks, skip_slots=skip_slots,
         )
         store.apply_slot_mutations()
+        store.move_trainable_grads_to(torch.device("cpu"))
         self._store: _BlockPinnedStore | None = store
 
         # Active resources allocated on CUDA activate().

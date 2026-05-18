@@ -6,7 +6,7 @@ import pytest
 import torch
 from torch import nn
 
-from torch_offload.pinned_param import PinnedParam
+from torch_offload.pinned_param import PinnedParam, storage_key
 from torch_offload.tensor_adapters import (
     DequantRequantCopyIntoTensorAdapter,
     DequantRequantTensorAdapter,
@@ -28,6 +28,11 @@ class TestPinnedParam:
         second = select_adapter(torch.randn(2))
 
         assert first is second
+
+    def test_regular_storage_key_includes_device(self) -> None:
+        t = torch.randn(2, 3)
+
+        assert storage_key(t)[:2] == ("regular", t.device)
 
     def test_non_quanto_pin_and_load(self) -> None:
         p = nn.Parameter(torch.randn(8, 16, dtype=torch.bfloat16), requires_grad=False)
@@ -159,6 +164,21 @@ class TestPinnedParam:
 
 
 class TestPinnedParamQuanto:
+    def test_quanto_storage_key_includes_inner_devices(self) -> None:
+        quanto = pytest.importorskip("optimum.quanto")
+        from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
+
+        rows, cols = 4, 8
+        data = torch.randint(-32, 32, (rows, cols), dtype=torch.int8)
+        scale = torch.rand(rows, 1, dtype=torch.bfloat16).add_(0.25)
+        qt = WeightQBytesTensor.create(
+            quanto.qint8, 0, (rows, cols), (cols, 1), data, scale, None,
+        )
+
+        key = storage_key(qt)
+        assert key[1] == qt._data.device
+        assert key[7] == qt._scale.device
+
     def test_quanto_adapter_dequant_requant_capability(self) -> None:
         quanto = pytest.importorskip("optimum.quanto")
         from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor

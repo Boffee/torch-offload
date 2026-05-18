@@ -47,6 +47,7 @@ __all__ = [
     "TensorAdapter",
     "TensorCopyIntoAdapter",
     "adapter_name",
+    "clone_to_pinned_cpu",
     "register_adapter",
     "select_adapter",
 ]
@@ -90,8 +91,9 @@ class TensorAdapter(Protocol[PinnedStateT, GpuStateT]):
     def storage_key(t: torch.Tensor) -> tuple:
         """Composite identity key for tied-weight detection. Two tensors
         with the same key share storage and quant metadata; different
-        keys must not be deduped. Includes view layout (shape/stride/
-        offset) so distinct views into the same buffer don't collapse."""
+        keys must not be deduped. Includes device and view layout
+        (shape/stride/offset) so distinct devices or views into the
+        same buffer don't collapse."""
         ...
 
     @staticmethod
@@ -274,6 +276,33 @@ class DequantRequantCopyIntoTensorAdapter(
 # ---------------------------------------------------------------------------
 
 
+def clone_to_pinned_cpu(
+    t: torch.Tensor,
+    *,
+    memory_format: torch.memory_format = torch.preserve_format,
+) -> torch.Tensor:
+    """Clone ``t`` into pinned CPU memory from any source device."""
+    source = t.detach()
+    if source.device.type == "cpu":
+        return source.clone(memory_format=memory_format).pin_memory()
+
+    if memory_format == torch.preserve_format:
+        pinned = torch.empty_strided(
+            tuple(source.shape),
+            source.stride(),
+            dtype=source.dtype,
+            device="cpu",
+        ).pin_memory()
+    else:
+        pinned = torch.empty_like(
+            source,
+            device="cpu",
+            memory_format=memory_format,
+        ).pin_memory()
+    pinned.copy_(source)
+    return pinned
+
+
 @dataclass(slots=True)
 class _RegularPinned:
     """Pinned-CPU state for a regular tensor: one contiguous host buffer."""
@@ -320,6 +349,7 @@ class RegularAdapter:
     def storage_key(t: torch.Tensor) -> tuple:
         return (
             "regular",
+            t.device,
             t.data_ptr(),
             t.dtype,
             tuple(t.shape),
@@ -334,7 +364,10 @@ class RegularAdapter:
     @staticmethod
     def clone_pin(t: torch.Tensor) -> _RegularPinned:
         return _RegularPinned(
-            data=t.data.clone(memory_format=torch.contiguous_format).pin_memory()
+            data=clone_to_pinned_cpu(
+                t.data,
+                memory_format=torch.contiguous_format,
+            )
         )
 
     @staticmethod

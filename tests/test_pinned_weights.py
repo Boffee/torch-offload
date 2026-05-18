@@ -193,6 +193,22 @@ class TestConstruction:
         finally:
             pw.deactivate()
 
+    def test_constructor_does_not_call_module_to(self) -> None:
+        class Guarded(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = nn.Parameter(torch.randn(4), requires_grad=False)
+
+            def to(self, *args, **kwargs):
+                raise AssertionError("constructor must pin slots directly")
+
+        m = Guarded()
+        pw = PinnedWeights(m)
+        try:
+            assert m.weight.is_pinned()
+        finally:
+            pw.deactivate()
+
 
 # ---------------------------------------------------------------------------
 # Tied-weight dedup — the V1 model-agnostic claim
@@ -308,6 +324,21 @@ class TestTiedWeightDedup:
         finally:
             pw.deactivate()
 
+    @CUDA
+    def test_cuda_origin_tied_params_dedupe_before_cpu_pin(self) -> None:
+        shared = torch.randn(8, 16, dtype=torch.bfloat16, device="cuda")
+        m = nn.Module()
+        m.a = nn.Parameter(shared, requires_grad=False)
+        m.b = nn.Parameter(shared, requires_grad=False)
+
+        pw = PinnedWeights(m)
+        try:
+            assert len(pw.param_bindings) == 1
+            assert m._parameters["a"] is m._parameters["b"]
+            assert m.a.is_pinned()
+        finally:
+            pw.deactivate()
+
 
 # ---------------------------------------------------------------------------
 # Edge cases caught in review
@@ -396,6 +427,33 @@ class TestSharedSubmoduleAlias:
             buffer_binding = pw.buffer_bindings[0]
             assert m.a.buf is buffer_binding.pinned
             assert m.b.buf is buffer_binding.pinned
+        finally:
+            pw.deactivate()
+
+    @CUDA
+    def test_cuda_origin_aliased_buffer_dedupes_before_cpu_pin(self) -> None:
+        shared_buf = torch.randn(4, device="cuda")
+
+        class Inner(nn.Module):
+            def __init__(self, b):
+                super().__init__()
+                self.register_buffer("buf", b)
+                self.weight = nn.Parameter(
+                    torch.randn(2, device="cuda"),
+                    requires_grad=False,
+                )
+
+        m = nn.Module()
+        m.a = Inner(shared_buf)
+        m.b = Inner(shared_buf)
+
+        pw = PinnedWeights(m)
+        try:
+            assert len(pw.buffer_bindings) == 1
+            buffer_binding = pw.buffer_bindings[0]
+            assert m.a.buf is buffer_binding.pinned
+            assert m.b.buf is buffer_binding.pinned
+            assert m.a.buf.is_pinned()
         finally:
             pw.deactivate()
 
