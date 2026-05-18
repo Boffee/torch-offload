@@ -52,8 +52,18 @@ import torch
 from torch import nn
 
 from ._devices import canonical_device
-from .pinned_bindings import PinnedParamBinding, bind_param_slots
-from .pinned_param import PinnedParam, PostCopyHook, PostCopyHookHandle
+from .pinned_bindings import (
+    PinnedBufferBinding,
+    PinnedParamBinding,
+    bind_param_slots,
+    pin_buffer_slots,
+)
+from .pinned_param import (
+    PinnedParam,
+    PostCopyHook,
+    PostCopyHookHandle,
+    storage_key,
+)
 from .protocols import SlotKey
 from .slots import (
     BufferSlot,
@@ -209,6 +219,12 @@ def _layout_signature(p: nn.Parameter) -> tuple:
     return select_adapter(p.data).layout_signature(p.data)
 
 
+def _buffer_storage_key(buffer: torch.Tensor) -> tuple:
+    if buffer.numel() == 0:
+        return ("__empty_buf__", id(buffer))
+    return storage_key(buffer)
+
+
 def _check_block_layouts_match(
     block_param_slot_groups: list[list[list[ParamSlot]]],
 ) -> None:
@@ -245,11 +261,11 @@ def _collect_block_slot_groups(
     skip: set[SlotKey],
 ) -> tuple[
     list[list[list[ParamSlot]]],
-    list[list[BufferSlot]],
+    list[list[list[BufferSlot]]],
     frozenset[SlotKey],
 ]:
     param_slot_groups_per_block: list[list[list[ParamSlot]]] = []
-    buffer_slots_per_block: list[list[BufferSlot]] = []
+    buffer_slot_groups_per_block: list[list[list[BufferSlot]]] = []
     slot_filter: set[SlotKey] = set()
 
     for layer in layers:
@@ -271,20 +287,32 @@ def _collect_block_slot_groups(
             [block_slots_by_id[param_id] for param_id in block_param_order]
         )
 
-        block_buffer_slots: list[BufferSlot] = []
-        seen_buffer_ids: set[int] = set()
+        block_buffer_slots_by_key: dict[tuple, list[BufferSlot]] = {}
+        block_buffer_order: list[tuple] = []
         for s in iter_buffer_slots(layer):
             if s.key in skip:
                 continue
             slot_filter.add(s.key)
             buffer = s.get()
-            if id(buffer) in seen_buffer_ids:
-                continue
-            seen_buffer_ids.add(id(buffer))
-            block_buffer_slots.append(s)
-        buffer_slots_per_block.append(block_buffer_slots)
+            buffer_key = _buffer_storage_key(buffer)
+            slots = block_buffer_slots_by_key.get(buffer_key)
+            if slots is None:
+                slots = []
+                block_buffer_slots_by_key[buffer_key] = slots
+                block_buffer_order.append(buffer_key)
+            slots.append(s)
+        buffer_slot_groups_per_block.append(
+            [
+                block_buffer_slots_by_key[buffer_key]
+                for buffer_key in block_buffer_order
+            ]
+        )
 
-    return param_slot_groups_per_block, buffer_slots_per_block, frozenset(slot_filter)
+    return (
+        param_slot_groups_per_block,
+        buffer_slot_groups_per_block,
+        frozenset(slot_filter),
+    )
 
 
 def _pin_block_param_slot_groups(
@@ -314,22 +342,14 @@ def _pin_block_param_slot_groups(
     return block_bindings
 
 
-def _pin_block_buffer_records(
-    block_buffer_slots: list[list[BufferSlot]],
-) -> list[list[tuple[BufferSlot, torch.Tensor, torch.Tensor]]]:
-    """Pin collected block buffers into records used for .data swaps."""
-    block_records: list[list[tuple[BufferSlot, torch.Tensor, torch.Tensor]]] = []
-    for slots in block_buffer_slots:
-        buffer_records: list[tuple[BufferSlot, torch.Tensor, torch.Tensor]] = []
-        for slot in slots:
-            buffer = slot.get()
-            cpu_clone = (
-                buffer.data.clone(memory_format=torch.contiguous_format)
-                .pin_memory()
-            )
-            buffer_records.append((slot, buffer, cpu_clone))
-        block_records.append(buffer_records)
-    return block_records
+def _pin_block_buffer_slot_groups(
+    block_buffer_slot_groups: list[list[list[BufferSlot]]],
+) -> list[list[PinnedBufferBinding]]:
+    """Pin collected block buffer slots into per-block bindings."""
+    return [
+        [pin_buffer_slots(slots) for slots in buffer_slot_groups]
+        for buffer_slot_groups in block_buffer_slot_groups
+    ]
 
 
 class _BlockPinnedStore:
@@ -372,12 +392,7 @@ class _BlockPinnedStore:
     ) -> None:
         self._layers = list(layers)
         self._param_bindings: list[list[PinnedParamBinding]] = []
-        # Per-block list of (buffer_slot, buffer_obj, cpu_clone) pending
-        # installation. apply_slot_mutations() does the
-        # `buffer_obj.data = cpu_clone` swaps.
-        self._buffer_records: list[
-            list[tuple[BufferSlot, torch.Tensor, torch.Tensor]]
-        ] = []
+        self._buffer_bindings: list[list[PinnedBufferBinding]] = []
         self._slots_applied = False
         skip: set[SlotKey] = skip_slots or set()
 
@@ -387,7 +402,7 @@ class _BlockPinnedStore:
         # raise before any model mutation.
         (
             block_param_slot_groups,
-            block_buffer_slots,
+            block_buffer_slot_groups,
             self._slot_filter,
         ) = _collect_block_slot_groups(self._layers, skip)
 
@@ -403,7 +418,9 @@ class _BlockPinnedStore:
         self._param_bindings = _pin_block_param_slot_groups(
             block_param_slot_groups,
         )
-        self._buffer_records = _pin_block_buffer_records(block_buffer_slots)
+        self._buffer_bindings = _pin_block_buffer_slot_groups(
+            block_buffer_slot_groups,
+        )
 
         self._device: torch.device | None = None
         self._pool: _GpuSlotPool | None = None
@@ -418,7 +435,7 @@ class _BlockPinnedStore:
         return self._slot_filter
 
     def apply_slot_mutations(self) -> None:
-        """Install the binding CPU params + buffer clones into the
+        """Install the binding CPU params + buffer bindings into the
         model's slots. Idempotent.
 
         Frozen params: ``submod._parameters[leaf] = binding.cpu_param``
@@ -433,6 +450,8 @@ class _BlockPinnedStore:
         Parameter's ``.data`` at the pinned clone (plain-tensor
         memory optimization), so the original storage is released
         without slot mutation.
+
+        Buffers use slot replacement, matching :class:`PinnedWeights`.
         """
         if self._slots_applied:
             return
@@ -445,9 +464,10 @@ class _BlockPinnedStore:
                 # for quanto correctness — see PinnedWeights for details.
                 for slot in param_binding.unique_slots:
                     slot.set(param_binding.cpu_param)
-        for buffer_records in self._buffer_records:
-            for _slot, mod_buf, cpu_clone in buffer_records:
-                set_tensor_data(mod_buf, cpu_clone)
+        for buffer_bindings in self._buffer_bindings:
+            for buffer_binding in buffer_bindings:
+                for slot in buffer_binding.unique_slots:
+                    slot.set(buffer_binding.pinned)
         self._slots_applied = True
 
     @property
@@ -456,9 +476,12 @@ class _BlockPinnedStore:
         for block_param_bindings in self._param_bindings:
             for param_binding in block_param_bindings:
                 total += param_binding.pinned.cache_bytes
-        for buffer_records in self._buffer_records:
-            for _slot, _mod_buf, cpu_clone in buffer_records:
-                total += cpu_clone.numel() * cpu_clone.element_size()
+        for buffer_bindings in self._buffer_bindings:
+            for buffer_binding in buffer_bindings:
+                total += (
+                    buffer_binding.pinned.numel()
+                    * buffer_binding.pinned.element_size()
+                )
         return total
 
     def activate_pool(self, num_gpu_slots: int, device: torch.device) -> None:
@@ -548,10 +571,10 @@ class _BlockPinnedStore:
             else:
                 for param_slot in param_binding.unique_slots:
                     param_slot.set(gpu_param)
-        for _buffer_slot, mod_buf, cpu_clone in self._buffer_records[idx]:
-            set_tensor_data(
-                mod_buf, cpu_clone.to(self._device, non_blocking=non_blocking)
-            )
+        for buffer_binding in self._buffer_bindings[idx]:
+            gpu = buffer_binding.pinned.to(self._device, non_blocking=non_blocking)
+            for buffer_slot in buffer_binding.unique_slots:
+                buffer_slot.set(gpu)
 
     def release_slot(self, idx: int) -> None:
         """Return ``idx``'s pool slot for reuse.
@@ -582,8 +605,9 @@ class _BlockPinnedStore:
             else:
                 for param_slot in param_binding.unique_slots:
                     param_slot.set(param_binding.cpu_param)
-        for _buffer_slot, mod_buf, cpu_clone in self._buffer_records[idx]:
-            set_tensor_data(mod_buf, cpu_clone)
+        for buffer_binding in self._buffer_bindings[idx]:
+            for buffer_slot in buffer_binding.unique_slots:
+                buffer_slot.set(buffer_binding.pinned)
         if self._pool is not None:
             slot_id = self._block_to_slot.pop(idx, None)
             if slot_id is not None:

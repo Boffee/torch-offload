@@ -1253,13 +1253,12 @@ class TestCrossRegionTiedDetection:
             )
 
     def test_intra_block_tied_buffers_raises(self) -> None:
-        shared = torch.randn(8)
-        view_a = shared.view(8)
-        view_b = shared.view(8)
-
         class TiedBufBlock(nn.Module):
             def __init__(self):
                 super().__init__()
+                shared = torch.randn(8)
+                view_a = shared.view(8)
+                view_b = shared.view(8)
                 self.register_buffer("buf_a", view_a)
                 self.register_buffer("buf_b", view_b)
                 self.weight = nn.Parameter(torch.randn(2), requires_grad=False)
@@ -1268,7 +1267,32 @@ class TestCrossRegionTiedDetection:
             def __init__(self):
                 super().__init__()
                 self.transformer_blocks = nn.ModuleList(
-                    [TiedBufBlock(), nn.Linear(4, 4, bias=False)]
+                    [TiedBufBlock(), TiedBufBlock()]
+                )
+
+        m = M()
+        for p in m.parameters():
+            p.requires_grad = False
+        with pytest.raises(ValueError, match="intra-block tied buffers"):
+            ModelOffloader(
+                m,
+                layers_attr="transformer_blocks", blocks_to_swap=1,
+            )
+
+    def test_intra_block_same_buffer_object_raises(self) -> None:
+        class TiedBufBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                shared = torch.randn(8)
+                self.register_buffer("buf_a", shared)
+                self.register_buffer("buf_b", shared)
+                self.weight = nn.Parameter(torch.randn(2), requires_grad=False)
+
+        class M(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.transformer_blocks = nn.ModuleList(
+                    [TiedBufBlock(), TiedBufBlock()]
                 )
 
         m = M()

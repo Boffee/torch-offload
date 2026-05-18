@@ -956,11 +956,16 @@ def detect_streaming_region_ties(  # noqa: PLR0912
       ``stream_trainables=True``. The same Parameter object is safe
       under default all-trainables-on-GPU movement, but unsafe when
       one streamed region owns a distinct pinned clone.
-    - **Unsupported intra-block ties** (two distinct slots in the
+    - **Unsupported intra-block parameter ties** (two distinct slots in the
       same block sharing storage). Same-Parameter all-trainable
       aliases are safe because a single ``.data`` swap reaches every
       alias slot; frozen aliases and distinct-Parameter trainable
       aliases are rejected.
+    - **Unsupported intra-block buffer ties** (two distinct buffer slots in
+      the same block sharing storage). Buffer slot replacement can preserve
+      those aliases after slot collection, but construction still normalizes
+      blocks to CPU before pinning; PyTorch's per-slot buffer conversion can
+      split aliases before the streamer sees them.
 
     Non-block-internal all-frozen ties (the standard ``tie_weights()``
     embed<->head pattern) are handled correctly by
@@ -1064,7 +1069,7 @@ def detect_streaming_region_ties(  # noqa: PLR0912
                     (id(s.parent), s.leaf), set()
                 ).add(f"block:{group_idx}:{block_idx}")
 
-    buffer_groups: dict[tuple, list[tuple[str, str, int]]] = {}
+    buffer_groups: dict[tuple, list[tuple[str, str, int, str]]] = {}
     for s in iter_buffer_slots(model):
         buffer = s.get()
         if buffer.numel() == 0:
@@ -1072,12 +1077,12 @@ def detect_streaming_region_ties(  # noqa: PLR0912
         regions = block_buffer_slot_regions.get((id(s.parent), s.leaf), {"non_block"})
         for region in regions:
             buffer_groups.setdefault(storage_key(buffer), []).append(
-                (region, s.name, id(buffer))
+                (region, s.name, id(s.parent), s.leaf)
             )
 
     for members in buffer_groups.values():
-        regions = {region for region, _, _ in members}
-        names = sorted({name for _, name, _ in members})
+        regions = {region for region, _, _, _ in members}
+        names = sorted({name for _, name, _, _ in members})
         if len(regions) > 1:
             raise ValueError(
                 f"Block streaming does not support tied buffers across "
@@ -1089,12 +1094,13 @@ def detect_streaming_region_ties(  # noqa: PLR0912
             )
         sole_region = next(iter(regions))
         if sole_region.startswith("block:"):
-            distinct_ids = {bid for _, _, bid in members}
-            if len(distinct_ids) > 1:
+            slot_locs = {(parent_id, leaf) for _, _, parent_id, leaf in members}
+            if len(slot_locs) > 1:
                 raise ValueError(
                     f"Block streaming does not support intra-block tied "
                     f"buffers: storage shared by {names} within "
-                    f"{sole_region}. _BlockPinnedStore clones each "
-                    "buffer independently — the alias would break. "
+                    f"{sole_region}. Construction still normalizes block "
+                    "buffers to CPU before alias-aware pinning, so PyTorch "
+                    "may split the alias before StreamedWeights can bind it. "
                     "Untie the buffers or use whole-model PinnedWeights."
                 )
