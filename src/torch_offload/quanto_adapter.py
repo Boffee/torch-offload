@@ -230,4 +230,4 @@ class QuantoAdapter:
 
 
 if QUANTO_AVAILABLE:
-    register_adapter(QuantoAdapter)
+    register_adapter(QuantoAdapter())

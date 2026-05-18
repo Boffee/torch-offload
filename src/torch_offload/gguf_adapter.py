@@ -269,4 +269,4 @@ class GgufAdapter:
 
 
 if _GGUF_AVAILABLE:
-    register_adapter(GgufAdapter)
+    register_adapter(GgufAdapter())

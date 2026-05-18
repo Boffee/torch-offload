@@ -33,6 +33,7 @@ from .tensor_adapters import (
     CpuRoundTripTensorAdapter,
     ParameterDataSwapTensorAdapter,
     TensorAdapter,
+    adapter_name,
     select_adapter,
 )
 
@@ -121,7 +122,7 @@ class PinnedParam:
 
     def __init__(self, name: str, param: nn.Parameter) -> None:
         self.name = name
-        self.adapter: type[TensorAdapter] = select_adapter(param.data)
+        self.adapter: TensorAdapter[Any, Any] = select_adapter(param.data)
         self.requires_grad: bool = param.requires_grad
         self.pinned_state = self.adapter.clone_pin(param.data)
         self.cpu_param: nn.Parameter = self.adapter.cpu_param(
@@ -169,7 +170,7 @@ class PinnedParam:
         """
         if not isinstance(self.adapter, CpuRoundTripTensorAdapter):
             raise NotImplementedError(
-                f"{self.adapter.__name__} does not support CPU round-trip: "
+                f"{adapter_name(self.adapter)} does not support CPU round-trip: "
                 "its GPU representation cannot be copied back into the "
                 "pinned host state without adapter-specific conversion."
             )
@@ -199,7 +200,7 @@ class PinnedParam:
         if not isinstance(self.adapter, ParameterDataSwapTensorAdapter):
             raise NotImplementedError(
                 f"Trainable streaming requires a Parameter.data-swap-capable "
-                f"tensor adapter; slot {name!r} uses {self.adapter.__name__}. "
+                f"tensor adapter; slot {name!r} uses {adapter_name(self.adapter)}. "
                 "Quantized or structured weights are inference-only here — "
                 "keep them frozen, or wrap with PEFT/LoRA so the trainable "
                 "adapter weights are plain tensors."

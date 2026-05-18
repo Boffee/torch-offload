@@ -8,6 +8,7 @@ from torch import nn
 
 from torch_offload.pinned_param import PinnedParam
 from torch_offload.tensor_adapters import (
+    DequantRequantCopyIntoTensorAdapter,
     DequantRequantTensorAdapter,
     TensorCopyIntoAdapter,
     select_adapter,
@@ -22,6 +23,12 @@ CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
 class TestPinnedParam:
+    def test_select_adapter_returns_stable_strategy_instance(self) -> None:
+        first = select_adapter(torch.randn(1))
+        second = select_adapter(torch.randn(2))
+
+        assert first is second
+
     def test_non_quanto_pin_and_load(self) -> None:
         p = nn.Parameter(torch.randn(8, 16, dtype=torch.bfloat16), requires_grad=False)
         pinned_param = PinnedParam("w", p)
@@ -153,6 +160,7 @@ class TestPinnedParamQuanto:
         )
 
         adapter = select_adapter(qt)
+        assert isinstance(adapter, DequantRequantCopyIntoTensorAdapter)
         assert isinstance(adapter, DequantRequantTensorAdapter)
         assert isinstance(adapter, TensorCopyIntoAdapter)
         dense = adapter.dequantize(qt)

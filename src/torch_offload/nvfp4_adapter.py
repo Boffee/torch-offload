@@ -291,4 +291,4 @@ class Nvfp4Adapter:
 
 
 if TORCHAO_NVFP4_AVAILABLE:
-    register_adapter(Nvfp4Adapter)
+    register_adapter(Nvfp4Adapter())

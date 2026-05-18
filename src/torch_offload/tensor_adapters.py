@@ -23,9 +23,10 @@ block-pool compatibility checks. Extra operations are expressed as small
 optional protocols so callers ask for the exact capability they need
 instead of hard-coding tensor classes.
 
-This module is internal to :mod:`torch_offload`. Adapters are registered
-at module import time; new types can be added by writing a new adapter
-class and calling :func:`register_adapter`.
+This module is internal to :mod:`torch_offload`. Adapter strategy
+instances are registered at module import time; new types can be added
+by writing a stateless adapter class and calling :func:`register_adapter`
+with one instance.
 """
 
 from __future__ import annotations
@@ -40,10 +41,12 @@ __all__ = [
     "DENSE_ADDMM_DTYPES",
     "CpuRoundTripTensorAdapter",
     "DenseAddmmTensorAdapter",
+    "DequantRequantCopyIntoTensorAdapter",
     "DequantRequantTensorAdapter",
     "ParameterDataSwapTensorAdapter",
     "TensorAdapter",
     "TensorCopyIntoAdapter",
+    "adapter_name",
     "register_adapter",
     "select_adapter",
 ]
@@ -61,7 +64,8 @@ GpuStateT = TypeVar("GpuStateT")
 @runtime_checkable
 class TensorAdapter(Protocol[PinnedStateT, GpuStateT]):
     """Adapter encoding the mechanics of pinning, moving, and wrapping
-    one tensor type. Adapters are stateless; they hold no per-param data.
+    one tensor type. Adapter instances are stateless; they hold no
+    per-param data.
 
     Generic over two opaque state types: ``PinnedStateT`` (the pinned
     host representation) and ``GpuStateT`` (the GPU storage). Each
@@ -256,6 +260,15 @@ class TensorCopyIntoAdapter(TensorAdapter[PinnedStateT, GpuStateT], Protocol):
         ...
 
 
+@runtime_checkable
+class DequantRequantCopyIntoTensorAdapter(
+    DequantRequantTensorAdapter[PinnedStateT, GpuStateT],
+    TensorCopyIntoAdapter[PinnedStateT, GpuStateT],
+    Protocol,
+):
+    """Combined capability for in-place representation-preserving updates."""
+
+
 # ---------------------------------------------------------------------------
 # RegularAdapter — plain torch.Tensor (bf16/fp16/fp32, etc.)
 # ---------------------------------------------------------------------------
@@ -393,27 +406,27 @@ class RegularAdapter:
 # Adapter registry / dispatch
 # ---------------------------------------------------------------------------
 
-# Adapters are tried in registration order. The first whose ``matches()``
-# returns True wins. RegularAdapter is appended last as the conservative
-# fallback for plain tensors. Subclass adapters (quanto, etc.) register
-# themselves at import time and slot in front.
-_ADAPTERS: list[type[TensorAdapter[Any, Any]]] = []
+# Adapters are singleton strategy instances tried in registration order. The
+# first whose ``matches()`` returns True wins. RegularAdapter is appended last
+# as the conservative fallback for plain tensors. Subclass adapters (quanto,
+# etc.) register themselves at import time and slot in front.
+_ADAPTERS: list[TensorAdapter[Any, Any]] = []
 
 
-def register_adapter(adapter: type[TensorAdapter[Any, Any]]) -> None:
+def register_adapter(adapter: TensorAdapter[Any, Any]) -> None:
     """Register an adapter for use by :func:`select_adapter`. Adapters
     registered later take priority over earlier ones for ``matches()``
     dispatch — this lets specialized adapters (quanto, FP8 variants)
     precede :class:`RegularAdapter`."""
-    if adapter not in _ADAPTERS:
+    if not any(type(existing) is type(adapter) for existing in _ADAPTERS):
         _ADAPTERS.insert(0, adapter)
 
 
-def select_adapter(t: torch.Tensor) -> type[TensorAdapter[Any, Any]]:
+def select_adapter(t: torch.Tensor) -> TensorAdapter[Any, Any]:
     """Find the registered adapter that handles tensor ``t``.
 
-    Tries adapters in reverse registration order (newest first), returning
-    the first whose :meth:`TensorAdapter.matches` returns True. Raises
+    Tries adapters in priority order (newest first), returning the first
+    whose :meth:`TensorAdapter.matches` returns True. Raises
     :class:`NotImplementedError` if no adapter matches — the alpha library
     refuses to silently dequantize or otherwise mishandle unknown tensor
     subclasses.
@@ -429,5 +442,10 @@ def select_adapter(t: torch.Tensor) -> type[TensorAdapter[Any, Any]]:
     )
 
 
+def adapter_name(adapter: TensorAdapter[Any, Any]) -> str:
+    """Human-readable name for an adapter strategy instance."""
+    return type(adapter).__name__
+
+
 # Register the regular fallback last so subclass adapters take priority.
-register_adapter(RegularAdapter)
+register_adapter(RegularAdapter())

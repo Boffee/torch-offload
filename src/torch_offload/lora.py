@@ -31,15 +31,15 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from types import TracebackType
-from typing import Any, cast
+from typing import Any
 
 import torch
 from torch import nn
 
 from .tensor_adapters import (
     DenseAddmmTensorAdapter,
-    DequantRequantTensorAdapter,
-    TensorCopyIntoAdapter,
+    DequantRequantCopyIntoTensorAdapter,
+    adapter_name,
     select_adapter,
 )
 
@@ -54,12 +54,6 @@ __all__ = [
 
 KeyTransformT = Callable[[str], str] | None
 _LoraFactorRef = tuple[torch.Tensor, torch.Tensor, float]
-_DequantRequantAdapter = type[DequantRequantTensorAdapter[Any, Any]]
-_TensorCopyIntoAdapter = type[TensorCopyIntoAdapter[Any, Any]]
-_DequantRequantAdapters = tuple[
-    _DequantRequantAdapter,
-    _TensorCopyIntoAdapter,
-]
 
 
 def default_key_transform(key: str) -> str:
@@ -151,19 +145,18 @@ class LoRATransform:
         error. :meth:`apply` uses the same validation path immediately
         before mutating the target parameter.
         """
-        self._target_adapters(param, target_key)
+        self._target_adapter(param, target_key)
 
     def apply(self, param: nn.Parameter, target_key: str) -> None:
-        adapters = self._target_adapters(param, target_key)
-        if adapters is None:
+        adapter = self._target_adapter(param, target_key)
+        if adapter is None:
             self._apply_dense(param.data)
             return
 
-        adapter, copy_adapter = adapters
         dense = adapter.dequantize(param.data)
         self._apply_dense(dense)
         new_data = adapter.requantize(dense, like=param.data)
-        copy_adapter.copy_into(new_data, target=param.data)
+        adapter.copy_into(new_data, target=param.data)
 
     def _apply_dense(self, data: torch.Tensor) -> None:
         dev, dt = data.device, data.dtype
@@ -172,11 +165,11 @@ class LoRATransform:
             b_gpu = b.to(device=dev, dtype=dt, non_blocking=True)
             data.addmm_(b_gpu, a_gpu, alpha=strength)
 
-    def _target_adapters(
+    def _target_adapter(
         self, param: nn.Parameter, target_key: str,
-    ) -> _DequantRequantAdapters | None:
+    ) -> DequantRequantCopyIntoTensorAdapter[Any, Any] | None:
         _validate_factor_shapes(self._refs, param.data, target_key)
-        return _dequant_requant_adapters(param.data, target_key)
+        return _dequant_requant_adapter(param.data, target_key)
 
 
 def _validate_factor_shapes(
@@ -197,9 +190,9 @@ def _validate_factor_shapes(
             )
 
 
-def _dequant_requant_adapters(
+def _dequant_requant_adapter(
     data: torch.Tensor, target_key: str,
-) -> _DequantRequantAdapters | None:
+) -> DequantRequantCopyIntoTensorAdapter[Any, Any] | None:
     try:
         adapter = select_adapter(data)
     except NotImplementedError as exc:
@@ -214,35 +207,19 @@ def _dequant_requant_adapters(
         try:
             adapter.validate_dense_addmm_target(data, target_key)
         except ValueError:
-            if (
-                isinstance(adapter, DequantRequantTensorAdapter)
-                and isinstance(adapter, TensorCopyIntoAdapter)
-            ):
-                return (
-                    cast(_DequantRequantAdapter, adapter),
-                    cast(_TensorCopyIntoAdapter, adapter),
-                )
+            if isinstance(adapter, DequantRequantCopyIntoTensorAdapter):
+                return adapter
             raise
         return None
 
-    if (
-        isinstance(adapter, DequantRequantTensorAdapter)
-        and isinstance(adapter, TensorCopyIntoAdapter)
-    ):
-        return (
-            cast(_DequantRequantAdapter, adapter),
-            cast(_TensorCopyIntoAdapter, adapter),
-        )
+    if isinstance(adapter, DequantRequantCopyIntoTensorAdapter):
+        return adapter
 
     raise ValueError(
-        f"Cannot merge LoRA into {target_key!r}: {_adapter_name(adapter)} "
+        f"Cannot merge LoRA into {target_key!r}: {adapter_name(adapter)} "
         "does not support dense in-place addmm or dequantize/requantize "
         "plus copy_into updates. Use routed LoRA for this tensor type."
     )
-
-
-def _adapter_name(adapter: object) -> str:
-    return str(getattr(adapter, "__name__", type(adapter).__name__))
 
 
 class LoRARouteHandle:
