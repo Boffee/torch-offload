@@ -322,7 +322,7 @@ class RegularAdapter:
 
     Builds fresh :class:`nn.Parameter` objects wrapping the pinned-CPU
     and GPU storages. The frozen-only callers (:class:`PinnedWeights`,
-    ``_BlockPinnedStore``) slot-replace via ``module._parameters[leaf]
+    ``_StreamedBlockBindings``) slot-replace via ``module._parameters[leaf]
     = ...`` with the binding's ``cpu_param`` or its pool-slot
     ``gpu_param``; the user's original Parameter object is orphaned,
     so optimizer state keyed on the pre-wrap object is lost. Trainable

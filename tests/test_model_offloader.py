@@ -29,7 +29,6 @@ from torch_offload import (
 )
 from torch_offload.model_offloader import detect_streaming_region_ties
 from torch_offload.slots import iter_buffer_slots
-from torch_offload.streamed_weights import _BlockPinnedStore
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -1538,7 +1537,7 @@ class TestBlockBuffersPinned:
 
 
 # ---------------------------------------------------------------------------
-# _BlockPinnedStore activate_pool idempotency
+# StreamedWeights _activate_pool idempotency
 # ---------------------------------------------------------------------------
 
 
@@ -1546,21 +1545,27 @@ class TestActivatePoolIdempotency:
     @CUDA
     def test_same_config_idempotent(self) -> None:
         m = _make_block_model()
-        store = _BlockPinnedStore(list(m.transformer_blocks))
-        store.activate_pool(2, torch.device("cuda"))
-        pool_first = store._pool
-        store.activate_pool(2, torch.device("cuda"))
-        assert store._pool is pool_first
+        streamer = StreamedWeights(
+            list(m.transformer_blocks),
+            blocks_to_swap=1,
+        )
+        streamer._activate_pool(2, torch.device("cuda"))
+        pool_first = streamer._pool
+        streamer._activate_pool(2, torch.device("cuda"))
+        assert streamer._pool is pool_first
 
     @CUDA
     def test_mismatched_config_raises(self) -> None:
         m = _make_block_model()
-        store = _BlockPinnedStore(list(m.transformer_blocks))
-        store.activate_pool(2, torch.device("cuda"))
+        streamer = StreamedWeights(
+            list(m.transformer_blocks),
+            blocks_to_swap=1,
+        )
+        streamer._activate_pool(2, torch.device("cuda"))
         with pytest.raises(ValueError, match="already activated"):
-            store.activate_pool(3, torch.device("cuda"))
+            streamer._activate_pool(3, torch.device("cuda"))
         with pytest.raises(ValueError, match="already activated"):
-            store.activate_pool(2, torch.device("cpu"))
+            streamer._activate_pool(2, torch.device("cpu"))
 
 
 # ---------------------------------------------------------------------------
@@ -1893,7 +1898,7 @@ class TestStreamedWeightsContractGuard:
     def test_direct_unskipped_trainable_constructs(self) -> None:
         # Build a trainable block with no skip_slots. The streamer
         # accepts the trainable slot (handled via ``.data`` swap inside
-        # ``_BlockPinnedStore``). The slot appears in the streamer's
+        # ``_StreamedBlockBindings``). The slot appears in the streamer's
         # slot_filter just like a frozen slot would.
         from torch_offload.slots import iter_param_slots
 
@@ -2091,8 +2096,8 @@ class TestMixedGradTieDetection:
     def test_all_trainable_same_parameter_intra_block_only_tie(self) -> None:
         # Pure intra-block aliasing (no cross-region): two slots inside
         # each block share the same trainable Parameter, but block 0's
-        # shared Parameter is distinct from block 1's. ``_BlockPinnedStore``
-        # dedups by ``id(param)`` per block, and the .data swap reaches
+        # shared Parameter is distinct from block 1's. Streamed block
+        # bindings dedup by ``id(param)`` per block, and the .data swap reaches
         # the shared Parameter so every aliased slot sees the update.
         # Layout signatures match because both blocks dedup to a single
         # entry (``a``) of identical shape/dtype.

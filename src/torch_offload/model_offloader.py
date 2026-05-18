@@ -895,7 +895,7 @@ def _check_block_groups_disjoint(
 
     This check is the precondition for
     :func:`detect_streaming_region_ties` and the per-block pinning
-    walk inside :class:`_BlockPinnedStore` to be unambiguous; it lives
+    walk inside :class:`_StreamedBlockBindings` to be unambiguous; it lives
     at the composer because it is about how the caller composed
     ``layers_attr`` paths, not about parameter aliasing.
     """
@@ -1016,7 +1016,7 @@ def detect_streaming_region_ties(  # noqa: PLR0912
             # is fine across regions because TrainableWeights owns the
             # single Parameter object directly. With
             # stream_trainable_weights=True, cross-region aliasing is NOT
-            # fine: each region builds its own ``_BlockPinnedStore`` (or
+            # fine: each region builds its own ``_StreamedBlockBindings`` (or
             # composes TrainableWeights for ``non_block``) with an
             # independent pinned clone.
             if stream_trainables and len(regions) > 1:
@@ -1033,7 +1033,7 @@ def detect_streaming_region_ties(  # noqa: PLR0912
             # Same-Parameter all-trainable ties that reach here are
             # either default-mode cross-region ties (handled by one
             # TrainableWeights mover) or intra-region streamed trainable ties
-            # (handled by one _BlockPinnedStore clone).
+            # (handled by one _StreamedBlockBindings clone).
             continue
         if len(regions) > 1:
             raise ValueError(
@@ -1050,7 +1050,7 @@ def detect_streaming_region_ties(  # noqa: PLR0912
                 raise ValueError(
                     f"Block streaming does not support intra-block tied "
                     f"parameters: storage shared by {names} within "
-                    f"{sole_region}. _BlockPinnedStore cannot preserve "
+                    f"{sole_region}. Streamed block bindings cannot preserve "
                     "the tying invariant — one alias would stay pointing "
                     "at non-pinned data. Untie the parameters or use "
                     "whole-model PinnedWeights instead."

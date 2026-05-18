@@ -99,7 +99,7 @@ class PinnedParam:
     The pinned parameter captures the source parameter's ``requires_grad`` at
     construction time and threads it through to the adapter when
     building CPU and GPU parameter wrappers. Frozen
-    callers (:class:`PinnedWeights`, ``_BlockPinnedStore`` for
+    callers (:class:`PinnedWeights`, ``_StreamedBlockBindings`` for
     ``requires_grad=False`` slots) get the historic behavior. Trainable
     callers can either request the wrapper preserve ``requires_grad``
     or skip the wrapper entirely and ``.data``-swap into their own
