@@ -770,7 +770,7 @@ class TestLoRATransform:
         b = torch.randn(4, 2)
         transform = LoRATransform([(a, b, 0.5)])
 
-        transform.validate_target(param, "target.weight")
+        transform.validate_target(param)
 
         torch.testing.assert_close(param, before)
 
@@ -781,7 +781,7 @@ class TestLoRATransform:
         transform = LoRATransform([(a, b, 0.5)])
 
         with pytest.raises(ValueError, match="B@A produces"):
-            transform.validate_target(param, "target.weight")
+            transform.validate_target(param)
 
     def test_dense_transform_mutates_param_in_place(self) -> None:
         param = nn.Parameter(torch.randn(4, 8), requires_grad=False)
@@ -790,7 +790,7 @@ class TestLoRATransform:
         b = torch.randn(4, 2)
         transform = LoRATransform([(a, b, 0.5)])
 
-        transform.apply(param, "target.weight")
+        transform.apply(param)
 
         expected = before.clone()
         expected.addmm_(b, a, alpha=0.5)
@@ -803,7 +803,7 @@ class TestLoRATransform:
         transform = LoRATransform([(a, b, 0.5)])
 
         with pytest.raises(ValueError, match="dense in-place addmm requires"):
-            transform.apply(param, "target.weight")
+            transform.apply(param)
 
     def test_quanto_transform_requantizes_param_in_place(self) -> None:
         quanto = pytest.importorskip("optimum.quanto")
@@ -822,7 +822,7 @@ class TestLoRATransform:
         original_param = param
         original_packed_ptr = param.data._data.data_ptr()
 
-        transform.apply(param, "target.weight")
+        transform.apply(param)
 
         expected_dense = qt.dequantize().to(torch.float32)
         expected_dense.addmm_(b.to(torch.float32), a.to(torch.float32), alpha=0.5)

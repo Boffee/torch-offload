@@ -73,15 +73,6 @@ def _routed_factor_dtype(module: nn.Module) -> torch.dtype:
     return select_adapter(weight.data).compute_dtype(weight.data)
 
 
-def _merge_lora_hook(
-    transform: LoRATransform, target_key: str,
-) -> Callable[[nn.Parameter], None]:
-    def hook(param: nn.Parameter) -> None:
-        transform.apply(param, target_key)
-
-    return hook
-
-
 class ModelOffloader:
     """Stream transformer blocks between pinned CPU and CUDA with
     optional LoRA merge and trainable-parameter support.
@@ -453,7 +444,7 @@ class ModelOffloader:
             component = self._target_to_component[target_key]
             transform = LoRATransform(refs)
             handle = component.register_post_copy_hook(
-                pinned, _merge_lora_hook(transform, target_key),
+                pinned, transform.apply,
             )
             self._lora_hook_handles.append(handle)
 

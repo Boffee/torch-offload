@@ -116,7 +116,7 @@ class TestNvfp4Adapter:
         with pytest.raises(NotImplementedError, match="CPU round-trip"):
             pinned_param.copy_to_cpu(state)
         with pytest.raises(NotImplementedError, match="Parameter.data-swap"):
-            pinned_param.validate_parameter_data_swap_target("w")
+            pinned_param.validate_parameter_data_swap_target()
 
     def test_merge_lora_rejects_nvfp4_weight(self) -> None:
         class M(nn.Module):

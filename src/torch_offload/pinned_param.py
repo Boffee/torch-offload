@@ -195,17 +195,22 @@ class PinnedParam:
         """Logical compute dtype reported by this pinned parameter's adapter."""
         return self.adapter.compute_dtype(self.cpu_param.data)
 
-    def validate_parameter_data_swap_target(self, name: str) -> None:
+    def validate_parameter_data_swap_target(self) -> None:
         """Raise if this pinned parameter cannot be trainable-streamed via ``.data``."""
         if not isinstance(self.adapter, ParameterDataSwapTensorAdapter):
             raise NotImplementedError(
                 f"Trainable streaming requires a Parameter.data-swap-capable "
-                f"tensor adapter; slot {name!r} uses {adapter_name(self.adapter)}. "
+                f"tensor adapter; this parameter uses {adapter_name(self.adapter)}. "
                 "Quantized or structured weights are inference-only here — "
                 "keep them frozen, or wrap with PEFT/LoRA so the trainable "
                 "adapter weights are plain tensors."
             )
-        self.adapter.validate_parameter_data_swap_target(self.cpu_param.data, name)
+        try:
+            self.adapter.validate_parameter_data_swap_target(self.cpu_param.data)
+        except NotImplementedError as exc:
+            raise NotImplementedError(
+                f"Trainable streaming cannot use Parameter.data swap: {exc}"
+            ) from exc
 
     @property
     def cache_bytes(self) -> int:

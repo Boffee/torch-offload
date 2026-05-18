@@ -197,7 +197,7 @@ class DenseAddmmTensorAdapter(TensorAdapter[PinnedStateT, GpuStateT], Protocol):
     """Optional capability for in-place dense ``addmm_`` updates."""
 
     @staticmethod
-    def validate_dense_addmm_target(t: torch.Tensor, name: str) -> None:
+    def validate_dense_addmm_target(t: torch.Tensor) -> None:
         """Raise if ``t`` cannot safely receive an in-place ``addmm_``.
 
         Used before installing a post-copy hook that mutates the freshly
@@ -234,7 +234,7 @@ class ParameterDataSwapTensorAdapter(TensorAdapter[PinnedStateT, GpuStateT], Pro
     """Optional capability for trainable streaming via ``Parameter.data`` swap."""
 
     @staticmethod
-    def validate_parameter_data_swap_target(t: torch.Tensor, name: str) -> None:
+    def validate_parameter_data_swap_target(t: torch.Tensor) -> None:
         """Raise if ``t`` cannot safely round-trip through ``param.data =``.
 
         Streamed trainables preserve user Parameter identity by swapping
@@ -377,23 +377,23 @@ class RegularAdapter:
         return t.dtype
 
     @staticmethod
-    def validate_dense_addmm_target(t: torch.Tensor, name: str) -> None:
+    def validate_dense_addmm_target(t: torch.Tensor) -> None:
         if type(t) is not torch.Tensor:
             raise ValueError(
-                f"Dense addmm target {name!r} is {type(t).__name__}; "
+                f"Dense addmm target is {type(t).__name__}; "
                 "dense in-place addmm requires a plain torch.Tensor."
             )
         if t.dtype not in DENSE_ADDMM_DTYPES:
             raise ValueError(
-                f"Dense addmm target {name!r} has dtype {t.dtype}; "
+                f"Dense addmm target has dtype {t.dtype}; "
                 "dense in-place addmm requires bf16, fp16, or fp32."
             )
 
     @staticmethod
-    def validate_parameter_data_swap_target(t: torch.Tensor, name: str) -> None:
+    def validate_parameter_data_swap_target(t: torch.Tensor) -> None:
         if type(t) is not torch.Tensor:
             raise NotImplementedError(
-                f"Trainable streaming slot {name!r} is {type(t).__name__}; "
+                f"Parameter data-swap target is {type(t).__name__}; "
                 "Parameter.data swap requires a plain torch.Tensor."
             )
 

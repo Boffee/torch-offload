@@ -365,7 +365,13 @@ class _BlockPinnedStore:
                 # the user's Parameter identity. Only adapters that
                 # explicitly opt into that capability are allowed.
                 if pinned.requires_grad:
-                    pinned.validate_parameter_data_swap_target(primary_slot.name)
+                    try:
+                        pinned.validate_parameter_data_swap_target()
+                    except NotImplementedError as exc:
+                        raise NotImplementedError(
+                            f"Trainable streaming slot {primary_slot.name!r} "
+                            f"cannot be streamed: {exc}"
+                        ) from exc
                 block_param_groups.append(PinnedParamGroup(pinned, slots))
             self._param_groups.append(block_param_groups)
 

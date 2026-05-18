@@ -138,17 +138,17 @@ class LoRATransform:
     def __init__(self, refs: list[_LoraFactorRef]) -> None:
         self._refs = refs
 
-    def validate_target(self, param: nn.Parameter, target_key: str) -> None:
+    def validate_target(self, param: nn.Parameter) -> None:
         """Raise if ``param`` cannot receive this LoRA merge.
 
         This is an optional preflight for callers that want an earlier
         error. :meth:`apply` uses the same validation path immediately
         before mutating the target parameter.
         """
-        self._target_adapter(param, target_key)
+        self._target_adapter(param)
 
-    def apply(self, param: nn.Parameter, target_key: str) -> None:
-        adapter = self._target_adapter(param, target_key)
+    def apply(self, param: nn.Parameter) -> None:
+        adapter = self._target_adapter(param)
         if adapter is None:
             self._apply_dense(param.data)
             return
@@ -166,59 +166,58 @@ class LoRATransform:
             data.addmm_(b_gpu, a_gpu, alpha=strength)
 
     def _target_adapter(
-        self, param: nn.Parameter, target_key: str,
+        self, param: nn.Parameter,
     ) -> DequantRequantCopyIntoTensorAdapter[Any, Any] | None:
-        _validate_factor_shapes(self._refs, param.data, target_key)
-        return _dequant_requant_adapter(param.data, target_key)
+        _validate_factor_shapes(self._refs, param.data)
+        return _dequant_requant_adapter(param.data)
 
 
 def _validate_factor_shapes(
-    refs: list[_LoraFactorRef], data: torch.Tensor, target_key: str,
+    refs: list[_LoraFactorRef], data: torch.Tensor,
 ) -> None:
     target_shape = tuple(data.shape)
     for a, b, _strength in refs:
         if a.ndim != 2 or b.ndim != 2 or a.shape[0] != b.shape[1]:
             raise ValueError(
-                f"LoRA factor shape mismatch for {target_key!r}: "
+                "LoRA factor shape mismatch: "
                 f"A shape is {tuple(a.shape)}, B shape is {tuple(b.shape)}."
             )
         produced_shape = (b.shape[0], a.shape[1])
         if target_shape != produced_shape:
             raise ValueError(
-                f"LoRA factor shape mismatch for {target_key!r}: "
+                "LoRA factor shape mismatch: "
                 f"B@A produces {produced_shape}, target shape is {target_shape}."
             )
 
 
 def _dequant_requant_adapter(
-    data: torch.Tensor, target_key: str,
+    data: torch.Tensor,
 ) -> DequantRequantCopyIntoTensorAdapter[Any, Any] | None:
     try:
         adapter = select_adapter(data)
     except NotImplementedError as exc:
         raise ValueError(
-            f"Cannot merge LoRA into {target_key!r}: tensor type "
-            f"{type(data).__name__} has no registered tensor adapter. "
+            f"Tensor type {type(data).__name__} has no registered tensor adapter. "
             "Merge requires a tensor adapter with dense addmm or "
             "dequantize/requantize plus copy_into support."
         ) from exc
 
     if isinstance(adapter, DenseAddmmTensorAdapter):
         try:
-            adapter.validate_dense_addmm_target(data, target_key)
-        except ValueError:
+            adapter.validate_dense_addmm_target(data)
+        except ValueError as exc:
             if isinstance(adapter, DequantRequantCopyIntoTensorAdapter):
                 return adapter
-            raise
+            raise ValueError(str(exc)) from exc
         return None
 
     if isinstance(adapter, DequantRequantCopyIntoTensorAdapter):
         return adapter
 
     raise ValueError(
-        f"Cannot merge LoRA into {target_key!r}: {adapter_name(adapter)} "
-        "does not support dense in-place addmm or dequantize/requantize "
-        "plus copy_into updates. Use routed LoRA for this tensor type."
+        f"{adapter_name(adapter)} does not support dense in-place addmm "
+        "or dequantize/requantize plus copy_into updates. Use routed "
+        "LoRA for this tensor type."
     )
 
 

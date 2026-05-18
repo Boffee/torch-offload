@@ -78,7 +78,12 @@ def merge_lora(
             merge_ops.append(_MergeOp(group, target_key, transform))
 
     for op in merge_ops:
-        op.transform.apply(op.group.param, op.target_key)
+        try:
+            op.transform.apply(op.group.param)
+        except ValueError as exc:
+            raise ValueError(
+                f"Cannot merge LoRA into {op.target_key!r}: {exc}"
+            ) from exc
 
     logger.info("merge_lora: merged %d/%d targets", len(merge_ops),
                 sum(len(lora.targets) for lora, _ in loras))
