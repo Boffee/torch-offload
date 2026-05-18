@@ -1142,6 +1142,9 @@ class StreamedWeights:
                 with torch.cuda.stream(step_stream):
                     for binding, parent, leaf in self._store.iter_trainables():
                         param = get_param_slot(parent, leaf)
+                        stack.callback(
+                            _repoint_data_to_cpu_param, param, binding.cpu_param
+                        )
                         set_param_data(
                             param,
                             binding.cpu_param.data.to(target, non_blocking=True),
@@ -1149,9 +1152,6 @@ class StreamedWeights:
                         if param.grad is not None and param.grad.device != target:
                             param.grad = param.grad.to(target, non_blocking=True)
                         materialized.append((param, binding))
-                        stack.callback(
-                            _repoint_data_to_cpu_param, param, binding.cpu_param
-                        )
                 # User's current stream now waits for step_stream's
                 # H2D. After this point the optimizer can safely read
                 # param.data on its own stream.
