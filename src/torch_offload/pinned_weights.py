@@ -88,6 +88,53 @@ from .slots import (
 )
 
 
+def _param_storage_key(param: nn.Parameter) -> tuple[Any, ...]:
+    if param.numel() == 0:
+        # Zero-sized tensors all share data_ptr()==0; key by object
+        # identity so aliases of the same Parameter still dedupe.
+        return ("__empty__", id(param))
+    return storage_key(param.data)
+
+
+def _buffer_storage_key(buffer: torch.Tensor) -> tuple[Any, ...]:
+    if buffer.numel() == 0:
+        return ("__empty_buf__", id(buffer))
+    return storage_key(buffer)
+
+
+def _collect_param_slot_groups(
+    model: nn.Module, *, skip_slots: set[SlotKey],
+) -> list[list[ParamSlot]]:
+    """Collect tied-weight-aware parameter slot groups without pinning."""
+    groups: dict[tuple[Any, ...], list[ParamSlot]] = {}
+    for slot in iter_param_slots(model):
+        if slot.key in skip_slots:
+            continue
+        assert_frozen(
+            slot, owner="PinnedWeights",
+            extra=(
+                "Splitting a tied storage group between skip_slots "
+                "and PinnedWeights silently breaks the alias on "
+                "GPU — validate ties yourself if you go that route, "
+                "or use ModelOffloader which handles it upstream."
+            ),
+        )
+        groups.setdefault(_param_storage_key(slot.get()), []).append(slot)
+    return list(groups.values())
+
+
+def _collect_buffer_slot_groups(
+    model: nn.Module, *, skip_slots: set[SlotKey],
+) -> list[list[BufferSlot]]:
+    """Collect alias-aware PyTorch buffer slot groups without pinning."""
+    groups: dict[tuple[Any, ...], list[BufferSlot]] = {}
+    for slot in iter_buffer_slots(model):
+        if slot.key in skip_slots:
+            continue
+        groups.setdefault(_buffer_storage_key(slot.get()), []).append(slot)
+    return list(groups.values())
+
+
 class PinnedWeights:
     """Whole-model pinned-CPU weight cache with bulk GPU transfer.
 
@@ -158,36 +205,26 @@ class PinnedWeights:
         # remember the build-time device dance.
         model.to("cpu")
 
-        # Phase 1: build all pinned templates without replacing module
-        # slots. PinnedParam intentionally repoints plain
-        # Parameter.data at each pinned clone during this phase to keep
-        # construction peak memory low. If a later pin fails, the caller
-        # must drop the partially constructed model/strategy and rebuild
-        # from a fresh model instance.
-        self._param_bindings = self._collect_param_bindings(model)
-        self._buffer_bindings = (
-            self._collect_buffer_bindings(model) if include_buffers else []
+        # Phase 1: collect the model slots to manage without pinning or
+        # slot mutation. This keeps skip/empty validation separate from
+        # pinned-memory allocation.
+        param_slot_groups = _collect_param_slot_groups(
+            model, skip_slots=self._skip_slots,
+        )
+        buffer_slot_groups = (
+            _collect_buffer_slot_groups(model, skip_slots=self._skip_slots)
+            if include_buffers
+            else []
         )
 
-        # Phase 2: apply slot replacement/register_buffer mutations after
-        # all pinning succeeded. This keeps module slot identity changes
-        # grouped, but construction is not fully rollback-safe because of
-        # the low-peak Parameter.data repointing described above.
-        for param_binding in self._param_bindings:
-            for slot in param_binding.unique_slots:
-                slot.set(param_binding.cpu_param)
-        for buffer_binding in self._buffer_bindings:
-            for slot in buffer_binding.unique_slots:
-                slot.set(buffer_binding.pinned)
-
-        # Reject only if there is nothing at all to manage — neither
-        # frozen params nor (when include_buffers=True) registered
-        # buffers. Buffer-only modules (e.g., a pure RoPE/positional
-        # table sibling) are valid: PinnedWeights still gives them
-        # pinned-CPU storage and the activate/deactivate round-trip,
-        # which is exactly what ModelOffloader non-block composition
-        # needs.
-        if not self._param_bindings and not self._buffer_bindings:
+        # Reject before pinning if there is nothing at all to manage —
+        # neither frozen params nor (when include_buffers=True)
+        # registered buffers. Buffer-only modules (e.g., a pure
+        # RoPE/positional table sibling) are valid: PinnedWeights still
+        # gives them pinned-CPU storage and the activate/deactivate
+        # round-trip, which is exactly what ModelOffloader non-block
+        # composition needs.
+        if not param_slot_groups and not buffer_slot_groups:
             raise ValueError(
                 "PinnedWeights requires at least one frozen parameter or, "
                 "when include_buffers=True, at least one registered buffer "
@@ -196,52 +233,24 @@ class PinnedWeights:
                 "leave the model unwrapped."
             )
 
-    def _collect_param_bindings(self, model: nn.Module) -> list[PinnedParamBinding]:
-        # Tied-weight aware pinning. We walk with remove_duplicate=False so
-        # shared submodule aliases and standard tie_weights() aliases both
-        # show up, then group by storage identity.
-        groups: dict[tuple[Any, ...], list[ParamSlot]] = {}
-        for s in iter_param_slots(model):
-            if s.key in self._skip_slots:
-                continue
-            assert_frozen(
-                s, owner="PinnedWeights",
-                extra=(
-                    "Splitting a tied storage group between skip_slots "
-                    "and PinnedWeights silently breaks the alias on "
-                    "GPU — validate ties yourself if you go that route, "
-                    "or use ModelOffloader which handles it upstream."
-                ),
-            )
-            groups.setdefault(self._param_storage_key(s.get()), []).append(s)
+        # Phase 2: pin collected slot groups into bindings without
+        # replacing module slots. PinnedParam intentionally repoints
+        # plain Parameter.data at each pinned clone during this phase to
+        # keep construction peak memory low. If a later pin fails, the
+        # caller must drop the partially constructed model/strategy and
+        # rebuild from a fresh model instance.
+        self._param_bindings = [
+            pin_param_slots(slots) for slots in param_slot_groups
+        ]
+        self._buffer_bindings = [
+            pin_buffer_slots(slots) for slots in buffer_slot_groups
+        ]
 
-        return [pin_param_slots(slots) for slots in groups.values()]
-
-    def _collect_buffer_bindings(
-        self, model: nn.Module
-    ) -> list[PinnedBufferBinding]:
-        groups: dict[tuple[Any, ...], list[BufferSlot]] = {}
-        for s in iter_buffer_slots(model):
-            if s.key in self._skip_slots:
-                continue
-            buffer = s.get()
-            skey = self._buffer_storage_key(buffer)
-            groups.setdefault(skey, []).append(s)
-        return [pin_buffer_slots(slots) for slots in groups.values()]
-
-    @staticmethod
-    def _param_storage_key(param: nn.Parameter) -> tuple[Any, ...]:
-        if param.numel() == 0:
-            # Zero-sized tensors all share data_ptr()==0; key by object
-            # identity so aliases of the same Parameter still dedupe.
-            return ("__empty__", id(param))
-        return storage_key(param.data)
-
-    @staticmethod
-    def _buffer_storage_key(buffer: torch.Tensor) -> tuple[Any, ...]:
-        if buffer.numel() == 0:
-            return ("__empty_buf__", id(buffer))
-        return storage_key(buffer)
+        # Phase 3: apply slot replacement/register_buffer mutations after
+        # all pinning succeeded. This keeps module slot identity changes
+        # grouped, but construction is not fully rollback-safe because of
+        # the low-peak Parameter.data repointing described above.
+        self._move_to_pinned()
 
     # ------------------------------------------------------------------
     # ModelStrategy protocol

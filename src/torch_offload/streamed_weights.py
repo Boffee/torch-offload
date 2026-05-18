@@ -287,6 +287,51 @@ def _collect_block_slots(
     return param_slots, buffer_slots, frozenset(slot_filter)
 
 
+def _pin_block_param_bindings(
+    block_param_slot_groups: list[list[list[ParamSlot]]],
+) -> list[list[PinnedParamBinding]]:
+    """Pin collected block parameter slots into per-block bindings."""
+    block_bindings: list[list[PinnedParamBinding]] = []
+    for block_param_slots in block_param_slot_groups:
+        param_bindings: list[PinnedParamBinding] = []
+        for slots in block_param_slots:
+            primary_slot = slots[0]
+            param = primary_slot.get()
+            pinned = PinnedParam(primary_slot.name, param)
+            # Trainable streaming uses ``.data`` swap to preserve the
+            # user's Parameter identity. Only adapters that explicitly opt
+            # into that capability are allowed.
+            if pinned.requires_grad:
+                try:
+                    pinned.validate_parameter_data_swap_target()
+                except NotImplementedError as exc:
+                    raise NotImplementedError(
+                        f"Trainable streaming slot {primary_slot.name!r} "
+                        f"cannot be streamed: {exc}"
+                    ) from exc
+            param_bindings.append(bind_param_slots(pinned, slots))
+        block_bindings.append(param_bindings)
+    return block_bindings
+
+
+def _pin_block_buffer_records(
+    block_buffer_slots: list[list[BufferSlot]],
+) -> list[list[tuple[BufferSlot, torch.Tensor, torch.Tensor]]]:
+    """Pin collected block buffers into records used for .data swaps."""
+    block_records: list[list[tuple[BufferSlot, torch.Tensor, torch.Tensor]]] = []
+    for slots in block_buffer_slots:
+        buffer_records: list[tuple[BufferSlot, torch.Tensor, torch.Tensor]] = []
+        for slot in slots:
+            buffer = slot.get()
+            cpu_clone = (
+                buffer.data.clone(memory_format=torch.contiguous_format)
+                .pin_memory()
+            )
+            buffer_records.append((slot, buffer, cpu_clone))
+        block_records.append(buffer_records)
+    return block_records
+
+
 class _BlockPinnedStore:
     """Per-block pinned CPU + (when activated) per-slot GPU storage.
 
@@ -341,8 +386,8 @@ class _BlockPinnedStore:
         # the layout-signature check passes, so invalid configurations
         # raise before any model mutation.
         (
-            block_param_slots,
-            buffer_slots,
+            block_param_slot_groups,
+            block_buffer_slots,
             self._slot_filter,
         ) = _collect_block_slots(self._layers, skip)
 
@@ -352,36 +397,13 @@ class _BlockPinnedStore:
         # load into block 0's pool slot without raising and corrupt
         # forward. Run before pinning so layout failures happen before
         # low-peak Parameter.data repointing starts.
-        _check_block_layouts_match(block_param_slots)
+        _check_block_layouts_match(block_param_slot_groups)
 
         # Pass 2: pin params + buffers.
-        for block_param_slot_lists in block_param_slots:
-            block_param_bindings: list[PinnedParamBinding] = []
-            for slots in block_param_slot_lists:
-                primary_slot = slots[0]
-                param = primary_slot.get()
-                pinned = PinnedParam(primary_slot.name, param)
-                # Trainable streaming uses ``.data`` swap to preserve
-                # the user's Parameter identity. Only adapters that
-                # explicitly opt into that capability are allowed.
-                if pinned.requires_grad:
-                    try:
-                        pinned.validate_parameter_data_swap_target()
-                    except NotImplementedError as exc:
-                        raise NotImplementedError(
-                            f"Trainable streaming slot {primary_slot.name!r} "
-                            f"cannot be streamed: {exc}"
-                        ) from exc
-                block_param_bindings.append(bind_param_slots(pinned, slots))
-            self._param_bindings.append(block_param_bindings)
-
-        for block_buffer_slots in buffer_slots:
-            buffer_records: list[tuple[BufferSlot, torch.Tensor, torch.Tensor]] = []
-            for slot in block_buffer_slots:
-                buffer = slot.get()
-                cpu_clone = buffer.data.clone(memory_format=torch.contiguous_format).pin_memory()
-                buffer_records.append((slot, buffer, cpu_clone))
-            self._buffer_records.append(buffer_records)
+        self._param_bindings = _pin_block_param_bindings(
+            block_param_slot_groups,
+        )
+        self._buffer_records = _pin_block_buffer_records(block_buffer_slots)
 
         self._device: torch.device | None = None
         self._pool: _GpuSlotPool | None = None
