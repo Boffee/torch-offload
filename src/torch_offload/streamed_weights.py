@@ -210,7 +210,7 @@ def _layout_signature(p: nn.Parameter) -> tuple:
 
 
 def _check_block_layouts_match(
-    block_param_slots: list[list[list[ParamSlot]]],
+    block_param_slot_groups: list[list[list[ParamSlot]]],
 ) -> None:
     """Raise if blocks have mismatched param layouts. Called before
     pinning so layout failures leave parameter slots and storage
@@ -218,7 +218,7 @@ def _check_block_layouts_match(
 
     See :func:`_layout_signature` for what counts as "matched."
     """
-    if len(block_param_slots) <= 1:
+    if len(block_param_slot_groups) <= 1:
         return
 
     def sig(param_slot_lists: list[list[ParamSlot]]) -> tuple:
@@ -227,9 +227,9 @@ def _check_block_layouts_match(
             for slots in param_slot_lists
         )
 
-    ref = sig(block_param_slots[0])
-    for i in range(1, len(block_param_slots)):
-        if sig(block_param_slots[i]) != ref:
+    ref = sig(block_param_slot_groups[0])
+    for i in range(1, len(block_param_slot_groups)):
+        if sig(block_param_slot_groups[i]) != ref:
             raise ValueError(
                 f"Block {i} param layout differs from block 0. "
                 "All blocks in a StreamedWeights group must share the "
@@ -240,7 +240,7 @@ def _check_block_layouts_match(
             )
 
 
-def _collect_block_slots(
+def _collect_block_slot_groups(
     layers: list[nn.Module],
     skip: set[SlotKey],
 ) -> tuple[
@@ -248,8 +248,8 @@ def _collect_block_slots(
     list[list[BufferSlot]],
     frozenset[SlotKey],
 ]:
-    param_slots: list[list[list[ParamSlot]]] = []
-    buffer_slots: list[list[BufferSlot]] = []
+    param_slot_groups_per_block: list[list[list[ParamSlot]]] = []
+    buffer_slots_per_block: list[list[BufferSlot]] = []
     slot_filter: set[SlotKey] = set()
 
     for layer in layers:
@@ -267,7 +267,7 @@ def _collect_block_slots(
                 block_slots_by_id[param_id] = slots
                 block_param_order.append(param_id)
             slots.append(s)
-        param_slots.append(
+        param_slot_groups_per_block.append(
             [block_slots_by_id[param_id] for param_id in block_param_order]
         )
 
@@ -282,19 +282,19 @@ def _collect_block_slots(
                 continue
             seen_buffer_ids.add(id(buffer))
             block_buffer_slots.append(s)
-        buffer_slots.append(block_buffer_slots)
+        buffer_slots_per_block.append(block_buffer_slots)
 
-    return param_slots, buffer_slots, frozenset(slot_filter)
+    return param_slot_groups_per_block, buffer_slots_per_block, frozenset(slot_filter)
 
 
-def _pin_block_param_bindings(
+def _pin_block_param_slot_groups(
     block_param_slot_groups: list[list[list[ParamSlot]]],
 ) -> list[list[PinnedParamBinding]]:
     """Pin collected block parameter slots into per-block bindings."""
     block_bindings: list[list[PinnedParamBinding]] = []
-    for block_param_slots in block_param_slot_groups:
+    for param_slot_groups in block_param_slot_groups:
         param_bindings: list[PinnedParamBinding] = []
-        for slots in block_param_slots:
+        for slots in param_slot_groups:
             primary_slot = slots[0]
             param = primary_slot.get()
             pinned = PinnedParam(primary_slot.name, param)
@@ -389,7 +389,7 @@ class _BlockPinnedStore:
             block_param_slot_groups,
             block_buffer_slots,
             self._slot_filter,
-        ) = _collect_block_slots(self._layers, skip)
+        ) = _collect_block_slot_groups(self._layers, skip)
 
         # Validate before pinning. ``Tensor.copy_`` silently casts dtype
         # and silently broadcasts compatible shapes, so any block N with
@@ -400,7 +400,7 @@ class _BlockPinnedStore:
         _check_block_layouts_match(block_param_slot_groups)
 
         # Pass 2: pin params + buffers.
-        self._param_bindings = _pin_block_param_bindings(
+        self._param_bindings = _pin_block_param_slot_groups(
             block_param_slot_groups,
         )
         self._buffer_records = _pin_block_buffer_records(block_buffer_slots)
