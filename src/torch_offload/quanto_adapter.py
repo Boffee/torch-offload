@@ -215,6 +215,13 @@ class QuantoAdapter:
         return requantize_qbytes_tensor(t, like=like)
 
     @staticmethod
+    def copy_into(src: torch.Tensor, *, target: torch.Tensor) -> None:
+        target_qt = require_qbytes_tensor(target)
+        src_qt = require_qbytes_tensor(src)
+        target_qt._data.copy_(src_qt._data)
+        target_qt._scale.copy_(src_qt._scale)
+
+    @staticmethod
     def cache_bytes(state: _QuantoPinned) -> int:
         return (
             state.data.numel() * state.data.element_size()

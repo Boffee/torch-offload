@@ -26,7 +26,7 @@ from .pinned_weights import PinnedWeights
 from .protocols import ModelStrategyComponent, SlotKey
 from .slots import canonical_param_name, iter_buffer_slots, iter_param_slots, walk_attr_path
 from .streamed_weights import StreamedWeights
-from .tensor_adapters import DenseAddmmTensorAdapter, select_adapter
+from .tensor_adapters import select_adapter
 from .trainable_weights import TrainableWeights
 
 logger = logging.getLogger(__name__)
@@ -73,18 +73,13 @@ def _routed_factor_dtype(module: nn.Module) -> torch.dtype:
     return select_adapter(weight.data).compute_dtype(weight.data)
 
 
-def _validate_merge_lora_target(pinned: PinnedParam, target_key: str) -> None:
-    """Raise if this LoRA target cannot use activation-scoped merge mode."""
-    adapter = pinned.adapter
-    if not isinstance(adapter, DenseAddmmTensorAdapter):
-        raise ValueError(
-            f"LoRA target {target_key!r} uses {adapter.__name__}; "
-            "merge mode requires a dense in-place addmm-capable tensor "
-            "adapter. Use mode='routed' for quantized or structured "
-            "weights, or apply torch_offload.merge_lora() permanently "
-            "when that format supports a dequantize/requantize merge."
-        )
-    adapter.validate_dense_addmm_target(pinned.cpu_param.data, target_key)
+def _merge_lora_hook(
+    transform: LoRATransform, target_key: str,
+) -> Callable[[nn.Parameter], None]:
+    def hook(param: nn.Parameter) -> None:
+        transform.apply(param, target_key)
+
+    return hook
 
 
 class ModelOffloader:
@@ -354,10 +349,11 @@ class ModelOffloader:
 
         - ``"merge"`` (default): on CUDA activation, installs a
           post-copy hook per matched target. The hook applies
-          :class:`LoRATransform` via in-place ``addmm_`` immediately
-          after the base weight is copied to GPU, so it rides along
-          with the streaming cycle. Requires CUDA activation and base
-          weight adapter that supports dense in-place ``addmm_`` merge.
+          :class:`LoRATransform` immediately after the base weight is
+          copied to GPU, so it rides along with the streaming cycle.
+          Requires CUDA activation and a base-weight adapter that
+          supports dense in-place ``addmm_`` or dequantize/requantize
+          plus ``copy_into`` merge.
         - ``"routed"``: on activation, registers a forward hook on each
           matched parent module. Forward becomes
           ``y = base(x) + alpha * B * A * x``. Doesn't touch the base
@@ -401,13 +397,6 @@ class ModelOffloader:
                 if pinned is None:
                     continue
                 matched_targets += 1
-                expected = tuple(pinned.cpu_param.shape)
-                if expected != (b.shape[0], a.shape[1]):
-                    raise ValueError(
-                        f"LoRA factor shape mismatch for {target_key!r}: "
-                        f"B@A produces ({b.shape[0]}, {a.shape[1]}), "
-                        f"target shape is {expected}."
-                    )
                 existing_target = per_pinned_param_target.setdefault(
                     id(pinned), target_key
                 )
@@ -459,16 +448,12 @@ class ModelOffloader:
                 "for CPU activation."
             )
 
-        for target_key in targets:
-            _validate_merge_lora_target(
-                self._target_to_pinned_param[target_key], target_key
-            )
-
         for target_key, refs in targets.items():
             pinned = self._target_to_pinned_param[target_key]
             component = self._target_to_component[target_key]
+            transform = LoRATransform(refs)
             handle = component.register_post_copy_hook(
-                pinned, LoRATransform(refs).apply,
+                pinned, _merge_lora_hook(transform, target_key),
             )
             self._lora_hook_handles.append(handle)
 

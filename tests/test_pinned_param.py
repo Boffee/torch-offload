@@ -7,7 +7,11 @@ import torch
 from torch import nn
 
 from torch_offload.pinned_param import PinnedParam
-from torch_offload.tensor_adapters import DequantRequantTensorAdapter, select_adapter
+from torch_offload.tensor_adapters import (
+    DequantRequantTensorAdapter,
+    TensorCopyIntoAdapter,
+    select_adapter,
+)
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -101,6 +105,35 @@ class TestPinnedParam:
         assert slot.get_param("a") is a_first
         assert slot.get_param("b") is b_first
 
+    @CUDA
+    def test_slot_hook_mutates_stable_param_in_place(self) -> None:
+        from torch_offload.streamed_weights import _GpuSlot
+
+        p = nn.Parameter(torch.randn(8, dtype=torch.bfloat16), requires_grad=False)
+        pinned_param = PinnedParam("w", p)
+        block = [pinned_param]
+        slot = _GpuSlot(block, torch.device("cuda"))
+        base_param = slot.get_param("w")
+
+        def hook(param: nn.Parameter) -> None:
+            param.data.add_(1)
+
+        slot.copy_from(block, {id(pinned_param): hook}, non_blocking=False)
+        torch.cuda.synchronize()
+        assert slot.get_param("w") is base_param
+        torch.testing.assert_close(
+            base_param.detach().cpu(),
+            pinned_param.cpu_param.detach() + 1,
+        )
+
+        slot.copy_from(block, non_blocking=False)
+        torch.cuda.synchronize()
+        assert slot.get_param("w") is base_param
+        torch.testing.assert_close(
+            base_param.detach().cpu(),
+            pinned_param.cpu_param.detach(),
+        )
+
 
 # ---------------------------------------------------------------------------
 # Quanto path — only nontrivial branch in PinnedParam
@@ -121,6 +154,7 @@ class TestPinnedParamQuanto:
 
         adapter = select_adapter(qt)
         assert isinstance(adapter, DequantRequantTensorAdapter)
+        assert isinstance(adapter, TensorCopyIntoAdapter)
         dense = adapter.dequantize(qt)
         assert type(dense) is torch.Tensor
         assert dense.dtype == torch.float32
@@ -133,6 +167,17 @@ class TestPinnedParamQuanto:
         assert tuple(requantized.size()) == (rows, cols)
         torch.testing.assert_close(requantized._data, data)
         torch.testing.assert_close(requantized._scale, scale)
+
+        updated = dense + 1
+        expected_packed = (
+            updated / scale.to(torch.float32)
+        ).round().clamp(-128, 127).to(torch.int8)
+        updated_qt = adapter.requantize(updated, like=qt)
+        original_scale_ptr = qt._scale.data_ptr()
+        adapter.copy_into(updated_qt, target=qt)
+        torch.testing.assert_close(qt._data, expected_packed)
+        torch.testing.assert_close(qt._scale, scale)
+        assert qt._scale.data_ptr() == original_scale_ptr
 
     def test_pin_decomposes_data_and_scale(self) -> None:
         # Quanto WeightQBytesTensor must be decomposed into _data + _scale

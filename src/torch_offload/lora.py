@@ -6,9 +6,10 @@ retained — this object owns the only copy of the pinned factors.
 
 Two application paths share the same :class:`LoRA` data container:
 
-- :class:`LoRATransform` (merge mode) — applied via in-place ``addmm_``
-  on the GPU weight buffer after DMA; integrates with block streaming.
-  Requires the base weight to be float (bf16/fp16/fp32).
+- :class:`LoRATransform` (merge mode) — applied to the GPU parameter
+  after DMA; integrates with block streaming. Uses dense in-place
+  ``addmm_`` when available, otherwise an adapter-provided
+  dequantize/requantize plus ``copy_into`` path.
 - :class:`LoRARouteHandle` (routed mode) — installs a forward hook on
   the layer that adds ``alpha * (x @ A.T @ B.T)`` to the layer's output;
   base weight is not touched in place. Restricted to ``nn.Linear``
@@ -30,9 +31,17 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from types import TracebackType
+from typing import Any, cast
 
 import torch
 from torch import nn
+
+from .tensor_adapters import (
+    DenseAddmmTensorAdapter,
+    DequantRequantTensorAdapter,
+    TensorCopyIntoAdapter,
+    select_adapter,
+)
 
 __all__ = [
     "KeyTransformT",
@@ -44,6 +53,13 @@ __all__ = [
 
 
 KeyTransformT = Callable[[str], str] | None
+_LoraFactorRef = tuple[torch.Tensor, torch.Tensor, float]
+_DequantRequantAdapter = type[DequantRequantTensorAdapter[Any, Any]]
+_TensorCopyIntoAdapter = type[TensorCopyIntoAdapter[Any, Any]]
+_DequantRequantAdapters = tuple[
+    _DequantRequantAdapter,
+    _TensorCopyIntoAdapter,
+]
 
 
 def default_key_transform(key: str) -> str:
@@ -113,26 +129,120 @@ class LoRA:
 
 
 class LoRATransform:
-    """Per-weight LoRA factors applied after DMA to GPU.
+    """Per-weight LoRA factors applied to one base parameter.
 
     Holds references to LoRA-owned pinned factor matrices — no cloning
-    or pinning happens here.  :meth:`apply` copies each factor pair to
-    GPU and merges via ``addmm_`` with ``alpha=strength``.
+    or pinning happens here. :meth:`apply` copies each factor pair to
+    the target parameter's device and applies the update using either
+    dense in-place ``addmm_`` or the tensor adapter's
+    dequantize/requantize plus ``copy_into`` capability. The target
+    :class:`~torch.nn.Parameter` object is always preserved.
     """
 
     __slots__ = ("_refs",)
 
-    def __init__(
-        self, refs: list[tuple[torch.Tensor, torch.Tensor, float]]
-    ) -> None:
+    def __init__(self, refs: list[_LoraFactorRef]) -> None:
         self._refs = refs
 
-    def apply(self, gpu_data: torch.Tensor) -> None:
-        dev, dt = gpu_data.device, gpu_data.dtype
+    def validate_target(self, param: nn.Parameter, target_key: str) -> None:
+        """Raise if ``param`` cannot receive this LoRA merge.
+
+        This is an optional preflight for callers that want an earlier
+        error. :meth:`apply` uses the same validation path immediately
+        before mutating the target parameter.
+        """
+        self._target_adapters(param, target_key)
+
+    def apply(self, param: nn.Parameter, target_key: str) -> None:
+        adapters = self._target_adapters(param, target_key)
+        if adapters is None:
+            self._apply_dense(param.data)
+            return
+
+        adapter, copy_adapter = adapters
+        dense = adapter.dequantize(param.data)
+        self._apply_dense(dense)
+        new_data = adapter.requantize(dense, like=param.data)
+        copy_adapter.copy_into(new_data, target=param.data)
+
+    def _apply_dense(self, data: torch.Tensor) -> None:
+        dev, dt = data.device, data.dtype
         for a, b, strength in self._refs:
             a_gpu = a.to(device=dev, dtype=dt, non_blocking=True)
             b_gpu = b.to(device=dev, dtype=dt, non_blocking=True)
-            gpu_data.addmm_(b_gpu, a_gpu, alpha=strength)
+            data.addmm_(b_gpu, a_gpu, alpha=strength)
+
+    def _target_adapters(
+        self, param: nn.Parameter, target_key: str,
+    ) -> _DequantRequantAdapters | None:
+        _validate_factor_shapes(self._refs, param.data, target_key)
+        return _dequant_requant_adapters(param.data, target_key)
+
+
+def _validate_factor_shapes(
+    refs: list[_LoraFactorRef], data: torch.Tensor, target_key: str,
+) -> None:
+    target_shape = tuple(data.shape)
+    for a, b, _strength in refs:
+        if a.ndim != 2 or b.ndim != 2 or a.shape[0] != b.shape[1]:
+            raise ValueError(
+                f"LoRA factor shape mismatch for {target_key!r}: "
+                f"A shape is {tuple(a.shape)}, B shape is {tuple(b.shape)}."
+            )
+        produced_shape = (b.shape[0], a.shape[1])
+        if target_shape != produced_shape:
+            raise ValueError(
+                f"LoRA factor shape mismatch for {target_key!r}: "
+                f"B@A produces {produced_shape}, target shape is {target_shape}."
+            )
+
+
+def _dequant_requant_adapters(
+    data: torch.Tensor, target_key: str,
+) -> _DequantRequantAdapters | None:
+    try:
+        adapter = select_adapter(data)
+    except NotImplementedError as exc:
+        raise ValueError(
+            f"Cannot merge LoRA into {target_key!r}: tensor type "
+            f"{type(data).__name__} has no registered tensor adapter. "
+            "Merge requires a tensor adapter with dense addmm or "
+            "dequantize/requantize plus copy_into support."
+        ) from exc
+
+    if isinstance(adapter, DenseAddmmTensorAdapter):
+        try:
+            adapter.validate_dense_addmm_target(data, target_key)
+        except ValueError:
+            if (
+                isinstance(adapter, DequantRequantTensorAdapter)
+                and isinstance(adapter, TensorCopyIntoAdapter)
+            ):
+                return (
+                    cast(_DequantRequantAdapter, adapter),
+                    cast(_TensorCopyIntoAdapter, adapter),
+                )
+            raise
+        return None
+
+    if (
+        isinstance(adapter, DequantRequantTensorAdapter)
+        and isinstance(adapter, TensorCopyIntoAdapter)
+    ):
+        return (
+            cast(_DequantRequantAdapter, adapter),
+            cast(_TensorCopyIntoAdapter, adapter),
+        )
+
+    raise ValueError(
+        f"Cannot merge LoRA into {target_key!r}: {_adapter_name(adapter)} "
+        "does not support dense in-place addmm or dequantize/requantize "
+        "plus copy_into updates. Use routed LoRA for this tensor type."
+    )
+
+
+def _adapter_name(adapter: object) -> str:
+    return str(getattr(adapter, "__name__", type(adapter).__name__))
 
 
 class LoRARouteHandle:

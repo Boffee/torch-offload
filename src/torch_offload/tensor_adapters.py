@@ -43,6 +43,7 @@ __all__ = [
     "DequantRequantTensorAdapter",
     "ParameterDataSwapTensorAdapter",
     "TensorAdapter",
+    "TensorCopyIntoAdapter",
     "register_adapter",
     "select_adapter",
 ]
@@ -236,6 +237,22 @@ class ParameterDataSwapTensorAdapter(TensorAdapter[PinnedStateT, GpuStateT], Pro
         only ``.data``. Tensor subclasses with wrapper metadata generally
         must not opt into this capability.
         """
+        ...
+
+
+@runtime_checkable
+class TensorCopyIntoAdapter(TensorAdapter[PinnedStateT, GpuStateT], Protocol):
+    """Optional capability for representation-preserving copy into ``target``.
+
+    ``copy_into(src, target=...)`` copies ``src``'s representation into
+    ``target`` while preserving ``target``'s object identity and storage.
+    Structured tensor wrappers use this when generic ``target.copy_(src)``
+    does not update their internal storage correctly.
+    """
+
+    @staticmethod
+    def copy_into(src: torch.Tensor, *, target: torch.Tensor) -> None:
+        """Copy ``src`` into ``target``'s existing representation."""
         ...
 
 

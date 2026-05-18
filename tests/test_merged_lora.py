@@ -17,6 +17,7 @@ from torch import nn
 
 from torch_offload import (
     LoRA,
+    LoRATransform,
     ModelCache,
     ModelOffloader,
     PinnedWeights,
@@ -287,7 +288,7 @@ class TestLoRAConstruction:
 
 
 class TestSetLorasValidation:
-    def test_rejects_target_shape_mismatch(self) -> None:
+    def test_target_shape_mismatch_is_deferred_until_apply(self) -> None:
         m = _make_bf16_model()
         s = _make_strategy(m)
         sd = {
@@ -295,8 +296,8 @@ class TestSetLorasValidation:
             "transformer_blocks.0.attn.lora_B.weight": torch.randn(8, 4),
         }
         s.set_loras([(LoRA(state_dict=sd), 1.0)])
-        with pytest.raises(ValueError, match="shape mismatch"):
-            _activate_loras_for_test(s)
+        _activate_loras_for_test(s)
+        assert _has_post_copy_hook(s, "transformer_blocks.0.attn.weight")
 
     def test_accepts_fp32_lora_target(self) -> None:
         m = _make_bf16_model().to(torch.float32)
@@ -423,13 +424,7 @@ class TestSetLorasValidation:
         s._clear_loras()
         assert not _has_post_copy_hook(s, "transformer_blocks.0.attn.weight")
 
-    def test_rejects_quanto_target_in_merge_mode(self) -> None:
-        # Regression: quanto WeightQBytesTensor advertises the scale's
-        # float dtype (bf16/fp16) via `weight.dtype`, which used to
-        # pass the merge-mode dtype gate. addmm_ on the wrapper then
-        # silently drops the LoRA — _data stays untouched. Activation
-        # must reject subclassed wrappers in merge mode regardless of
-        # the advertised dtype.
+    def test_accepts_quanto_target_in_merge_mode(self) -> None:
         quanto = pytest.importorskip("optimum.quanto")
         from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
 
@@ -448,17 +443,15 @@ class TestSetLorasValidation:
             "embed.lora_B.weight": torch.randn(16, 4),
         }
         s.set_loras([(LoRA(state_dict=sd), 1.0)], mode="merge")
-        with pytest.raises(
-            ValueError,
-            match=r"uses QuantoAdapter|dense in-place addmm-capable",
-        ):
-            _activate_loras_for_test(s)
+        assert _activate_loras_for_test(s) == 1
+        assert _has_post_copy_hook(s, "embed.weight")
+
         # routed mode must still accept it.
         s.set_loras([(LoRA(state_dict=sd), 1.0)], mode="routed")
         route_count = _activate_loras_for_test(s)
         assert route_count == 1
 
-    def test_merge_mode_rejects_regular_non_addmm_dtype(self) -> None:
+    def test_merge_mode_defers_regular_non_addmm_dtype_until_apply(self) -> None:
         m = _make_bf16_model()
         m.embed.weight = nn.Parameter(
             torch.zeros(16, 16, dtype=torch.int32),
@@ -470,8 +463,8 @@ class TestSetLorasValidation:
             "embed.lora_B.weight": torch.randn(16, 4),
         }
         s.set_loras([(LoRA(state_dict=sd), 1.0)], mode="merge")
-        with pytest.raises(ValueError, match="dense in-place addmm requires"):
-            _activate_loras_for_test(s)
+        _activate_loras_for_test(s)
+        assert _has_post_copy_hook(s, "embed.weight")
 
     def test_accepts_fp16_base(self) -> None:
         m = _make_bf16_model().to(torch.float16)
@@ -769,6 +762,165 @@ class TestMergeCorrectness:
             s.deactivate()
 
 
+class TestLoRATransform:
+    def test_validate_target_accepts_dense_without_mutation(self) -> None:
+        param = nn.Parameter(torch.randn(4, 8), requires_grad=False)
+        before = param.detach().clone()
+        a = torch.randn(2, 8)
+        b = torch.randn(4, 2)
+        transform = LoRATransform([(a, b, 0.5)])
+
+        transform.validate_target(param, "target.weight")
+
+        torch.testing.assert_close(param, before)
+
+    def test_validate_target_rejects_shape_mismatch(self) -> None:
+        param = nn.Parameter(torch.randn(4, 8), requires_grad=False)
+        a = torch.randn(2, 8)
+        b = torch.randn(3, 2)
+        transform = LoRATransform([(a, b, 0.5)])
+
+        with pytest.raises(ValueError, match="B@A produces"):
+            transform.validate_target(param, "target.weight")
+
+    def test_dense_transform_mutates_param_in_place(self) -> None:
+        param = nn.Parameter(torch.randn(4, 8), requires_grad=False)
+        before = param.detach().clone()
+        a = torch.randn(2, 8)
+        b = torch.randn(4, 2)
+        transform = LoRATransform([(a, b, 0.5)])
+
+        transform.apply(param, "target.weight")
+
+        expected = before.clone()
+        expected.addmm_(b, a, alpha=0.5)
+        torch.testing.assert_close(param, expected)
+
+    def test_regular_non_addmm_dtype_raises_on_apply(self) -> None:
+        param = nn.Parameter(torch.zeros(4, 8, dtype=torch.int32), requires_grad=False)
+        a = torch.randn(2, 8)
+        b = torch.randn(4, 2)
+        transform = LoRATransform([(a, b, 0.5)])
+
+        with pytest.raises(ValueError, match="dense in-place addmm requires"):
+            transform.apply(param, "target.weight")
+
+    def test_quanto_transform_requantizes_param_in_place(self) -> None:
+        quanto = pytest.importorskip("optimum.quanto")
+        from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
+
+        rows, cols, rank = 4, 8, 2
+        data = torch.randint(-32, 32, (rows, cols), dtype=torch.int8)
+        scale = torch.rand(rows, 1, dtype=torch.bfloat16).add_(0.25)
+        qt = WeightQBytesTensor.create(
+            quanto.qint8, 0, (rows, cols), (cols, 1), data, scale, None,
+        )
+        param = nn.Parameter(qt, requires_grad=False)
+        a = torch.randn(rank, cols)
+        b = torch.randn(rows, rank)
+        transform = LoRATransform([(a, b, 0.5)])
+        original_param = param
+        original_packed_ptr = param.data._data.data_ptr()
+
+        transform.apply(param, "target.weight")
+
+        expected_dense = qt.dequantize().to(torch.float32)
+        expected_dense.addmm_(b.to(torch.float32), a.to(torch.float32), alpha=0.5)
+        expected_packed = (
+            expected_dense / scale.to(torch.float32)
+        ).round().clamp(-128, 127).to(torch.int8)
+        assert param is original_param
+        assert param.data._data.data_ptr() == original_packed_ptr
+        assert isinstance(param.data, WeightQBytesTensor)
+        torch.testing.assert_close(param.data._data, expected_packed)
+        torch.testing.assert_close(param.data._scale, scale)
+
+    @CUDA
+    def test_non_block_quanto_merge_requantizes_on_activate(self) -> None:
+        quanto = pytest.importorskip("optimum.quanto")
+        from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
+
+        m = _make_bf16_model(num_blocks=1, dim=16)
+        rows = cols = 16
+        rank = 4
+        data = torch.randint(-32, 32, (rows, cols), dtype=torch.int8)
+        scale = torch.rand(rows, 1, dtype=torch.bfloat16).add_(0.25)
+        qt = WeightQBytesTensor.create(
+            quanto.qint8, 0, (rows, cols), (cols, 1), data, scale, None,
+        )
+        m.embed.weight = nn.Parameter(qt, requires_grad=False)
+        sd = {
+            "embed.lora_A.weight": torch.randn(rank, cols),
+            "embed.lora_B.weight": torch.randn(rows, rank),
+        }
+        lora = LoRA(state_dict=sd, key_transform=None)
+        a, b = lora.targets["embed.weight"]
+        expected_dense = qt.dequantize().to(torch.float32)
+        expected_dense.addmm_(b.to(torch.float32), a.to(torch.float32), alpha=0.5)
+        expected_packed = (
+            expected_dense / scale.to(torch.float32)
+        ).round().clamp(-128, 127).to(torch.int8)
+
+        s = _make_strategy(m)
+        s.set_loras([(lora, 0.5)], mode="merge")
+        s.activate("cuda")
+        try:
+            merged_qt = m.embed.weight.data
+            assert isinstance(merged_qt, WeightQBytesTensor)
+            torch.testing.assert_close(merged_qt._data.cpu(), expected_packed)
+            torch.testing.assert_close(merged_qt._scale.cpu(), scale)
+        finally:
+            s.deactivate()
+
+    @CUDA
+    def test_streamed_quanto_merge_requantizes_pool_param_in_place(self) -> None:
+        quanto = pytest.importorskip("optimum.quanto")
+        from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
+
+        m = _make_bf16_model(num_blocks=2, dim=16)
+        rows = cols = 16
+        rank = 4
+        scales: list[torch.Tensor] = []
+        original_qt: WeightQBytesTensor | None = None
+        for block in m.transformer_blocks:
+            data = torch.randint(-32, 32, (rows, cols), dtype=torch.int8)
+            scale = torch.rand(rows, 1, dtype=torch.bfloat16).add_(0.25)
+            qt = WeightQBytesTensor.create(
+                quanto.qint8, 0, (rows, cols), (cols, 1), data, scale, None,
+            )
+            if original_qt is None:
+                original_qt = qt
+            scales.append(scale)
+            block.attn.weight = nn.Parameter(qt, requires_grad=False)
+        assert original_qt is not None
+
+        sd = {
+            "transformer_blocks.0.attn.lora_A.weight": torch.randn(rank, cols),
+            "transformer_blocks.0.attn.lora_B.weight": torch.randn(rows, rank),
+        }
+        lora = LoRA(state_dict=sd, key_transform=None)
+        a, b = lora.targets["transformer_blocks.0.attn.weight"]
+        expected_dense = original_qt.dequantize().to(torch.float32)
+        expected_dense.addmm_(b.to(torch.float32), a.to(torch.float32), alpha=0.5)
+        expected_packed = (
+            expected_dense / scales[0].to(torch.float32)
+        ).round().clamp(-128, 127).to(torch.int8)
+
+        s = _make_strategy(m, blocks_to_swap=1)
+        s.set_loras([(lora, 0.5)], mode="merge")
+        s.activate("cuda")
+        try:
+            streamer = s._streamers[0]
+            assert streamer._store is not None
+            streamer._store.load_block(0)
+            merged_qt = m.transformer_blocks[0].attn.weight.data
+            assert isinstance(merged_qt, WeightQBytesTensor)
+            torch.testing.assert_close(merged_qt._data.cpu(), expected_packed)
+            torch.testing.assert_close(merged_qt._scale.cpu(), scales[0])
+        finally:
+            s.deactivate()
+
+
 class TestPermanentMerge:
     def test_quanto_target_uses_dequant_requant_strategy(self) -> None:
         quanto = pytest.importorskip("optimum.quanto")
@@ -788,6 +940,7 @@ class TestPermanentMerge:
         )
         m = M(qt)
         original_param = m.target.weight
+        original_packed_ptr = original_param.data._data.data_ptr()
         sd = {
             "target.lora_A.weight": torch.randn(rank, cols),
             "target.lora_B.weight": torch.randn(rows, rank),
@@ -804,9 +957,10 @@ class TestPermanentMerge:
         merged = merge_lora(m, [(lora, 0.5)])
 
         assert merged == 1
-        assert m.target.weight is not original_param
+        assert m.target.weight is original_param
         merged_qt = m.target.weight.data
         assert isinstance(merged_qt, WeightQBytesTensor)
+        assert merged_qt._data.data_ptr() == original_packed_ptr
         assert merged_qt.qtype is quanto.qint8
         assert merged_qt.axis == 0
         assert tuple(merged_qt.size()) == (rows, cols)

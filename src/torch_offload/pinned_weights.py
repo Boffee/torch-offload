@@ -391,7 +391,7 @@ class PinnedWeights:
             gpu_param = param_group.pinned.load_to_gpu(device, non_blocking=True)
             hook = self._post_copy_hooks.get(id(param_group.pinned))
             if hook is not None:
-                hook(gpu_param.data)
+                hook(gpu_param)
             for slot in param_group.unique_slots:
                 slot.set(gpu_param)
         if self._include_buffers:

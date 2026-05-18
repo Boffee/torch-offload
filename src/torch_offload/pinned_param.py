@@ -36,7 +36,7 @@ from .tensor_adapters import (
     select_adapter,
 )
 
-PostCopyHook = Callable[[torch.Tensor], None]
+PostCopyHook = Callable[[nn.Parameter], None]
 
 
 class PostCopyHookHandle:

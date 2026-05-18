@@ -146,7 +146,7 @@ class _GpuSlot:
                 else None
             )
             if hook is not None:
-                hook(self._gpu_params[pinned.name].data)
+                hook(self._gpu_params[pinned.name])
 
     def get_param(self, name: str) -> nn.Parameter:
         return self._gpu_params[name]

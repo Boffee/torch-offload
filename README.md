@@ -154,16 +154,16 @@ hook runs immediately after the owning component copies the base weight
 from pinned CPU storage to GPU, so both block-streamed and non-block
 weights use the same merge path. Merge compatibility is adapter-owned:
 plain dense tensors opt into in-place `addmm_`; structured quantized
-wrappers should use routed mode only when the module still exposes a
-compatible logical Linear weight shape and compute dtype, unless they
-provide their own permanent merge path. `PinnedParam` remains a
-storage primitive; LoRA merge mode asks the selected adapter for the
-dense-update capability.
+wrappers can opt into dequantize/requantize plus `copy_into` updates.
+Use routed mode for formats that do not expose either merge capability
+but still provide a compatible logical Linear weight shape and compute
+dtype. `PinnedParam` remains a storage primitive; LoRA merge mode asks
+the selected adapter for the required update capability.
 
 `set_loras()` records the replacement request while the offloader is
-inactive. Target matching and mode-specific compatibility are validated
-during activation, so LoRA application follows the same runtime boundary
-as device selection.
+inactive. Target matching is resolved during activation; target
+compatibility can be preflighted with `LoRATransform.validate_target()`
+or validated when the merge hook applies.
 
 ```python
 import torch
@@ -200,9 +200,9 @@ the previous merge — no explicit unmerge step needed.
 into the base weight. Use it when:
 
 - The base weight is quantized or otherwise structured, but still exposes
-  a logical `nn.Linear` weight shape and compute dtype: `mode="merge"`
-  only accepts adapters that explicitly support dense in-place `addmm_`;
-  `mode="routed"` works because it doesn't touch the base.
+  a logical `nn.Linear` weight shape and compute dtype, and its adapter
+  does not support merge updates. `mode="routed"` works because it
+  doesn't touch the base.
 - You want to switch LoRAs frequently without re-streaming the
   underlying base weight.
 
