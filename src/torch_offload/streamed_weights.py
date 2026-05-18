@@ -52,7 +52,7 @@ import torch
 from torch import nn
 
 from ._devices import canonical_device
-from .pinned_bindings import PinnedParamBinding
+from .pinned_bindings import PinnedParamBinding, bind_param_slots
 from .pinned_param import PinnedParam, PostCopyHook, PostCopyHookHandle
 from .protocols import SlotKey
 from .slots import (
@@ -372,13 +372,7 @@ class _BlockPinnedStore:
                             f"Trainable streaming slot {primary_slot.name!r} "
                             f"cannot be streamed: {exc}"
                         ) from exc
-                block_param_bindings.append(
-                    PinnedParamBinding(
-                        pinned=pinned,
-                        slots=slots,
-                        cpu_param=pinned.make_cpu_param(),
-                    )
-                )
+                block_param_bindings.append(bind_param_slots(pinned, slots))
             self._param_bindings.append(block_param_bindings)
 
         for block_buffer_slots in buffer_slots:

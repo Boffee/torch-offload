@@ -66,7 +66,12 @@ import torch
 from torch import nn
 
 from ._devices import canonical_device
-from .pinned_bindings import PinnedBufferBinding, PinnedParamBinding
+from .pinned_bindings import (
+    PinnedBufferBinding,
+    PinnedParamBinding,
+    pin_buffer_slots,
+    pin_param_slots,
+)
 from .pinned_param import (
     PinnedParam,
     PostCopyHook,
@@ -75,6 +80,7 @@ from .pinned_param import (
 )
 from .protocols import SlotKey
 from .slots import (
+    BufferSlot,
     ParamSlot,
     assert_frozen,
     iter_buffer_slots,
@@ -209,35 +215,19 @@ class PinnedWeights:
             )
             groups.setdefault(self._param_storage_key(s.get()), []).append(s)
 
-        param_bindings: list[PinnedParamBinding] = []
-        for slots in groups.values():
-            first = slots[0]
-            pinned = PinnedParam(first.name, first.get())
-            param_bindings.append(
-                PinnedParamBinding(
-                    pinned=pinned,
-                    slots=slots,
-                    cpu_param=pinned.make_cpu_param(),
-                )
-            )
-        return param_bindings
+        return [pin_param_slots(slots) for slots in groups.values()]
 
     def _collect_buffer_bindings(
         self, model: nn.Module
     ) -> list[PinnedBufferBinding]:
-        buffer_bindings: dict[tuple[Any, ...], PinnedBufferBinding] = {}
+        groups: dict[tuple[Any, ...], list[BufferSlot]] = {}
         for s in iter_buffer_slots(model):
             if s.key in self._skip_slots:
                 continue
             buffer = s.get()
             skey = self._buffer_storage_key(buffer)
-            existing = buffer_bindings.get(skey)
-            if existing is None:
-                pinned = buffer.detach().clone(memory_format=torch.contiguous_format).pin_memory()
-                buffer_bindings[skey] = PinnedBufferBinding(pinned, [s])
-            else:
-                existing.slots.append(s)
-        return list(buffer_bindings.values())
+            groups.setdefault(skey, []).append(s)
+        return [pin_buffer_slots(slots) for slots in groups.values()]
 
     @staticmethod
     def _param_storage_key(param: nn.Parameter) -> tuple[Any, ...]:

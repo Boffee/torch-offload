@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import torch
@@ -36,7 +37,49 @@ class PinnedBufferBinding:
         return unique_slots(self.slots)
 
 
+def bind_param_slots(
+    pinned: PinnedParam, slots: Sequence[ParamSlot],
+) -> PinnedParamBinding:
+    """Bind live model slots to an existing pinned parameter backing."""
+    slot_list = list(slots)
+    if not slot_list:
+        raise ValueError("bind_param_slots requires at least one ParamSlot")
+    return PinnedParamBinding(
+        pinned=pinned,
+        slots=slot_list,
+        cpu_param=pinned.make_cpu_param(),
+    )
+
+
+def pin_param_slots(slots: Sequence[ParamSlot]) -> PinnedParamBinding:
+    """Pin the first slot's parameter and bind all aliases to that backing."""
+    slot_list = list(slots)
+    if not slot_list:
+        raise ValueError("pin_param_slots requires at least one ParamSlot")
+    primary_slot = slot_list[0]
+    pinned = PinnedParam(primary_slot.name, primary_slot.get())
+    return bind_param_slots(pinned, slot_list)
+
+
+def pin_buffer_slots(slots: Sequence[BufferSlot]) -> PinnedBufferBinding:
+    """Clone and pin the first slot's buffer and bind all aliases to it."""
+    slot_list = list(slots)
+    if not slot_list:
+        raise ValueError("pin_buffer_slots requires at least one BufferSlot")
+    pinned = (
+        slot_list[0]
+        .get()
+        .detach()
+        .clone(memory_format=torch.contiguous_format)
+        .pin_memory()
+    )
+    return PinnedBufferBinding(pinned=pinned, slots=slot_list)
+
+
 __all__ = [
     "PinnedBufferBinding",
     "PinnedParamBinding",
+    "bind_param_slots",
+    "pin_buffer_slots",
+    "pin_param_slots",
 ]
