@@ -1,4 +1,4 @@
-"""Shared pinned group records."""
+"""Shared pinned binding records."""
 
 from __future__ import annotations
 
@@ -11,7 +11,9 @@ from .slots import BufferSlot, ParamSlot, unique_slots
 
 
 @dataclass(slots=True)
-class PinnedParamGroup:
+class PinnedParamBinding:
+    """One model instance's parameter slots bound to one pinned backing."""
+
     pinned: PinnedParam
     slots: list[ParamSlot]
 
@@ -21,7 +23,9 @@ class PinnedParamGroup:
 
 
 @dataclass(slots=True)
-class PinnedBufferGroup:
+class PinnedBufferBinding:
+    """One model instance's buffer slots bound to one pinned tensor."""
+
     pinned: torch.Tensor
     slots: list[BufferSlot]
 
@@ -31,6 +35,6 @@ class PinnedBufferGroup:
 
 
 __all__ = [
-    "PinnedBufferGroup",
-    "PinnedParamGroup",
+    "PinnedBufferBinding",
+    "PinnedParamBinding",
 ]

@@ -66,7 +66,7 @@ import torch
 from torch import nn
 
 from ._devices import canonical_device
-from .pinned_groups import PinnedBufferGroup, PinnedParamGroup
+from .pinned_bindings import PinnedBufferBinding, PinnedParamBinding
 from .pinned_param import (
     PinnedParam,
     PostCopyHook,
@@ -158,21 +158,21 @@ class PinnedWeights:
         # construction peak memory low. If a later pin fails, the caller
         # must drop the partially constructed model/strategy and rebuild
         # from a fresh model instance.
-        self._param_groups = self._collect_param_groups(model)
-        self._buffer_groups = (
-            self._collect_buffer_groups(model) if include_buffers else []
+        self._param_bindings = self._collect_param_bindings(model)
+        self._buffer_bindings = (
+            self._collect_buffer_bindings(model) if include_buffers else []
         )
 
         # Phase 2: apply slot replacement/register_buffer mutations after
         # all pinning succeeded. This keeps module slot identity changes
         # grouped, but construction is not fully rollback-safe because of
         # the low-peak Parameter.data repointing described above.
-        for param_group in self._param_groups:
-            for slot in param_group.unique_slots:
-                slot.set(param_group.pinned.cpu_param)
-        for buffer_group in self._buffer_groups:
-            for slot in buffer_group.unique_slots:
-                slot.set(buffer_group.pinned)
+        for param_binding in self._param_bindings:
+            for slot in param_binding.unique_slots:
+                slot.set(param_binding.pinned.cpu_param)
+        for buffer_binding in self._buffer_bindings:
+            for slot in buffer_binding.unique_slots:
+                slot.set(buffer_binding.pinned)
 
         # Reject only if there is nothing at all to manage — neither
         # frozen params nor (when include_buffers=True) registered
@@ -181,7 +181,7 @@ class PinnedWeights:
         # pinned-CPU storage and the activate/deactivate round-trip,
         # which is exactly what ModelOffloader non-block composition
         # needs.
-        if not self._param_groups and not self._buffer_groups:
+        if not self._param_bindings and not self._buffer_bindings:
             raise ValueError(
                 "PinnedWeights requires at least one frozen parameter or, "
                 "when include_buffers=True, at least one registered buffer "
@@ -190,7 +190,7 @@ class PinnedWeights:
                 "leave the model unwrapped."
             )
 
-    def _collect_param_groups(self, model: nn.Module) -> list[PinnedParamGroup]:
+    def _collect_param_bindings(self, model: nn.Module) -> list[PinnedParamBinding]:
         # Tied-weight aware pinning. We walk with remove_duplicate=False so
         # shared submodule aliases and standard tie_weights() aliases both
         # show up, then group by storage identity.
@@ -209,29 +209,29 @@ class PinnedWeights:
             )
             groups.setdefault(self._param_storage_key(s.get()), []).append(s)
 
-        param_groups: list[PinnedParamGroup] = []
+        param_bindings: list[PinnedParamBinding] = []
         for slots in groups.values():
             first = slots[0]
             pinned = PinnedParam(first.name, first.get())
-            param_groups.append(PinnedParamGroup(pinned, slots))
-        return param_groups
+            param_bindings.append(PinnedParamBinding(pinned, slots))
+        return param_bindings
 
-    def _collect_buffer_groups(
+    def _collect_buffer_bindings(
         self, model: nn.Module
-    ) -> list[PinnedBufferGroup]:
-        buffer_groups: dict[tuple[Any, ...], PinnedBufferGroup] = {}
+    ) -> list[PinnedBufferBinding]:
+        buffer_bindings: dict[tuple[Any, ...], PinnedBufferBinding] = {}
         for s in iter_buffer_slots(model):
             if s.key in self._skip_slots:
                 continue
             buffer = s.get()
             skey = self._buffer_storage_key(buffer)
-            existing = buffer_groups.get(skey)
+            existing = buffer_bindings.get(skey)
             if existing is None:
                 pinned = buffer.detach().clone(memory_format=torch.contiguous_format).pin_memory()
-                buffer_groups[skey] = PinnedBufferGroup(pinned, [s])
+                buffer_bindings[skey] = PinnedBufferBinding(pinned, [s])
             else:
                 existing.slots.append(s)
-        return list(buffer_groups.values())
+        return list(buffer_bindings.values())
 
     @staticmethod
     def _param_storage_key(param: nn.Parameter) -> tuple[Any, ...]:
@@ -252,27 +252,27 @@ class PinnedWeights:
     # ------------------------------------------------------------------
 
     @property
-    def param_groups(self) -> list[PinnedParamGroup]:
-        """Pinned parameter groups managed by this instance.
+    def param_bindings(self) -> list[PinnedParamBinding]:
+        """Pinned parameter bindings managed by this instance.
 
         Used by :class:`~torch_offload.ModelOffloader` to build its
         target-name to pinned-param map.
         """
-        return self._param_groups
+        return self._param_bindings
 
     @property
-    def buffer_groups(self) -> list[PinnedBufferGroup]:
-        """Pinned PyTorch buffer groups managed by this instance."""
-        return self._buffer_groups
+    def buffer_bindings(self) -> list[PinnedBufferBinding]:
+        """Pinned PyTorch buffer bindings managed by this instance."""
+        return self._buffer_bindings
 
     @property
     def cache_bytes(self) -> int:
         """Total pinned host bytes held. Tied weights counted once."""
         total = 0
-        for param_group in self._param_groups:
-            total += param_group.pinned.cache_bytes
-        for buffer_group in self._buffer_groups:
-            total += buffer_group.pinned.numel() * buffer_group.pinned.element_size()
+        for param_binding in self._param_bindings:
+            total += param_binding.pinned.cache_bytes
+        for buffer_binding in self._buffer_bindings:
+            total += buffer_binding.pinned.numel() * buffer_binding.pinned.element_size()
         return total
 
     @property
@@ -295,8 +295,8 @@ class PinnedWeights:
         handle whose :meth:`remove` method unregisters the hook.
         """
         if not any(
-            param_group.pinned is pinned
-            for param_group in self._param_groups
+            param_binding.pinned is pinned
+            for param_binding in self._param_bindings
         ):
             raise ValueError(
                 f"pinned param {pinned.name!r} is not owned by this PinnedWeights"
@@ -387,25 +387,25 @@ class PinnedWeights:
         # One active-device Parameter per unique pinned parameter. Tied slots
         # all receive the same Parameter object so the tying invariant
         # survives on device.
-        for param_group in self._param_groups:
-            gpu_param = param_group.pinned.load_to_gpu(device, non_blocking=True)
-            hook = self._post_copy_hooks.get(id(param_group.pinned))
+        for param_binding in self._param_bindings:
+            gpu_param = param_binding.pinned.load_to_gpu(device, non_blocking=True)
+            hook = self._post_copy_hooks.get(id(param_binding.pinned))
             if hook is not None:
                 hook(gpu_param)
-            for slot in param_group.unique_slots:
+            for slot in param_binding.unique_slots:
                 slot.set(gpu_param)
         if self._include_buffers:
-            for buffer_group in self._buffer_groups:
-                gpu = buffer_group.pinned.to(device, non_blocking=True)
-                for slot in buffer_group.unique_slots:
+            for buffer_binding in self._buffer_bindings:
+                gpu = buffer_binding.pinned.to(device, non_blocking=True)
+                for slot in buffer_binding.unique_slots:
                     slot.set(gpu)
         torch.cuda.synchronize(device)
 
     def _move_to_pinned(self) -> None:
-        for param_group in self._param_groups:
-            for slot in param_group.unique_slots:
-                slot.set(param_group.pinned.cpu_param)
+        for param_binding in self._param_bindings:
+            for slot in param_binding.unique_slots:
+                slot.set(param_binding.pinned.cpu_param)
         if self._include_buffers:
-            for buffer_group in self._buffer_groups:
-                for slot in buffer_group.unique_slots:
-                    slot.set(buffer_group.pinned)
+            for buffer_binding in self._buffer_bindings:
+                for slot in buffer_binding.unique_slots:
+                    slot.set(buffer_binding.pinned)

@@ -788,42 +788,42 @@ class ModelOffloader:
         components: dict[str, PinnedWeights | StreamedWeights] = {}
 
         for streamer, layer_path in zip(streamers, layer_paths, strict=True):
-            for block_idx, block_param_groups in enumerate(
-                streamer.param_groups_per_block
+            for block_idx, block_param_bindings in enumerate(
+                streamer.param_bindings_per_block
             ):
-                for param_group in block_param_groups:
+                for param_binding in block_param_bindings:
                     seen_parent_ids: set[int] = set()
                     slot_parents: list[nn.Module] = []
-                    for slot in param_group.slots:
+                    for slot in param_binding.slots:
                         parent_id = id(slot.parent)
                         if parent_id in seen_parent_ids:
                             continue
                         seen_parent_ids.add(parent_id)
                         slot_parents.append(slot.parent)
                     parent_tuple = tuple(slot_parents)
-                    for slot in param_group.slots:
+                    for slot in param_binding.slots:
                         full_name = f"{layer_path}.{block_idx}.{slot.name}"
                         key = canonical_param_name(full_name)
-                        pinned_params[key] = param_group.pinned
+                        pinned_params[key] = param_binding.pinned
                         parents[key] = parent_tuple
                         components[key] = streamer
 
         if non_block is not None:
-            for param_group in non_block.param_groups:
-                if not param_group.slots:
+            for param_binding in non_block.param_bindings:
+                if not param_binding.slots:
                     continue
                 seen_parent_ids: set[int] = set()
                 slot_parents: list[nn.Module] = []
-                for slot in param_group.slots:
+                for slot in param_binding.slots:
                     parent_id = id(slot.parent)
                     if parent_id in seen_parent_ids:
                         continue
                     seen_parent_ids.add(parent_id)
                     slot_parents.append(slot.parent)
                 parent_tuple = tuple(slot_parents)
-                for slot in param_group.slots:
+                for slot in param_binding.slots:
                     key = canonical_param_name(slot.name)
-                    pinned_params[key] = param_group.pinned
+                    pinned_params[key] = param_binding.pinned
                     parents[key] = parent_tuple
                     components[key] = non_block
 

@@ -52,7 +52,7 @@ import torch
 from torch import nn
 
 from ._devices import canonical_device
-from .pinned_groups import PinnedParamGroup
+from .pinned_bindings import PinnedParamBinding
 from .pinned_param import PinnedParam, PostCopyHook, PostCopyHookHandle
 from .protocols import SlotKey
 from .slots import (
@@ -326,7 +326,7 @@ class _BlockPinnedStore:
         skip_slots: set[SlotKey] | None = None,
     ) -> None:
         self._layers = list(layers)
-        self._param_groups: list[list[PinnedParamGroup]] = []
+        self._param_bindings: list[list[PinnedParamBinding]] = []
         # Per-block list of (buffer_slot, buffer_obj, cpu_clone) pending
         # installation. apply_slot_mutations() does the
         # `buffer_obj.data = cpu_clone` swaps.
@@ -356,7 +356,7 @@ class _BlockPinnedStore:
 
         # Pass 2: pin params + buffers.
         for block_param_slot_lists in block_param_slots:
-            block_param_groups: list[PinnedParamGroup] = []
+            block_param_bindings: list[PinnedParamBinding] = []
             for slots in block_param_slot_lists:
                 primary_slot = slots[0]
                 param = primary_slot.get()
@@ -372,8 +372,8 @@ class _BlockPinnedStore:
                             f"Trainable streaming slot {primary_slot.name!r} "
                             f"cannot be streamed: {exc}"
                         ) from exc
-                block_param_groups.append(PinnedParamGroup(pinned, slots))
-            self._param_groups.append(block_param_groups)
+                block_param_bindings.append(PinnedParamBinding(pinned, slots))
+            self._param_bindings.append(block_param_bindings)
 
         for block_buffer_slots in buffer_slots:
             buffer_records: list[tuple[BufferSlot, torch.Tensor, torch.Tensor]] = []
@@ -414,15 +414,15 @@ class _BlockPinnedStore:
         """
         if self._slots_applied:
             return
-        for block_param_groups in self._param_groups:
-            for param_group in block_param_groups:
-                if param_group.pinned.requires_grad:
+        for block_param_bindings in self._param_bindings:
+            for param_binding in block_param_bindings:
+                if param_binding.pinned.requires_grad:
                     # Trainable: keep user's Parameter, .data is already pinned.
                     continue
                 # _parameters[leaf] swap (rather than .data) is required
                 # for quanto correctness — see PinnedWeights for details.
-                for slot in param_group.unique_slots:
-                    slot.set(param_group.pinned.cpu_param)
+                for slot in param_binding.unique_slots:
+                    slot.set(param_binding.pinned.cpu_param)
         for buffer_records in self._buffer_records:
             for _slot, mod_buf, cpu_clone in buffer_records:
                 set_tensor_data(mod_buf, cpu_clone)
@@ -431,9 +431,9 @@ class _BlockPinnedStore:
     @property
     def cache_bytes(self) -> int:
         total = 0
-        for block_param_groups in self._param_groups:
-            for param_group in block_param_groups:
-                total += param_group.pinned.cache_bytes
+        for block_param_bindings in self._param_bindings:
+            for param_binding in block_param_bindings:
+                total += param_binding.pinned.cache_bytes
         for buffer_records in self._buffer_records:
             for _slot, _mod_buf, cpu_clone in buffer_records:
                 total += cpu_clone.numel() * cpu_clone.element_size()
@@ -460,7 +460,7 @@ class _BlockPinnedStore:
         # Pool template comes from block 0. The constructor's layout
         # check has already verified every other block matches.
         self._pool = _GpuSlotPool(
-            [param_group.pinned for param_group in self._param_groups[0]],
+            [param_binding.pinned for param_binding in self._param_bindings[0]],
             num_gpu_slots,
             device,
         )
@@ -474,9 +474,9 @@ class _BlockPinnedStore:
         self, pinned: PinnedParam, hook: PostCopyHook,
     ) -> PostCopyHookHandle:
         if not any(
-            param_group.pinned is pinned
-            for block_param_groups in self._param_groups
-            for param_group in block_param_groups
+            param_binding.pinned is pinned
+            for block_param_bindings in self._param_bindings
+            for param_binding in block_param_bindings
         ):
             raise ValueError(
                 "pinned param "
@@ -506,25 +506,25 @@ class _BlockPinnedStore:
         slot = self._pool.slot(slot_id)
         slot.copy_from(
             [
-                param_group.pinned
-                for param_group in self._param_groups[idx]
+                param_binding.pinned
+                for param_binding in self._param_bindings[idx]
             ],
             self._post_copy_hooks,
             non_blocking=non_blocking,
         )
 
-        for param_group in self._param_groups[idx]:
-            gpu_param = slot.get_param(param_group.pinned.name)
-            if param_group.pinned.requires_grad:
+        for param_binding in self._param_bindings[idx]:
+            gpu_param = slot.get_param(param_binding.pinned.name)
+            if param_binding.pinned.requires_grad:
                 # Trainable: .data swap into the slot's GPU storage.
                 # Preserves the user's Parameter object identity — so
                 # autograd and optimizer state survive across cycles.
                 # Reuses ``slot.get_param`` purely for its ``.data``
                 # storage; the wrapper itself isn't installed.
-                for param_slot in param_group.unique_slots:
+                for param_slot in param_binding.unique_slots:
                     set_param_data(param_slot.get(), gpu_param.data)
             else:
-                for param_slot in param_group.unique_slots:
+                for param_slot in param_binding.unique_slots:
                     param_slot.set(gpu_param)
         for _buffer_slot, mod_buf, cpu_clone in self._buffer_records[idx]:
             set_tensor_data(
@@ -551,15 +551,15 @@ class _BlockPinnedStore:
         Trainable: ``submod._parameters[leaf].data = pinned.cpu_param.data``
         (preserve the user's Parameter object).
         """
-        for param_group in self._param_groups[idx]:
-            if param_group.pinned.requires_grad:
-                for param_slot in param_group.unique_slots:
+        for param_binding in self._param_bindings[idx]:
+            if param_binding.pinned.requires_grad:
+                for param_slot in param_binding.unique_slots:
                     set_param_data(
-                        param_slot.get(), param_group.pinned.cpu_param.data
+                        param_slot.get(), param_binding.pinned.cpu_param.data
                     )
             else:
-                for param_slot in param_group.unique_slots:
-                    param_slot.set(param_group.pinned.cpu_param)
+                for param_slot in param_binding.unique_slots:
+                    param_slot.set(param_binding.pinned.cpu_param)
         for _buffer_slot, mod_buf, cpu_clone in self._buffer_records[idx]:
             set_tensor_data(mod_buf, cpu_clone)
         if self._pool is not None:
@@ -626,20 +626,20 @@ class _BlockPinnedStore:
         across all blocks. Used by ``StreamedWeights.optimizer_step``
         to walk all trainables when bringing them to GPU around the
         optimizer-step boundary."""
-        for block_param_groups in self._param_groups:
-            for param_group in block_param_groups:
-                if param_group.pinned.requires_grad:
-                    slot = param_group.unique_slots[0]
-                    yield param_group.pinned, slot.parent, slot.leaf
+        for block_param_bindings in self._param_bindings:
+            for param_binding in block_param_bindings:
+                if param_binding.pinned.requires_grad:
+                    slot = param_binding.unique_slots[0]
+                    yield param_binding.pinned, slot.parent, slot.leaf
 
     def has_trainables(self) -> bool:
         """True if any block contains a trainable param. Used by the
         composer to decide whether to enforce checkpointing as a
         precondition for ``activate``."""
         return any(
-            param_group.pinned.requires_grad
-            for block_param_groups in self._param_groups
-            for param_group in block_param_groups
+            param_binding.pinned.requires_grad
+            for block_param_bindings in self._param_bindings
+            for param_binding in block_param_bindings
         )
 
 
@@ -847,10 +847,10 @@ class StreamedWeights:
         return self._store.slot_filter
 
     @property
-    def param_groups_per_block(self) -> list[list[PinnedParamGroup]]:
-        """Per-block streamed parameter groups.
+    def param_bindings_per_block(self) -> list[list[PinnedParamBinding]]:
+        """Per-block streamed parameter bindings.
 
-        Each group is a :class:`PinnedParamGroup`: one
+        Each binding is a :class:`PinnedParamBinding`: one
         :class:`PinnedParam` plus every :class:`ParamSlot` that should use it.
         Used by
         :class:`~torch_offload.ModelOffloader` to build its target-name
@@ -858,11 +858,11 @@ class StreamedWeights:
 
         .. warning::
            Returned list shares internal store state. Treat it as
-           read-only — mutating the outer list, inner lists, or groups
+           read-only — mutating the outer list, inner lists, or bindings
            will corrupt streaming bookkeeping.
         """
         assert self._store is not None
-        return self._store._param_groups
+        return self._store._param_bindings
 
     @property
     def cache_bytes(self) -> int:
