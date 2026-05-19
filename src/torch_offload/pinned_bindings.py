@@ -136,7 +136,13 @@ class PinnedModuleTarget:
     The target owns adapter-specific GPU storage for every pinned param
     in a binding-compatible module scope. Repeated :meth:`load_param`
     calls copy pinned CPU bytes into the same GPU storage and return the
-    same ``nn.Parameter`` wrapper for a given param name.
+    same ``nn.Parameter`` wrapper for a given pinned param name.
+
+    ``PinnedParam.name`` is the target storage key. It is intentionally
+    the module-relative PyTorch parameter name: whole-model targets use
+    fully qualified names, while streamed block targets use block-local
+    names so every block can load into the same pool layout. Names must
+    be unique within one target.
     """
 
     __slots__ = ("_device", "_target_params", "_target_states")
@@ -150,6 +156,15 @@ class PinnedModuleTarget:
                 f"got {device}."
             )
         self._device = device
+        seen_names: set[str] = set()
+        for pinned in pinned_params:
+            if pinned.name in seen_names:
+                raise ValueError(
+                    "PinnedModuleTarget requires unique pinned target "
+                    f"names; got duplicate {pinned.name!r}."
+                )
+            seen_names.add(pinned.name)
+
         self._target_states: dict[str, object] = {}
         self._target_params: dict[str, nn.Parameter] = {}
         for pinned in pinned_params:

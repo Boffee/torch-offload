@@ -158,6 +158,18 @@ class TestPinnedParam:
         assert target.load_param(block[1], non_blocking=False) is b_first
 
     @CUDA
+    def test_module_target_rejects_duplicate_param_names(self) -> None:
+        p1 = nn.Parameter(torch.randn(8, dtype=torch.bfloat16), requires_grad=False)
+        p2 = nn.Parameter(torch.randn(8, dtype=torch.bfloat16), requires_grad=False)
+        block = [PinnedParam("w", p1), PinnedParam("w", p2)]
+
+        with pytest.raises(
+            ValueError,
+            match="duplicate 'w'",
+        ):
+            PinnedModuleTarget(block, torch.device("cuda"))
+
+    @CUDA
     def test_slot_hook_mutates_stable_param_in_place(self) -> None:
         from torch_offload.pinned_bindings import PinnedModuleTarget
 
