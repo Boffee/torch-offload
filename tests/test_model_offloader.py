@@ -3047,11 +3047,10 @@ class TestInBlockTrainableStreamingEndToEnd:
 
 class TestBlockGroupsDisjoint:
     """``ModelOffloader`` rejects configurations where the same module
-    slot is owned by more than one streamer region. Catches duplicate
+    slot is owned by more than one block entry. Catches duplicate
     blocks, parent/child overlap across groups, and the same block
-    listed twice in one group — all of which would have multiple
-    streamers (or one streamer twice) racing on the same slot's
-    Parameter / .data swap."""
+    listed twice in one group — all of which would make multiple
+    entries mutate the same slot's Parameter / .data swap."""
 
     def test_same_block_in_two_groups_raises(self) -> None:
         shared = nn.Linear(4, 4, bias=False)
