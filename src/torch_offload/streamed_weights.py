@@ -202,6 +202,34 @@ def _check_block_layouts_match(
             )
 
 
+def _check_block_binding_target_names_match(
+    block_bindings: Sequence[PinnedModuleBinding],
+) -> None:
+    """Raise if pinned binding names differ from block 0's pool template.
+
+    This post-pin internal invariant keeps the GPU pool's name-matching
+    contract explicit without putting validation on the block-load hot
+    path. The pre-pin layout check catches user-facing name mismatches
+    before mutation; this validates the actual ``PinnedParam.name`` keys
+    that will address :class:`PinnedModuleTarget` storage.
+    """
+    if len(block_bindings) <= 1:
+        return
+
+    ref = tuple(pinned.name for pinned in block_bindings[0].pinned_params)
+    for i in range(1, len(block_bindings)):
+        names = tuple(
+            pinned.name for pinned in block_bindings[i].pinned_params
+        )
+        if names != ref:
+            raise ValueError(
+                f"Block {i} pinned target names differ from block 0. "
+                "All blocks in a StreamedWeights group must share the "
+                "same ordered pinned target names. Expected "
+                f"{ref!r}; got {names!r}."
+            )
+
+
 def _collect_block_slot_collections(
     blocks: list[nn.Module],
     skip: set[SlotKey],
@@ -265,16 +293,16 @@ def _pin_block_module_bindings(
     # into block 0's pool slot without raising and corrupt forward.
     _check_block_layouts_match(block_slot_collections)
 
-    return (
-        [
-            pin_module_slot_collection(
-                collection,
-                validate_param=_validate_streamed_param,
-            )
-            for collection in block_slot_collections
-        ],
-        slot_filter,
-    )
+    block_bindings = [
+        pin_module_slot_collection(
+            collection,
+            validate_param=_validate_streamed_param,
+        )
+        for collection in block_slot_collections
+    ]
+    _check_block_binding_target_names_match(block_bindings)
+
+    return block_bindings, slot_filter
 
 
 # ---------------------------------------------------------------------------
@@ -944,6 +972,8 @@ class StreamedWeights:
     ) -> None:
         assert self._pool is not None, "_activate_pool not called"
 
+        binding = self._block_bindings[block_idx]
+
         slot_id = self._block_to_slot.get(block_idx)
         if slot_id is None:
             slot_id = self._pool.acquire()
@@ -951,7 +981,7 @@ class StreamedWeights:
 
         self._pool.wait_if_needed(slot_id, stream)
         target = self._pool.target(slot_id)
-        self._block_bindings[block_idx].load_to_target(
+        binding.load_to_target(
             target,
             post_copy_hooks=self._post_copy_hooks,
             non_blocking=non_blocking,

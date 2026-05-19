@@ -13,12 +13,15 @@ from __future__ import annotations
 
 import logging
 from concurrent.futures import Future
+from types import SimpleNamespace
+from typing import cast
 
 import pytest
 import torch
 import torch.utils.checkpoint
 from torch import nn
 
+import torch_offload.streamed_weights as streamed_weights_module
 from torch_offload import (
     ModelOffloader,
     ModelStrategy,
@@ -28,7 +31,11 @@ from torch_offload import (
     TrainableWeights,
 )
 from torch_offload.model_offloader import detect_streaming_region_ties
+from torch_offload.pinned_bindings import PinnedModuleBinding
 from torch_offload.slots import iter_buffer_slots
+from torch_offload.streamed_weights import (
+    _check_block_binding_target_names_match,
+)
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -1566,6 +1573,75 @@ class TestActivatePoolIdempotency:
             streamer._activate_pool(3, torch.device("cuda"))
         with pytest.raises(ValueError, match="already activated"):
             streamer._activate_pool(2, torch.device("cpu"))
+
+
+# ---------------------------------------------------------------------------
+# StreamedWeights pool target-name validation
+# ---------------------------------------------------------------------------
+
+
+class TestStreamedTargetPoolValidation:
+    def test_binding_name_mismatch_check_raises(self) -> None:
+        bindings = [
+            SimpleNamespace(
+                pinned_params=[
+                    SimpleNamespace(name="weight"),
+                    SimpleNamespace(name="bias"),
+                ],
+            ),
+            SimpleNamespace(
+                pinned_params=[
+                    SimpleNamespace(name="weight"),
+                    SimpleNamespace(name="other"),
+                ],
+            ),
+        ]
+
+        with pytest.raises(
+            ValueError,
+            match="Block 1 pinned target names differ from block 0",
+        ):
+            _check_block_binding_target_names_match(
+                cast(list[PinnedModuleBinding], bindings)
+            )
+
+    def test_constructor_validates_pinned_binding_names(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        m = _make_block_model(num_blocks=2)
+        bindings = iter(
+            [
+                SimpleNamespace(
+                    pinned_params=[SimpleNamespace(name="weight")],
+                ),
+                SimpleNamespace(
+                    pinned_params=[SimpleNamespace(name="other")],
+                ),
+            ]
+        )
+
+        def fake_pin_module_slot_collection(
+            _collection: object,
+            *,
+            validate_param: object | None = None,
+        ) -> PinnedModuleBinding:
+            del validate_param
+            return cast(PinnedModuleBinding, next(bindings))
+
+        monkeypatch.setattr(
+            streamed_weights_module,
+            "pin_module_slot_collection",
+            fake_pin_module_slot_collection,
+        )
+
+        with pytest.raises(
+            ValueError,
+            match="Block 1 pinned target names differ from block 0",
+        ):
+            StreamedWeights(
+                list(m.transformer_blocks),
+                blocks_to_swap=1,
+            )
 
 
 # ---------------------------------------------------------------------------
