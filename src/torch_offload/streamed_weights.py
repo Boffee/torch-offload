@@ -443,7 +443,7 @@ class StreamedWeights:
         )
         self._post_copy_hooks: dict[int, PostCopyHook] = {}
         for binding in self._block_bindings:
-            binding.place_on_pinned()
+            binding.restore_pinned()
         self._move_trainable_grads_to(torch.device("cpu"))
 
         # Active resources allocated on CUDA activate().
@@ -855,7 +855,7 @@ class StreamedWeights:
 
         During backward, PyTorch's native ``AccumulateGrad`` writes
         grads on the param's data device, which is GPU at that point
-        because the ``.data`` swap in :meth:`PinnedModuleBinding.place_on_gpu`
+        because the ``.data`` swap in :meth:`PinnedModuleBinding.load_to_target`
         repointed ``.data`` at slot storage. Eviction restores ``.data``
         to pinned CPU, but ``.grad`` keeps living wherever AccumulateGrad
         placed it.
@@ -921,14 +921,14 @@ class StreamedWeights:
 
         self._pool.wait_if_needed(slot_id, stream)
         target = self._pool.target(slot_id)
-        self._block_bindings[block_idx].place_on_gpu(
+        self._block_bindings[block_idx].load_to_target(
             target,
             post_copy_hooks=self._post_copy_hooks,
             non_blocking=non_blocking,
         )
 
     def _release_block(self, block_idx: int) -> None:
-        self._block_bindings[block_idx].place_on_pinned()
+        self._block_bindings[block_idx].restore_pinned()
         if self._pool is None:
             return
         slot_id = self._block_to_slot.pop(block_idx, None)

@@ -205,7 +205,7 @@ class PinnedWeights:
         # all pinning succeeded. This keeps module slot identity changes
         # grouped, but construction is not fully rollback-safe because of
         # the low-peak Parameter.data repointing described above.
-        self._binding.place_on_pinned()
+        self._binding.restore_pinned()
 
     # ------------------------------------------------------------------
     # ModelStrategy protocol
@@ -291,13 +291,13 @@ class PinnedWeights:
             )
         active_device = self._resolve_device(device)
         if active_device.type == "cpu":
-            self._binding.place_on_pinned()
+            self._binding.restore_pinned()
         elif active_device.type == "cuda":
             # One active-device Parameter per unique pinned parameter.
             # Tied slots all receive the same Parameter object so the
             # tying invariant survives on device.
             target = PinnedModuleTarget(self._binding.pinned_params, active_device)
-            self._binding.place_on_gpu(
+            self._binding.load_to_target(
                 target,
                 post_copy_hooks=self._post_copy_hooks,
                 non_blocking=True,
@@ -317,7 +317,7 @@ class PinnedWeights:
         memory (and the model reference too if you don't need it
         anymore)."""
         try:
-            self._binding.place_on_pinned()
+            self._binding.restore_pinned()
         finally:
             self._active_device = None
 

@@ -31,10 +31,68 @@ class PinnedParamBinding:
     def unique_slots(self) -> list[ParamSlot]:
         return unique_slots(self.slots)
 
+    def set_slots(self, param: nn.Parameter) -> None:
+        """Set every managed parameter slot to ``param``.
+
+        Trainable params keep the user's ``Parameter`` object and swap
+        only ``.data`` so autograd hooks and optimizer references stay
+        attached to the same wrapper.
+        """
+        if self.pinned.requires_grad:
+            for slot in self.unique_slots:
+                set_param_data(slot.get(), param.data)
+        else:
+            for slot in self.unique_slots:
+                slot.set(param)
+
+    def restore_pinned(self) -> None:
+        """Repoint managed parameter slots to their pinned CPU wrapper."""
+        self.set_slots(self.cpu_param)
+
+    def copy_to_target(
+        self,
+        target: PinnedModuleTarget,
+        *,
+        post_copy_hooks: Mapping[int, PostCopyHook] | None = None,
+        non_blocking: bool = False,
+    ) -> nn.Parameter:
+        """Copy pinned storage into ``target`` and return the target wrapper."""
+        target_param = target.load_param(
+            self.pinned, non_blocking=non_blocking,
+        )
+        hook = (
+            post_copy_hooks.get(id(self.pinned))
+            if post_copy_hooks is not None
+            else None
+        )
+        if hook is not None:
+            hook(target_param)
+        return target_param
+
+    def load_to_target(
+        self,
+        target: PinnedModuleTarget,
+        *,
+        post_copy_hooks: Mapping[int, PostCopyHook] | None = None,
+        non_blocking: bool = False,
+    ) -> None:
+        """Copy pinned storage into ``target`` and set managed slots."""
+        param = self.copy_to_target(
+            target,
+            post_copy_hooks=post_copy_hooks,
+            non_blocking=non_blocking,
+        )
+        self.set_slots(param)
+
 
 @dataclass(slots=True)
 class PinnedBufferBinding:
-    """One model instance's buffer slots bound to one pinned tensor."""
+    """One model instance's buffer slots bound to one pinned tensor.
+
+    Active-time buffer mutations are discarded on restore:
+    :meth:`restore_pinned` reinstalls this pinned clone rather than
+    copying active buffer state back.
+    """
 
     pinned: torch.Tensor
     slots: list[BufferSlot]
@@ -42,6 +100,34 @@ class PinnedBufferBinding:
     @property
     def unique_slots(self) -> list[BufferSlot]:
         return unique_slots(self.slots)
+
+    def set_slots(self, buffer: torch.Tensor) -> None:
+        """Set every managed buffer slot to ``buffer``."""
+        for slot in self.unique_slots:
+            slot.set(buffer)
+
+    def restore_pinned(self) -> None:
+        """Repoint managed buffer slots to the pinned CPU clone."""
+        self.set_slots(self.pinned)
+
+    def copy_to_target(
+        self,
+        target: PinnedModuleTarget,
+        *,
+        non_blocking: bool = False,
+    ) -> torch.Tensor:
+        """Copy the pinned clone to ``target`` and return the target tensor."""
+        return self.pinned.to(target.device, non_blocking=non_blocking)
+
+    def load_to_target(
+        self,
+        target: PinnedModuleTarget,
+        *,
+        non_blocking: bool = False,
+    ) -> None:
+        """Copy the pinned clone to ``target`` and set managed slots."""
+        buffer = self.copy_to_target(target, non_blocking=non_blocking)
+        self.set_slots(buffer)
 
 
 class PinnedModuleTarget:
@@ -53,7 +139,7 @@ class PinnedModuleTarget:
     same ``nn.Parameter`` wrapper for a given param name.
     """
 
-    __slots__ = ("_device", "_gpu_params", "_gpu_states")
+    __slots__ = ("_device", "_target_params", "_target_states")
 
     def __init__(
         self, pinned_params: Sequence[PinnedParam], device: torch.device,
@@ -64,12 +150,14 @@ class PinnedModuleTarget:
                 f"got {device}."
             )
         self._device = device
-        self._gpu_states: dict[str, object] = {}
-        self._gpu_params: dict[str, nn.Parameter] = {}
+        self._target_states: dict[str, object] = {}
+        self._target_params: dict[str, nn.Parameter] = {}
         for pinned in pinned_params:
-            gpu_state = pinned.allocate_gpu_storage(device)
-            self._gpu_states[pinned.name] = gpu_state
-            self._gpu_params[pinned.name] = pinned.make_gpu_param(gpu_state)
+            target_state = pinned.allocate_gpu_storage(device)
+            self._target_states[pinned.name] = target_state
+            self._target_params[pinned.name] = pinned.make_gpu_param(
+                target_state
+            )
 
     @property
     def device(self) -> torch.device:
@@ -83,9 +171,9 @@ class PinnedModuleTarget:
     ) -> nn.Parameter:
         """Copy ``pinned`` into this target and return its GPU Parameter."""
         pinned.copy_to_gpu(
-            self._gpu_states[pinned.name], non_blocking=non_blocking,
+            self._target_states[pinned.name], non_blocking=non_blocking,
         )
-        return self._gpu_params[pinned.name]
+        return self._target_params[pinned.name]
 
 
 @dataclass(slots=True)
@@ -93,8 +181,8 @@ class PinnedModuleBinding:
     """Pinned storage bound to slots collected from one module scope.
 
     The binding does not own the ``nn.Module``. It owns the pinned
-    param/buffer bindings and knows how to install either pinned CPU
-    storage or GPU materializations back into those slots.
+    param/buffer bindings and knows how to set either pinned CPU
+    storage or target materializations back into those slots.
     """
 
     param_bindings: list[PinnedParamBinding]
@@ -124,61 +212,41 @@ class PinnedModuleBinding:
             for param_binding in self.param_bindings
         )
 
-    def place_on_pinned(self) -> None:
+    def restore_pinned(self) -> None:
         """Restore managed slots to their pinned CPU forms.
 
         Frozen params use slot replacement. Trainable params keep the
         user's ``Parameter`` object and repoint only ``.data``.
         """
         for param_binding in self.param_bindings:
-            if param_binding.pinned.requires_grad:
-                for slot in param_binding.unique_slots:
-                    set_param_data(
-                        slot.get(), param_binding.cpu_param.data
-                    )
-            else:
-                for slot in param_binding.unique_slots:
-                    slot.set(param_binding.cpu_param)
+            param_binding.restore_pinned()
         for buffer_binding in self.buffer_bindings:
-            for slot in buffer_binding.unique_slots:
-                slot.set(buffer_binding.pinned)
+            buffer_binding.restore_pinned()
 
-    def place_on_gpu(
+    def load_to_target(
         self,
         target: PinnedModuleTarget,
         *,
         post_copy_hooks: Mapping[int, PostCopyHook] | None = None,
         non_blocking: bool = False,
     ) -> None:
-        """Copy pinned storage into ``target`` and install GPU slots."""
-        gpu_params: list[tuple[PinnedParamBinding, nn.Parameter]] = []
+        """Copy pinned storage into ``target`` and set managed slots."""
+        target_params: list[tuple[PinnedParamBinding, nn.Parameter]] = []
         for param_binding in self.param_bindings:
-            gpu_param = target.load_param(
-                param_binding.pinned, non_blocking=non_blocking,
+            target_param = param_binding.copy_to_target(
+                target,
+                post_copy_hooks=post_copy_hooks,
+                non_blocking=non_blocking,
             )
-            hook = (
-                post_copy_hooks.get(id(param_binding.pinned))
-                if post_copy_hooks is not None
-                else None
-            )
-            if hook is not None:
-                hook(gpu_param)
-            gpu_params.append((param_binding, gpu_param))
+            target_params.append((param_binding, target_param))
 
-        for param_binding, gpu_param in gpu_params:
-            if param_binding.pinned.requires_grad:
-                for slot in param_binding.unique_slots:
-                    set_param_data(slot.get(), gpu_param.data)
-            else:
-                for slot in param_binding.unique_slots:
-                    slot.set(gpu_param)
+        for param_binding, target_param in target_params:
+            param_binding.set_slots(target_param)
 
         for buffer_binding in self.buffer_bindings:
-            gpu = buffer_binding.pinned.to(
-                target.device, non_blocking=non_blocking,
+            buffer_binding.load_to_target(
+                target, non_blocking=non_blocking,
             )
-            for slot in buffer_binding.unique_slots:
-                slot.set(gpu)
 
     def iter_trainables(
         self,

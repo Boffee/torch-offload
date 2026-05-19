@@ -2,11 +2,19 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 import pytest
 import torch
 from torch import nn
 
+from torch_offload.pinned_bindings import (
+    PinnedBufferBinding,
+    PinnedModuleTarget,
+    PinnedParamBinding,
+)
 from torch_offload.pinned_param import PinnedParam
+from torch_offload.slots import BufferSlot, ParamSlot
 from torch_offload.tensor_adapters import (
     DequantRequantCopyIntoTensorAdapter,
     DequantRequantTensorAdapter,
@@ -15,6 +23,30 @@ from torch_offload.tensor_adapters import (
 from torch_offload.tensor_adapter_factory import select_adapter, storage_key
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+
+
+class _FakeParamTarget:
+    def __init__(self, param: nn.Parameter) -> None:
+        self.param = param
+        self.loaded: list[tuple[PinnedParam, bool]] = []
+
+    @property
+    def device(self) -> torch.device:
+        return self.param.device
+
+    def load_param(
+        self,
+        pinned: PinnedParam,
+        *,
+        non_blocking: bool = False,
+    ) -> nn.Parameter:
+        self.loaded.append((pinned, non_blocking))
+        return self.param
+
+
+class _FakeDeviceTarget:
+    def __init__(self, device: torch.device) -> None:
+        self.device = device
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +184,110 @@ class TestPinnedParam:
             base_param.detach().cpu(),
             cpu_param.detach(),
         )
+
+
+class TestPinnedBindings:
+    def test_param_binding_copy_to_target_does_not_set_slots(self) -> None:
+        parent = nn.Module()
+        parent.weight = nn.Parameter(
+            torch.tensor([1.0, 2.0]), requires_grad=False,
+        )
+        slot = ParamSlot("weight", parent, "weight")
+        pinned = PinnedParam("weight", parent.weight)
+        binding = PinnedParamBinding(
+            pinned=pinned,
+            slots=[slot],
+            cpu_param=pinned.make_cpu_param(),
+        )
+        binding.restore_pinned()
+        slot_param = parent.weight
+
+        target_param = nn.Parameter(
+            torch.tensor([3.0, 4.0]), requires_grad=False,
+        )
+        fake_target = _FakeParamTarget(target_param)
+        hook_calls: list[nn.Parameter] = []
+
+        def hook(param: nn.Parameter) -> None:
+            hook_calls.append(param)
+            param.data.add_(1)
+
+        copied = binding.copy_to_target(
+            cast(PinnedModuleTarget, fake_target),
+            post_copy_hooks={id(pinned): hook},
+            non_blocking=True,
+        )
+
+        assert copied is target_param
+        assert fake_target.loaded == [(pinned, True)]
+        assert hook_calls == [target_param]
+        assert parent.weight is slot_param
+        torch.testing.assert_close(
+            target_param.data,
+            torch.tensor([4.0, 5.0]),
+        )
+
+        binding.load_to_target(cast(PinnedModuleTarget, fake_target))
+
+        assert parent.weight is target_param
+
+    def test_param_binding_load_to_target_preserves_trainable_wrapper(
+        self,
+    ) -> None:
+        parent = nn.Module()
+        parent.weight = nn.Parameter(
+            torch.tensor([1.0, 2.0]), requires_grad=True,
+        )
+        slot = ParamSlot("weight", parent, "weight")
+        pinned = PinnedParam("weight", parent.weight)
+        binding = PinnedParamBinding(
+            pinned=pinned,
+            slots=[slot],
+            cpu_param=pinned.make_cpu_param(),
+        )
+        binding.restore_pinned()
+        slot_param = parent.weight
+
+        target_param = nn.Parameter(
+            torch.tensor([7.0, 8.0]), requires_grad=True,
+        )
+        binding.load_to_target(
+            cast(PinnedModuleTarget, _FakeParamTarget(target_param)),
+        )
+
+        assert parent.weight is slot_param
+        assert parent.weight.data.data_ptr() == target_param.data.data_ptr()
+        torch.testing.assert_close(parent.weight.data, target_param.data)
+
+    def test_buffer_binding_load_to_target_and_restore_pinned(self) -> None:
+        parent = nn.Module()
+        original = torch.tensor([1.0, 2.0])
+        parent.register_buffer("running", original, persistent=False)
+        slot = BufferSlot("running", parent, "running", persistent=False)
+        pinned = torch.tensor([5.0, 6.0])
+        binding = PinnedBufferBinding(pinned=pinned, slots=[slot])
+        target = cast(
+            PinnedModuleTarget,
+            _FakeDeviceTarget(torch.device("cpu")),
+        )
+
+        copied = binding.copy_to_target(target)
+
+        assert parent.running is original
+
+        binding.load_to_target(target)
+
+        assert parent.running is copied
+        assert "running" in parent._non_persistent_buffers_set
+
+        active = torch.tensor([9.0, 10.0])
+        binding.set_slots(active)
+        assert parent.running is active
+
+        binding.restore_pinned()
+
+        assert parent.running is pinned
+        assert "running" in parent._non_persistent_buffers_set
 
 
 # ---------------------------------------------------------------------------
