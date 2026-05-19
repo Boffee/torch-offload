@@ -198,13 +198,13 @@ class PinnedModuleBinding:
 ParamPinValidator = Callable[[PinnedParam, ParamSlot], None]
 
 
-def bind_param_slots(
+def _bind_param_slots(
     pinned: PinnedParam, slots: Sequence[ParamSlot],
 ) -> PinnedParamBinding:
     """Bind live model slots to an existing pinned parameter backing."""
     slot_list = list(slots)
     if not slot_list:
-        raise ValueError("bind_param_slots requires at least one ParamSlot")
+        raise ValueError("_bind_param_slots requires at least one ParamSlot")
     return PinnedParamBinding(
         pinned=pinned,
         slots=slot_list,
@@ -212,7 +212,7 @@ def bind_param_slots(
     )
 
 
-def pin_param_slots(
+def _pin_param_slots(
     slots: Sequence[ParamSlot],
     *,
     validate_param: ParamPinValidator | None = None,
@@ -220,19 +220,19 @@ def pin_param_slots(
     """Pin the first slot's parameter and bind all aliases to that backing."""
     slot_list = list(slots)
     if not slot_list:
-        raise ValueError("pin_param_slots requires at least one ParamSlot")
+        raise ValueError("_pin_param_slots requires at least one ParamSlot")
     primary_slot = slot_list[0]
     pinned = PinnedParam(primary_slot.name, primary_slot.get())
     if validate_param is not None:
         validate_param(pinned, primary_slot)
-    return bind_param_slots(pinned, slot_list)
+    return _bind_param_slots(pinned, slot_list)
 
 
-def pin_buffer_slots(slots: Sequence[BufferSlot]) -> PinnedBufferBinding:
+def _pin_buffer_slots(slots: Sequence[BufferSlot]) -> PinnedBufferBinding:
     """Clone and pin the first slot's buffer and bind all aliases to it."""
     slot_list = list(slots)
     if not slot_list:
-        raise ValueError("pin_buffer_slots requires at least one BufferSlot")
+        raise ValueError("_pin_buffer_slots requires at least one BufferSlot")
     pinned = clone_to_pinned_cpu(
         slot_list[0].get(),
         memory_format=torch.contiguous_format,
@@ -240,7 +240,7 @@ def pin_buffer_slots(slots: Sequence[BufferSlot]) -> PinnedBufferBinding:
     return PinnedBufferBinding(pinned=pinned, slots=slot_list)
 
 
-def pin_module_slots(
+def _pin_module_slots(
     param_slot_groups: Sequence[Sequence[ParamSlot]],
     buffer_slot_groups: Sequence[Sequence[BufferSlot]],
     *,
@@ -249,11 +249,11 @@ def pin_module_slots(
     """Pin grouped module slots into one aggregate binding."""
     return PinnedModuleBinding(
         param_bindings=[
-            pin_param_slots(slots, validate_param=validate_param)
+            _pin_param_slots(slots, validate_param=validate_param)
             for slots in param_slot_groups
         ],
         buffer_bindings=[
-            pin_buffer_slots(slots) for slots in buffer_slot_groups
+            _pin_buffer_slots(slots) for slots in buffer_slot_groups
         ],
     )
 
@@ -264,7 +264,7 @@ def pin_module_slot_collection(
     validate_param: ParamPinValidator | None = None,
 ) -> PinnedModuleBinding:
     """Pin collected module slots into one aggregate binding."""
-    return pin_module_slots(
+    return _pin_module_slots(
         collection.param_slot_groups,
         collection.buffer_slot_groups,
         validate_param=validate_param,
@@ -276,9 +276,5 @@ __all__ = [
     "PinnedModuleBinding",
     "PinnedModuleTarget",
     "PinnedParamBinding",
-    "bind_param_slots",
-    "pin_buffer_slots",
     "pin_module_slot_collection",
-    "pin_module_slots",
-    "pin_param_slots",
 ]
