@@ -820,10 +820,10 @@ class TestLoRATransform:
         transform = LoRATransform([(a, b, 0.5)])
         original_param = param
         original_packed_ptr = param.data._data.data_ptr()
+        expected_dense = qt.dequantize().to(torch.float32)
 
         transform.apply(param)
 
-        expected_dense = qt.dequantize().to(torch.float32)
         expected_dense.addmm_(b.to(torch.float32), a.to(torch.float32), alpha=0.5)
         expected_packed = (
             expected_dense / scale.to(torch.float32)
@@ -860,7 +860,7 @@ class TestLoRATransform:
             expected_dense / scale.to(torch.float32)
         ).round().clamp(-128, 127).to(torch.int8)
 
-        s = _make_strategy(m)
+        s = _make_strategy(m, blocks_to_swap=0)
         s.set_loras([(lora, 0.5)], mode="merge")
         s.activate("cuda")
         try:
