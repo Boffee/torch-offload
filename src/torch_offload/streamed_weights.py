@@ -590,7 +590,12 @@ class StreamedWeights:
                 "StreamedWeights.activate() supports CUDA or CPU; "
                 f"got {active_device}."
             )
+        self._activate_cuda_resolved(active_device)
 
+    def _activate_cpu_resolved(self) -> None:
+        self._active_device = torch.device("cpu")
+
+    def _activate_cuda_resolved(self, active_device: torch.device) -> None:
         num_layers = len(self._blocks)
         num_resident = num_layers - self._blocks_to_swap
         num_gpu_slots = num_resident + self._prefetch_count
@@ -619,9 +624,6 @@ class StreamedWeights:
             f"gpu_pool_slots={num_gpu_slots}"
         )
 
-    def _activate_cpu_resolved(self) -> None:
-        self._active_device = torch.device("cpu")
-
     def deactivate(self) -> None:
         """Tear down active resources idempotently — safe to call
         before activate or multiple times. Every step in
@@ -644,6 +646,10 @@ class StreamedWeights:
             yield
         finally:
             self.deactivate()
+
+    # ------------------------------------------------------------------
+    # Optimizer-step boundary
+    # ------------------------------------------------------------------
 
     @contextlib.contextmanager
     def optimizer_step(self) -> Iterator[None]:
@@ -772,52 +778,16 @@ class StreamedWeights:
         self._optimizer_step_active = True
         try:
             with contextlib.ExitStack() as stack:
-                # Each materialization registers a rollback that repoints
-                # the user's Parameter's .data back at its binding-owned
-                # CPU param. ExitStack unwinds these on the way out
-                # whether enter failed mid-loop (no scatter), the body
-                # exited cleanly (scatter, then rollback), or the body
-                # raised after yield (still scatter, then rollback) —
-                # the rollback is idempotent w.r.t. a successful copy.
-                materialized: list[tuple[nn.Parameter, PinnedParamBinding]] = []
-                with torch.cuda.stream(step_stream):
-                    for binding, parent, leaf in self._iter_trainables():
-                        param = get_param_slot(parent, leaf)
-                        stack.callback(
-                            _repoint_data_to_cpu_param, param, binding.cpu_param
-                        )
-                        set_param_data(
-                            param,
-                            binding.cpu_param.data.to(target, non_blocking=True),
-                        )
-                        if param.grad is not None and param.grad.device != target:
-                            param.grad = param.grad.to(target, non_blocking=True)
-                        materialized.append((param, binding))
-                # User's current stream now waits for step_stream's
-                # H2D. After this point the optimizer can safely read
-                # param.data on its own stream.
-                torch.cuda.current_stream(target).wait_stream(step_stream)
+                materialized = self._materialize_trainables_for_step(
+                    target, step_stream, stack,
+                )
 
                 try:
                     yield
                 finally:
-                    # Scatter on body-exit (clean OR exception). On body
-                    # exception the optimizer may have mutated some params
-                    # before raising; preserve that partial state rather
-                    # than silently rolling back to pre-step pinned bytes.
-                    # The blocking copy + sync guarantees the next prefetch
-                    # reads stable bytes.
-                    step_stream.wait_stream(torch.cuda.current_stream(target))
-                    with torch.cuda.stream(step_stream):
-                        for param, binding in materialized:
-                            binding.cpu_param.data.copy_(
-                                param.data, non_blocking=False,
-                            )
-                    step_stream.synchronize()
-                    # ExitStack unwinds on `with` exit: each materialized
-                    # param's .data is repointed at its binding-owned
-                    # CPU param data, releasing the optimizer-step GPU
-                    # allocation.
+                    self._scatter_trainables_after_step(
+                        materialized, step_stream, target,
+                    )
         finally:
             self._optimizer_step_active = False
 
@@ -840,7 +810,7 @@ class StreamedWeights:
             self._tracker.peak_gpu_blocks = len(self._tracker._on_gpu) + len(self._pending)
 
     # ------------------------------------------------------------------
-    # Internals
+    # Trainable helpers
     # ------------------------------------------------------------------
 
     def _iter_trainables(
@@ -849,6 +819,62 @@ class StreamedWeights:
         """Yield every trainable binding across all streamed blocks."""
         for binding in self._block_bindings:
             yield from binding.iter_trainables()
+
+    def _materialize_trainables_for_step(
+        self,
+        target: torch.device,
+        step_stream: torch.cuda.Stream,
+        stack: contextlib.ExitStack,
+    ) -> list[tuple[nn.Parameter, PinnedParamBinding]]:
+        """Move trainable ``.data`` to ``target`` for optimizer.step()."""
+        # Each materialization registers a rollback that repoints the
+        # user's Parameter's .data back at its binding-owned CPU param.
+        # ExitStack unwinds these on the way out whether enter failed
+        # mid-loop (no scatter), the body exited cleanly (scatter, then
+        # rollback), or the body raised after yield (still scatter, then
+        # rollback). The rollback is idempotent after a successful copy.
+        materialized: list[tuple[nn.Parameter, PinnedParamBinding]] = []
+        with torch.cuda.stream(step_stream):
+            for binding, parent, leaf in self._iter_trainables():
+                param = get_param_slot(parent, leaf)
+                stack.callback(
+                    _repoint_data_to_cpu_param, param, binding.cpu_param
+                )
+                set_param_data(
+                    param,
+                    binding.cpu_param.data.to(target, non_blocking=True),
+                )
+                if param.grad is not None and param.grad.device != target:
+                    param.grad = param.grad.to(target, non_blocking=True)
+                materialized.append((param, binding))
+        # User's current stream now waits for step_stream's H2D. After
+        # this point the optimizer can safely read param.data on its own
+        # stream.
+        torch.cuda.current_stream(target).wait_stream(step_stream)
+        return materialized
+
+    def _scatter_trainables_after_step(
+        self,
+        materialized: list[tuple[nn.Parameter, PinnedParamBinding]],
+        step_stream: torch.cuda.Stream,
+        target: torch.device,
+    ) -> None:
+        """Copy optimizer-updated trainable ``.data`` back to pinned CPU."""
+        # Scatter on body-exit (clean OR exception). On body exception
+        # the optimizer may have mutated some params before raising;
+        # preserve that partial state rather than silently rolling back
+        # to pre-step pinned bytes. The blocking copy + sync guarantees
+        # the next prefetch reads stable bytes.
+        step_stream.wait_stream(torch.cuda.current_stream(target))
+        with torch.cuda.stream(step_stream):
+            for param, binding in materialized:
+                binding.cpu_param.data.copy_(
+                    param.data, non_blocking=False,
+                )
+        step_stream.synchronize()
+        # ExitStack unwinds after this returns: each materialized
+        # param's .data is repointed at its binding-owned CPU param
+        # data, releasing the optimizer-step GPU allocation.
 
     def _move_trainable_grads_to(self, device: torch.device) -> None:
         """Move each trainable's ``.grad`` (if any) to ``device``.
@@ -873,6 +899,10 @@ class StreamedWeights:
                     # so move the grad storage in place when the data is
                     # currently offloaded.
                     set_tensor_data(param.grad, moved.data)
+
+    # ------------------------------------------------------------------
+    # Pool and block movement
+    # ------------------------------------------------------------------
 
     def _activate_pool(self, num_gpu_slots: int, device: torch.device) -> None:
         if self._pool_config is not None:
@@ -960,6 +990,10 @@ class StreamedWeights:
         if slot_id is not None:
             self._pool.set_compute_event(slot_id, event)
 
+    # ------------------------------------------------------------------
+    # Drain and teardown
+    # ------------------------------------------------------------------
+
     def _drain_and_evict_all(self) -> BaseException | None:
         """Quiesce streaming back to a baseline state.
 
@@ -1046,6 +1080,10 @@ class StreamedWeights:
 
         return first_prefetch_exc
 
+    # ------------------------------------------------------------------
+    # Prefetch and forward hooks
+    # ------------------------------------------------------------------
+
     def _evict_one(self, protected: set[int], compute_event: object | None = None) -> None:
         assert self._tracker is not None
         victim = self._tracker.pick_victim(protected=protected)
@@ -1086,6 +1124,58 @@ class StreamedWeights:
             self._load_block(idx)
             self._tracker.mark_on_gpu(idx)
 
+    def _before_block_forward(
+        self,
+        idx: int,
+        *,
+        num_resident: int,
+        max_on_gpu: int,
+        prefetch_count: int,
+        cyclic: bool,
+        num_layers: int,
+        wrap_threshold: int,
+    ) -> None:
+        tracker = self._tracker
+        if tracker is None:
+            return
+
+        pending = self._pending
+        if tracker.is_on_gpu(idx):
+            tracker.touch(idx)
+        else:
+            compute_event = torch.cuda.current_stream(
+                self._require_active_device()
+            ).record_event()
+            while len(tracker._on_gpu) >= num_resident:
+                protected = {idx} | set(pending.keys())
+                self._evict_one(protected, compute_event)
+            self._ensure_on_gpu(idx)
+
+        # Direction inference. In cyclic mode, a large index jump
+        # (|Delta| > num_layers/2) is iteration wraparound, not a
+        # reversal: keep the same forward/backward sense and let
+        # prefetch indices wrap modulo num_layers so the next
+        # iteration's leading blocks get streamed proactively.
+        last = self._last_idx
+        self._last_idx = idx
+        if last < 0:
+            direction = 1
+        else:
+            diff = idx - last
+            direction = (
+                (-1 if diff > 0 else 1)
+                if cyclic and abs(diff) > wrap_threshold
+                else 1 if diff >= 0 else -1
+            )
+        for offset in range(1, prefetch_count + 1):
+            target = idx + direction * offset
+            if cyclic:
+                target %= num_layers
+            self._submit_prefetch(target, max_on_gpu)
+
+        total = len(tracker._on_gpu) + len(pending)
+        tracker.peak_gpu_blocks = max(tracker.peak_gpu_blocks, total)
+
     def _register_hooks(self, num_resident: int) -> None:
         idx_map: dict[int, int] = {id(layer): idx for idx, layer in enumerate(self._blocks)}
         prefetch_count = self._prefetch_count  # capture as local — no `self` ref in closure
@@ -1111,45 +1201,15 @@ class StreamedWeights:
                 # had been evicted. Both are functional (CPU forward
                 # is slower but works on pinned tensors).
                 return
-            tracker = streamer._tracker
-            if tracker is None:
-                return
-            pending = streamer._pending
-            if tracker.is_on_gpu(idx):
-                tracker.touch(idx)
-            else:
-                compute_event = torch.cuda.current_stream(
-                    streamer._require_active_device()
-                ).record_event()
-                while len(tracker._on_gpu) >= num_resident:
-                    protected = {idx} | set(pending.keys())
-                    streamer._evict_one(protected, compute_event)
-                streamer._ensure_on_gpu(idx)
-
-            # Direction inference. In cyclic mode, a large index jump
-            # (|Δ| > num_layers/2) is iteration wraparound, not a
-            # reversal: keep the same forward/backward sense and let
-            # prefetch indices wrap modulo num_layers so the next
-            # iteration's leading blocks get streamed proactively.
-            last = streamer._last_idx
-            streamer._last_idx = idx
-            if last < 0:
-                direction = 1
-            else:
-                diff = idx - last
-                direction = (
-                    (-1 if diff > 0 else 1)
-                    if cyclic and abs(diff) > wrap_threshold
-                    else 1 if diff >= 0 else -1
-                )
-            for offset in range(1, prefetch_count + 1):
-                target = idx + direction * offset
-                if cyclic:
-                    target %= num_layers
-                streamer._submit_prefetch(target, max_on_gpu)
-
-            total = len(tracker._on_gpu) + len(pending)
-            tracker.peak_gpu_blocks = max(tracker.peak_gpu_blocks, total)
+            streamer._before_block_forward(
+                idx,
+                num_resident=num_resident,
+                max_on_gpu=max_on_gpu,
+                prefetch_count=prefetch_count,
+                cyclic=cyclic,
+                num_layers=num_layers,
+                wrap_threshold=wrap_threshold,
+            )
 
         for layer in self._blocks:
             idx = idx_map[id(layer)]
