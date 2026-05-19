@@ -37,6 +37,19 @@ typeCheckingMode = "standard"
 reportMissingImports = "none"
 reportPrivateImportUsage = "none"
 
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu130", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+torchao = [
+    { index = "pytorch-cu130", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
 [tool.ruff.lint]
 select = [
     "E", "F", "W", "I", "N", "ANN", "B", "A", "COM", "C4",

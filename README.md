@@ -568,6 +568,11 @@ rebuilds the `NVFP4Tensor` wrapper around GPU slot storage on activation.
 The optional extra requires TorchAO plus PyTorch 2.8+; dynamic NVFP4
 matmul execution still depends on Blackwell-class CUDA hardware and the
 matching PyTorch CUDA stack.
+For uv-managed installs on Linux/Windows, this repo routes `torch` and
+`torchao` through PyTorch's CUDA 13.0 wheel index. Use
+`uv sync --extra nvfp4 --group dev` and then
+`pytest tests/test_nvfp4_adapter.py -q -rs` to exercise the optional
+TorchAO NVFP4 coverage.
 
 NVFP4 support is intentionally model-weight only. The adapter does not
 opt into CPU round-trip, trainable `Parameter.data` swap, or activation
