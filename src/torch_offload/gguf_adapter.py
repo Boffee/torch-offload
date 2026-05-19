@@ -171,7 +171,11 @@ class GgufAdapter:
 
     @staticmethod
     def matches(t: torch.Tensor) -> bool:
-        return isinstance(t, GGUFWeight) and t.dtype == torch.uint8
+        return (
+            _GGUF_AVAILABLE
+            and isinstance(t, GGUFWeight)
+            and t.dtype == torch.uint8
+        )
 
     @staticmethod
     def storage_key(t: torch.Tensor) -> tuple[object, ...]:

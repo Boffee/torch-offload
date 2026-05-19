@@ -11,7 +11,7 @@ from typing import Any
 
 import torch
 
-from .gguf_adapter import _GGUF_AVAILABLE, GgufAdapter
+from .gguf_adapter import GgufAdapter
 from .nvfp4_adapter import Nvfp4Adapter
 from .quanto_adapter import QuantoAdapter
 from .tensor_adapters import RegularAdapter, TensorAdapter
@@ -23,7 +23,7 @@ def select_adapter(t: torch.Tensor) -> TensorAdapter[Any, Any]:
         return QuantoAdapter()
     if Nvfp4Adapter.matches(t):
         return Nvfp4Adapter()
-    if _GGUF_AVAILABLE and GgufAdapter.matches(t):
+    if GgufAdapter.matches(t):
         return GgufAdapter()
     if RegularAdapter.matches(t):
         return RegularAdapter()

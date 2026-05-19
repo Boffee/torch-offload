@@ -63,6 +63,7 @@ class TestQuantTypeSurvival:
 
 class TestAdapter:
     def test_matches_gguf(self, w: GGUFWeight) -> None:
+        pytest.importorskip("gguf")
         assert GgufAdapter.matches(w)
 
     def test_no_match_plain_uint8(self) -> None:
