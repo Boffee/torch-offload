@@ -71,7 +71,7 @@ from .slots import (
     set_param_data,
     set_tensor_data,
 )
-from .tensor_adapters import select_adapter
+from .tensor_adapter_factory import select_adapter
 
 logger = logging.getLogger(__name__)
 

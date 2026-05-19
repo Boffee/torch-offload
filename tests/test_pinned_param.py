@@ -6,13 +6,13 @@ import pytest
 import torch
 from torch import nn
 
-from torch_offload.pinned_param import PinnedParam, storage_key
+from torch_offload.pinned_param import PinnedParam
 from torch_offload.tensor_adapters import (
     DequantRequantCopyIntoTensorAdapter,
     DequantRequantTensorAdapter,
     TensorCopyIntoAdapter,
-    select_adapter,
 )
+from torch_offload.tensor_adapter_factory import select_adapter, storage_key
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -23,11 +23,11 @@ CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
 class TestPinnedParam:
-    def test_select_adapter_returns_stable_strategy_instance(self) -> None:
+    def test_select_adapter_returns_adapter_for_plain_tensor(self) -> None:
         first = select_adapter(torch.randn(1))
         second = select_adapter(torch.randn(2))
 
-        assert first is second
+        assert type(first) is type(second)
 
     def test_regular_storage_key_includes_device(self) -> None:
         t = torch.randn(2, 3)

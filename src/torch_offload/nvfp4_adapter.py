@@ -22,13 +22,12 @@ import torch
 from torch import nn
 
 from ._torchao_nvfp4 import (
-    TORCHAO_NVFP4_AVAILABLE,
     create_nvfp4_tensor,
     is_nvfp4_tensor,
     require_nvfp4_tensor,
     validate_layout,
 )
-from .tensor_adapters import clone_to_pinned_cpu, register_adapter
+from .tensor_adapters import clone_to_pinned_cpu
 
 
 @dataclass(slots=True)
@@ -289,7 +288,3 @@ class Nvfp4Adapter:
             ("per_tensor_scale", _tensor_layout(qt.per_tensor_scale)),
             ("act_per_tensor_scale", _tensor_layout(qt.act_per_tensor_scale)),
         )
-
-
-if TORCHAO_NVFP4_AVAILABLE:
-    register_adapter(Nvfp4Adapter())

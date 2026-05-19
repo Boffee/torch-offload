@@ -21,8 +21,8 @@ repo depends on. If quanto refactors the wrapper class, the
 :meth:`matches` (validates the expected attributes exist on first
 match).
 
-Auto-registers when this module is imported. Importing fails silently
-if optimum-quanto is not installed — quanto support is optional.
+Selected by :mod:`tensor_adapter_factory`. Importing fails silently if
+optimum-quanto is not installed — quanto support is optional.
 """
 
 from __future__ import annotations
@@ -33,7 +33,6 @@ import torch
 from torch import nn
 
 from ._quanto import (
-    QUANTO_AVAILABLE,
     create_qbytes_tensor,
     dequantize_qbytes_tensor,
     is_weight_qbytes_tensor,
@@ -42,7 +41,7 @@ from ._quanto import (
     require_qbytes_tensor,
     validate_layout,
 )
-from .tensor_adapters import clone_to_pinned_cpu, register_adapter
+from .tensor_adapters import clone_to_pinned_cpu
 
 
 @dataclass(slots=True)
@@ -235,7 +234,3 @@ class QuantoAdapter:
             state.data.numel() * state.data.element_size()
             + state.scale.numel() * state.scale.element_size()
         )
-
-
-if QUANTO_AVAILABLE:
-    register_adapter(QuantoAdapter())

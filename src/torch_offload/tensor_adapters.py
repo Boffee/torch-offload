@@ -14,19 +14,17 @@ across the CPU↔GPU boundary while preserving correctness:
   frozen-only via slot replacement.
 
 Each adapter encapsulates the mechanics for one tensor type. The rest
-of the package (:class:`PinnedParam`, :class:`PinnedWeights`,
-:class:`StreamedWeights`) is type-agnostic and dispatches through
-:func:`select_adapter`. The base adapter contract is intentionally small:
-clone/pin, move to GPU, rebuild wrappers, report cache bytes, and report
-the logical compute dtype. Adapters also provide a layout signature for
-block-pool compatibility checks. Extra operations are expressed as small
-optional protocols so callers ask for the exact capability they need
-instead of hard-coding tensor classes.
+of the package is type-agnostic and dispatches through
+``tensor_adapter_factory.select_adapter``. The base adapter contract is
+intentionally small: clone/pin, move to GPU, rebuild wrappers, report
+cache bytes, and report the logical compute dtype. Adapters also
+provide a layout signature for block-pool compatibility checks. Extra
+operations are expressed as small optional protocols so callers ask for
+the exact capability they need instead of hard-coding tensor classes.
 
-This module is internal to :mod:`torch_offload`. Adapter strategy
-instances are registered at module import time; new types can be added
-by writing a stateless adapter class and calling :func:`register_adapter`
-with one instance.
+This module is internal to :mod:`torch_offload`. It contains the base
+contracts and plain tensor adapter only; built-in adapter selection
+lives in :mod:`tensor_adapter_factory`.
 """
 
 from __future__ import annotations
@@ -48,8 +46,6 @@ __all__ = [
     "TensorCopyIntoAdapter",
     "adapter_name",
     "clone_to_pinned_cpu",
-    "register_adapter",
-    "select_adapter",
 ]
 
 
@@ -81,9 +77,8 @@ class TensorAdapter(Protocol[PinnedStateT, GpuStateT]):
 
     @staticmethod
     def matches(t: torch.Tensor) -> bool:
-        """True if this adapter handles tensor ``t``. Used by
-        :func:`select_adapter` for dispatch. Implementations should be
-        conservative — :class:`RegularAdapter` matches only plain
+        """True if this adapter handles tensor ``t``. Implementations
+        should be conservative — :class:`RegularAdapter` matches only plain
         ``torch.Tensor``, not unrecognized subclasses."""
         ...
 
@@ -333,8 +328,8 @@ class RegularAdapter:
 
     Conservative on dispatch: only matches exactly
     ``type(t) is torch.Tensor`` (or ``nn.Parameter``). Unrecognized
-    tensor subclasses fall through to other adapters or raise via
-    :func:`select_adapter`.
+    tensor subclasses fall through to other adapters or raise via the
+    factory.
     """
 
     @staticmethod
@@ -435,50 +430,6 @@ class RegularAdapter:
         return state.data.numel() * state.data.element_size()
 
 
-# ---------------------------------------------------------------------------
-# Adapter registry / dispatch
-# ---------------------------------------------------------------------------
-
-# Adapters are singleton strategy instances tried in registration order. The
-# first whose ``matches()`` returns True wins. RegularAdapter is appended last
-# as the conservative fallback for plain tensors. Subclass adapters (quanto,
-# etc.) register themselves at import time and slot in front.
-_ADAPTERS: list[TensorAdapter[Any, Any]] = []
-
-
-def register_adapter(adapter: TensorAdapter[Any, Any]) -> None:
-    """Register an adapter for use by :func:`select_adapter`. Adapters
-    registered later take priority over earlier ones for ``matches()``
-    dispatch — this lets specialized adapters (quanto, FP8 variants)
-    precede :class:`RegularAdapter`."""
-    if not any(type(existing) is type(adapter) for existing in _ADAPTERS):
-        _ADAPTERS.insert(0, adapter)
-
-
-def select_adapter(t: torch.Tensor) -> TensorAdapter[Any, Any]:
-    """Find the registered adapter that handles tensor ``t``.
-
-    Tries adapters in priority order (newest first), returning the first
-    whose :meth:`TensorAdapter.matches` returns True. Raises
-    :class:`NotImplementedError` if no adapter matches — the alpha library
-    refuses to silently dequantize or otherwise mishandle unknown tensor
-    subclasses.
-    """
-    for adapter in _ADAPTERS:
-        if adapter.matches(t):
-            return adapter
-    raise NotImplementedError(
-        f"No registered TensorAdapter for tensor type {type(t).__name__!r}. "
-        f"Plain tensors are handled by RegularAdapter; tensor subclasses "
-        f"need a dedicated adapter (see optimum.quanto integration in "
-        f"quanto_adapter.py for an example)."
-    )
-
-
 def adapter_name(adapter: TensorAdapter[Any, Any]) -> str:
     """Human-readable name for an adapter strategy instance."""
     return type(adapter).__name__
-
-
-# Register the regular fallback last so subclass adapters take priority.
-register_adapter(RegularAdapter())

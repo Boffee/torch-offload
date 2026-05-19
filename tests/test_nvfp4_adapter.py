@@ -8,7 +8,8 @@ from torch import nn
 
 from torch_offload import LoRA, ModelOffloader, PinnedWeights, merge_lora
 from torch_offload.nvfp4_adapter import Nvfp4Adapter
-from torch_offload.pinned_param import PinnedParam, storage_key
+from torch_offload.pinned_param import PinnedParam
+from torch_offload.tensor_adapter_factory import storage_key
 from torch_offload.streamed_weights import _layout_signature
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

@@ -23,21 +23,22 @@ from typing import Any
 import torch
 from torch import nn
 
-from . import (
-    gguf_adapter,  # noqa: F401 — registration side effect
-    nvfp4_adapter,  # noqa: F401 — registration side effect
-    quanto_adapter,  # noqa: F401 — registration side effect
-)
 from .slots import set_param_data
+from .tensor_adapter_factory import select_adapter
+from .tensor_adapter_factory import storage_key as _storage_key
 from .tensor_adapters import (
     CpuRoundTripTensorAdapter,
     ParameterDataSwapTensorAdapter,
     TensorAdapter,
     adapter_name,
-    select_adapter,
 )
 
 PostCopyHook = Callable[[nn.Parameter], None]
+
+
+def storage_key(t: torch.Tensor) -> tuple[Any, ...]:
+    """Compatibility wrapper for :func:`tensor_adapter_factory.storage_key`."""
+    return _storage_key(t)
 
 
 class PostCopyHookHandle:
@@ -57,26 +58,6 @@ class PostCopyHookHandle:
             return
         hooks.pop(self._key, None)
         self._hooks = None
-
-
-def storage_key(t: torch.Tensor) -> tuple[Any, ...]:
-    """Identity key for tied-weight detection.
-
-    Two tensors that produce the same key represent the same logical
-    tensor backed by the same device/storage region with the same view
-    layout and (for quanto) the same quant metadata; they can be
-    deduplicated into a single :class:`PinnedParam`.
-
-    Used by :class:`~torch_offload.PinnedWeights` (for handle-level
-    dedup of tied frozen params) and
-    :func:`~torch_offload.ModelOffloader` (for cross-region
-    tied-weight detection across blocks and non-block modules).
-
-    Dispatches to the matching adapter so each tensor type contributes
-    its own identity components (regular: storage + view; quanto:
-    storage of both inner tensors plus quant metadata).
-    """
-    return select_adapter(t).storage_key(t)
 
 
 class PinnedParam:

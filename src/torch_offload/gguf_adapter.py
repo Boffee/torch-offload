@@ -1,6 +1,6 @@
 """GGUF tensor adapter for the memory subsystem.
 
-Registers :class:`GgufAdapter` when the ``gguf`` package is installed,
+Provides :class:`GgufAdapter` when the ``gguf`` package is installed,
 enabling :class:`PinnedParam` to handle GGUF-quantized weights.
 
 Weights are stored in their compact quantized form in pinned CPU
@@ -22,8 +22,8 @@ GGUF intentionally does not implement the CPU round-trip adapter
 capability because GPU storage is dequantized bf16; copying back would
 require lossy re-quantization.
 
-Auto-registers when this module is imported.  Import fails silently if
-the ``gguf`` package is not installed — GGUF support is optional.
+Selected by :mod:`tensor_adapter_factory`. Import fails silently if the
+``gguf`` package is not installed — GGUF support is optional.
 """
 
 from __future__ import annotations
@@ -34,7 +34,7 @@ from typing import Any, cast
 import torch
 from torch import nn
 
-from .tensor_adapters import clone_to_pinned_cpu, register_adapter
+from .tensor_adapters import clone_to_pinned_cpu
 
 _DEQUANT_SHAPE: Any = None
 _DEQUANTIZE: Any = None
@@ -266,7 +266,3 @@ class GgufAdapter:
     @staticmethod
     def cache_bytes(state: _GgufPinned) -> int:
         return state.data.nbytes
-
-
-if _GGUF_AVAILABLE:
-    register_adapter(GgufAdapter())

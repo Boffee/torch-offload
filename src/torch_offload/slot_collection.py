@@ -15,9 +15,9 @@ from typing import Any, Literal
 import torch
 from torch import nn
 
-from .pinned_param import storage_key
 from .protocols import SlotKey
 from .slots import BufferSlot, ParamSlot, iter_buffer_slots, iter_param_slots
+from .tensor_adapter_factory import storage_key
 
 ParamGroupBy = Literal["storage", "object"]
 

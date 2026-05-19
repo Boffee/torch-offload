@@ -27,7 +27,7 @@ from .protocols import ModelStrategyComponent, SlotKey
 from .slot_collection import buffer_storage_key, param_storage_key
 from .slots import canonical_param_name, iter_buffer_slots, iter_param_slots, walk_attr_path
 from .streamed_weights import StreamedWeights
-from .tensor_adapters import select_adapter
+from .tensor_adapter_factory import select_adapter
 from .trainable_weights import TrainableWeights
 
 logger = logging.getLogger(__name__)
