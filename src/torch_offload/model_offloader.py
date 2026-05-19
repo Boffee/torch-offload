@@ -24,8 +24,14 @@ from .lora import LoRA, LoRARouteHandle, LoRATransform
 from .pinned_param import PinnedParam
 from .pinned_weights import PinnedWeights
 from .protocols import ModelStrategyComponent, SlotKey
-from .slot_collection import buffer_storage_key, param_storage_key
-from .slots import canonical_param_name, iter_buffer_slots, iter_param_slots, walk_attr_path
+from .slots import (
+    buffer_storage_key,
+    canonical_param_name,
+    iter_buffer_slots,
+    iter_param_slots,
+    param_storage_key,
+    walk_attr_path,
+)
 from .streamed_weights import StreamedWeights
 from .tensor_adapter_factory import select_adapter
 from .trainable_weights import TrainableWeights

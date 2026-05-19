@@ -78,10 +78,10 @@ from .pinned_param import (
     PostCopyHookHandle,
 )
 from .protocols import SlotKey
-from .slot_collection import collect_module_slots
 from .slots import (
     ParamSlot,
     assert_frozen,
+    collect_module_slots,
 )
 
 

@@ -1,12 +1,11 @@
-"""Tests for shared module slot collection helpers."""
+"""Tests for shared slot helpers."""
 
 from __future__ import annotations
 
 import torch
 from torch import nn
 
-from torch_offload.slot_collection import collect_module_slots
-from torch_offload.slots import iter_param_slots
+from torch_offload.slots import collect_module_slots, iter_param_slots
 
 
 class _DistinctParamStorageTie(nn.Module):

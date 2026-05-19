@@ -21,8 +21,12 @@ from typing import Any
 from torch import nn
 
 from .lora import LoRA, LoRATransform
-from .slot_collection import param_storage_key
-from .slots import ParamSlot, canonical_param_name, iter_param_slots
+from .slots import (
+    ParamSlot,
+    canonical_param_name,
+    iter_param_slots,
+    param_storage_key,
+)
 
 logger = logging.getLogger(__name__)
 

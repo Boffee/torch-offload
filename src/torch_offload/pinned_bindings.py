@@ -9,9 +9,9 @@ import torch
 from torch import nn
 
 from .pinned_param import PinnedParam, PostCopyHook
-from .slot_collection import ModuleSlotCollection
 from .slots import (
     BufferSlot,
+    ModuleSlotCollection,
     ParamSlot,
     set_param_data,
     unique_slots,

@@ -1,13 +1,11 @@
-"""Slot resolution helpers — the single source of truth for walking a
-model and producing stable slot records.
+"""Slot resolution and grouping helpers.
 
 A "slot" is a ``(parent_module, leaf_name, kind)`` triple identifying
 where a parameter or buffer lives in a module tree. The streaming and
 pinning components in this package all need to walk a model and resolve
-each named parameter/buffer back to its owning module slot. This module
-owns that walk so the duplication across ``pinned_weights``,
-``streamed_weights``, and ``model_offloader`` collapses to a single
-implementation.
+each named parameter/buffer back to its owning module slot, then often
+group aliases before pinning, streaming, merging, or validating them.
+This module owns that shared slot logic.
 
 The walk uses ``remove_duplicate=False`` throughout: a Parameter or
 buffer that's aliased under multiple names yields one row per alias.
@@ -18,23 +16,29 @@ themselves; callers that need every slot covered (e.g. building a
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
-from typing import TypeVar
+from typing import Any, Literal, TypeVar
 
 import torch
 from torch import nn
 
 from .protocols import SlotKey
+from .tensor_adapter_factory import storage_key
 
 __all__ = [
     "BufferSlot",
+    "ModuleSlotCollection",
+    "ParamGroupBy",
     "ParamSlot",
     "assert_frozen",
+    "buffer_storage_key",
     "canonical_param_name",
+    "collect_module_slots",
     "get_param_slot",
     "iter_buffer_slots",
     "iter_param_slots",
+    "param_storage_key",
     "set_buffer_slot",
     "set_param_data",
     "set_param_slot",
@@ -45,6 +49,7 @@ __all__ = [
 ]
 
 _SlotT = TypeVar("_SlotT", "ParamSlot", "BufferSlot")
+ParamGroupBy = Literal["storage", "object"]
 
 
 def walk_attr_path(root: nn.Module, dotted_path: str) -> object:
@@ -242,6 +247,15 @@ class BufferSlot:
         )
 
 
+@dataclass(slots=True)
+class ModuleSlotCollection:
+    """Alias-aware slots collected from one module scope."""
+
+    param_slot_groups: list[list[ParamSlot]]
+    buffer_slot_groups: list[list[BufferSlot]]
+    slot_filter: frozenset[SlotKey]
+
+
 def iter_param_slots(module: nn.Module) -> Iterator[ParamSlot]:
     """Walk every named parameter, yielding alias-aware slot info.
 
@@ -273,6 +287,77 @@ def iter_buffer_slots(module: nn.Module) -> Iterator[BufferSlot]:
             leaf=leaf,
             persistent=leaf not in parent._non_persistent_buffers_set,
         )
+
+
+def param_storage_key(param: nn.Parameter) -> tuple[Any, ...]:
+    """Return a storage-identity grouping key for a parameter."""
+    if param.numel() == 0:
+        # Zero-sized tensors all share data_ptr()==0; key by object
+        # identity so aliases of the same Parameter still dedupe.
+        return ("__empty__", id(param))
+    return storage_key(param.data)
+
+
+def buffer_storage_key(buffer: torch.Tensor) -> tuple[Any, ...]:
+    """Return a storage-identity grouping key for a registered buffer."""
+    if buffer.numel() == 0:
+        return ("__empty_buf__", id(buffer))
+    return storage_key(buffer)
+
+
+def collect_module_slots(
+    module: nn.Module,
+    *,
+    skip_slots: set[SlotKey] | frozenset[SlotKey] | None = None,
+    include_buffers: bool = True,
+    param_group_by: ParamGroupBy = "storage",
+    validate_param: Callable[[ParamSlot], None] | None = None,
+) -> ModuleSlotCollection:
+    """Collect grouped parameter and buffer slots from ``module``.
+
+    Parameters are grouped either by storage identity (for whole-module
+    pinning, where tied frozen weights must share one pinned backing) or
+    by ``Parameter`` object identity (for direct streamed blocks, where
+    composer-level validation owns distinct-Parameter storage ties).
+    Buffers are always grouped by storage identity.
+    """
+    skip = skip_slots or frozenset()
+    slot_filter: set[SlotKey] = set()
+
+    param_groups: dict[tuple[Any, ...], list[ParamSlot]] = {}
+    for slot in iter_param_slots(module):
+        if slot.key in skip:
+            continue
+        if validate_param is not None:
+            validate_param(slot)
+        slot_filter.add(slot.key)
+        param = slot.get()
+        param_key = _param_group_key(param, param_group_by)
+        param_groups.setdefault(param_key, []).append(slot)
+
+    buffer_groups: dict[tuple[Any, ...], list[BufferSlot]] = {}
+    if include_buffers:
+        for slot in iter_buffer_slots(module):
+            if slot.key in skip:
+                continue
+            slot_filter.add(slot.key)
+            buffer_groups.setdefault(
+                buffer_storage_key(slot.get()), []
+            ).append(slot)
+
+    return ModuleSlotCollection(
+        param_slot_groups=list(param_groups.values()),
+        buffer_slot_groups=list(buffer_groups.values()),
+        slot_filter=frozenset(slot_filter),
+    )
+
+
+def _param_group_key(
+    param: nn.Parameter, group_by: ParamGroupBy,
+) -> tuple[Any, ...]:
+    if group_by == "storage":
+        return param_storage_key(param)
+    return ("__param_object__", id(param))
 
 
 def _resolve_parent_leaf(

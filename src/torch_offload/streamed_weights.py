@@ -64,9 +64,10 @@ from .pinned_param import (
     PostCopyHookHandle,
 )
 from .protocols import SlotKey
-from .slot_collection import ModuleSlotCollection, collect_module_slots
 from .slots import (
+    ModuleSlotCollection,
     ParamSlot,
+    collect_module_slots,
     get_param_slot,
     set_param_data,
     set_tensor_data,
