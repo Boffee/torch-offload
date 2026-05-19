@@ -21,9 +21,10 @@ from torch import nn
 
 from ._devices import canonical_device
 from .lora import LoRA, LoRARouteHandle, LoRATransform
-from .pinned_param import PinnedParam, storage_key
+from .pinned_param import PinnedParam
 from .pinned_weights import PinnedWeights
 from .protocols import ModelStrategyComponent, SlotKey
+from .slot_collection import buffer_storage_key, param_storage_key
 from .slots import canonical_param_name, iter_buffer_slots, iter_param_slots, walk_attr_path
 from .streamed_weights import StreamedWeights
 from .tensor_adapters import select_adapter
@@ -986,7 +987,7 @@ def detect_streaming_region_ties(  # noqa: PLR0912
         if param.numel() == 0:
             continue
         region = slot_to_region.get((id(s.parent), s.leaf), "non_block")
-        skey = storage_key(param.data)
+        skey = param_storage_key(param)
         groups.setdefault(skey, []).append(
             (region, s.name, param.requires_grad, id(s.parent), s.leaf, id(param))
         )
@@ -1071,7 +1072,7 @@ def detect_streaming_region_ties(  # noqa: PLR0912
             continue
         regions = block_buffer_slot_regions.get((id(s.parent), s.leaf), {"non_block"})
         for region in regions:
-            buffer_groups.setdefault(storage_key(buffer), []).append(
+            buffer_groups.setdefault(buffer_storage_key(buffer), []).append(
                 (region, s.name)
             )
 

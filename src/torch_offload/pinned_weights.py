@@ -60,7 +60,6 @@ from __future__ import annotations
 
 import contextlib
 from collections.abc import Iterator
-from typing import Any
 
 import torch
 from torch import nn
@@ -77,63 +76,26 @@ from .pinned_param import (
     PinnedParam,
     PostCopyHook,
     PostCopyHookHandle,
-    storage_key,
 )
 from .protocols import SlotKey
+from .slot_collection import collect_module_slots
 from .slots import (
-    BufferSlot,
     ParamSlot,
     assert_frozen,
-    iter_buffer_slots,
-    iter_param_slots,
 )
 
 
-def _param_storage_key(param: nn.Parameter) -> tuple[Any, ...]:
-    if param.numel() == 0:
-        # Zero-sized tensors all share data_ptr()==0; key by object
-        # identity so aliases of the same Parameter still dedupe.
-        return ("__empty__", id(param))
-    return storage_key(param.data)
-
-
-def _buffer_storage_key(buffer: torch.Tensor) -> tuple[Any, ...]:
-    if buffer.numel() == 0:
-        return ("__empty_buf__", id(buffer))
-    return storage_key(buffer)
-
-
-def _collect_param_slot_groups(
-    model: nn.Module, *, skip_slots: set[SlotKey],
-) -> list[list[ParamSlot]]:
-    """Collect tied-weight-aware parameter slot groups without pinning."""
-    groups: dict[tuple[Any, ...], list[ParamSlot]] = {}
-    for slot in iter_param_slots(model):
-        if slot.key in skip_slots:
-            continue
-        assert_frozen(
-            slot, owner="PinnedWeights",
-            extra=(
-                "Splitting a tied storage group between skip_slots "
-                "and PinnedWeights silently breaks the alias on "
-                "GPU — validate ties yourself if you go that route, "
-                "or use ModelOffloader which handles it upstream."
-            ),
-        )
-        groups.setdefault(_param_storage_key(slot.get()), []).append(slot)
-    return list(groups.values())
-
-
-def _collect_buffer_slot_groups(
-    model: nn.Module, *, skip_slots: set[SlotKey],
-) -> list[list[BufferSlot]]:
-    """Collect alias-aware PyTorch buffer slot groups without pinning."""
-    groups: dict[tuple[Any, ...], list[BufferSlot]] = {}
-    for slot in iter_buffer_slots(model):
-        if slot.key in skip_slots:
-            continue
-        groups.setdefault(_buffer_storage_key(slot.get()), []).append(slot)
-    return list(groups.values())
+def _validate_frozen_param_slot(slot: ParamSlot) -> None:
+    assert_frozen(
+        slot,
+        owner="PinnedWeights",
+        extra=(
+            "Splitting a tied storage group between skip_slots "
+            "and PinnedWeights silently breaks the alias on "
+            "GPU — validate ties yourself if you go that route, "
+            "or use ModelOffloader which handles it upstream."
+        ),
+    )
 
 
 class PinnedWeights:
@@ -203,14 +165,15 @@ class PinnedWeights:
         # Phase 1: collect the model slots to manage without pinning or
         # slot mutation. This keeps skip/empty validation separate from
         # pinned-memory allocation.
-        param_slot_groups = _collect_param_slot_groups(
-            model, skip_slots=skip,
+        slot_collection = collect_module_slots(
+            model,
+            skip_slots=skip,
+            include_buffers=include_buffers,
+            param_group_by="storage",
+            validate_param=_validate_frozen_param_slot,
         )
-        buffer_slot_groups = (
-            _collect_buffer_slot_groups(model, skip_slots=skip)
-            if include_buffers
-            else []
-        )
+        param_slot_groups = slot_collection.param_slot_groups
+        buffer_slot_groups = slot_collection.buffer_slot_groups
 
         # Reject before pinning if there is nothing at all to manage —
         # neither frozen params nor (when include_buffers=True)

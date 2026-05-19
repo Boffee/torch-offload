@@ -62,15 +62,12 @@ from .pinned_param import (
     PinnedParam,
     PostCopyHook,
     PostCopyHookHandle,
-    storage_key,
 )
 from .protocols import SlotKey
+from .slot_collection import ModuleSlotCollection, collect_module_slots
 from .slots import (
-    BufferSlot,
     ParamSlot,
     get_param_slot,
-    iter_buffer_slots,
-    iter_param_slots,
     set_param_data,
     set_tensor_data,
 )
@@ -173,14 +170,8 @@ def _layout_signature(p: nn.Parameter) -> tuple:
     return select_adapter(p.data).layout_signature(p.data)
 
 
-def _buffer_storage_key(buffer: torch.Tensor) -> tuple:
-    if buffer.numel() == 0:
-        return ("__empty_buf__", id(buffer))
-    return storage_key(buffer)
-
-
 def _check_block_layouts_match(
-    block_param_slot_groups: list[list[list[ParamSlot]]],
+    block_slot_collections: Sequence[ModuleSlotCollection],
 ) -> None:
     """Raise if blocks have mismatched param layouts. Called before
     pinning so layout failures leave parameter slots and storage
@@ -188,18 +179,18 @@ def _check_block_layouts_match(
 
     See :func:`_layout_signature` for what counts as "matched."
     """
-    if len(block_param_slot_groups) <= 1:
+    if len(block_slot_collections) <= 1:
         return
 
-    def sig(param_slot_lists: list[list[ParamSlot]]) -> tuple:
+    def sig(collection: ModuleSlotCollection) -> tuple:
         return tuple(
             (slots[0].name, _layout_signature(slots[0].get()))
-            for slots in param_slot_lists
+            for slots in collection.param_slot_groups
         )
 
-    ref = sig(block_param_slot_groups[0])
-    for i in range(1, len(block_param_slot_groups)):
-        if sig(block_param_slot_groups[i]) != ref:
+    ref = sig(block_slot_collections[0])
+    for i in range(1, len(block_slot_collections)):
+        if sig(block_slot_collections[i]) != ref:
             raise ValueError(
                 f"Block {i} param layout differs from block 0. "
                 "All blocks in a StreamedWeights group must share the "
@@ -210,63 +201,23 @@ def _check_block_layouts_match(
             )
 
 
-def _collect_block_slot_groups(
+def _collect_block_slot_collections(
     blocks: list[nn.Module],
     skip: set[SlotKey],
-) -> tuple[
-    list[list[list[ParamSlot]]],
-    list[list[list[BufferSlot]]],
-    frozenset[SlotKey],
-]:
-    param_slot_groups_per_block: list[list[list[ParamSlot]]] = []
-    buffer_slot_groups_per_block: list[list[list[BufferSlot]]] = []
+) -> tuple[list[ModuleSlotCollection], frozenset[SlotKey]]:
+    slot_collections: list[ModuleSlotCollection] = []
     slot_filter: set[SlotKey] = set()
 
     for block in blocks:
-        block_param_slots_by_id: dict[int, list[ParamSlot]] = {}
-        block_param_order: list[int] = []
-        for s in iter_param_slots(block):
-            if s.key in skip:
-                continue
-            slot_filter.add(s.key)
-            param = s.get()
-            param_id = id(param)
-            slots = block_param_slots_by_id.get(param_id)
-            if slots is None:
-                slots = []
-                block_param_slots_by_id[param_id] = slots
-                block_param_order.append(param_id)
-            slots.append(s)
-        param_slot_groups_per_block.append(
-            [block_param_slots_by_id[param_id] for param_id in block_param_order]
+        collection = collect_module_slots(
+            block,
+            skip_slots=skip,
+            param_group_by="object",
         )
+        slot_collections.append(collection)
+        slot_filter.update(collection.slot_filter)
 
-        block_buffer_slots_by_key: dict[tuple, list[BufferSlot]] = {}
-        block_buffer_order: list[tuple] = []
-        for s in iter_buffer_slots(block):
-            if s.key in skip:
-                continue
-            slot_filter.add(s.key)
-            buffer = s.get()
-            buffer_key = _buffer_storage_key(buffer)
-            slots = block_buffer_slots_by_key.get(buffer_key)
-            if slots is None:
-                slots = []
-                block_buffer_slots_by_key[buffer_key] = slots
-                block_buffer_order.append(buffer_key)
-            slots.append(s)
-        buffer_slot_groups_per_block.append(
-            [
-                block_buffer_slots_by_key[buffer_key]
-                for buffer_key in block_buffer_order
-            ]
-        )
-
-    return (
-        param_slot_groups_per_block,
-        buffer_slot_groups_per_block,
-        frozenset(slot_filter),
-    )
+    return slot_collections, frozenset(slot_filter)
 
 
 def _validate_streamed_param(
@@ -303,30 +254,24 @@ def _pin_block_module_bindings(
     # Walk each block to collect param/buffer slots WITHOUT pinning
     # anything. Pinning runs only after the layout-signature check
     # passes, so invalid configurations raise before model mutation.
-    (
-        block_param_slot_groups,
-        block_buffer_slot_groups,
-        slot_filter,
-    ) = _collect_block_slot_groups(list(blocks), skip)
+    block_slot_collections, slot_filter = _collect_block_slot_collections(
+        list(blocks), skip,
+    )
 
     # Validate before pinning. ``Tensor.copy_`` silently casts dtype and
     # silently broadcasts compatible shapes, so any block N with
     # mismatched dtype, name, or wrapper metadata would otherwise load
     # into block 0's pool slot without raising and corrupt forward.
-    _check_block_layouts_match(block_param_slot_groups)
+    _check_block_layouts_match(block_slot_collections)
 
     return (
         [
             pin_module_slots(
-                param_slot_groups,
-                buffer_slot_groups,
+                collection.param_slot_groups,
+                collection.buffer_slot_groups,
                 validate_param=_validate_streamed_param,
             )
-            for param_slot_groups, buffer_slot_groups in zip(
-                block_param_slot_groups,
-                block_buffer_slot_groups,
-                strict=True,
-            )
+            for collection in block_slot_collections
         ],
         slot_filter,
     )

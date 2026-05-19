@@ -21,7 +21,7 @@ from typing import Any
 from torch import nn
 
 from .lora import LoRA, LoRATransform
-from .pinned_param import storage_key
+from .slot_collection import param_storage_key
 from .slots import ParamSlot, canonical_param_name, iter_param_slots
 
 logger = logging.getLogger(__name__)
@@ -102,7 +102,7 @@ def _param_group_for_slot(
     param_groups_by_storage: dict[tuple[Any, ...], _MergeParamGroup],
 ) -> _MergeParamGroup:
     target_param = target_slot.get()
-    storage = _param_storage_key(target_param)
+    storage = param_storage_key(target_param)
     group = param_groups_by_storage.get(storage)
     if group is not None:
         return group
@@ -110,9 +110,3 @@ def _param_group_for_slot(
     group = _MergeParamGroup(target_param, storage)
     param_groups_by_storage[storage] = group
     return group
-
-
-def _param_storage_key(param: nn.Parameter) -> tuple[Any, ...]:
-    if param.numel() == 0:
-        return ("__empty__", id(param))
-    return storage_key(param.data)
