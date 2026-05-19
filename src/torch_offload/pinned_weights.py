@@ -70,7 +70,7 @@ from .pinned_bindings import (
     PinnedModuleBinding,
     PinnedModuleTarget,
     PinnedParamBinding,
-    pin_module_slots,
+    pin_module_slot_collection,
 )
 from .pinned_param import (
     PinnedParam,
@@ -172,9 +172,6 @@ class PinnedWeights:
             param_group_by="storage",
             validate_param=_validate_frozen_param_slot,
         )
-        param_slot_groups = slot_collection.param_slot_groups
-        buffer_slot_groups = slot_collection.buffer_slot_groups
-
         # Reject before pinning if there is nothing at all to manage —
         # neither frozen params nor (when include_buffers=True)
         # registered buffers. Buffer-only modules (e.g., a pure
@@ -182,7 +179,10 @@ class PinnedWeights:
         # gives them pinned-CPU storage and the activate/deactivate
         # round-trip, which is exactly what ModelOffloader non-block
         # composition needs.
-        if not param_slot_groups and not buffer_slot_groups:
+        if (
+            not slot_collection.param_slot_groups
+            and not slot_collection.buffer_slot_groups
+        ):
             raise ValueError(
                 "PinnedWeights requires at least one frozen parameter or, "
                 "when include_buffers=True, at least one registered buffer "
@@ -197,9 +197,8 @@ class PinnedWeights:
         # keep construction peak memory low. If a later pin fails, the
         # caller must drop the partially constructed model/strategy and
         # rebuild from a fresh model instance.
-        self._binding: PinnedModuleBinding = pin_module_slots(
-            param_slot_groups,
-            buffer_slot_groups,
+        self._binding: PinnedModuleBinding = pin_module_slot_collection(
+            slot_collection,
         )
 
         # Phase 3: apply slot replacement/register_buffer mutations after

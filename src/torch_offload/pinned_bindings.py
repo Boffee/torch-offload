@@ -9,6 +9,7 @@ import torch
 from torch import nn
 
 from .pinned_param import PinnedParam, PostCopyHook
+from .slot_collection import ModuleSlotCollection
 from .slots import (
     BufferSlot,
     ParamSlot,
@@ -257,6 +258,19 @@ def pin_module_slots(
     )
 
 
+def pin_module_slot_collection(
+    collection: ModuleSlotCollection,
+    *,
+    validate_param: ParamPinValidator | None = None,
+) -> PinnedModuleBinding:
+    """Pin collected module slots into one aggregate binding."""
+    return pin_module_slots(
+        collection.param_slot_groups,
+        collection.buffer_slot_groups,
+        validate_param=validate_param,
+    )
+
+
 __all__ = [
     "PinnedBufferBinding",
     "PinnedModuleBinding",
@@ -264,6 +278,7 @@ __all__ = [
     "PinnedParamBinding",
     "bind_param_slots",
     "pin_buffer_slots",
+    "pin_module_slot_collection",
     "pin_module_slots",
     "pin_param_slots",
 ]

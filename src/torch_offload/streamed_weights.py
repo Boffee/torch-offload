@@ -56,7 +56,7 @@ from .pinned_bindings import (
     PinnedModuleBinding,
     PinnedModuleTarget,
     PinnedParamBinding,
-    pin_module_slots,
+    pin_module_slot_collection,
 )
 from .pinned_param import (
     PinnedParam,
@@ -266,9 +266,8 @@ def _pin_block_module_bindings(
 
     return (
         [
-            pin_module_slots(
-                collection.param_slot_groups,
-                collection.buffer_slot_groups,
+            pin_module_slot_collection(
+                collection,
                 validate_param=_validate_streamed_param,
             )
             for collection in block_slot_collections
