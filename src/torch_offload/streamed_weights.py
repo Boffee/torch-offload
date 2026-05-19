@@ -11,7 +11,7 @@ pinned state is used directly without streaming. Heterogeneous block lists
 :class:`StreamedWeights` instances composed via :class:`ModelOffloader`.
 
 In-block trainable params (LoRA adapters) flow through the same slot
-pool; ``_StreamedBlockBindings`` branches on ``pinned.requires_grad`` to
+pool; ``PinnedModuleBinding`` branches on ``pinned.requires_grad`` to
 swap ``.data`` (preserves user Parameter identity for autograd /
 optimizer state) instead of replacing the Parameter wrapper. Gradients
 live on GPU during backward via PyTorch's native ``AccumulateGrad``;
@@ -44,7 +44,7 @@ import functools
 import logging
 import weakref
 from collections import OrderedDict
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterator, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import cast
 
@@ -53,10 +53,10 @@ from torch import nn
 
 from ._devices import canonical_device
 from .pinned_bindings import (
-    PinnedBufferBinding,
+    PinnedModuleBinding,
+    PinnedModuleTarget,
     PinnedParamBinding,
-    bind_param_slots,
-    pin_buffer_slots,
+    pin_module_slots,
 )
 from .pinned_param import (
     PinnedParam,
@@ -110,60 +110,12 @@ def _release_cuda_cache_on_drop(is_cuda: bool) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Pre-allocated GPU buffer pool
+# Pre-allocated GPU target pool
 # ---------------------------------------------------------------------------
 
 
-class _GpuSlot:
-    """Pre-allocated GPU storage for one block's frozen params.
-
-    For each ``PinnedParam`` template, allocates matching GPU
-    tensors (data + optional scale for quanto) once at construction
-    and builds a stable ``nn.Parameter`` wrapping each. Subsequent
-    ``copy_from`` calls write the pinned bytes into the pre-allocated
-    GPU tensors in place — no malloc on the hot path, and the
-    Parameter wrappers stay identity-stable across loads (required
-    for PEFT compatibility and to avoid Python ref churn).
-    """
-
-    __slots__ = ("_gpu_params", "_gpu_states")
-
-    def __init__(self, template: list[PinnedParam], device: torch.device) -> None:
-        # Opaque adapter-specific GPU state per pinned parameter; the streamer
-        # round-trips it through copy_to_gpu / make_gpu_param without
-        # inspecting its shape.
-        self._gpu_states: dict[str, object] = {}
-        self._gpu_params: dict[str, nn.Parameter] = {}
-        for pinned in template:
-            gpu_state = pinned.allocate_gpu_storage(device)
-            self._gpu_states[pinned.name] = gpu_state
-            self._gpu_params[pinned.name] = pinned.make_gpu_param(gpu_state)
-
-    def copy_from(
-        self,
-        pinned_params: list[PinnedParam],
-        post_copy_hooks: Mapping[int, PostCopyHook] | None = None,
-        *,
-        non_blocking: bool = False,
-    ) -> None:
-        for pinned in pinned_params:
-            pinned.copy_to_gpu(
-                self._gpu_states[pinned.name], non_blocking=non_blocking
-            )
-            hook = (
-                post_copy_hooks.get(id(pinned))
-                if post_copy_hooks is not None
-                else None
-            )
-            if hook is not None:
-                hook(self._gpu_params[pinned.name])
-
-    def get_param(self, name: str) -> nn.Parameter:
-        return self._gpu_params[name]
-
-
-class _GpuSlotPool:
-    """Pool of pre-allocated :class:`_GpuSlot` instances."""
+class _PinnedModuleTargetPool:
+    """Pool of pre-allocated :class:`PinnedModuleTarget` instances."""
 
     def __init__(
         self,
@@ -171,7 +123,9 @@ class _GpuSlotPool:
         num_slots: int,
         device: torch.device,
     ) -> None:
-        self._slots = [_GpuSlot(template, device) for _ in range(num_slots)]
+        self._targets = [
+            PinnedModuleTarget(template, device) for _ in range(num_slots)
+        ]
         self._free: list[int] = list(range(num_slots))
         self._events: list[torch.cuda.Event | None] = [None] * num_slots
 
@@ -181,8 +135,8 @@ class _GpuSlotPool:
     def release(self, slot_id: int) -> None:
         self._free.append(slot_id)
 
-    def slot(self, slot_id: int) -> _GpuSlot:
-        return self._slots[slot_id]
+    def target(self, slot_id: int) -> PinnedModuleTarget:
+        return self._targets[slot_id]
 
     def set_compute_event(self, slot_id: int, event: torch.cuda.Event) -> None:
         self._events[slot_id] = event
@@ -315,303 +269,67 @@ def _collect_block_slot_groups(
     )
 
 
-def _pin_block_param_slot_groups(
-    block_param_slot_groups: list[list[list[ParamSlot]]],
-) -> list[list[PinnedParamBinding]]:
-    """Pin collected block parameter slots into per-block bindings."""
-    block_bindings: list[list[PinnedParamBinding]] = []
-    for param_slot_groups in block_param_slot_groups:
-        param_bindings: list[PinnedParamBinding] = []
-        for slots in param_slot_groups:
-            primary_slot = slots[0]
-            param = primary_slot.get()
-            pinned = PinnedParam(primary_slot.name, param)
-            # Trainable streaming uses ``.data`` swap to preserve the
-            # user's Parameter identity. Only adapters that explicitly opt
-            # into that capability are allowed.
-            if pinned.requires_grad:
-                try:
-                    pinned.validate_parameter_data_swap_target()
-                except NotImplementedError as exc:
-                    raise NotImplementedError(
-                        f"Trainable streaming slot {primary_slot.name!r} "
-                        f"cannot be streamed: {exc}"
-                    ) from exc
-            param_bindings.append(bind_param_slots(pinned, slots))
-        block_bindings.append(param_bindings)
-    return block_bindings
+def _validate_streamed_param(
+    pinned: PinnedParam, primary_slot: ParamSlot,
+) -> None:
+    # Trainable streaming uses ``.data`` swap to preserve the user's
+    # Parameter identity. Only adapters that explicitly opt into that
+    # capability are allowed.
+    if not pinned.requires_grad:
+        return
+    try:
+        pinned.validate_parameter_data_swap_target()
+    except NotImplementedError as exc:
+        raise NotImplementedError(
+            f"Trainable streaming slot {primary_slot.name!r} "
+            f"cannot be streamed: {exc}"
+        ) from exc
 
 
-def _pin_block_buffer_slot_groups(
-    block_buffer_slot_groups: list[list[list[BufferSlot]]],
-) -> list[list[PinnedBufferBinding]]:
-    """Pin collected block buffer slots into per-block bindings."""
-    return [
-        [pin_buffer_slots(slots) for slots in buffer_slot_groups]
-        for buffer_slot_groups in block_buffer_slot_groups
-    ]
+def _pin_block_module_bindings(
+    blocks: Sequence[nn.Module],
+    *,
+    skip_slots: set[SlotKey] | None = None,
+) -> tuple[list[PinnedModuleBinding], frozenset[SlotKey]]:
+    """Collect, validate, and pin one :class:`PinnedModuleBinding` per block.
 
-
-class _StreamedBlockBindings:
-    """Per-block pinned CPU bindings for one streamed model instance.
-
-    Construction is three-phase. Pre-pin validation failures do not pin
-    and do not mutate model slots:
-
-    1. ``__init__`` first walks each block to collect param/buffer
-       slots (no pinning) and verifies that every block shares
-       the same layout signature. A mismatch raises ``ValueError``
-       before any pin or slot mutation.
-    2. Then it pins every managed param/buffer into a fresh
-       :class:`PinnedParam` / pinned clone and records the
-       named slots they'll be installed at. For plain
-       ``torch.Tensor`` parameters, :class:`PinnedParam`
-       immediately repoints the source ``Parameter.data`` at the
-       pinned clone as a low-peak memory optimization. ``__init__`` does
-       NOT install pinned Parameter wrappers into the model's slots.
-    3. :meth:`apply_slot_mutations` swaps the model's slots to point
-       at the pinned objects. After this point the bindings own slot
-       state and :meth:`evict_block` is needed to restore CPU params.
-
-    Scope of the pre-pin validation guarantee: phase 1 inspects the
-    model's current slots before any pinning or device normalization, so
-    alias grouping sees the live module graph. Once phase 2 starts,
-    pinning uses the low-peak ``Parameter.data`` repointing described
-    above. A pin-time failure after that point can leave the model
-    partially repointed to pinned storage; recovery of the partially
-    constructed strategy/model is unsupported. Drop those references and
-    rebuild from a fresh model instance.
+    Pre-pin validation failures do not pin and do not mutate model
+    slots. Once pinning starts, :class:`PinnedParam` may use its
+    low-peak ``Parameter.data`` repointing optimization; recovery from
+    a pin-time failure is unsupported, matching :class:`PinnedWeights`.
     """
+    skip: set[SlotKey] = skip_slots or set()
 
-    def __init__(
-        self,
-        blocks: Sequence[nn.Module],
-        *,
-        skip_slots: set[SlotKey] | None = None,
-    ) -> None:
-        self._blocks = list(blocks)
-        self._param_bindings: list[list[PinnedParamBinding]] = []
-        self._buffer_bindings: list[list[PinnedBufferBinding]] = []
-        self._slots_applied = False
-        skip: set[SlotKey] = skip_slots or set()
+    # Walk each block to collect param/buffer slots WITHOUT pinning
+    # anything. Pinning runs only after the layout-signature check
+    # passes, so invalid configurations raise before model mutation.
+    (
+        block_param_slot_groups,
+        block_buffer_slot_groups,
+        slot_filter,
+    ) = _collect_block_slot_groups(list(blocks), skip)
 
-        # Pass 1: walk each block to collect param/buffer slots
-        # WITHOUT pinning anything. Pinning runs in pass 2 only after
-        # the layout-signature check passes, so invalid configurations
-        # raise before any model mutation.
-        (
-            block_param_slot_groups,
-            block_buffer_slot_groups,
-            self._slot_filter,
-        ) = _collect_block_slot_groups(self._blocks, skip)
+    # Validate before pinning. ``Tensor.copy_`` silently casts dtype and
+    # silently broadcasts compatible shapes, so any block N with
+    # mismatched dtype, name, or wrapper metadata would otherwise load
+    # into block 0's pool slot without raising and corrupt forward.
+    _check_block_layouts_match(block_param_slot_groups)
 
-        # Validate before pinning. ``Tensor.copy_`` silently casts dtype
-        # and silently broadcasts compatible shapes, so any block N with
-        # mismatched dtype, name, or wrapper metadata would otherwise
-        # load into block 0's pool slot without raising and corrupt
-        # forward. Run before pinning so layout failures happen before
-        # low-peak Parameter.data repointing starts.
-        _check_block_layouts_match(block_param_slot_groups)
-
-        # Pass 2: pin params + buffers.
-        self._param_bindings = _pin_block_param_slot_groups(
-            block_param_slot_groups,
-        )
-        self._buffer_bindings = _pin_block_buffer_slot_groups(
-            block_buffer_slot_groups,
-        )
-
-        self._post_copy_hooks: dict[int, PostCopyHook] = {}
-
-    @property
-    def slot_filter(self) -> frozenset[SlotKey]:
-        """``SlotKey`` set covering every slot the bindings manage.
-        Stable across the bindings' lifetime."""
-        return self._slot_filter
-
-    @property
-    def param_bindings_per_block(self) -> list[list[PinnedParamBinding]]:
-        return self._param_bindings
-
-    def apply_slot_mutations(self) -> None:
-        """Install the binding CPU params + buffer bindings into the
-        model's slots. Idempotent.
-
-        Frozen params: ``submod._parameters[leaf] = binding.cpu_param``
-        replaces the slot Parameter with a fresh
-        ``Parameter(requires_grad=False)`` wrapping the pinned host
-        clone. This orphans the user's pre-pin Parameter — fine for
-        frozen, since there's no autograd/optimizer state to lose.
-
-        Trainable params: leave the user's Parameter in place so
-        autograd and optimizer references survive. The
-        ``PinnedParam`` constructor already repointed the user
-        Parameter's ``.data`` at the pinned clone (plain-tensor
-        memory optimization), so the original storage is released
-        without slot mutation.
-
-        Buffers use slot replacement, matching :class:`PinnedWeights`.
-        """
-        if self._slots_applied:
-            return
-        for block_param_bindings in self._param_bindings:
-            for param_binding in block_param_bindings:
-                if param_binding.pinned.requires_grad:
-                    # Trainable: keep user's Parameter, .data is already pinned.
-                    continue
-                # _parameters[leaf] swap (rather than .data) is required
-                # for quanto correctness — see PinnedWeights for details.
-                for slot in param_binding.unique_slots:
-                    slot.set(param_binding.cpu_param)
-        for buffer_bindings in self._buffer_bindings:
-            for buffer_binding in buffer_bindings:
-                for slot in buffer_binding.unique_slots:
-                    slot.set(buffer_binding.pinned)
-        self._slots_applied = True
-
-    @property
-    def cache_bytes(self) -> int:
-        total = 0
-        for block_param_bindings in self._param_bindings:
-            for param_binding in block_param_bindings:
-                total += param_binding.pinned.cache_bytes
-        for buffer_bindings in self._buffer_bindings:
-            for buffer_binding in buffer_bindings:
-                total += (
-                    buffer_binding.pinned.numel()
-                    * buffer_binding.pinned.element_size()
-                )
-        return total
-
-    def pinned_params_for_block(self, block_idx: int) -> list[PinnedParam]:
-        return [
-            param_binding.pinned
-            for param_binding in self._param_bindings[block_idx]
-        ]
-
-    def register_post_copy_hook(
-        self, pinned: PinnedParam, hook: PostCopyHook,
-    ) -> PostCopyHookHandle:
-        if not any(
-            param_binding.pinned is pinned
-            for block_param_bindings in self._param_bindings
-            for param_binding in block_param_bindings
-        ):
-            raise ValueError(
-                "pinned param "
-                f"{pinned.name!r} is not owned by this StreamedWeights"
+    return (
+        [
+            pin_module_slots(
+                param_slot_groups,
+                buffer_slot_groups,
+                validate_param=_validate_streamed_param,
             )
-        key = id(pinned)
-        if key in self._post_copy_hooks:
-            raise RuntimeError(
-                "post-copy hook already registered for "
-                f"pinned param {pinned.name!r}"
+            for param_slot_groups, buffer_slot_groups in zip(
+                block_param_slot_groups,
+                block_buffer_slot_groups,
+                strict=True,
             )
-        self._post_copy_hooks[key] = hook
-        return PostCopyHookHandle(self._post_copy_hooks, key)
-
-    def load_block(
-        self,
-        block_idx: int,
-        gpu_slot: _GpuSlot,
-        device: torch.device,
-        *,
-        non_blocking: bool = False,
-    ) -> None:
-        gpu_slot.copy_from(
-            self.pinned_params_for_block(block_idx),
-            self._post_copy_hooks,
-            non_blocking=non_blocking,
-        )
-
-        for param_binding in self._param_bindings[block_idx]:
-            gpu_param = gpu_slot.get_param(param_binding.pinned.name)
-            if param_binding.pinned.requires_grad:
-                # Trainable: .data swap into the slot's GPU storage.
-                # Preserves the user's Parameter object identity — so
-                # autograd and optimizer state survive across cycles.
-                # Reuses ``slot.get_param`` purely for its ``.data``
-                # storage; the wrapper itself isn't installed.
-                for param_slot in param_binding.unique_slots:
-                    set_param_data(param_slot.get(), gpu_param.data)
-            else:
-                for param_slot in param_binding.unique_slots:
-                    param_slot.set(gpu_param)
-        for buffer_binding in self._buffer_bindings[block_idx]:
-            gpu = buffer_binding.pinned.to(device, non_blocking=non_blocking)
-            for buffer_slot in buffer_binding.unique_slots:
-                buffer_slot.set(gpu)
-
-    def evict_block(self, block_idx: int) -> None:
-        """Restore ``block_idx``'s slots to their pinned CPU forms.
-
-        Frozen: ``submod._parameters[leaf] = binding.cpu_param``.
-        Trainable: ``submod._parameters[leaf].data = binding.cpu_param.data``
-        (preserve the user's Parameter object).
-        """
-        for param_binding in self._param_bindings[block_idx]:
-            if param_binding.pinned.requires_grad:
-                for param_slot in param_binding.unique_slots:
-                    set_param_data(
-                        param_slot.get(), param_binding.cpu_param.data
-                    )
-            else:
-                for param_slot in param_binding.unique_slots:
-                    param_slot.set(param_binding.cpu_param)
-        for buffer_binding in self._buffer_bindings[block_idx]:
-            for buffer_slot in buffer_binding.unique_slots:
-                buffer_slot.set(buffer_binding.pinned)
-
-    def move_trainable_grads_to(self, device: torch.device) -> None:
-        """Move each trainable's ``.grad`` (if any) to ``device``.
-
-        During backward, PyTorch's native ``AccumulateGrad`` writes
-        grads on the param's data device — which is GPU at that point
-        because the ``.data`` swap in :meth:`load_block` repointed
-        ``.data`` at slot storage. The streamer's ``.data`` lifecycle
-        restores ``.data`` to pinned CPU on eviction, but ``.grad``
-        keeps living wherever AccumulateGrad placed it.
-
-        This is called on activate to move any previously-deactivated
-        CPU grads back to GPU before accumulation, and on deactivate
-        to honor the documented "model on CPU" contract.
-        """
-        for _binding, parent, leaf in self.iter_trainables():
-            param = get_param_slot(parent, leaf)
-            if param.grad is not None and param.grad.device != device:
-                moved = param.grad.to(device)
-                if param.data.device == device:
-                    param.grad = moved
-                else:
-                    # PyTorch's grad setter rejects cross-device grad/data
-                    # pairs. Streamed trainables intentionally have CPU
-                    # data and GPU grads while active between block loads,
-                    # so move the grad storage in place when the data is
-                    # currently offloaded.
-                    set_tensor_data(param.grad, moved.data)
-
-    def iter_trainables(
-        self,
-    ) -> "Iterator[tuple[PinnedParamBinding, nn.Module, str]]":
-        """Yield ``(binding, parent, leaf)`` for every trainable pinned param
-        across all blocks. Used by ``StreamedWeights.optimizer_step``
-        to walk all trainables when bringing them to GPU around the
-        optimizer-step boundary."""
-        for block_param_bindings in self._param_bindings:
-            for param_binding in block_param_bindings:
-                if param_binding.pinned.requires_grad:
-                    slot = param_binding.unique_slots[0]
-                    yield param_binding, slot.parent, slot.leaf
-
-    def has_trainables(self) -> bool:
-        """True if any block contains a trainable param. Used by the
-        composer to decide whether to enforce checkpointing as a
-        precondition for ``activate``."""
-        return any(
-            param_binding.pinned.requires_grad
-            for block_param_bindings in self._param_bindings
-            for param_binding in block_param_bindings
-        )
+        ],
+        slot_filter,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -770,20 +488,21 @@ class StreamedWeights:
 
         # Pin in __init__ — uniform lifecycle with PinnedWeights, and
         # ModelCache integration sees a final `cache_bytes` immediately.
-        # _StreamedBlockBindings validates that every block shares the same
-        # param-layout signature before any model slot is mutated, then
-        # clones directly from the source device into pinned CPU storage.
-        # Heterogeneous block lists split across separate `layers_attr=[...]`
-        # entries in ModelOffloader.
-        bindings = _StreamedBlockBindings(
+        # Block binding construction validates that every block shares
+        # the same param-layout signature before any model slot is
+        # mutated, then clones directly from the source device into
+        # pinned CPU storage. Heterogeneous block lists split across
+        # separate `layers_attr=[...]` entries in ModelOffloader.
+        self._block_bindings, self._slot_filter = _pin_block_module_bindings(
             self._blocks, skip_slots=skip_slots,
         )
-        bindings.apply_slot_mutations()
-        bindings.move_trainable_grads_to(torch.device("cpu"))
-        self._bindings: _StreamedBlockBindings | None = bindings
+        self._post_copy_hooks: dict[int, PostCopyHook] = {}
+        for binding in self._block_bindings:
+            binding.place_on_pinned()
+        self._move_trainable_grads_to(torch.device("cpu"))
 
         # Active resources allocated on CUDA activate().
-        self._pool: _GpuSlotPool | None = None
+        self._pool: _PinnedModuleTargetPool | None = None
         self._block_to_slot: dict[int, int] = {}
         self._pool_config: tuple[int, torch.device] | None = None
         self._tracker: _BlockTracker | None = None
@@ -817,8 +536,7 @@ class StreamedWeights:
         mutation, so a consumer can construct a
         :class:`PinnedWeights` with this filter regardless of order
         relative to the streamer."""
-        assert self._bindings is not None
-        return self._bindings.slot_filter
+        return self._slot_filter
 
     @property
     def param_bindings_per_block(self) -> list[list[PinnedParamBinding]]:
@@ -835,16 +553,17 @@ class StreamedWeights:
            read-only — mutating the outer list, inner lists, or bindings
            will corrupt streaming bookkeeping.
         """
-        assert self._bindings is not None
-        return self._bindings.param_bindings_per_block
+        return [
+            binding.param_bindings for binding in self._block_bindings
+        ]
 
     @property
     def cache_bytes(self) -> int:
-        return self._bindings.cache_bytes if self._bindings is not None else 0
+        return sum(binding.cache_bytes for binding in self._block_bindings)
 
     @property
     def has_trainables(self) -> bool:
-        return self._bindings is not None and self._bindings.has_trainables()
+        return any(binding.has_trainables() for binding in self._block_bindings)
 
     def register_post_copy_hook(
         self, pinned: PinnedParam, hook: PostCopyHook,
@@ -855,8 +574,22 @@ class StreamedWeights:
         LoRA. Mirrors PyTorch's hook registration pattern by returning a
         handle whose :meth:`remove` method unregisters the hook.
         """
-        assert self._bindings is not None
-        return self._bindings.register_post_copy_hook(pinned, hook)
+        if not any(
+            binding.contains_pinned_param(pinned)
+            for binding in self._block_bindings
+        ):
+            raise ValueError(
+                "pinned param "
+                f"{pinned.name!r} is not owned by this StreamedWeights"
+            )
+        key = id(pinned)
+        if key in self._post_copy_hooks:
+            raise RuntimeError(
+                "post-copy hook already registered for "
+                f"pinned param {pinned.name!r}"
+            )
+        self._post_copy_hooks[key] = hook
+        return PostCopyHookHandle(self._post_copy_hooks, key)
 
     def _resolve_device(self, device: torch.device | str | None) -> torch.device:
         if device is not None:
@@ -893,7 +626,6 @@ class StreamedWeights:
         activation on that streamer is unsupported; the caller's only
         supported cleanup path is :meth:`deactivate`, which idempotently
         tears down whatever was allocated."""
-        assert self._bindings is not None
         # Hard-guard against the documented "don't activate twice"
         # case. Without this, a double-activate would double-install
         # forward-pre hooks (silent grad doubling) and stack a second
@@ -927,7 +659,7 @@ class StreamedWeights:
         self._last_idx = -1
 
         self._activate_pool(num_gpu_slots, active_device)
-        self._bindings.move_trainable_grads_to(active_device)
+        self._move_trainable_grads_to(active_device)
 
         for block_idx in range(min(num_resident, num_layers)):
             self._load_block(block_idx)
@@ -1044,10 +776,6 @@ class StreamedWeights:
         re-loads from pinned), but that cost is dominated by the
         forward + backward of the next iteration.
         """
-        assert self._bindings is not None, (
-            "StreamedWeights.optimizer_step() requires activate() to "
-            "have been called and not yet deactivated."
-        )
         if self._executor is None:
             if self._active_device is not None and self._active_device.type == "cpu":
                 if self._optimizer_step_active:
@@ -1073,7 +801,7 @@ class StreamedWeights:
                 "scatter the outer step's stale pinned bytes on top of "
                 "the inner update."
             )
-        if not self._bindings.has_trainables():
+        if not self.has_trainables:
             yield
             return
 
@@ -1108,7 +836,7 @@ class StreamedWeights:
                 # the rollback is idempotent w.r.t. a successful copy.
                 materialized: list[tuple[nn.Parameter, PinnedParamBinding]] = []
                 with torch.cuda.stream(step_stream):
-                    for binding, parent, leaf in self._bindings.iter_trainables():
+                    for binding, parent, leaf in self._iter_trainables():
                         param = get_param_slot(parent, leaf)
                         stack.callback(
                             _repoint_data_to_cpu_param, param, binding.cpu_param
@@ -1170,6 +898,37 @@ class StreamedWeights:
     # Internals
     # ------------------------------------------------------------------
 
+    def _iter_trainables(
+        self,
+    ) -> Iterator[tuple[PinnedParamBinding, nn.Module, str]]:
+        """Yield every trainable binding across all streamed blocks."""
+        for binding in self._block_bindings:
+            yield from binding.iter_trainables()
+
+    def _move_trainable_grads_to(self, device: torch.device) -> None:
+        """Move each trainable's ``.grad`` (if any) to ``device``.
+
+        During backward, PyTorch's native ``AccumulateGrad`` writes
+        grads on the param's data device, which is GPU at that point
+        because the ``.data`` swap in :meth:`PinnedModuleBinding.place_on_gpu`
+        repointed ``.data`` at slot storage. Eviction restores ``.data``
+        to pinned CPU, but ``.grad`` keeps living wherever AccumulateGrad
+        placed it.
+        """
+        for _binding, parent, leaf in self._iter_trainables():
+            param = get_param_slot(parent, leaf)
+            if param.grad is not None and param.grad.device != device:
+                moved = param.grad.to(device)
+                if param.data.device == device:
+                    param.grad = moved
+                else:
+                    # PyTorch's grad setter rejects cross-device grad/data
+                    # pairs. Streamed trainables intentionally have CPU
+                    # data and GPU grads while active between block loads,
+                    # so move the grad storage in place when the data is
+                    # currently offloaded.
+                    set_tensor_data(param.grad, moved.data)
+
     def _activate_pool(self, num_gpu_slots: int, device: torch.device) -> None:
         if self._pool_config is not None:
             existing = self._pool_config
@@ -1187,11 +946,10 @@ class StreamedWeights:
                 "fires when prefetch_count is negative."
             )
 
-        assert self._bindings is not None
         # Pool template comes from block 0. The constructor's layout
         # check has already verified every other block matches.
-        self._pool = _GpuSlotPool(
-            self._bindings.pinned_params_for_block(0),
+        self._pool = _PinnedModuleTargetPool(
+            self._block_bindings[0].pinned_params,
             num_gpu_slots,
             device,
         )
@@ -1209,7 +967,6 @@ class StreamedWeights:
         non_blocking: bool = False,
         stream: torch.cuda.Stream | None = None,
     ) -> None:
-        assert self._bindings is not None
         assert self._pool is not None, "_activate_pool not called"
 
         slot_id = self._block_to_slot.get(block_idx)
@@ -1218,17 +975,15 @@ class StreamedWeights:
             self._block_to_slot[block_idx] = slot_id
 
         self._pool.wait_if_needed(slot_id, stream)
-        gpu_slot = self._pool.slot(slot_id)
-        self._bindings.load_block(
-            block_idx,
-            gpu_slot,
-            self._require_active_device(),
+        target = self._pool.target(slot_id)
+        self._block_bindings[block_idx].place_on_gpu(
+            target,
+            post_copy_hooks=self._post_copy_hooks,
             non_blocking=non_blocking,
         )
 
     def _release_block(self, block_idx: int) -> None:
-        assert self._bindings is not None
-        self._bindings.evict_block(block_idx)
+        self._block_bindings[block_idx].place_on_pinned()
         if self._pool is None:
             return
         slot_id = self._block_to_slot.pop(block_idx, None)
@@ -1336,10 +1091,9 @@ class StreamedWeights:
         # the ``.data`` restoration that already happened in
         # ``evict_allocated_blocks``.
         active_device = self._active_device
-        if self._bindings is not None:
-            self._bindings.move_trainable_grads_to(torch.device("cpu"))
-            if active_device is None or active_device.type == "cuda":
-                self._deactivate_pool()
+        self._move_trainable_grads_to(torch.device("cpu"))
+        if active_device is None or active_device.type == "cuda":
+            self._deactivate_pool()
 
         self._tracker = None
         self._last_idx = -1
@@ -1413,7 +1167,7 @@ class StreamedWeights:
                 # is slower but works on pinned tensors).
                 return
             tracker = streamer._tracker
-            if tracker is None or streamer._bindings is None:
+            if tracker is None:
                 return
             pending = streamer._pending
             if tracker.is_on_gpu(idx):

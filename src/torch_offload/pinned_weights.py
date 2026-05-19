@@ -68,9 +68,10 @@ from torch import nn
 from ._devices import canonical_device
 from .pinned_bindings import (
     PinnedBufferBinding,
+    PinnedModuleBinding,
+    PinnedModuleTarget,
     PinnedParamBinding,
-    pin_buffer_slots,
-    pin_param_slots,
+    pin_module_slots,
 )
 from .pinned_param import (
     PinnedParam,
@@ -195,19 +196,18 @@ class PinnedWeights:
         skip_slots: set[SlotKey] | None = None,
     ) -> None:
         self._model: nn.Module | None = model
-        self._include_buffers = include_buffers
-        self._skip_slots: set[SlotKey] = skip_slots or set()
         self._active_device: torch.device | None = None
         self._post_copy_hooks: dict[int, PostCopyHook] = {}
+        skip: set[SlotKey] = skip_slots or set()
 
         # Phase 1: collect the model slots to manage without pinning or
         # slot mutation. This keeps skip/empty validation separate from
         # pinned-memory allocation.
         param_slot_groups = _collect_param_slot_groups(
-            model, skip_slots=self._skip_slots,
+            model, skip_slots=skip,
         )
         buffer_slot_groups = (
-            _collect_buffer_slot_groups(model, skip_slots=self._skip_slots)
+            _collect_buffer_slot_groups(model, skip_slots=skip)
             if include_buffers
             else []
         )
@@ -234,18 +234,16 @@ class PinnedWeights:
         # keep construction peak memory low. If a later pin fails, the
         # caller must drop the partially constructed model/strategy and
         # rebuild from a fresh model instance.
-        self._param_bindings = [
-            pin_param_slots(slots) for slots in param_slot_groups
-        ]
-        self._buffer_bindings = [
-            pin_buffer_slots(slots) for slots in buffer_slot_groups
-        ]
+        self._binding: PinnedModuleBinding = pin_module_slots(
+            param_slot_groups,
+            buffer_slot_groups,
+        )
 
         # Phase 3: apply slot replacement/register_buffer mutations after
         # all pinning succeeded. This keeps module slot identity changes
         # grouped, but construction is not fully rollback-safe because of
         # the low-peak Parameter.data repointing described above.
-        self._move_to_pinned()
+        self._binding.place_on_pinned()
 
     # ------------------------------------------------------------------
     # ModelStrategy protocol
@@ -258,22 +256,17 @@ class PinnedWeights:
         Used by :class:`~torch_offload.ModelOffloader` to build its
         target-name to pinned-param map.
         """
-        return self._param_bindings
+        return self._binding.param_bindings
 
     @property
     def buffer_bindings(self) -> list[PinnedBufferBinding]:
         """Pinned PyTorch buffer bindings managed by this instance."""
-        return self._buffer_bindings
+        return self._binding.buffer_bindings
 
     @property
     def cache_bytes(self) -> int:
         """Total pinned host bytes held. Tied weights counted once."""
-        total = 0
-        for param_binding in self._param_bindings:
-            total += param_binding.pinned.cache_bytes
-        for buffer_binding in self._buffer_bindings:
-            total += buffer_binding.pinned.numel() * buffer_binding.pinned.element_size()
-        return total
+        return self._binding.cache_bytes
 
     @property
     def model(self) -> nn.Module:
@@ -294,10 +287,7 @@ class PinnedWeights:
         LoRA. Mirrors PyTorch's hook registration pattern by returning a
         handle whose :meth:`remove` method unregisters the hook.
         """
-        if not any(
-            param_binding.pinned is pinned
-            for param_binding in self._param_bindings
-        ):
+        if not self._binding.contains_pinned_param(pinned):
             raise ValueError(
                 f"pinned param {pinned.name!r} is not owned by this PinnedWeights"
             )
@@ -338,7 +328,24 @@ class PinnedWeights:
                 "for a leaked context manager."
             )
         active_device = self._resolve_device(device)
-        self._move_to_device(active_device)
+        if active_device.type == "cpu":
+            self._binding.place_on_pinned()
+        elif active_device.type == "cuda":
+            # One active-device Parameter per unique pinned parameter.
+            # Tied slots all receive the same Parameter object so the
+            # tying invariant survives on device.
+            target = PinnedModuleTarget(self._binding.pinned_params, active_device)
+            self._binding.place_on_gpu(
+                target,
+                post_copy_hooks=self._post_copy_hooks,
+                non_blocking=True,
+            )
+            torch.cuda.synchronize(active_device)
+        else:
+            raise ValueError(
+                "PinnedWeights.activate() supports CUDA or CPU; "
+                f"got {active_device}."
+            )
         self._active_device = active_device
 
     def deactivate(self) -> None:
@@ -348,7 +355,7 @@ class PinnedWeights:
         memory (and the model reference too if you don't need it
         anymore)."""
         try:
-            self._move_to_pinned()
+            self._binding.place_on_pinned()
         finally:
             self._active_device = None
 
@@ -373,39 +380,3 @@ class PinnedWeights:
             "activate(device) or use this strategy through "
             "ModelCache.use(..., device=...)"
         )
-
-    def _move_to_device(self, device: torch.device) -> None:
-        if device.type == "cpu":
-            self._move_to_pinned()
-            return
-        if device.type != "cuda":
-            raise ValueError(
-                "PinnedWeights.activate() supports CUDA or CPU; "
-                f"got {device}."
-            )
-
-        # One active-device Parameter per unique pinned parameter. Tied slots
-        # all receive the same Parameter object so the tying invariant
-        # survives on device.
-        for param_binding in self._param_bindings:
-            gpu_param = param_binding.pinned.load_to_gpu(device, non_blocking=True)
-            hook = self._post_copy_hooks.get(id(param_binding.pinned))
-            if hook is not None:
-                hook(gpu_param)
-            for slot in param_binding.unique_slots:
-                slot.set(gpu_param)
-        if self._include_buffers:
-            for buffer_binding in self._buffer_bindings:
-                gpu = buffer_binding.pinned.to(device, non_blocking=True)
-                for slot in buffer_binding.unique_slots:
-                    slot.set(gpu)
-        torch.cuda.synchronize(device)
-
-    def _move_to_pinned(self) -> None:
-        for param_binding in self._param_bindings:
-            for slot in param_binding.unique_slots:
-                slot.set(param_binding.cpu_param)
-        if self._include_buffers:
-            for buffer_binding in self._buffer_bindings:
-                for slot in buffer_binding.unique_slots:
-                    slot.set(buffer_binding.pinned)

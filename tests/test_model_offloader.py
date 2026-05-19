@@ -1898,7 +1898,7 @@ class TestStreamedWeightsContractGuard:
     def test_direct_unskipped_trainable_constructs(self) -> None:
         # Build a trainable block with no skip_slots. The streamer
         # accepts the trainable slot (handled via ``.data`` swap inside
-        # ``_StreamedBlockBindings``). The slot appears in the streamer's
+        # ``PinnedModuleBinding``). The slot appears in the streamer's
         # slot_filter just like a frozen slot would.
         from torch_offload.slots import iter_param_slots
 

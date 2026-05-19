@@ -202,8 +202,7 @@ def _has_post_copy_hook(strategy: ModelOffloader, target_key: str) -> bool:
     if isinstance(component, PinnedWeights):
         return id(pinned) in component._post_copy_hooks
     if isinstance(component, StreamedWeights):
-        assert component._bindings is not None
-        return id(pinned) in component._bindings._post_copy_hooks
+        return id(pinned) in component._post_copy_hooks
     return False
 
 
@@ -911,7 +910,6 @@ class TestLoRATransform:
         s.activate("cuda")
         try:
             streamer = s._streamers[0]
-            assert streamer._bindings is not None
             streamer._load_block(0)
             merged_qt = m.transformer_blocks[0].attn.weight.data
             assert isinstance(merged_qt, WeightQBytesTensor)

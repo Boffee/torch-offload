@@ -66,7 +66,7 @@ class TestPinnedParam:
 
     @CUDA
     def test_pool_pattern_allocate_and_copy(self) -> None:
-        # Mirrors how _GpuSlot uses PinnedParam: allocate GPU
+        # Mirrors how PinnedModuleTarget uses PinnedParam: allocate GPU
         # storage once, then copy_to_gpu in place on each load.
         p = nn.Parameter(torch.randn(16, dtype=torch.bfloat16), requires_grad=False)
         pinned_param = PinnedParam("w", p)
@@ -86,7 +86,7 @@ class TestPinnedParam:
         torch.cuda.synchronize()
         assert torch.equal(gpu_state.data.cpu(), new_vals)
         # Stable storage — gpu_param wraps the same GPU bytes as gpu_state.
-        # _GpuSlot relies on this: build the Parameter wrapper once at slot
+        # PinnedModuleTarget relies on this: build the Parameter wrapper once at target
         # construction, mutate underlying storage in place on each load.
         assert gpu_param.data_ptr() == gpu_state.data.data_ptr()
 
@@ -105,53 +105,49 @@ class TestPinnedParam:
 
     @CUDA
     def test_slot_param_identity_stable_across_loads(self) -> None:
-        # _GpuSlot caches the Parameter wrapping its GPU storage; copy_from
-        # must not churn that wrapper. Hooks repointing submod._parameters
-        # at slot.get_param() observe a stable object across reloads — the
-        # whole point of the pool-slot pattern over per-load allocation.
-        from torch_offload.streamed_weights import _GpuSlot
+        # PinnedModuleTarget caches the Parameter wrapping its GPU storage;
+        # load_param must not churn that wrapper. Module slots observe a
+        # stable object across reloads — the whole point of the pooled
+        # target pattern over per-load allocation.
+        from torch_offload.pinned_bindings import PinnedModuleTarget
 
         p1 = nn.Parameter(torch.randn(8, dtype=torch.bfloat16), requires_grad=False)
         p2 = nn.Parameter(torch.randn(8, dtype=torch.bfloat16), requires_grad=False)
         block = [PinnedParam("a", p1), PinnedParam("b", p2)]
-        slot = _GpuSlot(block, torch.device("cuda"))
+        target = PinnedModuleTarget(block, torch.device("cuda"))
 
-        a_first = slot.get_param("a")
-        b_first = slot.get_param("b")
-        slot.copy_from(block, non_blocking=False)
+        a_first = target.load_param(block[0], non_blocking=False)
+        b_first = target.load_param(block[1], non_blocking=False)
         torch.cuda.synchronize()
-        assert slot.get_param("a") is a_first
-        assert slot.get_param("b") is b_first
-        slot.copy_from(block, non_blocking=False)
+        assert target.load_param(block[0], non_blocking=False) is a_first
+        assert target.load_param(block[1], non_blocking=False) is b_first
         torch.cuda.synchronize()
-        assert slot.get_param("a") is a_first
-        assert slot.get_param("b") is b_first
+        assert target.load_param(block[0], non_blocking=False) is a_first
+        assert target.load_param(block[1], non_blocking=False) is b_first
 
     @CUDA
     def test_slot_hook_mutates_stable_param_in_place(self) -> None:
-        from torch_offload.streamed_weights import _GpuSlot
+        from torch_offload.pinned_bindings import PinnedModuleTarget
 
         p = nn.Parameter(torch.randn(8, dtype=torch.bfloat16), requires_grad=False)
         pinned_param = PinnedParam("w", p)
         block = [pinned_param]
-        slot = _GpuSlot(block, torch.device("cuda"))
-        base_param = slot.get_param("w")
+        target = PinnedModuleTarget(block, torch.device("cuda"))
+        base_param = target.load_param(pinned_param, non_blocking=False)
 
         def hook(param: nn.Parameter) -> None:
             param.data.add_(1)
 
-        slot.copy_from(block, {id(pinned_param): hook}, non_blocking=False)
+        hook(target.load_param(pinned_param, non_blocking=False))
         torch.cuda.synchronize()
-        assert slot.get_param("w") is base_param
         cpu_param = pinned_param.make_cpu_param()
         torch.testing.assert_close(
             base_param.detach().cpu(),
             cpu_param.detach() + 1,
         )
 
-        slot.copy_from(block, non_blocking=False)
+        assert target.load_param(pinned_param, non_blocking=False) is base_param
         torch.cuda.synchronize()
-        assert slot.get_param("w") is base_param
         torch.testing.assert_close(
             base_param.detach().cpu(),
             cpu_param.detach(),
