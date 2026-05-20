@@ -9,6 +9,7 @@ import torch
 from torch import nn
 
 from torch_offload.pinned_bindings import (
+    PinnedBuffer,
     PinnedBufferBinding,
     PinnedModuleTarget,
     PinnedParamBinding,
@@ -276,7 +277,7 @@ class TestPinnedBindings:
         original = torch.tensor([1.0, 2.0])
         parent.register_buffer("running", original, persistent=False)
         slot = BufferSlot("running", parent, "running", persistent=False)
-        pinned = torch.tensor([5.0, 6.0])
+        pinned = PinnedBuffer.clone("running", torch.tensor([5.0, 6.0]))
         binding = PinnedBufferBinding(pinned=pinned, slots=[slot])
         target = cast(
             PinnedModuleTarget,
@@ -285,6 +286,9 @@ class TestPinnedBindings:
 
         copied = binding.copy_to_target(target)
 
+        assert pinned.name == "running"
+        assert pinned.tensor.is_pinned()
+        assert pinned.cache_bytes == pinned.tensor.numel() * pinned.tensor.element_size()
         assert parent.running is original
 
         binding.load_to_target(target)
@@ -298,7 +302,7 @@ class TestPinnedBindings:
 
         binding.restore_pinned()
 
-        assert parent.running is pinned
+        assert parent.running is pinned.tensor
         assert "running" in parent._non_persistent_buffers_set
 
 

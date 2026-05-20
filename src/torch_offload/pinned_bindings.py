@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 
+from .pinned_buffer import PinnedBuffer
 from .pinned_param import PinnedParam, PostCopyHook
 from .slots import (
     BufferSlot,
@@ -16,7 +17,6 @@ from .slots import (
     set_param_data,
     unique_slots,
 )
-from .tensor_adapters import clone_to_pinned_cpu
 
 
 @dataclass(slots=True)
@@ -87,14 +87,14 @@ class PinnedParamBinding:
 
 @dataclass(slots=True)
 class PinnedBufferBinding:
-    """One model instance's buffer slots bound to one pinned tensor.
+    """One model instance's buffer slots bound to one pinned backing.
 
     Active-time buffer mutations are discarded on restore:
     :meth:`restore_pinned` reinstalls this pinned clone rather than
     copying active buffer state back.
     """
 
-    pinned: torch.Tensor
+    pinned: PinnedBuffer
     slots: list[BufferSlot]
 
     @property
@@ -108,7 +108,7 @@ class PinnedBufferBinding:
 
     def restore_pinned(self) -> None:
         """Repoint managed buffer slots to the pinned CPU clone."""
-        self.set_slots(self.pinned)
+        self.set_slots(self.pinned.tensor)
 
     def copy_to_target(
         self,
@@ -117,7 +117,9 @@ class PinnedBufferBinding:
         non_blocking: bool = False,
     ) -> torch.Tensor:
         """Copy the pinned clone to ``target`` and return the target tensor."""
-        return self.pinned.to(target.device, non_blocking=non_blocking)
+        return self.pinned.tensor.to(
+            target.device, non_blocking=non_blocking,
+        )
 
     def load_to_target(
         self,
@@ -209,16 +211,19 @@ class PinnedModuleBinding:
         for param_binding in self.param_bindings:
             total += param_binding.pinned.cache_bytes
         for buffer_binding in self.buffer_bindings:
-            total += (
-                buffer_binding.pinned.numel()
-                * buffer_binding.pinned.element_size()
-            )
+            total += buffer_binding.pinned.cache_bytes
         return total
 
     @property
     def pinned_params(self) -> list[PinnedParam]:
         return [
             param_binding.pinned for param_binding in self.param_bindings
+        ]
+
+    @property
+    def pinned_buffers(self) -> list[PinnedBuffer]:
+        return [
+            buffer_binding.pinned for buffer_binding in self.buffer_bindings
         ]
 
     def contains_pinned_param(self, pinned: PinnedParam) -> bool:
@@ -316,10 +321,8 @@ def _pin_buffer_slots(slots: Sequence[BufferSlot]) -> PinnedBufferBinding:
     slot_list = list(slots)
     if not slot_list:
         raise ValueError("_pin_buffer_slots requires at least one BufferSlot")
-    pinned = clone_to_pinned_cpu(
-        slot_list[0].get(),
-        memory_format=torch.contiguous_format,
-    )
+    primary_slot = slot_list[0]
+    pinned = PinnedBuffer.clone(primary_slot.name, primary_slot.get())
     return PinnedBufferBinding(pinned=pinned, slots=slot_list)
 
 
@@ -355,6 +358,7 @@ def pin_module_slot_collection(
 
 
 __all__ = [
+    "PinnedBuffer",
     "PinnedBufferBinding",
     "PinnedModuleBinding",
     "PinnedModuleTarget",

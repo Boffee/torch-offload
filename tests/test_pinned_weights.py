@@ -401,11 +401,12 @@ class TestSharedSubmoduleAlias:
             # One pinned buffer binding covers both alias paths.
             assert len(pw.buffer_bindings) == 1
             buffer_binding = pw.buffer_bindings[0]
-            assert buffer_binding.pinned.is_pinned()
+            assert buffer_binding.pinned.name == "a.buf"
+            assert buffer_binding.pinned.tensor.is_pinned()
             assert len(buffer_binding.unique_slots) == 2
             # Both module slots reference the SAME pinned tensor.
-            assert m.a.buf is buffer_binding.pinned
-            assert m.b.buf is buffer_binding.pinned
+            assert m.a.buf is buffer_binding.pinned.tensor
+            assert m.b.buf is buffer_binding.pinned.tensor
         finally:
             pw.deactivate()
 
@@ -425,8 +426,8 @@ class TestSharedSubmoduleAlias:
         try:
             assert len(pw.buffer_bindings) == 1
             buffer_binding = pw.buffer_bindings[0]
-            assert m.a.buf is buffer_binding.pinned
-            assert m.b.buf is buffer_binding.pinned
+            assert m.a.buf is buffer_binding.pinned.tensor
+            assert m.b.buf is buffer_binding.pinned.tensor
         finally:
             pw.deactivate()
 
@@ -451,8 +452,8 @@ class TestSharedSubmoduleAlias:
         try:
             assert len(pw.buffer_bindings) == 1
             buffer_binding = pw.buffer_bindings[0]
-            assert m.a.buf is buffer_binding.pinned
-            assert m.b.buf is buffer_binding.pinned
+            assert m.a.buf is buffer_binding.pinned.tensor
+            assert m.b.buf is buffer_binding.pinned.tensor
             assert m.a.buf.is_pinned()
         finally:
             pw.deactivate()
