@@ -53,8 +53,33 @@ class PinnedParamBinding:
         return self.pinned.name
 
     @property
+    def requires_grad(self) -> bool:
+        return self.pinned.requires_grad
+
+    @property
+    def cache_bytes(self) -> int:
+        return self.pinned.cache_bytes
+
+    @property
     def unique_slots(self) -> list[ParamSlot]:
         return unique_slots(self.slots)
+
+    def allocate_gpu_storage(self, device: torch.device) -> object:
+        return self.pinned.allocate_gpu_storage(device)
+
+    def make_gpu_param(self, target_state: object) -> nn.Parameter:
+        return self.pinned.make_gpu_param(target_state)
+
+    def copy_to_gpu(
+        self,
+        target_state: object,
+        *,
+        non_blocking: bool = False,
+    ) -> None:
+        self.pinned.copy_to_gpu(target_state, non_blocking=non_blocking)
+
+    def validate_parameter_data_swap_target(self) -> None:
+        self.pinned.validate_parameter_data_swap_target()
 
     def set_slots(self, param: nn.Parameter) -> None:
         """Set every managed parameter slot to ``param``.
@@ -63,7 +88,7 @@ class PinnedParamBinding:
         only ``.data`` so autograd hooks and optimizer references stay
         attached to the same wrapper.
         """
-        if self.pinned.requires_grad:
+        if self.requires_grad:
             for slot in self.unique_slots:
                 set_param_data(slot.get(), param.data)
         else:
@@ -92,8 +117,23 @@ class PinnedBufferBinding:
         return self.pinned.name
 
     @property
+    def cache_bytes(self) -> int:
+        return self.pinned.cache_bytes
+
+    @property
     def unique_slots(self) -> list[BufferSlot]:
         return unique_slots(self.slots)
+
+    def allocate_gpu_buffer(self, device: torch.device) -> torch.Tensor:
+        return torch.empty_like(self.pinned.tensor, device=device)
+
+    def copy_to_gpu(
+        self,
+        target: torch.Tensor,
+        *,
+        non_blocking: bool = False,
+    ) -> None:
+        target.copy_(self.pinned.tensor, non_blocking=non_blocking)
 
     def set_slots(self, buffer: torch.Tensor) -> None:
         """Set every managed buffer slot to ``buffer``."""
@@ -114,7 +154,7 @@ class PinnedModuleTarget:
     bytes into the same GPU storage and return the same active object
     for a given pinned state name.
 
-    ``PinnedParam.name`` and ``PinnedBuffer.name`` are target storage
+    Binding names are target storage
     keys. They are intentionally the module-relative PyTorch names:
     whole-model targets use fully qualified names, while streamed block
     targets use block-local names so every block can load into the same
@@ -169,17 +209,15 @@ class PinnedModuleTarget:
         self._target_states: dict[str, object] = {}
         self._target_params: dict[str, nn.Parameter] = {}
         for param_binding in binding.param_bindings:
-            pinned = param_binding.pinned
-            target_state = pinned.allocate_gpu_storage(device)
+            target_state = param_binding.allocate_gpu_storage(device)
             self._target_states[param_binding.name] = target_state
-            self._target_params[param_binding.name] = pinned.make_gpu_param(
+            self._target_params[param_binding.name] = param_binding.make_gpu_param(
                 target_state
             )
         self._target_buffers: dict[str, torch.Tensor] = {}
         for buffer_binding in binding.buffer_bindings:
-            self._target_buffers[buffer_binding.name] = torch.empty_like(
-                buffer_binding.pinned.tensor,
-                device=device,
+            self._target_buffers[buffer_binding.name] = (
+                buffer_binding.allocate_gpu_buffer(device)
             )
 
     @property
@@ -199,7 +237,7 @@ class PinnedModuleTarget:
         """
         target_params: dict[str, nn.Parameter] = {}
         for binding in param_bindings:
-            binding.pinned.copy_to_gpu(
+            binding.copy_to_gpu(
                 self._target_states[binding.name],
                 non_blocking=non_blocking,
             )
@@ -219,7 +257,7 @@ class PinnedModuleTarget:
         target_buffers: dict[str, torch.Tensor] = {}
         for binding in buffer_bindings:
             target = self._target_buffers[binding.name]
-            target.copy_(binding.pinned.tensor, non_blocking=non_blocking)
+            binding.copy_to_gpu(target, non_blocking=non_blocking)
             target_buffers[binding.name] = target
         return target_buffers
 
@@ -240,9 +278,9 @@ class PinnedModuleBinding:
     def cache_bytes(self) -> int:
         total = 0
         for param_binding in self.param_bindings:
-            total += param_binding.pinned.cache_bytes
+            total += param_binding.cache_bytes
         for buffer_binding in self.buffer_bindings:
-            total += buffer_binding.pinned.cache_bytes
+            total += buffer_binding.cache_bytes
         return total
 
     def contains_param_binding(self, binding: PinnedParamBinding) -> bool:
@@ -299,18 +337,15 @@ class PinnedModuleBinding:
         self,
     ) -> Iterator[tuple[PinnedParamBinding, nn.Module, str]]:
         for param_binding in self.param_bindings:
-            if param_binding.pinned.requires_grad:
+            if param_binding.requires_grad:
                 slot = param_binding.unique_slots[0]
                 yield param_binding, slot.parent, slot.leaf
 
     def has_trainables(self) -> bool:
-        return any(
-            param_binding.pinned.requires_grad
-            for param_binding in self.param_bindings
-        )
+        return any(param_binding.requires_grad for param_binding in self.param_bindings)
 
 
-ParamPinValidator = Callable[[PinnedParam, ParamSlot], None]
+ParamPinValidator = Callable[[PinnedParamBinding], None]
 
 
 def _bind_param_slots(
@@ -338,9 +373,10 @@ def _pin_param_slots(
         raise ValueError("_pin_param_slots requires at least one ParamSlot")
     primary_slot = slot_list[0]
     pinned = PinnedParam(primary_slot.name, primary_slot.get())
+    binding = _bind_param_slots(pinned, slot_list)
     if validate_param is not None:
-        validate_param(pinned, primary_slot)
-    return _bind_param_slots(pinned, slot_list)
+        validate_param(binding)
+    return binding
 
 
 def _pin_buffer_slots(slots: Sequence[BufferSlot]) -> PinnedBufferBinding:

@@ -11,12 +11,11 @@ pinned state is used directly without streaming. Heterogeneous block lists
 :class:`StreamedWeights` instances composed via :class:`ModelOffloader`.
 
 In-block trainable params (LoRA adapters) flow through the same slot
-pool; ``PinnedModuleBinding`` branches on ``pinned.requires_grad`` to
-swap ``.data`` (preserves user Parameter identity for autograd /
-optimizer state) instead of replacing the Parameter wrapper. Gradients
-live on GPU during backward via PyTorch's native ``AccumulateGrad``;
-only ``.data`` is materialized around ``optimizer.step()`` via
-:meth:`optimizer_step`.
+pool; parameter bindings branch on the source trainable flag to swap
+``.data`` (preserves user Parameter identity for autograd / optimizer
+state) instead of replacing the Parameter wrapper. Gradients live on GPU
+during backward via PyTorch's native ``AccumulateGrad``; only ``.data``
+is materialized around ``optimizer.step()`` via :meth:`optimizer_step`.
 
 This is the sharp, low-level primitive. It does NOT manage:
 
@@ -60,13 +59,9 @@ from .pinned_bindings import (
     PostCopyHookHandle,
     pin_module_slot_collection,
 )
-from .pinned_param import (
-    PinnedParam,
-)
 from .protocols import SlotKey
 from .slots import (
     ModuleSlotCollection,
-    ParamSlot,
     collect_module_slots,
     get_param_slot,
     set_param_data,
@@ -294,19 +289,17 @@ def _collect_block_slot_collections(
     return slot_collections, frozenset(slot_filter)
 
 
-def _validate_streamed_param(
-    pinned: PinnedParam, primary_slot: ParamSlot,
-) -> None:
+def _validate_streamed_param(binding: PinnedParamBinding) -> None:
     # Trainable streaming uses ``.data`` swap to preserve the user's
     # Parameter identity. Only adapters that explicitly opt into that
     # capability are allowed.
-    if not pinned.requires_grad:
+    if not binding.requires_grad:
         return
     try:
-        pinned.validate_parameter_data_swap_target()
+        binding.validate_parameter_data_swap_target()
     except NotImplementedError as exc:
         raise NotImplementedError(
-            f"Trainable streaming slot {primary_slot.name!r} "
+            f"Trainable streaming slot {binding.name!r} "
             f"cannot be streamed: {exc}"
         ) from exc
 
@@ -560,8 +553,8 @@ class StreamedWeights:
     def param_bindings_per_block(self) -> list[list[PinnedParamBinding]]:
         """Per-block streamed parameter bindings.
 
-        Each binding is a :class:`PinnedParamBinding`: one
-        :class:`PinnedParam` plus every :class:`ParamSlot` that should use it.
+        Each binding is a :class:`PinnedParamBinding`: one pinned
+        parameter backing plus every parameter slot that should use it.
         Used by
         :class:`~torch_offload.ModelOffloader` to build its target-name
         index.
