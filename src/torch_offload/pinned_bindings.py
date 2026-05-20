@@ -368,7 +368,7 @@ def _pin_param_slots(
         raise ValueError("_pin_param_slots requires at least one ParamSlot")
     primary_slot = slot_list[0]
     name = primary_slot.name
-    pinned = PinnedParam(name, primary_slot.get())
+    pinned = PinnedParam(primary_slot.get())
     binding = _bind_param_slots(name, pinned, slot_list)
     if validate_param is not None:
         validate_param(binding)
@@ -382,7 +382,7 @@ def _pin_buffer_slots(slots: Sequence[BufferSlot]) -> PinnedBufferBinding:
         raise ValueError("_pin_buffer_slots requires at least one BufferSlot")
     primary_slot = slot_list[0]
     name = primary_slot.name
-    pinned = PinnedBuffer.clone(name, primary_slot.get())
+    pinned = PinnedBuffer.clone(primary_slot.get())
     return PinnedBufferBinding(name=name, pinned=pinned, slots=slot_list)
 
 

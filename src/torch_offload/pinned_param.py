@@ -41,11 +41,6 @@ def storage_key(t: torch.Tensor) -> tuple[Any, ...]:
 class PinnedParam:
     """Pinned host storage for one parameter, with GPU-load helpers.
 
-    ``name`` is the module-relative parameter name used to identify the
-    corresponding GPU target storage slot. It comes from PyTorch-style
-    ``named_parameters()`` paths (for example ``"mlp.fc1.weight"``) and
-    must be unique within any single :class:`PinnedModuleTarget`.
-
     Construction picks an adapter via :func:`select_adapter` based on
     the parameter's tensor type, then uses the adapter to clone-and-pin
     the bytes. Model-bound callers create their own
@@ -82,10 +77,9 @@ class PinnedParam:
     state.
     """
 
-    __slots__ = ("adapter", "name", "pinned_state", "requires_grad")
+    __slots__ = ("adapter", "pinned_state", "requires_grad")
 
-    def __init__(self, name: str, param: nn.Parameter) -> None:
-        self.name = name
+    def __init__(self, param: nn.Parameter) -> None:
         self.adapter: TensorAdapter[Any, Any] = select_adapter(param.data)
         self.requires_grad: bool = param.requires_grad
         self.pinned_state = self.adapter.clone_pin(param.data)

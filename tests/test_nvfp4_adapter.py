@@ -57,7 +57,7 @@ class TestNvfp4Adapter:
         nvfp4_tensor_cls, _ = _nvfp4_modules()
         qt = _make_nvfp4(swizzled=True)
         p = nn.Parameter(qt, requires_grad=False)
-        pinned_param = PinnedParam("w", p)
+        pinned_param = PinnedParam(p)
 
         pinned = pinned_param.make_cpu_param().data
         assert isinstance(pinned, nvfp4_tensor_cls)
@@ -77,7 +77,7 @@ class TestNvfp4Adapter:
 
     def test_transposed_qdata_stride_is_preserved(self) -> None:
         qt = _make_nvfp4(rows=16, cols=32).t()
-        pinned_param = PinnedParam("w", nn.Parameter(qt, requires_grad=False))
+        pinned_param = PinnedParam(nn.Parameter(qt, requires_grad=False))
         pinned = pinned_param.make_cpu_param().data
 
         assert pinned.shape == qt.shape
@@ -112,7 +112,6 @@ class TestNvfp4Adapter:
 
     def test_no_cpu_round_trip_or_trainable_swap_capability(self) -> None:
         pinned_param = PinnedParam(
-            "w",
             nn.Parameter(_make_nvfp4(), requires_grad=True),
         )
         state = pinned_param.allocate_gpu_storage(torch.device("cpu"))
@@ -148,7 +147,6 @@ class TestNvfp4Adapter:
     def test_load_to_gpu_preserves_wrapper(self) -> None:
         nvfp4_tensor_cls, _ = _nvfp4_modules()
         pinned_param = PinnedParam(
-            "w",
             nn.Parameter(_make_nvfp4(swizzled=True), requires_grad=False),
         )
 
