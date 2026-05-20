@@ -55,6 +55,7 @@ from .pinned_bindings import (
     PinnedModuleBinding,
     PinnedModuleTarget,
     PinnedParamBinding,
+    PinnedParamTarget,
     PostCopyHook,
     PostCopyHookHandle,
     pin_module_slot_collection,
@@ -71,6 +72,8 @@ from .slots import (
 )
 
 logger = logging.getLogger(__name__)
+
+_MaterializedTrainable = tuple[nn.Parameter, PinnedParamBinding, PinnedParamTarget]
 
 
 def _repoint_data_to_cpu_param(
@@ -766,9 +769,9 @@ class StreamedWeights:
              eviction still ran first so the streamer is in a
              consistent baseline.
           2. On the streamer's private ``self._stream``, H2D each
-             trainable's pinned ``.data`` to a fresh allocator-managed
-             GPU buffer. Each H2D registers a rollback (repoint
-             ``.data`` at pinned) on an :class:`~contextlib.ExitStack`.
+             trainable's pinned ``.data`` to a fresh binding-owned GPU
+             target. Each H2D registers a rollback (repoint ``.data`` at
+             pinned) on an :class:`~contextlib.ExitStack`.
           3. Have the user's current CUDA stream wait on
              ``self._stream`` so the optimizer (running on the user's
              stream) sees the materialized bytes.
@@ -915,7 +918,7 @@ class StreamedWeights:
         target: torch.device,
         step_stream: torch.cuda.Stream,
         stack: contextlib.ExitStack,
-    ) -> list[tuple[nn.Parameter, PinnedParamBinding]]:
+    ) -> list[_MaterializedTrainable]:
         """Move trainable ``.data`` to ``target`` for optimizer.step()."""
         # Each materialization registers a rollback that repoints the
         # user's Parameter's .data back at its binding-owned CPU param.
@@ -923,20 +926,22 @@ class StreamedWeights:
         # mid-loop (no scatter), the body exited cleanly (scatter, then
         # rollback), or the body raised after yield (still scatter, then
         # rollback). The rollback is idempotent after a successful copy.
-        materialized: list[tuple[nn.Parameter, PinnedParamBinding]] = []
+        materialized: list[_MaterializedTrainable] = []
         with torch.cuda.stream(step_stream):
             for binding, parent, leaf in self._iter_trainables():
                 param = get_param_slot(parent, leaf)
                 stack.callback(
                     _repoint_data_to_cpu_param, param, binding.cpu_param
                 )
+                param_target = binding.allocate_target(target)
+                binding.copy_to_target(param_target, non_blocking=True)
                 set_param_data(
                     param,
-                    binding.cpu_param.data.to(target, non_blocking=True),
+                    param_target.param.data,
                 )
                 if param.grad is not None and param.grad.device != target:
                     param.grad = param.grad.to(target, non_blocking=True)
-                materialized.append((param, binding))
+                materialized.append((param, binding, param_target))
         # User's current stream now waits for step_stream's H2D. After
         # this point the optimizer can safely read param.data on its own
         # stream.
@@ -945,7 +950,7 @@ class StreamedWeights:
 
     def _scatter_trainables_after_step(
         self,
-        materialized: list[tuple[nn.Parameter, PinnedParamBinding]],
+        materialized: list[_MaterializedTrainable],
         step_stream: torch.cuda.Stream,
         target: torch.device,
     ) -> None:
@@ -957,10 +962,8 @@ class StreamedWeights:
         # the next prefetch reads stable bytes.
         step_stream.wait_stream(torch.cuda.current_stream(target))
         with torch.cuda.stream(step_stream):
-            for param, binding in materialized:
-                binding.cpu_param.data.copy_(
-                    param.data, non_blocking=False,
-                )
+            for _param, binding, param_target in materialized:
+                binding.copy_from_target(param_target, non_blocking=False)
         step_stream.synchronize()
         # ExitStack unwinds after this returns: each materialized
         # param's .data is repointed at its binding-owned CPU param

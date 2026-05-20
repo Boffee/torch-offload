@@ -49,11 +49,11 @@ class PinnedParam:
 
     The lifecycle methods (:meth:`make_cpu_param`,
     :meth:`allocate_gpu_storage`, :meth:`make_gpu_param`,
-    :meth:`copy_to_gpu`, :meth:`load_to_gpu`)
-    all dispatch through the adapter. Consumers work with the opaque
-    :class:`GpuState` returned by :meth:`allocate_gpu_storage`; the
-    pinned parameter round-trips that opaque handle through subsequent
-    calls.
+    :meth:`copy_to_gpu`, :meth:`copy_to_cpu`, :meth:`load_to_gpu`)
+    all dispatch through the adapter. This primitive works with the
+    opaque state returned by :meth:`allocate_gpu_storage`; model-bound
+    callers should normally use :class:`PinnedParamBinding`, which wraps
+    that state in a binding-owned target object.
 
     The pinned parameter captures the source parameter's ``requires_grad`` at
     construction time and threads it through to the adapter when
@@ -187,7 +187,12 @@ class PinnedParam:
         return self.adapter.compute_dtype(self.make_cpu_param().data)
 
     def validate_parameter_data_swap_target(self) -> None:
-        """Raise if this pinned parameter cannot be trainable-streamed via ``.data``."""
+        """Raise if this pinned parameter cannot use trainable streaming.
+
+        CUDA trainable streaming requires both Parameter.data swap
+        compatibility and a D2H path back into pinned host state after
+        optimizer updates.
+        """
         if not isinstance(self.adapter, ParameterDataSwapTensorAdapter):
             raise NotImplementedError(
                 f"Trainable streaming requires a Parameter.data-swap-capable "
@@ -204,6 +209,11 @@ class PinnedParam:
             raise NotImplementedError(
                 f"Trainable streaming cannot use Parameter.data swap: {exc}"
             ) from exc
+        if not isinstance(self.adapter, CpuRoundTripTensorAdapter):
+            raise NotImplementedError(
+                f"Trainable streaming requires a CPU-round-trip-capable "
+                f"tensor adapter; this parameter uses {adapter_name(self.adapter)}."
+            )
 
     @property
     def cache_bytes(self) -> int:

@@ -11,9 +11,11 @@ from torch import nn
 from torch_offload.pinned_bindings import (
     PinnedBuffer,
     PinnedBufferBinding,
+    PinnedBufferTarget,
     PinnedModuleBinding,
     PinnedModuleTarget,
     PinnedParamBinding,
+    PinnedParamTarget,
 )
 from torch_offload.pinned_param import PinnedParam
 from torch_offload.slots import BufferSlot, ParamSlot
@@ -71,11 +73,19 @@ class _FakeModuleTarget:
 
 
 class _FakePinnedParam:
-    def __init__(self, name: str, *, cache_bytes: int = 0) -> None:
+    def __init__(
+        self,
+        name: str,
+        *,
+        cache_bytes: int = 0,
+        requires_grad: bool = False,
+    ) -> None:
         self.name = name
         self.allocated = False
         self.copied = False
+        self.copied_back = False
         self._cache_bytes = cache_bytes
+        self.requires_grad = requires_grad
 
     @property
     def cache_bytes(self) -> int:
@@ -101,11 +111,26 @@ class _FakePinnedParam:
         del target_state, non_blocking
         self.copied = True
 
+    def copy_to_cpu(
+        self,
+        target_state: object,
+        *,
+        non_blocking: bool = False,
+    ) -> None:
+        del target_state, non_blocking
+        self.copied_back = True
+
 
 class _FakePinnedBuffer:
-    def __init__(self, name: str, *, cache_bytes: int = 0) -> None:
+    def __init__(
+        self,
+        name: str,
+        *,
+        cache_bytes: int = 0,
+        tensor: torch.Tensor | None = None,
+    ) -> None:
         self.name = name
-        self.tensor = torch.empty(0)
+        self.tensor = tensor if tensor is not None else torch.empty(0)
         self._cache_bytes = cache_bytes
 
     @property
@@ -460,6 +485,88 @@ class TestPinnedBindings:
         assert first.cache_bytes + second.cache_bytes == (
             unique_backing_bytes * 2
         )
+
+    def test_param_binding_target_wraps_adapter_state(self) -> None:
+        pinned = _FakePinnedParam("weight")
+        binding = PinnedParamBinding(
+            name="weight",
+            pinned=cast(PinnedParam, pinned),
+            slots=[],
+            cpu_param=pinned.make_cpu_param(),
+        )
+
+        target = binding.allocate_target(torch.device("cuda"))
+
+        assert isinstance(target, PinnedParamTarget)
+        assert target.param.requires_grad is False
+        assert pinned.allocated
+
+    def test_param_binding_copies_to_target(self) -> None:
+        pinned = _FakePinnedParam("weight")
+        binding = PinnedParamBinding(
+            name="weight",
+            pinned=cast(PinnedParam, pinned),
+            slots=[],
+            cpu_param=pinned.make_cpu_param(),
+        )
+        target = binding.allocate_target(torch.device("cuda"))
+
+        binding.copy_to_target(target, non_blocking=True)
+
+        assert pinned.copied
+
+    def test_param_binding_rejects_copy_from_target_for_frozen_binding(
+        self,
+    ) -> None:
+        pinned = _FakePinnedParam("weight", requires_grad=False)
+        binding = PinnedParamBinding(
+            name="weight",
+            pinned=cast(PinnedParam, pinned),
+            slots=[],
+            cpu_param=pinned.make_cpu_param(),
+        )
+        target = binding.allocate_target(torch.device("cuda"))
+
+        with pytest.raises(RuntimeError, match="only valid for trainable"):
+            binding.copy_from_target(target, non_blocking=True)
+
+        assert not pinned.copied_back
+
+    def test_param_binding_copies_from_target_for_trainable_binding(
+        self,
+    ) -> None:
+        pinned = _FakePinnedParam("weight", requires_grad=True)
+        binding = PinnedParamBinding(
+            name="weight",
+            pinned=cast(PinnedParam, pinned),
+            slots=[],
+            cpu_param=pinned.make_cpu_param(),
+        )
+        target = binding.allocate_target(torch.device("cuda"))
+
+        binding.copy_from_target(target, non_blocking=True)
+
+        assert pinned.copied_back
+
+    def test_buffer_binding_copies_to_target(self) -> None:
+        pinned = _FakePinnedBuffer(
+            "table",
+            tensor=torch.tensor([1.0, 2.0]),
+        )
+        binding = PinnedBufferBinding(
+            name="table",
+            pinned=cast(PinnedBuffer, pinned),
+            slots=[],
+        )
+
+        target = binding.allocate_target(torch.device("cpu"))
+        assert isinstance(target, PinnedBufferTarget)
+        assert target.tensor.shape == pinned.tensor.shape
+
+        target.tensor.zero_()
+        binding.copy_to_target(target)
+
+        torch.testing.assert_close(target.tensor, pinned.tensor)
 
     def test_module_binding_load_to_target_copies_before_setting_slots(
         self,

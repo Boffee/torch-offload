@@ -41,6 +41,20 @@ class PostCopyHookHandle:
 
 
 @dataclass(slots=True)
+class PinnedParamTarget:
+    """Adapter-owned active storage for one pinned parameter binding.
+
+    ``_state`` is intentionally private to the binding layer. It is
+    the adapter-specific object returned by :class:`PinnedParam`; callers
+    use ``param`` for slot mutation and pass the whole target back to the
+    binding for H2D/D2H copies.
+    """
+
+    _state: object
+    param: nn.Parameter
+
+
+@dataclass(slots=True)
 class PinnedParamBinding:
     """One model instance's parameter slots bound to one pinned backing."""
 
@@ -70,19 +84,40 @@ class PinnedParamBinding:
     def unique_slots(self) -> list[ParamSlot]:
         return unique_slots(self.slots)
 
-    def allocate_gpu_storage(self, device: torch.device) -> object:
-        return self.pinned.allocate_gpu_storage(device)
+    def allocate_target(self, device: torch.device) -> PinnedParamTarget:
+        """Allocate active storage for this binding on ``device``."""
+        state = self.pinned.allocate_gpu_storage(device)
+        return PinnedParamTarget(
+            _state=state,
+            param=self.pinned.make_gpu_param(state),
+        )
 
-    def make_gpu_param(self, target_state: object) -> nn.Parameter:
-        return self.pinned.make_gpu_param(target_state)
-
-    def copy_to_gpu(
+    def copy_to_target(
         self,
-        target_state: object,
+        target: PinnedParamTarget,
         *,
         non_blocking: bool = False,
     ) -> None:
-        self.pinned.copy_to_gpu(target_state, non_blocking=non_blocking)
+        """Copy pinned host bytes into ``target`` active storage."""
+        self.pinned.copy_to_gpu(target._state, non_blocking=non_blocking)
+
+    def copy_from_target(
+        self,
+        target: PinnedParamTarget,
+        *,
+        non_blocking: bool = False,
+    ) -> None:
+        """Copy active storage back into pinned host bytes.
+
+        This is an explicit pinned-cache mutation path for trainable
+        optimizer-step sync. Frozen inference code should not call it.
+        """
+        if not self.requires_grad:
+            raise RuntimeError(
+                "copy_from_target mutates pinned host backing and is only "
+                f"valid for trainable param bindings; got {self.name!r}."
+            )
+        self.pinned.copy_to_cpu(target._state, non_blocking=non_blocking)
 
     def validate_parameter_data_swap_target(self) -> None:
         self.pinned.validate_parameter_data_swap_target()
@@ -104,6 +139,13 @@ class PinnedParamBinding:
     def restore_pinned(self) -> None:
         """Repoint managed parameter slots to their pinned CPU wrapper."""
         self.set_slots(self.cpu_param)
+
+
+@dataclass(slots=True)
+class PinnedBufferTarget:
+    """Active tensor storage for one pinned buffer binding."""
+
+    tensor: torch.Tensor
 
 
 @dataclass(slots=True)
@@ -136,16 +178,20 @@ class PinnedBufferBinding:
     def unique_slots(self) -> list[BufferSlot]:
         return unique_slots(self.slots)
 
-    def allocate_gpu_buffer(self, device: torch.device) -> torch.Tensor:
-        return torch.empty_like(self.pinned.tensor, device=device)
+    def allocate_target(self, device: torch.device) -> PinnedBufferTarget:
+        """Allocate active storage for this buffer binding on ``device``."""
+        return PinnedBufferTarget(
+            tensor=torch.empty_like(self.pinned.tensor, device=device),
+        )
 
-    def copy_to_gpu(
+    def copy_to_target(
         self,
-        target: torch.Tensor,
+        target: PinnedBufferTarget,
         *,
         non_blocking: bool = False,
     ) -> None:
-        target.copy_(self.pinned.tensor, non_blocking=non_blocking)
+        """Copy pinned host bytes into ``target`` active storage."""
+        target.tensor.copy_(self.pinned.tensor, non_blocking=non_blocking)
 
     def set_slots(self, buffer: torch.Tensor) -> None:
         """Set every managed buffer slot to ``buffer``."""
@@ -178,10 +224,9 @@ class PinnedModuleTarget:
     """
 
     __slots__ = (
+        "_buffer_targets",
         "_device",
-        "_target_buffers",
-        "_target_params",
-        "_target_states",
+        "_param_targets",
     )
 
     def __init__(
@@ -218,18 +263,15 @@ class PinnedModuleTarget:
         self._device = device
 
         # Allocate reusable active storage for the validated layout.
-        self._target_states: dict[str, object] = {}
-        self._target_params: dict[str, nn.Parameter] = {}
+        self._param_targets: dict[str, PinnedParamTarget] = {}
         for param_binding in binding.param_bindings:
-            target_state = param_binding.allocate_gpu_storage(device)
-            self._target_states[param_binding.name] = target_state
-            self._target_params[param_binding.name] = param_binding.make_gpu_param(
-                target_state
+            self._param_targets[param_binding.name] = (
+                param_binding.allocate_target(device)
             )
-        self._target_buffers: dict[str, torch.Tensor] = {}
+        self._buffer_targets: dict[str, PinnedBufferTarget] = {}
         for buffer_binding in binding.buffer_bindings:
-            self._target_buffers[buffer_binding.name] = (
-                buffer_binding.allocate_gpu_buffer(device)
+            self._buffer_targets[buffer_binding.name] = (
+                buffer_binding.allocate_target(device)
             )
 
     @property
@@ -249,11 +291,12 @@ class PinnedModuleTarget:
         """
         target_params: dict[str, nn.Parameter] = {}
         for binding in param_bindings:
-            binding.copy_to_gpu(
-                self._target_states[binding.name],
+            target = self._param_targets[binding.name]
+            binding.copy_to_target(
+                target,
                 non_blocking=non_blocking,
             )
-            target_params[binding.name] = self._target_params[binding.name]
+            target_params[binding.name] = target.param
         return target_params
 
     def load_buffer_bindings(
@@ -268,9 +311,9 @@ class PinnedModuleTarget:
         """
         target_buffers: dict[str, torch.Tensor] = {}
         for binding in buffer_bindings:
-            target = self._target_buffers[binding.name]
-            binding.copy_to_gpu(target, non_blocking=non_blocking)
-            target_buffers[binding.name] = target
+            target = self._buffer_targets[binding.name]
+            binding.copy_to_target(target, non_blocking=non_blocking)
+            target_buffers[binding.name] = target.tensor
         return target_buffers
 
 
@@ -456,9 +499,11 @@ def pin_module_slot_collection(
 __all__ = [
     "PinnedBuffer",
     "PinnedBufferBinding",
+    "PinnedBufferTarget",
     "PinnedModuleBinding",
     "PinnedModuleTarget",
     "PinnedParamBinding",
+    "PinnedParamTarget",
     "PostCopyHook",
     "PostCopyHookHandle",
     "pin_module_slot_collection",
