@@ -121,10 +121,7 @@ class _PinnedModuleTargetPool:
         device: torch.device,
     ) -> None:
         self._targets = [
-            PinnedModuleTarget(
-                template_binding,
-                device=device,
-            )
+            template_binding.allocate_target(device)
             for _ in range(num_slots)
         ]
         self._free: list[int] = list(range(num_slots))

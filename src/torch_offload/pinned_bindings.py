@@ -203,14 +203,14 @@ class PinnedBufferBinding:
         self.set_slots(self.pinned.tensor)
 
 
+@dataclass(slots=True)
 class PinnedModuleTarget:
-    """GPU storage target for one :class:`PinnedModuleBinding` layout.
+    """GPU storage target for one module binding layout.
 
-    The target owns adapter-specific GPU storage for every pinned param
-    and reusable GPU tensors for every pinned buffer in a
-    binding-compatible module scope. Repeated load calls copy pinned CPU
-    bytes into the same GPU storage and return the same active object
-    for a given pinned state name.
+    The target owns active storage allocated by
+    :meth:`PinnedModuleBinding.allocate_target`: adapter-specific GPU
+    storage for every pinned param and reusable GPU tensors for every
+    pinned buffer in a binding-compatible module scope.
 
     Binding names are target storage
     keys. They are intentionally the module-relative PyTorch names:
@@ -218,103 +218,21 @@ class PinnedModuleTarget:
     targets use block-local names so every block can load into the same
     pool layout. Names must be unique within each target namespace.
 
-    Construction snapshots the binding's pinned layout. The target does
-    not retain the template binding as the source of load bytes; any
-    compatible binding can later load into the target.
+    The target does not retain the template binding as the source of load
+    bytes; compatible bindings can later load into the target by name.
     """
 
-    __slots__ = (
-        "_buffer_targets",
-        "_device",
-        "_param_targets",
-    )
+    device: torch.device
+    param_targets: dict[str, PinnedParamTarget]
+    buffer_targets: dict[str, PinnedBufferTarget]
 
-    def __init__(
-        self,
-        binding: PinnedModuleBinding,
-        *,
-        device: torch.device,
-    ) -> None:
-        if device.type != "cuda":
-            raise ValueError(
-                "PinnedModuleTarget requires a CUDA device; "
-                f"got {device}."
-            )
+    def param_target(self, name: str) -> PinnedParamTarget:
+        """Return active storage for parameter target ``name``."""
+        return self.param_targets[name]
 
-        # Validate the whole target layout before allocating any GPU storage.
-        seen_param_names: set[str] = set()
-        for param_binding in binding.param_bindings:
-            if param_binding.name in seen_param_names:
-                raise ValueError(
-                    "PinnedModuleTarget requires unique pinned param target "
-                    f"names; got duplicate {param_binding.name!r}."
-                )
-            seen_param_names.add(param_binding.name)
-
-        seen_buffer_names: set[str] = set()
-        for buffer_binding in binding.buffer_bindings:
-            if buffer_binding.name in seen_buffer_names:
-                raise ValueError(
-                    "PinnedModuleTarget requires unique pinned buffer target "
-                    f"names; got duplicate {buffer_binding.name!r}."
-                )
-            seen_buffer_names.add(buffer_binding.name)
-
-        self._device = device
-
-        # Allocate reusable active storage for the validated layout.
-        self._param_targets: dict[str, PinnedParamTarget] = {}
-        for param_binding in binding.param_bindings:
-            self._param_targets[param_binding.name] = (
-                param_binding.allocate_target(device)
-            )
-        self._buffer_targets: dict[str, PinnedBufferTarget] = {}
-        for buffer_binding in binding.buffer_bindings:
-            self._buffer_targets[buffer_binding.name] = (
-                buffer_binding.allocate_target(device)
-            )
-
-    @property
-    def device(self) -> torch.device:
-        return self._device
-
-    def load_param_bindings(
-        self,
-        param_bindings: Sequence[PinnedParamBinding],
-        *,
-        non_blocking: bool = False,
-    ) -> dict[str, nn.Parameter]:
-        """Copy ``param_bindings`` into this target.
-
-        Returns the stable GPU ``Parameter`` wrappers keyed by pinned
-        target name.
-        """
-        target_params: dict[str, nn.Parameter] = {}
-        for binding in param_bindings:
-            target = self._param_targets[binding.name]
-            binding.copy_to_target(
-                target,
-                non_blocking=non_blocking,
-            )
-            target_params[binding.name] = target.param
-        return target_params
-
-    def load_buffer_bindings(
-        self,
-        buffer_bindings: Sequence[PinnedBufferBinding],
-        *,
-        non_blocking: bool = False,
-    ) -> dict[str, torch.Tensor]:
-        """Copy ``buffer_bindings`` into this target.
-
-        Returns the stable GPU tensors keyed by pinned target name.
-        """
-        target_buffers: dict[str, torch.Tensor] = {}
-        for binding in buffer_bindings:
-            target = self._buffer_targets[binding.name]
-            binding.copy_to_target(target, non_blocking=non_blocking)
-            target_buffers[binding.name] = target.tensor
-        return target_buffers
+    def buffer_target(self, name: str) -> PinnedBufferTarget:
+        """Return active storage for buffer target ``name``."""
+        return self.buffer_targets[name]
 
 
 @dataclass(slots=True)
@@ -359,6 +277,44 @@ class PinnedModuleBinding:
     def contains_param_binding(self, binding: PinnedParamBinding) -> bool:
         return any(binding is candidate for candidate in self.param_bindings)
 
+    def allocate_target(self, device: torch.device) -> PinnedModuleTarget:
+        """Allocate active target storage for this binding on ``device``."""
+        if device.type != "cuda":
+            raise ValueError(
+                "PinnedModuleTarget requires a CUDA device; "
+                f"got {device}."
+            )
+
+        seen_param_names: set[str] = set()
+        for param_binding in self.param_bindings:
+            if param_binding.name in seen_param_names:
+                raise ValueError(
+                    "PinnedModuleTarget requires unique pinned param target "
+                    f"names; got duplicate {param_binding.name!r}."
+                )
+            seen_param_names.add(param_binding.name)
+
+        seen_buffer_names: set[str] = set()
+        for buffer_binding in self.buffer_bindings:
+            if buffer_binding.name in seen_buffer_names:
+                raise ValueError(
+                    "PinnedModuleTarget requires unique pinned buffer target "
+                    f"names; got duplicate {buffer_binding.name!r}."
+                )
+            seen_buffer_names.add(buffer_binding.name)
+
+        return PinnedModuleTarget(
+            device=device,
+            param_targets={
+                binding.name: binding.allocate_target(device)
+                for binding in self.param_bindings
+            },
+            buffer_targets={
+                binding.name: binding.allocate_target(device)
+                for binding in self.buffer_bindings
+            },
+        )
+
     def restore_pinned(self) -> None:
         """Restore managed slots to their pinned CPU forms.
 
@@ -383,9 +339,15 @@ class PinnedModuleBinding:
         copies and post-copy hooks complete, so a copy failure does not
         leave the module partially active.
         """
-        target_params = target.load_param_bindings(
-            self.param_bindings, non_blocking=non_blocking,
-        )
+        target_params: dict[str, nn.Parameter] = {}
+        for param_binding in self.param_bindings:
+            param_target = target.param_target(param_binding.name)
+            param_binding.copy_to_target(
+                param_target,
+                non_blocking=non_blocking,
+            )
+            target_params[param_binding.name] = param_target.param
+
         for param_binding in self.param_bindings:
             target_param = target_params[param_binding.name]
             hook = (
@@ -396,9 +358,14 @@ class PinnedModuleBinding:
             if hook is not None:
                 hook(target_param)
 
-        target_buffers = target.load_buffer_bindings(
-            self.buffer_bindings, non_blocking=non_blocking,
-        )
+        target_buffers: dict[str, torch.Tensor] = {}
+        for buffer_binding in self.buffer_bindings:
+            buffer_target = target.buffer_target(buffer_binding.name)
+            buffer_binding.copy_to_target(
+                buffer_target,
+                non_blocking=non_blocking,
+            )
+            target_buffers[buffer_binding.name] = buffer_target.tensor
 
         for param_binding in self.param_bindings:
             param_binding.set_slots(target_params[param_binding.name])

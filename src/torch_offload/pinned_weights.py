@@ -68,7 +68,6 @@ from ._devices import canonical_device
 from .pinned_bindings import (
     PinnedBufferBinding,
     PinnedModuleBinding,
-    PinnedModuleTarget,
     PinnedParamBinding,
     PostCopyHook,
     PostCopyHookHandle,
@@ -294,10 +293,7 @@ class PinnedWeights:
             # One active-device Parameter per unique pinned parameter.
             # Tied slots all receive the same Parameter object so the
             # tying invariant survives on device.
-            target = PinnedModuleTarget(
-                self._binding,
-                device=active_device,
-            )
+            target = self._binding.allocate_target(active_device)
             self._binding.load_to_target(
                 target,
                 post_copy_hooks=self._post_copy_hooks,
