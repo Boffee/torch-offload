@@ -55,6 +55,11 @@ class PinnedParamBinding:
 
     @property
     def cache_bytes(self) -> int:
+        """Pinned host bytes reachable through this parameter binding.
+
+        Binding-level accounting is not an ownership claim: another
+        binding may reference the same pinned backing.
+        """
         return self.pinned.cache_bytes
 
     @property
@@ -116,6 +121,11 @@ class PinnedBufferBinding:
 
     @property
     def cache_bytes(self) -> int:
+        """Pinned host bytes reachable through this buffer binding.
+
+        Binding-level accounting is not an ownership claim: another
+        binding may reference the same pinned backing.
+        """
         return self.pinned.cache_bytes
 
     @property
@@ -278,10 +288,28 @@ class PinnedModuleBinding:
 
     @property
     def cache_bytes(self) -> int:
+        """Pinned host bytes reachable through this module binding.
+
+        This deduplicates repeated binding records that point at the
+        same pinned backing inside this module binding. It still is not
+        a cross-binding ownership total: two module bindings can share
+        the same pinned backing, so callers must not sum this across
+        shared-looking bindings unless ownership is known externally.
+        """
         total = 0
+        seen_params: set[int] = set()
         for param_binding in self.param_bindings:
+            key = id(param_binding.pinned)
+            if key in seen_params:
+                continue
+            seen_params.add(key)
             total += param_binding.cache_bytes
+        seen_buffers: set[int] = set()
         for buffer_binding in self.buffer_bindings:
+            key = id(buffer_binding.pinned)
+            if key in seen_buffers:
+                continue
+            seen_buffers.add(key)
             total += buffer_binding.cache_bytes
         return total
 

@@ -71,10 +71,15 @@ class _FakeModuleTarget:
 
 
 class _FakePinnedParam:
-    def __init__(self, name: str) -> None:
+    def __init__(self, name: str, *, cache_bytes: int = 0) -> None:
         self.name = name
         self.allocated = False
         self.copied = False
+        self._cache_bytes = cache_bytes
+
+    @property
+    def cache_bytes(self) -> int:
+        return self._cache_bytes
 
     def allocate_gpu_storage(self, device: torch.device) -> object:
         self.allocated = True
@@ -98,9 +103,14 @@ class _FakePinnedParam:
 
 
 class _FakePinnedBuffer:
-    def __init__(self, name: str) -> None:
+    def __init__(self, name: str, *, cache_bytes: int = 0) -> None:
         self.name = name
         self.tensor = torch.empty(0)
+        self._cache_bytes = cache_bytes
+
+    @property
+    def cache_bytes(self) -> int:
+        return self._cache_bytes
 
 
 def _target_binding(
@@ -405,6 +415,52 @@ class TestPinnedParam:
 
 
 class TestPinnedBindings:
+    def test_module_binding_cache_bytes_dedupes_repeated_backing(
+        self,
+    ) -> None:
+        pinned_param = cast(
+            PinnedParam,
+            _FakePinnedParam("shared-param", cache_bytes=64),
+        )
+        pinned_buffer = cast(
+            PinnedBuffer,
+            _FakePinnedBuffer("shared-buffer", cache_bytes=16),
+        )
+        module_binding = _target_binding(
+            [("weight", pinned_param), ("tied_weight", pinned_param)],
+            [("table", pinned_buffer), ("tied_table", pinned_buffer)],
+        )
+
+        assert module_binding.cache_bytes == 80
+
+    def test_module_binding_cache_bytes_are_not_cross_binding_ownership(
+        self,
+    ) -> None:
+        pinned_param = cast(
+            PinnedParam,
+            _FakePinnedParam("shared-param", cache_bytes=64),
+        )
+        pinned_buffer = cast(
+            PinnedBuffer,
+            _FakePinnedBuffer("shared-buffer", cache_bytes=16),
+        )
+        first = _target_binding(
+            [("weight", pinned_param)],
+            [("table", pinned_buffer)],
+        )
+        second = _target_binding(
+            [("weight", pinned_param)],
+            [("table", pinned_buffer)],
+        )
+
+        unique_backing_bytes = pinned_param.cache_bytes + pinned_buffer.cache_bytes
+
+        assert first.cache_bytes == unique_backing_bytes
+        assert second.cache_bytes == unique_backing_bytes
+        assert first.cache_bytes + second.cache_bytes == (
+            unique_backing_bytes * 2
+        )
+
     def test_module_binding_load_to_target_copies_before_setting_slots(
         self,
     ) -> None:
