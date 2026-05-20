@@ -245,18 +245,6 @@ class PinnedModuleBinding:
             total += buffer_binding.pinned.cache_bytes
         return total
 
-    @property
-    def pinned_params(self) -> list[PinnedParam]:
-        return [
-            param_binding.pinned for param_binding in self.param_bindings
-        ]
-
-    @property
-    def pinned_buffers(self) -> list[PinnedBuffer]:
-        return [
-            buffer_binding.pinned for buffer_binding in self.buffer_bindings
-        ]
-
     def contains_param_binding(self, binding: PinnedParamBinding) -> bool:
         return any(binding is candidate for candidate in self.param_bindings)
 
