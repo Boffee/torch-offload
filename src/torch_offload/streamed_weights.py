@@ -59,6 +59,8 @@ from .pinned_bindings import (
     PostCopyHookHandle,
     pin_module_slot_collection,
 )
+from .pinned_buffer import PinnedBuffer
+from .pinned_param import PinnedParam
 from .protocols import SlotKey
 from .slots import (
     ModuleSlotCollection,
@@ -67,7 +69,6 @@ from .slots import (
     set_param_data,
     set_tensor_data,
 )
-from .tensor_adapter_factory import select_adapter
 
 logger = logging.getLogger(__name__)
 
@@ -151,7 +152,7 @@ class _PinnedModuleTargetPool:
 # ---------------------------------------------------------------------------
 
 
-def _layout_signature(p: nn.Parameter) -> tuple:
+def _param_target_layout(p: nn.Parameter) -> tuple[object, object]:
     """Layout fields that block 0's pool template must match across blocks.
 
     ``Tensor.copy_`` silently casts dtype and silently broadcasts
@@ -159,24 +160,16 @@ def _layout_signature(p: nn.Parameter) -> tuple:
     silently corrupt a load. Wrapper metadata (qtype, axis,
     activation_qtype, quant_type) is similarly invisible to copy_.
 
-    The selected tensor adapter owns the layout signature because
-    wrapper metadata is type-specific. For example, quanto needs its
-    qtype/axis and inner storage layouts, GGUF needs the packed quant
-    type, and TorchAO NVFP4 needs qdata/scale layouts plus scale
-    metadata. The signature intentionally excludes storage identity so
-    distinct block instances with the same layout can share one pool
-    template.
+    :class:`PinnedParam` owns the tensor-adapter details needed for the
+    opaque target layout because wrapper metadata is type-specific. The
+    returned value intentionally excludes storage identity so distinct
+    block instances with the same layout can share one pool template.
     """
-    return select_adapter(p.data).layout_signature(p.data)
+    return PinnedParam.target_layout_for(p)
 
 
-def _buffer_layout_signature(buffer: torch.Tensor) -> tuple:
-    return (
-        tuple(buffer.shape),
-        tuple(buffer.stride()),
-        buffer.dtype,
-        buffer.layout,
-    )
+def _buffer_target_layout(buffer: torch.Tensor) -> tuple[object, ...]:
+    return PinnedBuffer.target_layout_for(buffer)
 
 
 def _check_block_layouts_match(
@@ -186,20 +179,20 @@ def _check_block_layouts_match(
     pinning so layout failures leave parameter slots and storage
     untouched.
 
-    See :func:`_layout_signature` for what counts as "matched."
+    See :func:`_param_target_layout` for what counts as "matched."
     """
     if len(block_slot_collections) <= 1:
         return
 
     def sig(collection: ModuleSlotCollection) -> tuple:
         return tuple(
-            (slots[0].name, _layout_signature(slots[0].get()))
+            (slots[0].name, _param_target_layout(slots[0].get()))
             for slots in collection.param_slot_groups
         )
 
     def buffer_sig(collection: ModuleSlotCollection) -> tuple:
         return tuple(
-            (slots[0].name, _buffer_layout_signature(slots[0].get()))
+            (slots[0].name, _buffer_target_layout(slots[0].get()))
             for slots in collection.buffer_slot_groups
         )
 
@@ -226,16 +219,17 @@ def _check_block_layouts_match(
             )
 
 
-def _check_block_binding_target_names_match(
+def _check_block_binding_target_layouts_match(
     block_bindings: Sequence[PinnedModuleBinding],
 ) -> None:
-    """Raise if pinned binding names differ from block 0's pool template.
+    """Raise if pinned binding target contracts differ from block 0.
 
-    This post-pin internal invariant keeps the GPU pool's name-matching
+    This post-pin internal invariant keeps the GPU pool's layout-matching
     contract explicit without putting validation on the block-load hot
     path. The pre-pin layout check catches user-facing name mismatches
     before mutation; this validates the actual pinned param/buffer name
-    keys that will address :class:`PinnedModuleTarget` storage.
+    keys and target layouts that will address :class:`PinnedModuleTarget`
+    storage.
     """
     if len(block_bindings) <= 1:
         return
@@ -243,8 +237,16 @@ def _check_block_binding_target_names_match(
     ref_params = tuple(
         binding.name for binding in block_bindings[0].param_bindings
     )
+    ref_param_layouts = tuple(
+        (binding.name, binding.target_layout)
+        for binding in block_bindings[0].param_bindings
+    )
     ref_buffers = tuple(
         binding.name for binding in block_bindings[0].buffer_bindings
+    )
+    ref_buffer_layouts = tuple(
+        (binding.name, binding.target_layout)
+        for binding in block_bindings[0].buffer_bindings
     )
     for i in range(1, len(block_bindings)):
         param_names = tuple(
@@ -257,6 +259,17 @@ def _check_block_binding_target_names_match(
                 "same ordered pinned param target names. Expected "
                 f"{ref_params!r}; got {param_names!r}."
             )
+        param_layouts = tuple(
+            (binding.name, binding.target_layout)
+            for binding in block_bindings[i].param_bindings
+        )
+        if param_layouts != ref_param_layouts:
+            raise ValueError(
+                f"Block {i} pinned param target layouts differ from block 0. "
+                "All blocks in a StreamedWeights group must share the "
+                "same ordered pinned param target layouts. Expected "
+                f"{ref_param_layouts!r}; got {param_layouts!r}."
+            )
 
         buffer_names = tuple(
             binding.name for binding in block_bindings[i].buffer_bindings
@@ -267,6 +280,17 @@ def _check_block_binding_target_names_match(
                 "All blocks in a StreamedWeights group must share the "
                 "same ordered pinned buffer target names. Expected "
                 f"{ref_buffers!r}; got {buffer_names!r}."
+            )
+        buffer_layouts = tuple(
+            (binding.name, binding.target_layout)
+            for binding in block_bindings[i].buffer_bindings
+        )
+        if buffer_layouts != ref_buffer_layouts:
+            raise ValueError(
+                f"Block {i} pinned buffer target layouts differ from block 0. "
+                "All blocks in a StreamedWeights group must share the "
+                "same ordered pinned buffer target layouts. Expected "
+                f"{ref_buffer_layouts!r}; got {buffer_layouts!r}."
             )
 
 
@@ -338,7 +362,7 @@ def _pin_block_module_bindings(
         )
         for collection in block_slot_collections
     ]
-    _check_block_binding_target_names_match(block_bindings)
+    _check_block_binding_target_layouts_match(block_bindings)
 
     return block_bindings, slot_filter
 

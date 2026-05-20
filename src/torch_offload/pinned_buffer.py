@@ -14,6 +14,7 @@ class PinnedBuffer:
     """Pinned host storage for one registered buffer."""
 
     tensor: torch.Tensor
+    target_layout: tuple[object, ...]
 
     @classmethod
     def clone(cls, buffer: torch.Tensor) -> PinnedBuffer:
@@ -23,6 +24,17 @@ class PinnedBuffer:
                 buffer,
                 memory_format=torch.contiguous_format,
             ),
+            target_layout=cls.target_layout_for(buffer),
+        )
+
+    @staticmethod
+    def target_layout_for(buffer: torch.Tensor) -> tuple[object, ...]:
+        """Opaque target-compatibility layout for ``buffer``."""
+        return (
+            tuple(buffer.shape),
+            tuple(buffer.stride()),
+            buffer.dtype,
+            buffer.layout,
         )
 
     @property

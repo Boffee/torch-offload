@@ -34,7 +34,7 @@ from torch_offload.model_offloader import detect_streaming_region_ties
 from torch_offload.pinned_bindings import PinnedModuleBinding
 from torch_offload.slots import iter_buffer_slots
 from torch_offload.streamed_weights import (
-    _check_block_binding_target_names_match,
+    _check_block_binding_target_layouts_match,
 )
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -1585,15 +1585,29 @@ class TestStreamedTargetPoolValidation:
     def _binding(
         param_names: tuple[str, ...],
         buffer_names: tuple[str, ...] = (),
+        param_layouts: tuple[object, ...] | None = None,
+        buffer_layouts: tuple[object, ...] | None = None,
     ) -> PinnedModuleBinding:
+        param_layout_values = param_layouts or (("param-layout",),) * len(
+            param_names
+        )
+        buffer_layout_values = buffer_layouts or (("buffer-layout",),) * len(
+            buffer_names
+        )
         return cast(
             PinnedModuleBinding,
             SimpleNamespace(
                 param_bindings=[
-                    SimpleNamespace(name=name) for name in param_names
+                    SimpleNamespace(name=name, target_layout=layout)
+                    for name, layout in zip(
+                        param_names, param_layout_values, strict=True,
+                    )
                 ],
                 buffer_bindings=[
-                    SimpleNamespace(name=name) for name in buffer_names
+                    SimpleNamespace(name=name, target_layout=layout)
+                    for name, layout in zip(
+                        buffer_names, buffer_layout_values, strict=True,
+                    )
                 ],
             ),
         )
@@ -1608,7 +1622,7 @@ class TestStreamedTargetPoolValidation:
             ValueError,
             match="Block 1 pinned param target names differ from block 0",
         ):
-            _check_block_binding_target_names_match(bindings)
+            _check_block_binding_target_layouts_match(bindings)
 
     def test_binding_buffer_name_mismatch_check_raises(self) -> None:
         bindings = [
@@ -1620,7 +1634,31 @@ class TestStreamedTargetPoolValidation:
             ValueError,
             match="Block 1 pinned buffer target names differ from block 0",
         ):
-            _check_block_binding_target_names_match(bindings)
+            _check_block_binding_target_layouts_match(bindings)
+
+    def test_binding_param_layout_mismatch_check_raises(self) -> None:
+        bindings = [
+            self._binding(("weight",), param_layouts=(("shape", 1),)),
+            self._binding(("weight",), param_layouts=(("shape", 2),)),
+        ]
+
+        with pytest.raises(
+            ValueError,
+            match="Block 1 pinned param target layouts differ from block 0",
+        ):
+            _check_block_binding_target_layouts_match(bindings)
+
+    def test_binding_buffer_layout_mismatch_check_raises(self) -> None:
+        bindings = [
+            self._binding(("weight",), ("table",), buffer_layouts=(("shape", 1),)),
+            self._binding(("weight",), ("table",), buffer_layouts=(("shape", 2),)),
+        ]
+
+        with pytest.raises(
+            ValueError,
+            match="Block 1 pinned buffer target layouts differ from block 0",
+        ):
+            _check_block_binding_target_layouts_match(bindings)
 
     def test_constructor_validates_pinned_binding_names(
         self, monkeypatch: pytest.MonkeyPatch,

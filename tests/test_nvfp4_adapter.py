@@ -10,7 +10,7 @@ from torch_offload import LoRA, ModelOffloader, PinnedWeights, merge_lora
 from torch_offload.nvfp4_adapter import Nvfp4Adapter
 from torch_offload.pinned_param import PinnedParam
 from torch_offload.tensor_adapter_factory import storage_key
-from torch_offload.streamed_weights import _layout_signature
+from torch_offload.streamed_weights import _param_target_layout
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -94,13 +94,13 @@ class TestNvfp4Adapter:
         assert key[3][0] == qt.per_tensor_scale.device
         assert key == storage_key(qt)
 
-    def test_layout_signature_ignores_storage_identity(self) -> None:
+    def test_target_layout_ignores_storage_identity(self) -> None:
         p1 = nn.Parameter(_make_nvfp4(), requires_grad=False)
         p2 = nn.Parameter(_make_nvfp4(), requires_grad=False)
 
-        assert _layout_signature(p1) == _layout_signature(p2)
+        assert _param_target_layout(p1) == _param_target_layout(p2)
 
-    def test_layout_signature_tracks_activation_quantization(self) -> None:
+    def test_target_layout_tracks_activation_quantization(self) -> None:
         with_activation = nn.Parameter(
             _make_nvfp4(dynamic_activation=True), requires_grad=False
         )
@@ -108,7 +108,9 @@ class TestNvfp4Adapter:
             _make_nvfp4(dynamic_activation=False), requires_grad=False
         )
 
-        assert _layout_signature(with_activation) != _layout_signature(weight_only)
+        assert _param_target_layout(with_activation) != _param_target_layout(
+            weight_only
+        )
 
     def test_no_cpu_round_trip_or_trainable_swap_capability(self) -> None:
         pinned_param = PinnedParam(

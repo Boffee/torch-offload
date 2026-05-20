@@ -58,6 +58,10 @@ class PinnedParamBinding:
         return self.pinned.cache_bytes
 
     @property
+    def target_layout(self) -> tuple[object, object]:
+        return self.pinned.target_layout
+
+    @property
     def unique_slots(self) -> list[ParamSlot]:
         return unique_slots(self.slots)
 
@@ -113,6 +117,10 @@ class PinnedBufferBinding:
     @property
     def cache_bytes(self) -> int:
         return self.pinned.cache_bytes
+
+    @property
+    def target_layout(self) -> tuple[object, ...]:
+        return self.pinned.target_layout
 
     @property
     def unique_slots(self) -> list[BufferSlot]:

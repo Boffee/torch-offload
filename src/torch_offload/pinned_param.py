@@ -77,10 +77,13 @@ class PinnedParam:
     state.
     """
 
-    __slots__ = ("adapter", "pinned_state", "requires_grad")
+    __slots__ = ("_target_layout", "adapter", "pinned_state", "requires_grad")
 
     def __init__(self, param: nn.Parameter) -> None:
         self.adapter: TensorAdapter[Any, Any] = select_adapter(param.data)
+        self._target_layout = self._target_layout_from_adapter(
+            self.adapter, param.data,
+        )
         self.requires_grad: bool = param.requires_grad
         self.pinned_state = self.adapter.clone_pin(param.data)
         # Low-peak construction optimization: release the original source
@@ -92,6 +95,28 @@ class PinnedParam:
         # metadata or ignore .data assignment.
         if type(param.data) is torch.Tensor:
             set_param_data(param, self.make_cpu_param().data)
+
+    @staticmethod
+    def _target_layout_from_adapter(
+        adapter: TensorAdapter[Any, Any], tensor: torch.Tensor,
+    ) -> tuple[object, object]:
+        return (type(adapter), adapter.layout_signature(tensor))
+
+    @classmethod
+    def target_layout_for(cls, param: nn.Parameter) -> tuple[object, object]:
+        """Opaque target-compatibility layout for ``param``.
+
+        Used by pre-pin validation paths that must fail before
+        :class:`PinnedParam` mutates the source parameter. Callers should
+        compare the returned value for equality only.
+        """
+        adapter = select_adapter(param.data)
+        return cls._target_layout_from_adapter(adapter, param.data)
+
+    @property
+    def target_layout(self) -> tuple[object, object]:
+        """Opaque target-compatibility layout for this pinned backing."""
+        return self._target_layout
 
     def make_cpu_param(self) -> nn.Parameter:
         """Build a CPU :class:`nn.Parameter` wrapper over this pinned state.
