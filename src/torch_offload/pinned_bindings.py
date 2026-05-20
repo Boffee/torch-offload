@@ -90,6 +90,10 @@ class PinnedModuleTarget:
     whole-model targets use fully qualified names, while streamed block
     targets use block-local names so every block can load into the same
     pool layout. Names must be unique within each target namespace.
+
+    Construction snapshots the binding's pinned layout. The target does
+    not retain the template binding as the source of load bytes; any
+    compatible binding can later load into the target.
     """
 
     __slots__ = (
@@ -101,8 +105,7 @@ class PinnedModuleTarget:
 
     def __init__(
         self,
-        pinned_params: Sequence[PinnedParam],
-        pinned_buffers: Sequence[PinnedBuffer] = (),
+        binding: PinnedModuleBinding,
         *,
         device: torch.device,
     ) -> None:
@@ -111,6 +114,9 @@ class PinnedModuleTarget:
                 "PinnedModuleTarget requires a CUDA device; "
                 f"got {device}."
             )
+
+        pinned_params = binding.pinned_params
+        pinned_buffers = binding.pinned_buffers
 
         # Validate the whole target layout before allocating any GPU storage.
         seen_param_names: set[str] = set()

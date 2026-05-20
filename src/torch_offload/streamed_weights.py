@@ -58,7 +58,6 @@ from .pinned_bindings import (
     PinnedParamBinding,
     pin_module_slot_collection,
 )
-from .pinned_buffer import PinnedBuffer
 from .pinned_param import (
     PinnedParam,
     PostCopyHook,
@@ -118,15 +117,13 @@ class _PinnedModuleTargetPool:
 
     def __init__(
         self,
-        template_params: list[PinnedParam],
-        template_buffers: list[PinnedBuffer],
+        template_binding: PinnedModuleBinding,
         num_slots: int,
         device: torch.device,
     ) -> None:
         self._targets = [
             PinnedModuleTarget(
-                template_params,
-                template_buffers,
+                template_binding,
                 device=device,
             )
             for _ in range(num_slots)
@@ -1000,8 +997,7 @@ class StreamedWeights:
         # Pool template comes from block 0. The constructor's layout
         # check has already verified every other block matches.
         self._pool = _PinnedModuleTargetPool(
-            self._block_bindings[0].pinned_params,
-            self._block_bindings[0].pinned_buffers,
+            self._block_bindings[0],
             num_gpu_slots,
             device,
         )

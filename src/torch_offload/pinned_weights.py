@@ -297,8 +297,7 @@ class PinnedWeights:
             # Tied slots all receive the same Parameter object so the
             # tying invariant survives on device.
             target = PinnedModuleTarget(
-                self._binding.pinned_params,
-                self._binding.pinned_buffers,
+                self._binding,
                 device=active_device,
             )
             self._binding.load_to_target(
