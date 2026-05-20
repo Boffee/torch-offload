@@ -110,6 +110,7 @@ def _target_binding(
     return PinnedModuleBinding(
         param_bindings=[
             PinnedParamBinding(
+                name=pinned.name,
                 pinned=pinned,
                 slots=[],
                 cpu_param=pinned.make_cpu_param(),
@@ -117,7 +118,7 @@ def _target_binding(
             for pinned in params
         ],
         buffer_bindings=[
-            PinnedBufferBinding(pinned=pinned, slots=[])
+            PinnedBufferBinding(name=pinned.name, pinned=pinned, slots=[])
             for pinned in (buffers or [])
         ],
     )
@@ -154,16 +155,41 @@ def test_module_target_snapshots_binding_layout_before_allocation(
 
     assert param.allocated
     param_binding = PinnedParamBinding(
+        name=param.name,
         pinned=cast(PinnedParam, param),
         slots=[],
         cpu_param=param.make_cpu_param(),
     )
     buffer_binding = PinnedBufferBinding(
+        name=buffer.name,
         pinned=cast(PinnedBuffer, buffer),
         slots=[],
     )
     assert target.load_param_bindings([param_binding])["w"] is not None
     assert target.load_buffer_bindings([buffer_binding])["buf"] is not None
+
+
+def test_module_target_uses_binding_name_as_storage_key() -> None:
+    param = _FakePinnedParam("pinned-name")
+    binding = PinnedParamBinding(
+        name="target-name",
+        pinned=cast(PinnedParam, param),
+        slots=[],
+        cpu_param=param.make_cpu_param(),
+    )
+    module_binding = PinnedModuleBinding(
+        param_bindings=[binding],
+        buffer_bindings=[],
+    )
+
+    target = PinnedModuleTarget(
+        module_binding,
+        device=torch.device("cuda"),
+    )
+
+    assert target.load_param_bindings([binding])["target-name"] is not None
+    assert param.allocated
+    assert param.copied
 
 
 # ---------------------------------------------------------------------------
@@ -389,6 +415,7 @@ class TestPinnedBindings:
         slot = ParamSlot("weight", parent, "weight")
         pinned = PinnedParam("weight", parent.weight)
         binding = PinnedParamBinding(
+            name=pinned.name,
             pinned=pinned,
             slots=[slot],
             cpu_param=pinned.make_cpu_param(),
@@ -436,6 +463,7 @@ class TestPinnedBindings:
         slot = ParamSlot("weight", parent, "weight")
         pinned = PinnedParam("weight", parent.weight)
         binding = PinnedParamBinding(
+            name=pinned.name,
             pinned=pinned,
             slots=[slot],
             cpu_param=pinned.make_cpu_param(),
@@ -467,7 +495,11 @@ class TestPinnedBindings:
         parent.register_buffer("running", original, persistent=False)
         slot = BufferSlot("running", parent, "running", persistent=False)
         pinned = PinnedBuffer.clone("running", torch.tensor([5.0, 6.0]))
-        binding = PinnedBufferBinding(pinned=pinned, slots=[slot])
+        binding = PinnedBufferBinding(
+            name=pinned.name,
+            pinned=pinned,
+            slots=[slot],
+        )
         module_binding = PinnedModuleBinding(
             param_bindings=[],
             buffer_bindings=[binding],

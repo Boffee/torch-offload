@@ -44,13 +44,10 @@ class PostCopyHookHandle:
 class PinnedParamBinding:
     """One model instance's parameter slots bound to one pinned backing."""
 
+    name: str
     pinned: PinnedParam
     slots: list[ParamSlot]
     cpu_param: nn.Parameter
-
-    @property
-    def name(self) -> str:
-        return self.pinned.name
 
     @property
     def requires_grad(self) -> bool:
@@ -109,12 +106,9 @@ class PinnedBufferBinding:
     copying active buffer state back.
     """
 
+    name: str
     pinned: PinnedBuffer
     slots: list[BufferSlot]
-
-    @property
-    def name(self) -> str:
-        return self.pinned.name
 
     @property
     def cache_bytes(self) -> int:
@@ -349,13 +343,14 @@ ParamPinValidator = Callable[[PinnedParamBinding], None]
 
 
 def _bind_param_slots(
-    pinned: PinnedParam, slots: Sequence[ParamSlot],
+    name: str, pinned: PinnedParam, slots: Sequence[ParamSlot],
 ) -> PinnedParamBinding:
     """Bind live model slots to an existing pinned parameter backing."""
     slot_list = list(slots)
     if not slot_list:
         raise ValueError("_bind_param_slots requires at least one ParamSlot")
     return PinnedParamBinding(
+        name=name,
         pinned=pinned,
         slots=slot_list,
         cpu_param=pinned.make_cpu_param(),
@@ -372,8 +367,9 @@ def _pin_param_slots(
     if not slot_list:
         raise ValueError("_pin_param_slots requires at least one ParamSlot")
     primary_slot = slot_list[0]
-    pinned = PinnedParam(primary_slot.name, primary_slot.get())
-    binding = _bind_param_slots(pinned, slot_list)
+    name = primary_slot.name
+    pinned = PinnedParam(name, primary_slot.get())
+    binding = _bind_param_slots(name, pinned, slot_list)
     if validate_param is not None:
         validate_param(binding)
     return binding
@@ -385,8 +381,9 @@ def _pin_buffer_slots(slots: Sequence[BufferSlot]) -> PinnedBufferBinding:
     if not slot_list:
         raise ValueError("_pin_buffer_slots requires at least one BufferSlot")
     primary_slot = slot_list[0]
-    pinned = PinnedBuffer.clone(primary_slot.name, primary_slot.get())
-    return PinnedBufferBinding(pinned=pinned, slots=slot_list)
+    name = primary_slot.name
+    pinned = PinnedBuffer.clone(name, primary_slot.get())
+    return PinnedBufferBinding(name=name, pinned=pinned, slots=slot_list)
 
 
 def _pin_module_slots(
