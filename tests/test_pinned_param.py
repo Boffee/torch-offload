@@ -153,8 +153,8 @@ def test_module_target_snapshots_binding_layout_before_allocation(
     binding.buffer_bindings.clear()
 
     assert param.allocated
-    assert target.param_target("w").param is not None
-    assert target.buffer_target("buf").tensor is not None
+    assert target.param_targets["w"].param is not None
+    assert target.buffer_targets["buf"].tensor is not None
 
 
 def test_module_target_rejects_non_cuda_before_child_allocation(
@@ -203,7 +203,7 @@ def test_module_target_uses_binding_name_as_storage_key() -> None:
     target = module_binding.allocate_target(torch.device("cuda"))
 
     module_binding.load_to_target(target)
-    assert target.param_target("target-name").param is not None
+    assert target.param_targets["target-name"].param is not None
     assert param.allocated
     assert param.copied
 
@@ -246,10 +246,12 @@ class TestPinnedParam:
         assert p.data.data_ptr() == pinned_param.pinned_state.data.data_ptr()
 
     @CUDA
-    def test_load_to_gpu_non_quanto(self) -> None:
+    def test_allocate_copy_make_gpu_param_non_quanto(self) -> None:
         p = nn.Parameter(torch.randn(4, 8, dtype=torch.bfloat16), requires_grad=False)
         pinned_param = PinnedParam(p)
-        gpu = pinned_param.load_to_gpu(torch.device("cuda"))
+        gpu_state = pinned_param.allocate_gpu_storage(torch.device("cuda"))
+        pinned_param.copy_to_gpu(gpu_state, non_blocking=True)
+        gpu = pinned_param.make_gpu_param(gpu_state)
         assert gpu.is_cuda
         assert gpu.shape == p.shape
         torch.cuda.synchronize()
@@ -297,7 +299,7 @@ class TestPinnedParam:
     @CUDA
     def test_slot_param_identity_stable_across_loads(self) -> None:
         # PinnedModuleTarget caches the Parameter wrapping its GPU storage;
-        # load_params must not churn those wrappers. Module slots observe a
+        # load_to_target must not churn those wrappers. Module slots observe a
         # stable object across reloads — the whole point of the pooled
         # target pattern over per-load allocation.
         p1 = nn.Parameter(torch.randn(8, dtype=torch.bfloat16), requires_grad=False)
@@ -307,16 +309,16 @@ class TestPinnedParam:
         target = binding.allocate_target(torch.device("cuda"))
 
         binding.load_to_target(target, non_blocking=False)
-        a_first = target.param_target("a").param
-        b_first = target.param_target("b").param
+        a_first = target.param_targets["a"].param
+        b_first = target.param_targets["b"].param
         torch.cuda.synchronize()
         binding.load_to_target(target, non_blocking=False)
-        assert target.param_target("a").param is a_first
-        assert target.param_target("b").param is b_first
+        assert target.param_targets["a"].param is a_first
+        assert target.param_targets["b"].param is b_first
         torch.cuda.synchronize()
         binding.load_to_target(target, non_blocking=False)
-        assert target.param_target("a").param is a_first
-        assert target.param_target("b").param is b_first
+        assert target.param_targets["a"].param is a_first
+        assert target.param_targets["b"].param is b_first
 
     @CUDA
     def test_module_target_rejects_duplicate_param_names(self) -> None:
@@ -350,11 +352,11 @@ class TestPinnedParam:
         target = binding.allocate_target(torch.device("cuda"))
 
         binding.load_to_target(target, non_blocking=False)
-        first = target.buffer_target("buf").tensor
+        first = target.buffer_targets["buf"].tensor
         torch.cuda.synchronize()
         pinned.tensor.copy_(torch.randn(8))
         binding.load_to_target(target, non_blocking=False)
-        second = target.buffer_target("buf").tensor
+        second = target.buffer_targets["buf"].tensor
         torch.cuda.synchronize()
 
         assert second is first
@@ -368,7 +370,7 @@ class TestPinnedParam:
         binding = _target_binding(block)
         target = binding.allocate_target(torch.device("cuda"))
         binding.load_to_target(target, non_blocking=False)
-        base_param = target.param_target("w").param
+        base_param = target.param_targets["w"].param
 
         def hook(param: nn.Parameter) -> None:
             param.data.add_(1)
@@ -386,7 +388,7 @@ class TestPinnedParam:
         )
 
         binding.load_to_target(target, non_blocking=False)
-        assert target.param_target("w").param is base_param
+        assert target.param_targets["w"].param is base_param
         torch.cuda.synchronize()
         torch.testing.assert_close(
             base_param.detach().cpu(),
@@ -549,7 +551,7 @@ class TestPinnedBindings:
         slot_param = parent.weight
 
         target = module_binding.allocate_target(torch.device("cuda"))
-        target_param = target.param_target("weight").param
+        target_param = target.param_targets["weight"].param
         hook_calls: list[nn.Parameter] = []
 
         def hook(param: nn.Parameter) -> None:
@@ -597,7 +599,7 @@ class TestPinnedBindings:
         slot_param = parent.weight
 
         target = module_binding.allocate_target(torch.device("cuda"))
-        target_param = target.param_target("weight").param
+        target_param = target.param_targets["weight"].param
         module_binding.load_to_target(target)
 
         assert parent.weight is slot_param
@@ -621,7 +623,6 @@ class TestPinnedBindings:
         )
         copied = torch.tensor([5.0, 6.0])
         target = PinnedModuleTarget(
-            device=torch.device("cuda"),
             param_targets={},
             buffer_targets={"running": PinnedBufferTarget(copied)},
         )
@@ -743,7 +744,7 @@ class TestPinnedParamQuanto:
         assert qt_pinned._scale.data_ptr() == pinned_param.pinned_state.scale.data_ptr()
 
     @CUDA
-    def test_load_to_gpu_round_trip(self) -> None:
+    def test_allocate_copy_make_gpu_param_quanto_round_trip(self) -> None:
         quanto = pytest.importorskip("optimum.quanto")
         from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
 
@@ -756,7 +757,9 @@ class TestPinnedParamQuanto:
         p = nn.Parameter(qt, requires_grad=False)
         pinned_param = PinnedParam(p)
 
-        gpu_param = pinned_param.load_to_gpu(torch.device("cuda"))
+        gpu_state = pinned_param.allocate_gpu_storage(torch.device("cuda"))
+        pinned_param.copy_to_gpu(gpu_state, non_blocking=True)
+        gpu_param = pinned_param.make_gpu_param(gpu_state)
         torch.cuda.synchronize()
         assert isinstance(gpu_param.data, WeightQBytesTensor)
         assert gpu_param.data._data.is_cuda

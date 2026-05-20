@@ -146,13 +146,15 @@ class TestNvfp4Adapter:
             merge_lora(model, [(lora, 1.0)])
 
     @CUDA
-    def test_load_to_gpu_preserves_wrapper(self) -> None:
+    def test_allocate_copy_make_gpu_param_preserves_wrapper(self) -> None:
         nvfp4_tensor_cls, _ = _nvfp4_modules()
         pinned_param = PinnedParam(
             nn.Parameter(_make_nvfp4(swizzled=True), requires_grad=False),
         )
 
-        gpu_param = pinned_param.load_to_gpu(torch.device("cuda"))
+        gpu_state = pinned_param.allocate_gpu_storage(torch.device("cuda"))
+        pinned_param.copy_to_gpu(gpu_state, non_blocking=True)
+        gpu_param = pinned_param.make_gpu_param(gpu_state)
         torch.cuda.synchronize()
         pinned = pinned_param.make_cpu_param().data
 

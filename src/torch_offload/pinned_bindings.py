@@ -203,6 +203,21 @@ class PinnedBufferBinding:
         self.set_slots(self.pinned.tensor)
 
 
+def _validate_unique_binding_names(
+    bindings: Sequence[PinnedParamBinding] | Sequence[PinnedBufferBinding],
+    *,
+    kind: str,
+) -> None:
+    seen_names: set[str] = set()
+    for binding in bindings:
+        if binding.name in seen_names:
+            raise ValueError(
+                f"PinnedModuleTarget requires unique pinned {kind} "
+                f"target names; got duplicate {binding.name!r}."
+            )
+        seen_names.add(binding.name)
+
+
 @dataclass(slots=True)
 class PinnedModuleTarget:
     """GPU storage target for one module binding layout.
@@ -222,17 +237,8 @@ class PinnedModuleTarget:
     bytes; compatible bindings can later load into the target by name.
     """
 
-    device: torch.device
     param_targets: dict[str, PinnedParamTarget]
     buffer_targets: dict[str, PinnedBufferTarget]
-
-    def param_target(self, name: str) -> PinnedParamTarget:
-        """Return active storage for parameter target ``name``."""
-        return self.param_targets[name]
-
-    def buffer_target(self, name: str) -> PinnedBufferTarget:
-        """Return active storage for buffer target ``name``."""
-        return self.buffer_targets[name]
 
 
 @dataclass(slots=True)
@@ -285,26 +291,10 @@ class PinnedModuleBinding:
                 f"got {device}."
             )
 
-        seen_param_names: set[str] = set()
-        for param_binding in self.param_bindings:
-            if param_binding.name in seen_param_names:
-                raise ValueError(
-                    "PinnedModuleTarget requires unique pinned param target "
-                    f"names; got duplicate {param_binding.name!r}."
-                )
-            seen_param_names.add(param_binding.name)
-
-        seen_buffer_names: set[str] = set()
-        for buffer_binding in self.buffer_bindings:
-            if buffer_binding.name in seen_buffer_names:
-                raise ValueError(
-                    "PinnedModuleTarget requires unique pinned buffer target "
-                    f"names; got duplicate {buffer_binding.name!r}."
-                )
-            seen_buffer_names.add(buffer_binding.name)
+        _validate_unique_binding_names(self.param_bindings, kind="param")
+        _validate_unique_binding_names(self.buffer_bindings, kind="buffer")
 
         return PinnedModuleTarget(
-            device=device,
             param_targets={
                 binding.name: binding.allocate_target(device)
                 for binding in self.param_bindings
@@ -341,7 +331,7 @@ class PinnedModuleBinding:
         """
         target_params: dict[str, nn.Parameter] = {}
         for param_binding in self.param_bindings:
-            param_target = target.param_target(param_binding.name)
+            param_target = target.param_targets[param_binding.name]
             param_binding.copy_to_target(
                 param_target,
                 non_blocking=non_blocking,
@@ -360,7 +350,7 @@ class PinnedModuleBinding:
 
         target_buffers: dict[str, torch.Tensor] = {}
         for buffer_binding in self.buffer_bindings:
-            buffer_target = target.buffer_target(buffer_binding.name)
+            buffer_target = target.buffer_targets[buffer_binding.name]
             buffer_binding.copy_to_target(
                 buffer_target,
                 non_blocking=non_blocking,

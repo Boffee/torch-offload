@@ -49,11 +49,11 @@ class PinnedParam:
 
     The lifecycle methods (:meth:`make_cpu_param`,
     :meth:`allocate_gpu_storage`, :meth:`make_gpu_param`,
-    :meth:`copy_to_gpu`, :meth:`copy_to_cpu`, :meth:`load_to_gpu`)
-    all dispatch through the adapter. This primitive works with the
-    opaque state returned by :meth:`allocate_gpu_storage`; model-bound
-    callers should normally use :class:`PinnedParamBinding`, which wraps
-    that state in a binding-owned target object.
+    :meth:`copy_to_gpu`, :meth:`copy_to_cpu`) all dispatch through the
+    adapter. This primitive works with the opaque state returned by
+    :meth:`allocate_gpu_storage`; model-bound callers should normally
+    use :class:`PinnedParamBinding`, which wraps that state in a
+    binding-owned target object.
 
     The pinned parameter captures the source parameter's ``requires_grad`` at
     construction time and threads it through to the adapter when
@@ -168,18 +168,6 @@ class PinnedParam:
         self.adapter.copy_to_cpu(
             gpu_state, self.pinned_state, non_blocking=non_blocking
         )
-
-    def load_to_gpu(
-        self, device: torch.device, non_blocking: bool = False
-    ) -> nn.Parameter:
-        """Convenience: allocate GPU storage and copy in one shot.
-        Used by :class:`PinnedWeights` (one-shot per-param load on
-        activate); :class:`StreamedWeights` instead reuses a slot pool
-        via :meth:`allocate_gpu_storage` + :meth:`make_gpu_param` once
-        at pool construction and :meth:`copy_to_gpu` on each load."""
-        gpu_state = self.allocate_gpu_storage(device)
-        self.copy_to_gpu(gpu_state, non_blocking=non_blocking)
-        return self.make_gpu_param(gpu_state)
 
     @property
     def compute_dtype(self) -> torch.dtype:
