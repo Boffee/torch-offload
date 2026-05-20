@@ -11,6 +11,7 @@ from torch import nn
 from torch_offload.pinned_bindings import (
     PinnedBuffer,
     PinnedBufferBinding,
+    PinnedModuleBinding,
     PinnedModuleTarget,
     PinnedParamBinding,
 )
@@ -26,38 +27,41 @@ from torch_offload.tensor_adapter_factory import select_adapter, storage_key
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
-class _FakeParamTarget:
-    def __init__(self, param: nn.Parameter) -> None:
-        self.param = param
-        self.loaded: list[tuple[PinnedParam, bool]] = []
+class _FakeModuleTarget:
+    def __init__(
+        self,
+        *,
+        params: dict[str, nn.Parameter] | None = None,
+        buffers: dict[str, torch.Tensor] | None = None,
+        device: torch.device | None = None,
+    ) -> None:
+        self.params = params or {}
+        self.buffers = buffers or {}
+        self._device = device or torch.device("cpu")
+        self.loaded_params: list[tuple[list[PinnedParam], bool]] = []
+        self.loaded_buffers: list[tuple[list[PinnedBuffer], bool]] = []
 
     @property
     def device(self) -> torch.device:
-        return self.param.device
+        return self._device
 
-    def load_param(
+    def load_params(
         self,
-        pinned: PinnedParam,
+        pinned_params: list[PinnedParam],
         *,
         non_blocking: bool = False,
-    ) -> nn.Parameter:
-        self.loaded.append((pinned, non_blocking))
-        return self.param
+    ) -> dict[str, nn.Parameter]:
+        self.loaded_params.append((list(pinned_params), non_blocking))
+        return {pinned.name: self.params[pinned.name] for pinned in pinned_params}
 
-
-class _FakeDeviceTarget:
-    def __init__(self, device: torch.device) -> None:
-        self.device = device
-        self.loaded_buffers: list[tuple[PinnedBuffer, bool]] = []
-
-    def load_buffer(
+    def load_buffers(
         self,
-        pinned: PinnedBuffer,
+        pinned_buffers: list[PinnedBuffer],
         *,
         non_blocking: bool = False,
-    ) -> torch.Tensor:
-        self.loaded_buffers.append((pinned, non_blocking))
-        return pinned.tensor.to(self.device, non_blocking=non_blocking)
+    ) -> dict[str, torch.Tensor]:
+        self.loaded_buffers.append((list(pinned_buffers), non_blocking))
+        return {pinned.name: self.buffers[pinned.name] for pinned in pinned_buffers}
 
 
 # ---------------------------------------------------------------------------
@@ -159,14 +163,17 @@ class TestPinnedParam:
         block = [PinnedParam("a", p1), PinnedParam("b", p2)]
         target = PinnedModuleTarget(block, torch.device("cuda"))
 
-        a_first = target.load_param(block[0], non_blocking=False)
-        b_first = target.load_param(block[1], non_blocking=False)
+        loaded = target.load_params(block, non_blocking=False)
+        a_first = loaded["a"]
+        b_first = loaded["b"]
         torch.cuda.synchronize()
-        assert target.load_param(block[0], non_blocking=False) is a_first
-        assert target.load_param(block[1], non_blocking=False) is b_first
+        loaded = target.load_params(block, non_blocking=False)
+        assert loaded["a"] is a_first
+        assert loaded["b"] is b_first
         torch.cuda.synchronize()
-        assert target.load_param(block[0], non_blocking=False) is a_first
-        assert target.load_param(block[1], non_blocking=False) is b_first
+        loaded = target.load_params(block, non_blocking=False)
+        assert loaded["a"] is a_first
+        assert loaded["b"] is b_first
 
     @CUDA
     def test_module_target_rejects_duplicate_param_names(self) -> None:
@@ -206,10 +213,10 @@ class TestPinnedParam:
             pinned_buffers=[pinned],
         )
 
-        first = target.load_buffer(pinned, non_blocking=False)
+        first = target.load_buffers([pinned], non_blocking=False)["buf"]
         torch.cuda.synchronize()
         pinned.tensor.copy_(torch.randn(8))
-        second = target.load_buffer(pinned, non_blocking=False)
+        second = target.load_buffers([pinned], non_blocking=False)["buf"]
         torch.cuda.synchronize()
 
         assert second is first
@@ -223,12 +230,12 @@ class TestPinnedParam:
         pinned_param = PinnedParam("w", p)
         block = [pinned_param]
         target = PinnedModuleTarget(block, torch.device("cuda"))
-        base_param = target.load_param(pinned_param, non_blocking=False)
+        base_param = target.load_params(block, non_blocking=False)["w"]
 
         def hook(param: nn.Parameter) -> None:
             param.data.add_(1)
 
-        hook(target.load_param(pinned_param, non_blocking=False))
+        hook(target.load_params(block, non_blocking=False)["w"])
         torch.cuda.synchronize()
         cpu_param = pinned_param.make_cpu_param()
         torch.testing.assert_close(
@@ -236,7 +243,7 @@ class TestPinnedParam:
             cpu_param.detach() + 1,
         )
 
-        assert target.load_param(pinned_param, non_blocking=False) is base_param
+        assert target.load_params(block, non_blocking=False)["w"] is base_param
         torch.cuda.synchronize()
         torch.testing.assert_close(
             base_param.detach().cpu(),
@@ -245,7 +252,9 @@ class TestPinnedParam:
 
 
 class TestPinnedBindings:
-    def test_param_binding_copy_to_target_does_not_set_slots(self) -> None:
+    def test_module_binding_load_to_target_copies_before_setting_slots(
+        self,
+    ) -> None:
         parent = nn.Module()
         parent.weight = nn.Parameter(
             torch.tensor([1.0, 2.0]), requires_grad=False,
@@ -257,39 +266,40 @@ class TestPinnedBindings:
             slots=[slot],
             cpu_param=pinned.make_cpu_param(),
         )
+        module_binding = PinnedModuleBinding(
+            param_bindings=[binding],
+            buffer_bindings=[],
+        )
         binding.restore_pinned()
         slot_param = parent.weight
 
         target_param = nn.Parameter(
             torch.tensor([3.0, 4.0]), requires_grad=False,
         )
-        fake_target = _FakeParamTarget(target_param)
+        fake_target = _FakeModuleTarget(params={"weight": target_param})
         hook_calls: list[nn.Parameter] = []
 
         def hook(param: nn.Parameter) -> None:
+            assert parent.weight is slot_param
             hook_calls.append(param)
             param.data.add_(1)
 
-        copied = binding.copy_to_target(
+        module_binding.load_to_target(
             cast(PinnedModuleTarget, fake_target),
             post_copy_hooks={id(pinned): hook},
             non_blocking=True,
         )
 
-        assert copied is target_param
-        assert fake_target.loaded == [(pinned, True)]
+        assert fake_target.loaded_params == [([pinned], True)]
+        assert fake_target.loaded_buffers == [([], True)]
         assert hook_calls == [target_param]
-        assert parent.weight is slot_param
+        assert parent.weight is target_param
         torch.testing.assert_close(
             target_param.data,
             torch.tensor([4.0, 5.0]),
         )
 
-        binding.load_to_target(cast(PinnedModuleTarget, fake_target))
-
-        assert parent.weight is target_param
-
-    def test_param_binding_load_to_target_preserves_trainable_wrapper(
+    def test_module_binding_load_to_target_preserves_trainable_wrapper(
         self,
     ) -> None:
         parent = nn.Module()
@@ -303,43 +313,54 @@ class TestPinnedBindings:
             slots=[slot],
             cpu_param=pinned.make_cpu_param(),
         )
+        module_binding = PinnedModuleBinding(
+            param_bindings=[binding],
+            buffer_bindings=[],
+        )
         binding.restore_pinned()
         slot_param = parent.weight
 
         target_param = nn.Parameter(
             torch.tensor([7.0, 8.0]), requires_grad=True,
         )
-        binding.load_to_target(
-            cast(PinnedModuleTarget, _FakeParamTarget(target_param)),
+        module_binding.load_to_target(
+            cast(
+                PinnedModuleTarget,
+                _FakeModuleTarget(params={"weight": target_param}),
+            ),
         )
 
         assert parent.weight is slot_param
         assert parent.weight.data.data_ptr() == target_param.data.data_ptr()
         torch.testing.assert_close(parent.weight.data, target_param.data)
 
-    def test_buffer_binding_load_to_target_and_restore_pinned(self) -> None:
+    def test_module_binding_loads_buffer_to_target_and_restore_pinned(self) -> None:
         parent = nn.Module()
         original = torch.tensor([1.0, 2.0])
         parent.register_buffer("running", original, persistent=False)
         slot = BufferSlot("running", parent, "running", persistent=False)
         pinned = PinnedBuffer.clone("running", torch.tensor([5.0, 6.0]))
         binding = PinnedBufferBinding(pinned=pinned, slots=[slot])
+        module_binding = PinnedModuleBinding(
+            param_bindings=[],
+            buffer_bindings=[binding],
+        )
+        copied = torch.tensor([5.0, 6.0])
         target = cast(
             PinnedModuleTarget,
-            _FakeDeviceTarget(torch.device("cpu")),
+            _FakeModuleTarget(buffers={"running": copied}),
         )
-
-        copied = binding.copy_to_target(target)
 
         assert pinned.name == "running"
         assert pinned.tensor.is_pinned()
         assert pinned.cache_bytes == pinned.tensor.numel() * pinned.tensor.element_size()
         assert parent.running is original
 
-        binding.load_to_target(target)
+        module_binding.load_to_target(target)
 
         assert parent.running is copied
-        assert target.loaded_buffers == [(pinned, False), (pinned, False)]
+        assert target.loaded_params == [([], False)]
+        assert target.loaded_buffers == [([pinned], False)]
         assert "running" in parent._non_persistent_buffers_set
 
         active = torch.tensor([9.0, 10.0])

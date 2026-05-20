@@ -49,41 +49,6 @@ class PinnedParamBinding:
         """Repoint managed parameter slots to their pinned CPU wrapper."""
         self.set_slots(self.cpu_param)
 
-    def copy_to_target(
-        self,
-        target: PinnedModuleTarget,
-        *,
-        post_copy_hooks: Mapping[int, PostCopyHook] | None = None,
-        non_blocking: bool = False,
-    ) -> nn.Parameter:
-        """Copy pinned storage into ``target`` and return the target wrapper."""
-        target_param = target.load_param(
-            self.pinned, non_blocking=non_blocking,
-        )
-        hook = (
-            post_copy_hooks.get(id(self.pinned))
-            if post_copy_hooks is not None
-            else None
-        )
-        if hook is not None:
-            hook(target_param)
-        return target_param
-
-    def load_to_target(
-        self,
-        target: PinnedModuleTarget,
-        *,
-        post_copy_hooks: Mapping[int, PostCopyHook] | None = None,
-        non_blocking: bool = False,
-    ) -> None:
-        """Copy pinned storage into ``target`` and set managed slots."""
-        param = self.copy_to_target(
-            target,
-            post_copy_hooks=post_copy_hooks,
-            non_blocking=non_blocking,
-        )
-        self.set_slots(param)
-
 
 @dataclass(slots=True)
 class PinnedBufferBinding:
@@ -109,27 +74,6 @@ class PinnedBufferBinding:
     def restore_pinned(self) -> None:
         """Repoint managed buffer slots to the pinned CPU clone."""
         self.set_slots(self.pinned.tensor)
-
-    def copy_to_target(
-        self,
-        target: PinnedModuleTarget,
-        *,
-        non_blocking: bool = False,
-    ) -> torch.Tensor:
-        """Copy the pinned clone to ``target`` and return the target tensor."""
-        return target.load_buffer(
-            self.pinned, non_blocking=non_blocking,
-        )
-
-    def load_to_target(
-        self,
-        target: PinnedModuleTarget,
-        *,
-        non_blocking: bool = False,
-    ) -> None:
-        """Copy the pinned clone to ``target`` and set managed slots."""
-        buffer = self.copy_to_target(target, non_blocking=non_blocking)
-        self.set_slots(buffer)
 
 
 class PinnedModuleTarget:
@@ -167,7 +111,8 @@ class PinnedModuleTarget:
                 "PinnedModuleTarget requires a CUDA device; "
                 f"got {device}."
             )
-        self._device = device
+
+        # Validate the whole target layout before allocating any GPU storage.
         seen_param_names: set[str] = set()
         for pinned in pinned_params:
             if pinned.name in seen_param_names:
@@ -186,6 +131,9 @@ class PinnedModuleTarget:
                 )
             seen_buffer_names.add(pinned.name)
 
+        self._device = device
+
+        # Allocate reusable active storage for the validated layout.
         self._target_states: dict[str, object] = {}
         self._target_params: dict[str, nn.Parameter] = {}
         for pinned in pinned_params:
@@ -205,28 +153,42 @@ class PinnedModuleTarget:
     def device(self) -> torch.device:
         return self._device
 
-    def load_param(
+    def load_params(
         self,
-        pinned: PinnedParam,
+        pinned_params: Sequence[PinnedParam],
         *,
         non_blocking: bool = False,
-    ) -> nn.Parameter:
-        """Copy ``pinned`` into this target and return its GPU Parameter."""
-        pinned.copy_to_gpu(
-            self._target_states[pinned.name], non_blocking=non_blocking,
-        )
-        return self._target_params[pinned.name]
+    ) -> dict[str, nn.Parameter]:
+        """Copy ``pinned_params`` into this target.
 
-    def load_buffer(
+        Returns the stable GPU ``Parameter`` wrappers keyed by pinned
+        target name.
+        """
+        target_params: dict[str, nn.Parameter] = {}
+        for pinned in pinned_params:
+            pinned.copy_to_gpu(
+                self._target_states[pinned.name],
+                non_blocking=non_blocking,
+            )
+            target_params[pinned.name] = self._target_params[pinned.name]
+        return target_params
+
+    def load_buffers(
         self,
-        pinned: PinnedBuffer,
+        pinned_buffers: Sequence[PinnedBuffer],
         *,
         non_blocking: bool = False,
-    ) -> torch.Tensor:
-        """Copy ``pinned`` into this target and return its GPU tensor."""
-        target = self._target_buffers[pinned.name]
-        target.copy_(pinned.tensor, non_blocking=non_blocking)
-        return target
+    ) -> dict[str, torch.Tensor]:
+        """Copy ``pinned_buffers`` into this target.
+
+        Returns the stable GPU tensors keyed by pinned target name.
+        """
+        target_buffers: dict[str, torch.Tensor] = {}
+        for pinned in pinned_buffers:
+            target = self._target_buffers[pinned.name]
+            target.copy_(pinned.tensor, non_blocking=non_blocking)
+            target_buffers[pinned.name] = target
+        return target_buffers
 
 
 @dataclass(slots=True)
@@ -286,23 +248,34 @@ class PinnedModuleBinding:
         post_copy_hooks: Mapping[int, PostCopyHook] | None = None,
         non_blocking: bool = False,
     ) -> None:
-        """Copy pinned storage into ``target`` and set managed slots."""
-        target_params: list[tuple[PinnedParamBinding, nn.Parameter]] = []
-        for param_binding in self.param_bindings:
-            target_param = param_binding.copy_to_target(
-                target,
-                post_copy_hooks=post_copy_hooks,
-                non_blocking=non_blocking,
-            )
-            target_params.append((param_binding, target_param))
+        """Copy pinned storage into ``target`` and set managed slots.
 
-        for param_binding, target_param in target_params:
-            param_binding.set_slots(target_param)
+        Slot mutation is deliberately delayed until after all target
+        copies and post-copy hooks complete, so a copy failure does not
+        leave the module partially active.
+        """
+        target_params = target.load_params(
+            self.pinned_params, non_blocking=non_blocking,
+        )
+        for param_binding in self.param_bindings:
+            target_param = target_params[param_binding.pinned.name]
+            hook = (
+                post_copy_hooks.get(id(param_binding.pinned))
+                if post_copy_hooks is not None
+                else None
+            )
+            if hook is not None:
+                hook(target_param)
+
+        target_buffers = target.load_buffers(
+            self.pinned_buffers, non_blocking=non_blocking,
+        )
+
+        for param_binding in self.param_bindings:
+            param_binding.set_slots(target_params[param_binding.pinned.name])
 
         for buffer_binding in self.buffer_bindings:
-            buffer_binding.load_to_target(
-                target, non_blocking=non_blocking,
-            )
+            buffer_binding.set_slots(target_buffers[buffer_binding.pinned.name])
 
     def iter_trainables(
         self,
