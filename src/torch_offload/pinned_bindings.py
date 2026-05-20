@@ -144,43 +144,41 @@ class PinnedModuleTarget:
                 f"got {device}."
             )
 
-        pinned_params = binding.pinned_params
-        pinned_buffers = binding.pinned_buffers
-
         # Validate the whole target layout before allocating any GPU storage.
         seen_param_names: set[str] = set()
-        for pinned in pinned_params:
-            if pinned.name in seen_param_names:
+        for param_binding in binding.param_bindings:
+            if param_binding.name in seen_param_names:
                 raise ValueError(
                     "PinnedModuleTarget requires unique pinned param target "
-                    f"names; got duplicate {pinned.name!r}."
+                    f"names; got duplicate {param_binding.name!r}."
                 )
-            seen_param_names.add(pinned.name)
+            seen_param_names.add(param_binding.name)
 
         seen_buffer_names: set[str] = set()
-        for pinned in pinned_buffers:
-            if pinned.name in seen_buffer_names:
+        for buffer_binding in binding.buffer_bindings:
+            if buffer_binding.name in seen_buffer_names:
                 raise ValueError(
                     "PinnedModuleTarget requires unique pinned buffer target "
-                    f"names; got duplicate {pinned.name!r}."
+                    f"names; got duplicate {buffer_binding.name!r}."
                 )
-            seen_buffer_names.add(pinned.name)
+            seen_buffer_names.add(buffer_binding.name)
 
         self._device = device
 
         # Allocate reusable active storage for the validated layout.
         self._target_states: dict[str, object] = {}
         self._target_params: dict[str, nn.Parameter] = {}
-        for pinned in pinned_params:
+        for param_binding in binding.param_bindings:
+            pinned = param_binding.pinned
             target_state = pinned.allocate_gpu_storage(device)
-            self._target_states[pinned.name] = target_state
-            self._target_params[pinned.name] = pinned.make_gpu_param(
+            self._target_states[param_binding.name] = target_state
+            self._target_params[param_binding.name] = pinned.make_gpu_param(
                 target_state
             )
         self._target_buffers: dict[str, torch.Tensor] = {}
-        for pinned in pinned_buffers:
-            self._target_buffers[pinned.name] = torch.empty_like(
-                pinned.tensor,
+        for buffer_binding in binding.buffer_bindings:
+            self._target_buffers[buffer_binding.name] = torch.empty_like(
+                buffer_binding.pinned.tensor,
                 device=device,
             )
 
@@ -188,41 +186,41 @@ class PinnedModuleTarget:
     def device(self) -> torch.device:
         return self._device
 
-    def load_params(
+    def load_param_bindings(
         self,
-        pinned_params: Sequence[PinnedParam],
+        param_bindings: Sequence[PinnedParamBinding],
         *,
         non_blocking: bool = False,
     ) -> dict[str, nn.Parameter]:
-        """Copy ``pinned_params`` into this target.
+        """Copy ``param_bindings`` into this target.
 
         Returns the stable GPU ``Parameter`` wrappers keyed by pinned
         target name.
         """
         target_params: dict[str, nn.Parameter] = {}
-        for pinned in pinned_params:
-            pinned.copy_to_gpu(
-                self._target_states[pinned.name],
+        for binding in param_bindings:
+            binding.pinned.copy_to_gpu(
+                self._target_states[binding.name],
                 non_blocking=non_blocking,
             )
-            target_params[pinned.name] = self._target_params[pinned.name]
+            target_params[binding.name] = self._target_params[binding.name]
         return target_params
 
-    def load_buffers(
+    def load_buffer_bindings(
         self,
-        pinned_buffers: Sequence[PinnedBuffer],
+        buffer_bindings: Sequence[PinnedBufferBinding],
         *,
         non_blocking: bool = False,
     ) -> dict[str, torch.Tensor]:
-        """Copy ``pinned_buffers`` into this target.
+        """Copy ``buffer_bindings`` into this target.
 
         Returns the stable GPU tensors keyed by pinned target name.
         """
         target_buffers: dict[str, torch.Tensor] = {}
-        for pinned in pinned_buffers:
-            target = self._target_buffers[pinned.name]
-            target.copy_(pinned.tensor, non_blocking=non_blocking)
-            target_buffers[pinned.name] = target
+        for binding in buffer_bindings:
+            target = self._target_buffers[binding.name]
+            target.copy_(binding.pinned.tensor, non_blocking=non_blocking)
+            target_buffers[binding.name] = target
         return target_buffers
 
 
@@ -286,8 +284,8 @@ class PinnedModuleBinding:
         copies and post-copy hooks complete, so a copy failure does not
         leave the module partially active.
         """
-        target_params = target.load_params(
-            self.pinned_params, non_blocking=non_blocking,
+        target_params = target.load_param_bindings(
+            self.param_bindings, non_blocking=non_blocking,
         )
         for param_binding in self.param_bindings:
             target_param = target_params[param_binding.name]
@@ -299,8 +297,8 @@ class PinnedModuleBinding:
             if hook is not None:
                 hook(target_param)
 
-        target_buffers = target.load_buffers(
-            self.pinned_buffers, non_blocking=non_blocking,
+        target_buffers = target.load_buffer_bindings(
+            self.buffer_bindings, non_blocking=non_blocking,
         )
 
         for param_binding in self.param_bindings:
