@@ -48,6 +48,16 @@ class _FakeParamTarget:
 class _FakeDeviceTarget:
     def __init__(self, device: torch.device) -> None:
         self.device = device
+        self.loaded_buffers: list[tuple[PinnedBuffer, bool]] = []
+
+    def load_buffer(
+        self,
+        pinned: PinnedBuffer,
+        *,
+        non_blocking: bool = False,
+    ) -> torch.Tensor:
+        self.loaded_buffers.append((pinned, non_blocking))
+        return pinned.tensor.to(self.device, non_blocking=non_blocking)
 
 
 # ---------------------------------------------------------------------------
@@ -169,6 +179,41 @@ class TestPinnedParam:
             match="duplicate 'w'",
         ):
             PinnedModuleTarget(block, torch.device("cuda"))
+
+    @CUDA
+    def test_module_target_rejects_duplicate_buffer_names(self) -> None:
+        buffers = [
+            PinnedBuffer.clone("buf", torch.randn(8)),
+            PinnedBuffer.clone("buf", torch.randn(8)),
+        ]
+
+        with pytest.raises(
+            ValueError,
+            match="duplicate 'buf'",
+        ):
+            PinnedModuleTarget(
+                [],
+                torch.device("cuda"),
+                pinned_buffers=buffers,
+            )
+
+    @CUDA
+    def test_slot_buffer_identity_stable_across_loads(self) -> None:
+        pinned = PinnedBuffer.clone("buf", torch.randn(8))
+        target = PinnedModuleTarget(
+            [],
+            torch.device("cuda"),
+            pinned_buffers=[pinned],
+        )
+
+        first = target.load_buffer(pinned, non_blocking=False)
+        torch.cuda.synchronize()
+        pinned.tensor.copy_(torch.randn(8))
+        second = target.load_buffer(pinned, non_blocking=False)
+        torch.cuda.synchronize()
+
+        assert second is first
+        torch.testing.assert_close(first.cpu(), pinned.tensor)
 
     @CUDA
     def test_slot_hook_mutates_stable_param_in_place(self) -> None:
@@ -294,6 +339,7 @@ class TestPinnedBindings:
         binding.load_to_target(target)
 
         assert parent.running is copied
+        assert target.loaded_buffers == [(pinned, False), (pinned, False)]
         assert "running" in parent._non_persistent_buffers_set
 
         active = torch.tensor([9.0, 10.0])

@@ -1581,29 +1581,46 @@ class TestActivatePoolIdempotency:
 
 
 class TestStreamedTargetPoolValidation:
+    @staticmethod
+    def _binding(
+        param_names: tuple[str, ...],
+        buffer_names: tuple[str, ...] = (),
+    ) -> PinnedModuleBinding:
+        return cast(
+            PinnedModuleBinding,
+            SimpleNamespace(
+                pinned_params=[
+                    SimpleNamespace(name=name) for name in param_names
+                ],
+                pinned_buffers=[
+                    SimpleNamespace(name=name) for name in buffer_names
+                ],
+            ),
+        )
+
     def test_binding_name_mismatch_check_raises(self) -> None:
         bindings = [
-            SimpleNamespace(
-                pinned_params=[
-                    SimpleNamespace(name="weight"),
-                    SimpleNamespace(name="bias"),
-                ],
-            ),
-            SimpleNamespace(
-                pinned_params=[
-                    SimpleNamespace(name="weight"),
-                    SimpleNamespace(name="other"),
-                ],
-            ),
+            self._binding(("weight", "bias")),
+            self._binding(("weight", "other")),
         ]
 
         with pytest.raises(
             ValueError,
-            match="Block 1 pinned target names differ from block 0",
+            match="Block 1 pinned param target names differ from block 0",
         ):
-            _check_block_binding_target_names_match(
-                cast(list[PinnedModuleBinding], bindings)
-            )
+            _check_block_binding_target_names_match(bindings)
+
+    def test_binding_buffer_name_mismatch_check_raises(self) -> None:
+        bindings = [
+            self._binding(("weight",), ("table", "mask")),
+            self._binding(("weight",), ("table", "other")),
+        ]
+
+        with pytest.raises(
+            ValueError,
+            match="Block 1 pinned buffer target names differ from block 0",
+        ):
+            _check_block_binding_target_names_match(bindings)
 
     def test_constructor_validates_pinned_binding_names(
         self, monkeypatch: pytest.MonkeyPatch,
@@ -1611,12 +1628,8 @@ class TestStreamedTargetPoolValidation:
         m = _make_block_model(num_blocks=2)
         bindings = iter(
             [
-                SimpleNamespace(
-                    pinned_params=[SimpleNamespace(name="weight")],
-                ),
-                SimpleNamespace(
-                    pinned_params=[SimpleNamespace(name="other")],
-                ),
+                self._binding(("weight",)),
+                self._binding(("other",)),
             ]
         )
 
@@ -1636,7 +1649,41 @@ class TestStreamedTargetPoolValidation:
 
         with pytest.raises(
             ValueError,
-            match="Block 1 pinned target names differ from block 0",
+            match="Block 1 pinned param target names differ from block 0",
+        ):
+            StreamedWeights(
+                list(m.transformer_blocks),
+                blocks_to_swap=1,
+            )
+
+    def test_constructor_validates_pinned_buffer_names(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        m = _make_block_model(num_blocks=2)
+        bindings = iter(
+            [
+                self._binding(("weight",), ("table",)),
+                self._binding(("weight",), ("other",)),
+            ]
+        )
+
+        def fake_pin_module_slot_collection(
+            _collection: object,
+            *,
+            validate_param: object | None = None,
+        ) -> PinnedModuleBinding:
+            del validate_param
+            return next(bindings)
+
+        monkeypatch.setattr(
+            streamed_weights_module,
+            "pin_module_slot_collection",
+            fake_pin_module_slot_collection,
+        )
+
+        with pytest.raises(
+            ValueError,
+            match="Block 1 pinned buffer target names differ from block 0",
         ):
             StreamedWeights(
                 list(m.transformer_blocks),
@@ -1701,6 +1748,64 @@ class TestBlockLayoutSignature:
                 self.bar = nn.Parameter(torch.randn(4, 4), requires_grad=False)
 
         with pytest.raises(ValueError, match="layout differs"):
+            StreamedWeights(
+                blocks=[A(), B()],
+                blocks_to_swap=1,
+            )
+
+    def test_buffer_shape_mismatch_raises(self) -> None:
+        class Block(nn.Module):
+            def __init__(self, buffer_size: int):
+                super().__init__()
+                self.weight = nn.Parameter(
+                    torch.randn(4, 4), requires_grad=False,
+                )
+                self.register_buffer("table", torch.randn(buffer_size))
+
+        with pytest.raises(ValueError, match="buffer layout differs"):
+            StreamedWeights(
+                blocks=[Block(4), Block(8)],
+                blocks_to_swap=1,
+            )
+
+    def test_buffer_stride_mismatch_raises(self) -> None:
+        class Block(nn.Module):
+            def __init__(self, table: torch.Tensor):
+                super().__init__()
+                self.weight = nn.Parameter(
+                    torch.randn(4, 4), requires_grad=False,
+                )
+                self.register_buffer("table", table)
+
+        contiguous = torch.randn(2, 3)
+        non_contiguous = torch.randn(3, 2).t()
+        assert contiguous.shape == non_contiguous.shape
+        assert contiguous.stride() != non_contiguous.stride()
+
+        with pytest.raises(ValueError, match="buffer layout differs"):
+            StreamedWeights(
+                blocks=[Block(contiguous), Block(non_contiguous)],
+                blocks_to_swap=1,
+            )
+
+    def test_buffer_name_mismatch_raises(self) -> None:
+        class A(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = nn.Parameter(
+                    torch.randn(4, 4), requires_grad=False,
+                )
+                self.register_buffer("foo", torch.randn(4))
+
+        class B(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = nn.Parameter(
+                    torch.randn(4, 4), requires_grad=False,
+                )
+                self.register_buffer("bar", torch.randn(4))
+
+        with pytest.raises(ValueError, match="buffer layout differs"):
             StreamedWeights(
                 blocks=[A(), B()],
                 blocks_to_swap=1,

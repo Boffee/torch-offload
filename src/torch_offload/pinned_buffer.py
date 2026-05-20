@@ -9,7 +9,7 @@ import torch
 from .tensor_adapters import clone_to_pinned_cpu
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, eq=False)
 class PinnedBuffer:
     """Pinned host storage for one registered buffer.
 

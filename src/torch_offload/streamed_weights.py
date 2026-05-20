@@ -58,6 +58,7 @@ from .pinned_bindings import (
     PinnedParamBinding,
     pin_module_slot_collection,
 )
+from .pinned_buffer import PinnedBuffer
 from .pinned_param import (
     PinnedParam,
     PostCopyHook,
@@ -117,12 +118,18 @@ class _PinnedModuleTargetPool:
 
     def __init__(
         self,
-        template: list[PinnedParam],
+        template_params: list[PinnedParam],
+        template_buffers: list[PinnedBuffer],
         num_slots: int,
         device: torch.device,
     ) -> None:
         self._targets = [
-            PinnedModuleTarget(template, device) for _ in range(num_slots)
+            PinnedModuleTarget(
+                template_params,
+                device,
+                pinned_buffers=template_buffers,
+            )
+            for _ in range(num_slots)
         ]
         self._free: list[int] = list(range(num_slots))
         self._events: list[torch.cuda.Event | None] = [None] * num_slots
@@ -171,10 +178,19 @@ def _layout_signature(p: nn.Parameter) -> tuple:
     return select_adapter(p.data).layout_signature(p.data)
 
 
+def _buffer_layout_signature(buffer: torch.Tensor) -> tuple:
+    return (
+        tuple(buffer.shape),
+        tuple(buffer.stride()),
+        buffer.dtype,
+        buffer.layout,
+    )
+
+
 def _check_block_layouts_match(
     block_slot_collections: Sequence[ModuleSlotCollection],
 ) -> None:
-    """Raise if blocks have mismatched param layouts. Called before
+    """Raise if blocks have mismatched param/buffer layouts. Called before
     pinning so layout failures leave parameter slots and storage
     untouched.
 
@@ -189,7 +205,14 @@ def _check_block_layouts_match(
             for slots in collection.param_slot_groups
         )
 
+    def buffer_sig(collection: ModuleSlotCollection) -> tuple:
+        return tuple(
+            (slots[0].name, _buffer_layout_signature(slots[0].get()))
+            for slots in collection.buffer_slot_groups
+        )
+
     ref = sig(block_slot_collections[0])
+    ref_buffers = buffer_sig(block_slot_collections[0])
     for i in range(1, len(block_slot_collections)):
         if sig(block_slot_collections[i]) != ref:
             raise ValueError(
@@ -199,6 +222,15 @@ def _check_block_layouts_match(
                 "tensor-adapter wrapper metadata). Split heterogeneous "
                 "block lists across separate `layers_attr=[...]` "
                 "groups in ModelOffloader."
+            )
+        if buffer_sig(block_slot_collections[i]) != ref_buffers:
+            raise ValueError(
+                f"Block {i} buffer layout differs from block 0. "
+                "All blocks in a StreamedWeights group must share the "
+                "same buffer structure (names, shapes, dtypes, and "
+                "tensor layouts). Split heterogeneous block lists "
+                "across separate `layers_attr=[...]` groups in "
+                "ModelOffloader."
             )
 
 
@@ -210,23 +242,39 @@ def _check_block_binding_target_names_match(
     This post-pin internal invariant keeps the GPU pool's name-matching
     contract explicit without putting validation on the block-load hot
     path. The pre-pin layout check catches user-facing name mismatches
-    before mutation; this validates the actual ``PinnedParam.name`` keys
-    that will address :class:`PinnedModuleTarget` storage.
+    before mutation; this validates the actual pinned param/buffer name
+    keys that will address :class:`PinnedModuleTarget` storage.
     """
     if len(block_bindings) <= 1:
         return
 
-    ref = tuple(pinned.name for pinned in block_bindings[0].pinned_params)
+    ref_params = tuple(
+        pinned.name for pinned in block_bindings[0].pinned_params
+    )
+    ref_buffers = tuple(
+        pinned.name for pinned in block_bindings[0].pinned_buffers
+    )
     for i in range(1, len(block_bindings)):
-        names = tuple(
+        param_names = tuple(
             pinned.name for pinned in block_bindings[i].pinned_params
         )
-        if names != ref:
+        if param_names != ref_params:
             raise ValueError(
-                f"Block {i} pinned target names differ from block 0. "
+                f"Block {i} pinned param target names differ from block 0. "
                 "All blocks in a StreamedWeights group must share the "
-                "same ordered pinned target names. Expected "
-                f"{ref!r}; got {names!r}."
+                "same ordered pinned param target names. Expected "
+                f"{ref_params!r}; got {param_names!r}."
+            )
+
+        buffer_names = tuple(
+            pinned.name for pinned in block_bindings[i].pinned_buffers
+        )
+        if buffer_names != ref_buffers:
+            raise ValueError(
+                f"Block {i} pinned buffer target names differ from block 0. "
+                "All blocks in a StreamedWeights group must share the "
+                "same ordered pinned buffer target names. Expected "
+                f"{ref_buffers!r}; got {buffer_names!r}."
             )
 
 
@@ -953,6 +1001,7 @@ class StreamedWeights:
         # check has already verified every other block matches.
         self._pool = _PinnedModuleTargetPool(
             self._block_bindings[0].pinned_params,
+            self._block_bindings[0].pinned_buffers,
             num_gpu_slots,
             device,
         )

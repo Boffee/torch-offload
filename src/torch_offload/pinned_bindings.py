@@ -117,8 +117,8 @@ class PinnedBufferBinding:
         non_blocking: bool = False,
     ) -> torch.Tensor:
         """Copy the pinned clone to ``target`` and return the target tensor."""
-        return self.pinned.tensor.to(
-            target.device, non_blocking=non_blocking,
+        return target.load_buffer(
+            self.pinned, non_blocking=non_blocking,
         )
 
     def load_to_target(
@@ -136,21 +136,31 @@ class PinnedModuleTarget:
     """GPU storage target for one :class:`PinnedModuleBinding` layout.
 
     The target owns adapter-specific GPU storage for every pinned param
-    in a binding-compatible module scope. Repeated :meth:`load_param`
-    calls copy pinned CPU bytes into the same GPU storage and return the
-    same ``nn.Parameter`` wrapper for a given pinned param name.
+    and reusable GPU tensors for every pinned buffer in a
+    binding-compatible module scope. Repeated load calls copy pinned CPU
+    bytes into the same GPU storage and return the same active object
+    for a given pinned state name.
 
-    ``PinnedParam.name`` is the target storage key. It is intentionally
-    the module-relative PyTorch parameter name: whole-model targets use
-    fully qualified names, while streamed block targets use block-local
-    names so every block can load into the same pool layout. Names must
-    be unique within one target.
+    ``PinnedParam.name`` and ``PinnedBuffer.name`` are target storage
+    keys. They are intentionally the module-relative PyTorch names:
+    whole-model targets use fully qualified names, while streamed block
+    targets use block-local names so every block can load into the same
+    pool layout. Names must be unique within each target namespace.
     """
 
-    __slots__ = ("_device", "_target_params", "_target_states")
+    __slots__ = (
+        "_device",
+        "_target_buffers",
+        "_target_params",
+        "_target_states",
+    )
 
     def __init__(
-        self, pinned_params: Sequence[PinnedParam], device: torch.device,
+        self,
+        pinned_params: Sequence[PinnedParam],
+        device: torch.device,
+        *,
+        pinned_buffers: Sequence[PinnedBuffer] = (),
     ) -> None:
         if device.type != "cuda":
             raise ValueError(
@@ -158,14 +168,23 @@ class PinnedModuleTarget:
                 f"got {device}."
             )
         self._device = device
-        seen_names: set[str] = set()
+        seen_param_names: set[str] = set()
         for pinned in pinned_params:
-            if pinned.name in seen_names:
+            if pinned.name in seen_param_names:
                 raise ValueError(
-                    "PinnedModuleTarget requires unique pinned target "
+                    "PinnedModuleTarget requires unique pinned param target "
                     f"names; got duplicate {pinned.name!r}."
                 )
-            seen_names.add(pinned.name)
+            seen_param_names.add(pinned.name)
+
+        seen_buffer_names: set[str] = set()
+        for pinned in pinned_buffers:
+            if pinned.name in seen_buffer_names:
+                raise ValueError(
+                    "PinnedModuleTarget requires unique pinned buffer target "
+                    f"names; got duplicate {pinned.name!r}."
+                )
+            seen_buffer_names.add(pinned.name)
 
         self._target_states: dict[str, object] = {}
         self._target_params: dict[str, nn.Parameter] = {}
@@ -174,6 +193,12 @@ class PinnedModuleTarget:
             self._target_states[pinned.name] = target_state
             self._target_params[pinned.name] = pinned.make_gpu_param(
                 target_state
+            )
+        self._target_buffers: dict[str, torch.Tensor] = {}
+        for pinned in pinned_buffers:
+            self._target_buffers[pinned.name] = torch.empty_like(
+                pinned.tensor,
+                device=device,
             )
 
     @property
@@ -191,6 +216,17 @@ class PinnedModuleTarget:
             self._target_states[pinned.name], non_blocking=non_blocking,
         )
         return self._target_params[pinned.name]
+
+    def load_buffer(
+        self,
+        pinned: PinnedBuffer,
+        *,
+        non_blocking: bool = False,
+    ) -> torch.Tensor:
+        """Copy ``pinned`` into this target and return its GPU tensor."""
+        target = self._target_buffers[pinned.name]
+        target.copy_(pinned.tensor, non_blocking=non_blocking)
+        return target
 
 
 @dataclass(slots=True)
