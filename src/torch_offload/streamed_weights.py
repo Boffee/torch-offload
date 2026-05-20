@@ -246,14 +246,14 @@ def _check_block_binding_target_names_match(
         return
 
     ref_params = tuple(
-        pinned.name for pinned in block_bindings[0].pinned_params
+        binding.name for binding in block_bindings[0].param_bindings
     )
     ref_buffers = tuple(
-        pinned.name for pinned in block_bindings[0].pinned_buffers
+        binding.name for binding in block_bindings[0].buffer_bindings
     )
     for i in range(1, len(block_bindings)):
         param_names = tuple(
-            pinned.name for pinned in block_bindings[i].pinned_params
+            binding.name for binding in block_bindings[i].param_bindings
         )
         if param_names != ref_params:
             raise ValueError(
@@ -264,7 +264,7 @@ def _check_block_binding_target_names_match(
             )
 
         buffer_names = tuple(
-            pinned.name for pinned in block_bindings[i].pinned_buffers
+            binding.name for binding in block_bindings[i].buffer_bindings
         )
         if buffer_names != ref_buffers:
             raise ValueError(
@@ -598,13 +598,13 @@ class StreamedWeights:
         ):
             raise ValueError(
                 "param binding "
-                f"{binding.pinned.name!r} is not owned by this StreamedWeights"
+                f"{binding.name!r} is not owned by this StreamedWeights"
             )
         key = id(binding)
         if key in self._post_copy_hooks:
             raise RuntimeError(
                 "post-copy hook already registered for "
-                f"param binding {binding.pinned.name!r}"
+                f"param binding {binding.name!r}"
             )
         self._post_copy_hooks[key] = hook
         return PostCopyHookHandle(self._post_copy_hooks, key)

@@ -49,6 +49,10 @@ class PinnedParamBinding:
     cpu_param: nn.Parameter
 
     @property
+    def name(self) -> str:
+        return self.pinned.name
+
+    @property
     def unique_slots(self) -> list[ParamSlot]:
         return unique_slots(self.slots)
 
@@ -82,6 +86,10 @@ class PinnedBufferBinding:
 
     pinned: PinnedBuffer
     slots: list[BufferSlot]
+
+    @property
+    def name(self) -> str:
+        return self.pinned.name
 
     @property
     def unique_slots(self) -> list[BufferSlot]:
@@ -282,7 +290,7 @@ class PinnedModuleBinding:
             self.pinned_params, non_blocking=non_blocking,
         )
         for param_binding in self.param_bindings:
-            target_param = target_params[param_binding.pinned.name]
+            target_param = target_params[param_binding.name]
             hook = (
                 post_copy_hooks.get(id(param_binding))
                 if post_copy_hooks is not None
@@ -296,10 +304,10 @@ class PinnedModuleBinding:
         )
 
         for param_binding in self.param_bindings:
-            param_binding.set_slots(target_params[param_binding.pinned.name])
+            param_binding.set_slots(target_params[param_binding.name])
 
         for buffer_binding in self.buffer_bindings:
-            buffer_binding.set_slots(target_buffers[buffer_binding.pinned.name])
+            buffer_binding.set_slots(target_buffers[buffer_binding.name])
 
     def iter_trainables(
         self,

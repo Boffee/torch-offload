@@ -249,13 +249,13 @@ class PinnedWeights:
         if not self._binding.contains_param_binding(binding):
             raise ValueError(
                 "param binding "
-                f"{binding.pinned.name!r} is not owned by this PinnedWeights"
+                f"{binding.name!r} is not owned by this PinnedWeights"
             )
         key = id(binding)
         if key in self._post_copy_hooks:
             raise RuntimeError(
                 "post-copy hook already registered for "
-                f"param binding {binding.pinned.name!r}"
+                f"param binding {binding.name!r}"
             )
         self._post_copy_hooks[key] = hook
         return PostCopyHookHandle(self._post_copy_hooks, key)

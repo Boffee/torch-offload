@@ -401,7 +401,7 @@ class TestSharedSubmoduleAlias:
             # One pinned buffer binding covers both alias paths.
             assert len(pw.buffer_bindings) == 1
             buffer_binding = pw.buffer_bindings[0]
-            assert buffer_binding.pinned.name == "a.buf"
+            assert buffer_binding.name == "a.buf"
             assert buffer_binding.pinned.tensor.is_pinned()
             assert len(buffer_binding.unique_slots) == 2
             # Both module slots reference the SAME pinned tensor.

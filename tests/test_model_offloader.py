@@ -1589,10 +1589,10 @@ class TestStreamedTargetPoolValidation:
         return cast(
             PinnedModuleBinding,
             SimpleNamespace(
-                pinned_params=[
+                param_bindings=[
                     SimpleNamespace(name=name) for name in param_names
                 ],
-                pinned_buffers=[
+                buffer_bindings=[
                     SimpleNamespace(name=name) for name in buffer_names
                 ],
             ),
