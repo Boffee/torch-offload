@@ -17,7 +17,6 @@ are exposed through adapter capability methods.
 
 from __future__ import annotations
 
-from collections.abc import Callable, MutableMapping
 from typing import Any
 
 import torch
@@ -33,31 +32,10 @@ from .tensor_adapters import (
     adapter_name,
 )
 
-PostCopyHook = Callable[[nn.Parameter], None]
-
 
 def storage_key(t: torch.Tensor) -> tuple[Any, ...]:
     """Compatibility wrapper for :func:`tensor_adapter_factory.storage_key`."""
     return _storage_key(t)
-
-
-class PostCopyHookHandle:
-    """Removal handle returned by post-copy hook registration."""
-
-    __slots__ = ("_hooks", "_key")
-
-    def __init__(
-        self, hooks: MutableMapping[int, PostCopyHook], key: int,
-    ) -> None:
-        self._hooks: MutableMapping[int, PostCopyHook] | None = hooks
-        self._key = key
-
-    def remove(self) -> None:
-        hooks = self._hooks
-        if hooks is None:
-            return
-        hooks.pop(self._key, None)
-        self._hooks = None
 
 
 class PinnedParam:

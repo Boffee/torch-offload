@@ -377,7 +377,7 @@ class TestPinnedBindings:
 
         module_binding.load_to_target(
             cast(PinnedModuleTarget, fake_target),
-            post_copy_hooks={id(pinned): hook},
+            post_copy_hooks={id(binding): hook},
             non_blocking=True,
         )
 

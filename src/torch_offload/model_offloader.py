@@ -22,7 +22,7 @@ from torch import nn
 
 from ._devices import canonical_device
 from .lora import LoRA, LoRARouteHandle, LoRATransform
-from .pinned_param import PinnedParam
+from .pinned_bindings import PinnedParamBinding
 from .pinned_weights import PinnedWeights
 from .protocols import ModelStrategyComponent, SlotKey
 from .slots import (
@@ -310,7 +310,7 @@ class ModelOffloader:
         self._teardown_stack: contextlib.ExitStack | None = None
 
         (
-            self._target_to_pinned_param,
+            self._target_to_param_binding,
             self._target_to_parents,
             self._target_to_component,
         ) = self._build_target_index(streamers, layer_paths, non_block)
@@ -387,18 +387,18 @@ class ModelOffloader:
         self, loras: Sequence[tuple[LoRA, float]],
     ) -> _LoraTargetMap:
         per_target: _LoraTargetMap = {}
-        per_pinned_param_target: dict[int, str] = {}
+        per_param_binding_target: dict[int, str] = {}
         total_targets = 0
         matched_targets = 0
         for lora, strength in loras:
             for target_key, (a, b) in lora.targets.items():
                 total_targets += 1
-                pinned = self._target_to_pinned_param.get(target_key)
-                if pinned is None:
+                param_binding = self._target_to_param_binding.get(target_key)
+                if param_binding is None:
                     continue
                 matched_targets += 1
-                existing_target = per_pinned_param_target.setdefault(
-                    id(pinned), target_key
+                existing_target = per_param_binding_target.setdefault(
+                    id(param_binding), target_key
                 )
                 if existing_target != target_key:
                     raise ValueError(
@@ -414,7 +414,7 @@ class ModelOffloader:
 
         if matched_targets < total_targets:
             sample_lora = sorted(next(iter(loras))[0].targets)[:3]
-            sample_index = sorted(self._target_to_pinned_param)[:3]
+            sample_index = sorted(self._target_to_param_binding)[:3]
             logger.warning(
                 "set_loras matched %d/%d targets. "
                 "Sample LoRA keys: %s ... Sample index keys: %s ...",
@@ -449,11 +449,11 @@ class ModelOffloader:
             )
 
         for target_key, refs in targets.items():
-            pinned = self._target_to_pinned_param[target_key]
+            param_binding = self._target_to_param_binding[target_key]
             component = self._target_to_component[target_key]
             transform = LoRATransform(refs)
             handle = component.register_post_copy_hook(
-                pinned, transform.apply,
+                param_binding, transform.apply,
             )
             self._lora_hook_handles.append(handle)
 
@@ -767,14 +767,14 @@ class ModelOffloader:
         layer_paths: list[str],
         non_block: PinnedWeights | None,
     ) -> tuple[
-        dict[str, PinnedParam],
+        dict[str, PinnedParamBinding],
         dict[str, tuple[nn.Module, ...]],
         dict[str, PinnedWeights | StreamedWeights],
     ]:
-        """Map canonical param names to their :class:`PinnedParam`
+        """Map canonical param names to their :class:`PinnedParamBinding`
         and to the tuple of parent modules where the param is installed.
 
-        The pinned-param map drives merge-mode LoRA post-copy hooks, the
+        The param-binding map drives merge-mode LoRA post-copy hooks, the
         component map identifies which component owns the copy loop,
         and the parents map drives routed-mode LoRA forward hooks.
 
@@ -792,7 +792,7 @@ class ModelOffloader:
         handles tied storage uniformly because it mutates the shared
         bytes).
         """
-        pinned_params: dict[str, PinnedParam] = {}
+        param_bindings: dict[str, PinnedParamBinding] = {}
         parents: dict[str, tuple[nn.Module, ...]] = {}
         components: dict[str, PinnedWeights | StreamedWeights] = {}
 
@@ -813,7 +813,7 @@ class ModelOffloader:
                     for slot in param_binding.slots:
                         full_name = f"{layer_path}.{block_idx}.{slot.name}"
                         key = canonical_param_name(full_name)
-                        pinned_params[key] = param_binding.pinned
+                        param_bindings[key] = param_binding
                         parents[key] = parent_tuple
                         components[key] = streamer
 
@@ -832,11 +832,11 @@ class ModelOffloader:
                 parent_tuple = tuple(slot_parents)
                 for slot in param_binding.slots:
                     key = canonical_param_name(slot.name)
-                    pinned_params[key] = param_binding.pinned
+                    param_bindings[key] = param_binding
                     parents[key] = parent_tuple
                     components[key] = non_block
 
-        return pinned_params, parents, components
+        return param_bindings, parents, components
 
 
 # ---------------------------------------------------------------------------

@@ -56,12 +56,12 @@ from .pinned_bindings import (
     PinnedModuleBinding,
     PinnedModuleTarget,
     PinnedParamBinding,
+    PostCopyHook,
+    PostCopyHookHandle,
     pin_module_slot_collection,
 )
 from .pinned_param import (
     PinnedParam,
-    PostCopyHook,
-    PostCopyHookHandle,
 )
 from .protocols import SlotKey
 from .slots import (
@@ -584,27 +584,27 @@ class StreamedWeights:
         return any(binding.has_trainables() for binding in self._block_bindings)
 
     def register_post_copy_hook(
-        self, pinned: PinnedParam, hook: PostCopyHook,
+        self, binding: PinnedParamBinding, hook: PostCopyHook,
     ) -> PostCopyHookHandle:
-        """Register a hook run after this component copies ``pinned`` to GPU.
+        """Register a hook after this component copies ``binding`` to GPU.
 
         Package-internal: used by :class:`ModelOffloader` for merge-mode
         LoRA. Mirrors PyTorch's hook registration pattern by returning a
         handle whose :meth:`remove` method unregisters the hook.
         """
         if not any(
-            binding.contains_pinned_param(pinned)
-            for binding in self._block_bindings
+            block_binding.contains_param_binding(binding)
+            for block_binding in self._block_bindings
         ):
             raise ValueError(
-                "pinned param "
-                f"{pinned.name!r} is not owned by this StreamedWeights"
+                "param binding "
+                f"{binding.pinned.name!r} is not owned by this StreamedWeights"
             )
-        key = id(pinned)
+        key = id(binding)
         if key in self._post_copy_hooks:
             raise RuntimeError(
                 "post-copy hook already registered for "
-                f"pinned param {pinned.name!r}"
+                f"param binding {binding.pinned.name!r}"
             )
         self._post_copy_hooks[key] = hook
         return PostCopyHookHandle(self._post_copy_hooks, key)

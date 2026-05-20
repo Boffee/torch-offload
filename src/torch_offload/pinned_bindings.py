@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass
 
 import torch
 from torch import nn
 
 from .pinned_buffer import PinnedBuffer
-from .pinned_param import PinnedParam, PostCopyHook
+from .pinned_param import PinnedParam
 from .slots import (
     BufferSlot,
     ModuleSlotCollection,
@@ -17,6 +17,27 @@ from .slots import (
     set_param_data,
     unique_slots,
 )
+
+PostCopyHook = Callable[[nn.Parameter], None]
+
+
+class PostCopyHookHandle:
+    """Removal handle returned by post-copy hook registration."""
+
+    __slots__ = ("_hooks", "_key")
+
+    def __init__(
+        self, hooks: MutableMapping[int, PostCopyHook], key: int,
+    ) -> None:
+        self._hooks: MutableMapping[int, PostCopyHook] | None = hooks
+        self._key = key
+
+    def remove(self) -> None:
+        hooks = self._hooks
+        if hooks is None:
+            return
+        hooks.pop(self._key, None)
+        self._hooks = None
 
 
 @dataclass(slots=True)
@@ -230,11 +251,8 @@ class PinnedModuleBinding:
             buffer_binding.pinned for buffer_binding in self.buffer_bindings
         ]
 
-    def contains_pinned_param(self, pinned: PinnedParam) -> bool:
-        return any(
-            param_binding.pinned is pinned
-            for param_binding in self.param_bindings
-        )
+    def contains_param_binding(self, binding: PinnedParamBinding) -> bool:
+        return any(binding is candidate for candidate in self.param_bindings)
 
     def restore_pinned(self) -> None:
         """Restore managed slots to their pinned CPU forms.
@@ -266,7 +284,7 @@ class PinnedModuleBinding:
         for param_binding in self.param_bindings:
             target_param = target_params[param_binding.pinned.name]
             hook = (
-                post_copy_hooks.get(id(param_binding.pinned))
+                post_copy_hooks.get(id(param_binding))
                 if post_copy_hooks is not None
                 else None
             )
@@ -378,5 +396,7 @@ __all__ = [
     "PinnedModuleBinding",
     "PinnedModuleTarget",
     "PinnedParamBinding",
+    "PostCopyHook",
+    "PostCopyHookHandle",
     "pin_module_slot_collection",
 ]

@@ -195,14 +195,14 @@ def _make_strategy(
 
 def _has_post_copy_hook(strategy: ModelOffloader, target_key: str) -> bool:
     """Check whether a merge hook is installed for the given target."""
-    pinned = strategy._target_to_pinned_param.get(target_key)
+    param_binding = strategy._target_to_param_binding.get(target_key)
     component = strategy._target_to_component.get(target_key)
-    if pinned is None or component is None:
+    if param_binding is None or component is None:
         return False
     if isinstance(component, PinnedWeights):
-        return id(pinned) in component._post_copy_hooks
+        return id(param_binding) in component._post_copy_hooks
     if isinstance(component, StreamedWeights):
-        return id(pinned) in component._post_copy_hooks
+        return id(param_binding) in component._post_copy_hooks
     return False
 
 
