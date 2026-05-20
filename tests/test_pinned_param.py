@@ -153,7 +153,7 @@ class TestPinnedParam:
     @CUDA
     def test_slot_param_identity_stable_across_loads(self) -> None:
         # PinnedModuleTarget caches the Parameter wrapping its GPU storage;
-        # load_param must not churn that wrapper. Module slots observe a
+        # load_params must not churn those wrappers. Module slots observe a
         # stable object across reloads — the whole point of the pooled
         # target pattern over per-load allocation.
         from torch_offload.pinned_bindings import PinnedModuleTarget
@@ -161,7 +161,7 @@ class TestPinnedParam:
         p1 = nn.Parameter(torch.randn(8, dtype=torch.bfloat16), requires_grad=False)
         p2 = nn.Parameter(torch.randn(8, dtype=torch.bfloat16), requires_grad=False)
         block = [PinnedParam("a", p1), PinnedParam("b", p2)]
-        target = PinnedModuleTarget(block, torch.device("cuda"))
+        target = PinnedModuleTarget(block, device=torch.device("cuda"))
 
         loaded = target.load_params(block, non_blocking=False)
         a_first = loaded["a"]
@@ -185,7 +185,7 @@ class TestPinnedParam:
             ValueError,
             match="duplicate 'w'",
         ):
-            PinnedModuleTarget(block, torch.device("cuda"))
+            PinnedModuleTarget(block, device=torch.device("cuda"))
 
     @CUDA
     def test_module_target_rejects_duplicate_buffer_names(self) -> None:
@@ -200,8 +200,8 @@ class TestPinnedParam:
         ):
             PinnedModuleTarget(
                 [],
-                torch.device("cuda"),
-                pinned_buffers=buffers,
+                buffers,
+                device=torch.device("cuda"),
             )
 
     @CUDA
@@ -209,8 +209,8 @@ class TestPinnedParam:
         pinned = PinnedBuffer.clone("buf", torch.randn(8))
         target = PinnedModuleTarget(
             [],
-            torch.device("cuda"),
-            pinned_buffers=[pinned],
+            [pinned],
+            device=torch.device("cuda"),
         )
 
         first = target.load_buffers([pinned], non_blocking=False)["buf"]
@@ -229,7 +229,7 @@ class TestPinnedParam:
         p = nn.Parameter(torch.randn(8, dtype=torch.bfloat16), requires_grad=False)
         pinned_param = PinnedParam("w", p)
         block = [pinned_param]
-        target = PinnedModuleTarget(block, torch.device("cuda"))
+        target = PinnedModuleTarget(block, device=torch.device("cuda"))
         base_param = target.load_params(block, non_blocking=False)["w"]
 
         def hook(param: nn.Parameter) -> None:

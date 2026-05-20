@@ -102,9 +102,9 @@ class PinnedModuleTarget:
     def __init__(
         self,
         pinned_params: Sequence[PinnedParam],
-        device: torch.device,
-        *,
         pinned_buffers: Sequence[PinnedBuffer] = (),
+        *,
+        device: torch.device,
     ) -> None:
         if device.type != "cuda":
             raise ValueError(

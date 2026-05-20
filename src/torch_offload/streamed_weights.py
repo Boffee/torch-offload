@@ -126,8 +126,8 @@ class _PinnedModuleTargetPool:
         self._targets = [
             PinnedModuleTarget(
                 template_params,
-                device,
-                pinned_buffers=template_buffers,
+                template_buffers,
+                device=device,
             )
             for _ in range(num_slots)
         ]

@@ -298,8 +298,8 @@ class PinnedWeights:
             # tying invariant survives on device.
             target = PinnedModuleTarget(
                 self._binding.pinned_params,
-                active_device,
-                pinned_buffers=self._binding.pinned_buffers,
+                self._binding.pinned_buffers,
+                device=active_device,
             )
             self._binding.load_to_target(
                 target,
