@@ -13,7 +13,6 @@ from torch_offload.pinned_bindings import (
     PinnedBufferBinding,
     PinnedBufferTarget,
     PinnedModuleBinding,
-    PinnedModuleStore,
     PinnedModuleTarget,
     PinnedParamBinding,
     PinnedParamTarget,
@@ -398,79 +397,6 @@ class TestPinnedParam:
 
 
 class TestPinnedBindings:
-    def test_module_store_maps_alias_names_to_shared_param_backing(
-        self,
-    ) -> None:
-        module = nn.Module()
-        shared = nn.Linear(2, 2, bias=False)
-        module.left = shared
-        module.right = shared
-
-        store = PinnedModuleStore.from_module(module)
-
-        assert set(store.params) == {"left.weight", "right.weight"}
-        assert store.params["left.weight"] is store.params["right.weight"]
-        assert store.cache_bytes == store.params["left.weight"].cache_bytes
-
-    def test_module_store_keeps_distinct_param_backings_separate(
-        self,
-    ) -> None:
-        module = nn.Module()
-        module.left = nn.Linear(2, 2, bias=False)
-        module.right = nn.Linear(2, 2, bias=False)
-
-        store = PinnedModuleStore.from_module(module)
-
-        assert set(store.params) == {"left.weight", "right.weight"}
-        assert store.params["left.weight"] is not store.params["right.weight"]
-        assert store.cache_bytes == (
-            store.params["left.weight"].cache_bytes
-            + store.params["right.weight"].cache_bytes
-        )
-
-    def test_module_store_restores_storage_aliases_to_shared_pinned_param(
-        self,
-    ) -> None:
-        module = nn.Module()
-        shared = torch.randn(2, 2)
-        module.a = nn.Parameter(shared, requires_grad=False)
-        module.b = nn.Parameter(shared, requires_grad=False)
-
-        store = PinnedModuleStore.from_module(module)
-
-        assert set(store.params) == {"a", "b"}
-        assert store.params["a"] is store.params["b"]
-        assert module.a is module.b
-        assert module.a.data.data_ptr() == store.params["a"].make_cpu_param().data_ptr()
-
-    def test_module_store_maps_alias_names_to_shared_buffer_backing(
-        self,
-    ) -> None:
-        module = nn.Module()
-        shared = torch.tensor([1.0, 2.0])
-        module.register_buffer("running", shared)
-        module.register_buffer("running_alias", shared)
-
-        store = PinnedModuleStore.from_module(module)
-
-        assert store.params == {}
-        assert set(store.buffers) == {"running", "running_alias"}
-        assert store.buffers["running"] is store.buffers["running_alias"]
-        assert store.cache_bytes == store.buffers["running"].cache_bytes
-        assert module.running is module.running_alias
-        assert module.running.data_ptr() == store.buffers["running"].tensor.data_ptr()
-
-    def test_module_store_can_exclude_buffers(self) -> None:
-        module = nn.Module()
-        module.weight = nn.Parameter(torch.randn(2, 2), requires_grad=False)
-        module.register_buffer("running", torch.randn(2))
-
-        store = PinnedModuleStore.from_module(module, include_buffers=False)
-
-        assert set(store.params) == {"weight"}
-        assert store.buffers == {}
-        assert store.cache_bytes == store.params["weight"].cache_bytes
-
     def test_module_binding_cache_bytes_dedupes_repeated_backing(
         self,
     ) -> None:

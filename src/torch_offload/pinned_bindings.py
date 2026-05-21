@@ -10,13 +10,10 @@ from torch import nn
 
 from .pinned_buffer import PinnedBuffer
 from .pinned_param import PinnedParam
-from .protocols import SlotKey
 from .slots import (
     BufferSlot,
     ModuleSlotCollection,
-    ParamGroupBy,
     ParamSlot,
-    collect_module_slots,
     set_param_data,
     unique_slots,
 )
@@ -204,72 +201,6 @@ class PinnedBufferBinding:
     def restore_pinned(self) -> None:
         """Repoint managed buffer slots to the pinned CPU clone."""
         self.set_slots(self.pinned.tensor)
-
-
-@dataclass(slots=True)
-class PinnedModuleStore:
-    """Name-keyed pinned backing store for one module layout.
-
-    The store has no live module slots. It only records the pinned host
-    bytes that may be shared by multiple concrete module instances.
-    Alias names point at the same :class:`PinnedParam` or
-    :class:`PinnedBuffer` object, so object identity is the canonical
-    backing identity.
-    """
-
-    params: dict[str, PinnedParam]
-    buffers: dict[str, PinnedBuffer]
-
-    @classmethod
-    def from_module(
-        cls,
-        module: nn.Module,
-        *,
-        skip_slots: set[SlotKey] | frozenset[SlotKey] | None = None,
-        include_buffers: bool = True,
-        param_group_by: ParamGroupBy = "storage",
-        validate_param: Callable[[ParamSlot], None] | None = None,
-    ) -> PinnedModuleStore:
-        """Pin ``module`` into a name-keyed backing store.
-
-        ``remove_duplicate=False`` slot collection preserves every
-        logical PyTorch name. Slot groups that share backing storage are
-        pinned once, and every alias name maps to that one pinned object.
-        After each group is pinned, the source module's slots are
-        restored to the shared pinned CPU backing so construction does
-        not leave storage aliases split between original and pinned
-        tensors.
-        """
-        collection = collect_module_slots(
-            module,
-            skip_slots=skip_slots,
-            include_buffers=include_buffers,
-            param_group_by=param_group_by,
-            validate_param=validate_param,
-        )
-        return cls(
-            params=_pin_store_params(collection.param_slot_groups),
-            buffers=_pin_store_buffers(collection.buffer_slot_groups),
-        )
-
-    @property
-    def cache_bytes(self) -> int:
-        """Pinned host bytes owned by this store, deduped by backing."""
-        total = 0
-        seen: set[int] = set()
-        for pinned in self.params.values():
-            key = id(pinned)
-            if key in seen:
-                continue
-            seen.add(key)
-            total += pinned.cache_bytes
-        for pinned in self.buffers.values():
-            key = id(pinned)
-            if key in seen:
-                continue
-            seen.add(key)
-            total += pinned.cache_bytes
-        return total
 
 
 def _validate_unique_binding_names(
@@ -491,48 +422,6 @@ def _pin_buffer_slots(slots: Sequence[BufferSlot]) -> PinnedBufferBinding:
     return PinnedBufferBinding(name=name, pinned=pinned, slots=slot_list)
 
 
-def _pin_store_params(
-    param_slot_groups: Sequence[Sequence[ParamSlot]],
-) -> dict[str, PinnedParam]:
-    params: dict[str, PinnedParam] = {}
-    for slots in param_slot_groups:
-        slot_list = list(slots)
-        if not slot_list:
-            raise ValueError("PinnedModuleStore requires non-empty param groups")
-        binding = _pin_param_slots(slot_list)
-        binding.restore_pinned()
-        pinned = binding.pinned
-        for slot in slot_list:
-            if slot.name in params:
-                raise ValueError(
-                    "PinnedModuleStore requires unique param names; "
-                    f"got duplicate {slot.name!r}."
-                )
-            params[slot.name] = pinned
-    return params
-
-
-def _pin_store_buffers(
-    buffer_slot_groups: Sequence[Sequence[BufferSlot]],
-) -> dict[str, PinnedBuffer]:
-    buffers: dict[str, PinnedBuffer] = {}
-    for slots in buffer_slot_groups:
-        slot_list = list(slots)
-        if not slot_list:
-            raise ValueError("PinnedModuleStore requires non-empty buffer groups")
-        binding = _pin_buffer_slots(slot_list)
-        binding.restore_pinned()
-        pinned = binding.pinned
-        for slot in slot_list:
-            if slot.name in buffers:
-                raise ValueError(
-                    "PinnedModuleStore requires unique buffer names; "
-                    f"got duplicate {slot.name!r}."
-                )
-            buffers[slot.name] = pinned
-    return buffers
-
-
 def _pin_module_slots(
     param_slot_groups: Sequence[Sequence[ParamSlot]],
     buffer_slot_groups: Sequence[Sequence[BufferSlot]],
@@ -569,7 +458,6 @@ __all__ = [
     "PinnedBufferBinding",
     "PinnedBufferTarget",
     "PinnedModuleBinding",
-    "PinnedModuleStore",
     "PinnedModuleTarget",
     "PinnedParamBinding",
     "PinnedParamTarget",
