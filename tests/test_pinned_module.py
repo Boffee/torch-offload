@@ -2,14 +2,71 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 import pytest
 import torch
 from torch import nn
 
+from torch_offload.pinned_buffer import PinnedBuffer
 from torch_offload.pinned_module import (
+    PinnedBufferTarget,
     PinnedModuleInstance,
     PinnedModuleStore,
+    PinnedModuleTarget,
+    PinnedParamTarget,
 )
+from torch_offload.pinned_param import PinnedParam
+
+
+class _FakePinnedParam:
+    def __init__(
+        self,
+        target_data: torch.Tensor,
+        *,
+        requires_grad: bool = False,
+    ) -> None:
+        self.allocated = 0
+        self.copied = 0
+        self.validated = 0
+        self.requires_grad = requires_grad
+        self.target_data = target_data
+        self.target_layout = PinnedParam.target_layout_for(
+            nn.Parameter(target_data, requires_grad=requires_grad),
+        )
+
+    @property
+    def cache_bytes(self) -> int:
+        return self.target_data.numel() * self.target_data.element_size()
+
+    def make_cpu_param(self) -> nn.Parameter:
+        return nn.Parameter(
+            torch.empty_like(self.target_data),
+            requires_grad=self.requires_grad,
+        )
+
+    def allocate_gpu_storage(self, device: torch.device) -> object:
+        self.allocated += 1
+        return {"device": device}
+
+    def make_gpu_param(self, target_state: object) -> nn.Parameter:
+        del target_state
+        return nn.Parameter(
+            self.target_data.clone(),
+            requires_grad=self.requires_grad,
+        )
+
+    def copy_to_gpu(
+        self,
+        target_state: object,
+        *,
+        non_blocking: bool = False,
+    ) -> None:
+        del target_state, non_blocking
+        self.copied += 1
+
+    def validate_parameter_data_swap_target(self) -> None:
+        self.validated += 1
 
 
 class TestPinnedModuleStore:
@@ -121,6 +178,270 @@ class TestPinnedModuleStore:
 
 
 class TestPinnedModuleInstance:
+    def test_allocate_target_dedupes_alias_backings(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        original_empty_like = torch.empty_like
+
+        def fake_empty_like(
+            tensor: torch.Tensor,
+            *,
+            device: torch.device | None = None,
+        ) -> torch.Tensor:
+            if device is not None:
+                assert device == torch.device("cuda")
+            return original_empty_like(tensor)
+
+        monkeypatch.setattr(torch, "empty_like", fake_empty_like)
+        pinned_param = _FakePinnedParam(torch.empty(2, 2))
+        pinned_buffer = PinnedBuffer.clone(torch.randn(2))
+        store = PinnedModuleStore(
+            params={
+                "left.weight": cast(PinnedParam, pinned_param),
+                "right.weight": cast(PinnedParam, pinned_param),
+            },
+            buffers={
+                "running": pinned_buffer,
+                "running_alias": pinned_buffer,
+            },
+        )
+        instance = PinnedModuleInstance(
+            module=nn.Module(),
+            store=store,
+            cpu_params_by_pinned_id={
+                id(pinned_param): pinned_param.make_cpu_param(),
+            },
+        )
+
+        target = instance.allocate_target(torch.device("cuda"))
+
+        assert pinned_param.allocated == 1
+        assert target.param_targets["left.weight"] is target.param_targets["right.weight"]
+        assert target.buffer_targets["running"] is target.buffer_targets["running_alias"]
+
+    def test_allocate_target_rejects_non_cuda_device(self) -> None:
+        instance = PinnedModuleInstance(
+            module=nn.Module(),
+            store=PinnedModuleStore(params={}, buffers={}),
+            cpu_params_by_pinned_id={},
+        )
+
+        with pytest.raises(ValueError, match="requires a CUDA device"):
+            instance.allocate_target(torch.device("cpu"))
+
+    def test_load_to_target_copies_and_hooks_once_for_aliases(self) -> None:
+        module = nn.Module()
+        shared = nn.Linear(2, 2, bias=False)
+        shared.weight.requires_grad_(False)
+        module.left = shared
+        module.right = shared
+        pinned = _FakePinnedParam(torch.ones(2, 2))
+        store = PinnedModuleStore(
+            params={
+                "left.weight": cast(PinnedParam, pinned),
+                "right.weight": cast(PinnedParam, pinned),
+            },
+            buffers={},
+        )
+        instance = PinnedModuleInstance(
+            module=module,
+            store=store,
+            cpu_params_by_pinned_id={id(pinned): pinned.make_cpu_param()},
+        )
+        target = instance.allocate_target(torch.device("cuda"))
+        hook_calls: list[nn.Parameter] = []
+
+        def hook(param: nn.Parameter) -> None:
+            hook_calls.append(param)
+            param.data.add_(1)
+
+        instance.load_to_target(target, post_copy_hooks={id(pinned): hook})
+
+        target_param = target.param_targets["left.weight"].param
+        assert pinned.copied == 1
+        assert hook_calls == [target_param]
+        assert module.left.weight is target_param
+        assert module.right.weight is target_param
+        torch.testing.assert_close(target_param, torch.full((2, 2), 2.0))
+
+    def test_load_to_target_preserves_trainable_param_wrapper(self) -> None:
+        module = nn.Module()
+        module.weight = nn.Parameter(torch.zeros(2), requires_grad=True)
+        original = module.weight
+        pinned = _FakePinnedParam(torch.ones(2), requires_grad=True)
+        store = PinnedModuleStore(
+            params={"weight": cast(PinnedParam, pinned)},
+            buffers={},
+        )
+        instance = PinnedModuleInstance(
+            module=module,
+            store=store,
+            cpu_params_by_pinned_id={id(pinned): pinned.make_cpu_param()},
+        )
+        target = instance.allocate_target(torch.device("cuda"))
+
+        instance.load_to_target(target)
+
+        assert module.weight is original
+        assert module.weight.data_ptr() == target.param_targets["weight"].param.data_ptr()
+        assert pinned.validated == 1
+
+    def test_load_to_target_copies_buffers_and_preserves_persistence(self) -> None:
+        prototype = nn.Module()
+        shared = torch.tensor([1.0, 2.0])
+        prototype.register_buffer("running", shared)
+        prototype.register_buffer("running_alias", shared)
+        store = PinnedModuleStore.from_module(prototype)
+        module = nn.Module()
+        module.register_buffer("running", torch.zeros(2), persistent=False)
+        module.register_buffer("running_alias", module.running, persistent=False)
+        instance = PinnedModuleInstance.from_store(store, module)
+        target_tensor = torch.empty_like(store.buffers["running"].tensor)
+        buffer_target = PinnedBufferTarget(target_tensor)
+        target = PinnedModuleTarget(
+            param_targets={},
+            buffer_targets={
+                "running": buffer_target,
+                "running_alias": buffer_target,
+            },
+        )
+
+        instance.load_to_target(target)
+
+        torch.testing.assert_close(target_tensor, store.buffers["running"].tensor)
+        assert module.running is target_tensor
+        assert module.running_alias is target_tensor
+        assert "running" in module._non_persistent_buffers_set
+        assert "running_alias" in module._non_persistent_buffers_set
+
+    def test_load_to_target_rejects_target_alias_mismatch(self) -> None:
+        pinned = _FakePinnedParam(torch.empty(2))
+        store = PinnedModuleStore(
+            params={
+                "a": cast(PinnedParam, pinned),
+                "b": cast(PinnedParam, pinned),
+            },
+            buffers={},
+        )
+        instance = PinnedModuleInstance(
+            module=nn.Module(),
+            store=store,
+            cpu_params_by_pinned_id={id(pinned): pinned.make_cpu_param()},
+        )
+        first = PinnedParamTarget(object(), nn.Parameter(torch.empty(2)))
+        second = PinnedParamTarget(object(), nn.Parameter(torch.empty(2)))
+        target = PinnedModuleTarget(
+            param_targets={"a": first, "b": second},
+            buffer_targets={},
+        )
+
+        with pytest.raises(ValueError, match="param target alias topology mismatch"):
+            instance.load_to_target(target)
+
+    def test_load_to_target_rejects_target_param_name_mismatch(self) -> None:
+        pinned = _FakePinnedParam(torch.empty(2))
+        store = PinnedModuleStore(
+            params={"weight": cast(PinnedParam, pinned)},
+            buffers={},
+        )
+        instance = PinnedModuleInstance(
+            module=nn.Module(),
+            store=store,
+            cpu_params_by_pinned_id={id(pinned): pinned.make_cpu_param()},
+        )
+        target_param = PinnedParamTarget(object(), nn.Parameter(torch.empty(2)))
+
+        with pytest.raises(ValueError, match="param target names mismatch.*missing"):
+            instance.load_to_target(
+                PinnedModuleTarget(param_targets={}, buffer_targets={}),
+            )
+
+        with pytest.raises(ValueError, match="param target names mismatch.*extra"):
+            instance.load_to_target(
+                PinnedModuleTarget(
+                    param_targets={
+                        "weight": target_param,
+                        "extra": target_param,
+                    },
+                    buffer_targets={},
+                ),
+            )
+
+    def test_load_to_target_rejects_target_buffer_name_mismatch(self) -> None:
+        pinned = PinnedBuffer.clone(torch.empty(2))
+        store = PinnedModuleStore(
+            params={},
+            buffers={"running": pinned},
+        )
+        instance = PinnedModuleInstance(
+            module=nn.Module(),
+            store=store,
+            cpu_params_by_pinned_id={},
+        )
+        target_buffer = PinnedBufferTarget(torch.empty_like(pinned.tensor))
+
+        with pytest.raises(ValueError, match="buffer target names mismatch.*missing"):
+            instance.load_to_target(
+                PinnedModuleTarget(param_targets={}, buffer_targets={}),
+            )
+
+        with pytest.raises(ValueError, match="buffer target names mismatch.*extra"):
+            instance.load_to_target(
+                PinnedModuleTarget(
+                    param_targets={},
+                    buffer_targets={
+                        "running": target_buffer,
+                        "extra": target_buffer,
+                    },
+                ),
+            )
+
+    def test_load_to_target_rejects_target_param_layout_mismatch(self) -> None:
+        pinned = _FakePinnedParam(torch.empty(2))
+        store = PinnedModuleStore(
+            params={"weight": cast(PinnedParam, pinned)},
+            buffers={},
+        )
+        instance = PinnedModuleInstance(
+            module=nn.Module(),
+            store=store,
+            cpu_params_by_pinned_id={id(pinned): pinned.make_cpu_param()},
+        )
+        target = PinnedModuleTarget(
+            param_targets={
+                "weight": PinnedParamTarget(
+                    object(),
+                    nn.Parameter(torch.empty(3)),
+                ),
+            },
+            buffer_targets={},
+        )
+
+        with pytest.raises(ValueError, match="Param target 'weight' layout mismatch"):
+            instance.load_to_target(target)
+
+    def test_load_to_target_rejects_target_buffer_layout_mismatch(self) -> None:
+        pinned = PinnedBuffer.clone(torch.empty(2))
+        store = PinnedModuleStore(
+            params={},
+            buffers={"running": pinned},
+        )
+        instance = PinnedModuleInstance(
+            module=nn.Module(),
+            store=store,
+            cpu_params_by_pinned_id={},
+        )
+        target = PinnedModuleTarget(
+            param_targets={},
+            buffer_targets={
+                "running": PinnedBufferTarget(torch.empty(3)),
+            },
+        )
+
+        with pytest.raises(ValueError, match="Buffer target 'running' layout mismatch"):
+            instance.load_to_target(target)
+
     def test_binds_same_store_to_multiple_modules(self) -> None:
         prototype = nn.Module()
         prototype.weight = nn.Parameter(torch.randn(2, 2), requires_grad=False)

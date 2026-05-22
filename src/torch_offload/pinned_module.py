@@ -20,8 +20,36 @@ from .pinned_param import PinnedParam
 from .tensor_adapter_factory import storage_key
 
 ParamAliasMode = Literal["storage", "object"]
+PostCopyHook = Callable[[nn.Parameter], None]
 ParamValidator = Callable[[str, nn.Parameter], None]
 _NamedT = TypeVar("_NamedT")
+
+
+@dataclass(slots=True)
+class PinnedParamTarget:
+    """Active adapter storage for one pinned parameter backing."""
+
+    _state: object
+    param: nn.Parameter
+
+
+@dataclass(slots=True)
+class PinnedBufferTarget:
+    """Active tensor storage for one pinned buffer backing."""
+
+    tensor: torch.Tensor
+
+
+@dataclass(slots=True)
+class PinnedModuleTarget:
+    """Name-keyed active storage for a :class:`PinnedModuleStore`.
+
+    Aliased names point at the same target object, mirroring the store's
+    ``name -> pinned`` topology.
+    """
+
+    param_targets: dict[str, PinnedParamTarget]
+    buffer_targets: dict[str, PinnedBufferTarget]
 
 
 @dataclass(slots=True)
@@ -109,6 +137,65 @@ class PinnedModuleInstance:
         )
         _restore_buffers(self.module, self.store.buffers)
 
+    def allocate_target(self, device: torch.device) -> PinnedModuleTarget:
+        """Allocate active storage for this instance's store on ``device``."""
+        if device.type != "cuda":
+            raise ValueError(
+                "PinnedModuleTarget requires a CUDA device; "
+                f"got {device}."
+            )
+
+        return PinnedModuleTarget(
+            param_targets=_allocate_param_targets(self.store.params, device),
+            buffer_targets=_allocate_buffer_targets(self.store.buffers, device),
+        )
+
+    def load_to_target(
+        self,
+        target: PinnedModuleTarget,
+        *,
+        post_copy_hooks: Mapping[int, PostCopyHook] | None = None,
+        non_blocking: bool = False,
+    ) -> None:
+        """Copy pinned bytes into ``target`` and install target storage.
+
+        Copying and hooks complete before any module mutation, so a copy
+        failure does not leave the instance partially active.
+        """
+        _validate_target_matches_store(self.store, target)
+
+        _copy_params_to_target(
+            self.store.params,
+            target.param_targets,
+            non_blocking=non_blocking,
+        )
+        _run_post_copy_hooks(
+            self.store.params,
+            target.param_targets,
+            post_copy_hooks,
+        )
+        _copy_buffers_to_target(
+            self.store.buffers,
+            target.buffer_targets,
+            non_blocking=non_blocking,
+        )
+
+        _set_params(
+            self.module,
+            self.store.params,
+            {
+                name: param_target.param
+                for name, param_target in target.param_targets.items()
+            },
+        )
+        _set_buffers(
+            self.module,
+            {
+                name: buffer_target.tensor
+                for name, buffer_target in target.buffer_targets.items()
+            },
+        )
+
 
 def _pin_params(
     params: Mapping[str, nn.Parameter],
@@ -177,6 +264,43 @@ def _validate_module_matches_store(
     )
 
 
+def _validate_target_matches_store(
+    store: PinnedModuleStore, target: PinnedModuleTarget,
+) -> None:
+    _validate_names_match("param target", store.params, target.param_targets)
+    _validate_names_match("buffer target", store.buffers, target.buffer_targets)
+
+    _validate_alias_topology(
+        "param target",
+        _pinned_alias_groups(store.params),
+        _alias_groups(target.param_targets, lambda name: id(target.param_targets[name])),
+    )
+    _validate_alias_topology(
+        "buffer target",
+        _pinned_alias_groups(store.buffers),
+        _alias_groups(
+            target.buffer_targets,
+            lambda name: id(target.buffer_targets[name]),
+        ),
+    )
+
+    for name, pinned in store.params.items():
+        layout = PinnedParam.target_layout_for(target.param_targets[name].param)
+        if layout != pinned.target_layout:
+            raise ValueError(
+                f"Param target {name!r} layout mismatch: store has "
+                f"{pinned.target_layout!r}, target has {layout!r}."
+            )
+
+    for name, pinned in store.buffers.items():
+        layout = PinnedBuffer.target_layout_for(target.buffer_targets[name].tensor)
+        if layout != pinned.target_layout:
+            raise ValueError(
+                f"Buffer target {name!r} layout mismatch: store has "
+                f"{pinned.target_layout!r}, target has {layout!r}."
+            )
+
+
 def _validate_store_names(store: PinnedModuleStore) -> None:
     overlap = sorted(set(store.params) & set(store.buffers))
     if overlap:
@@ -184,6 +308,26 @@ def _validate_store_names(store: PinnedModuleStore) -> None:
             "PinnedModuleStore cannot bind names as both params and buffers: "
             f"{_format_names(overlap)}."
         )
+
+
+def _validate_names_match(
+    kind: str,
+    store_items: Mapping[str, object],
+    target_items: Mapping[str, object],
+) -> None:
+    expected = set(store_items)
+    actual = set(target_items)
+    if actual == expected:
+        return
+
+    missing = sorted(expected - actual)
+    extra = sorted(actual - expected)
+    details = []
+    if missing:
+        details.append(f"missing {_format_names(missing)}")
+    if extra:
+        details.append(f"extra {_format_names(extra)}")
+    raise ValueError(f"PinnedModuleTarget {kind} names mismatch: {'; '.join(details)}.")
 
 
 def _validate_names_present(
@@ -219,29 +363,141 @@ def _validate_alias_topology(
     )
 
 
+def _allocate_param_targets(
+    params: Mapping[str, PinnedParam],
+    device: torch.device,
+) -> dict[str, PinnedParamTarget]:
+    targets_by_pinned_id: dict[int, PinnedParamTarget] = {}
+    targets_by_name: dict[str, PinnedParamTarget] = {}
+    for name, pinned in params.items():
+        key = id(pinned)
+        target = targets_by_pinned_id.get(key)
+        if target is None:
+            state = pinned.allocate_gpu_storage(device)
+            target = PinnedParamTarget(
+                _state=state,
+                param=pinned.make_gpu_param(state),
+            )
+            targets_by_pinned_id[key] = target
+        targets_by_name[name] = target
+    return targets_by_name
+
+
+def _allocate_buffer_targets(
+    buffers: Mapping[str, PinnedBuffer],
+    device: torch.device,
+) -> dict[str, PinnedBufferTarget]:
+    targets_by_pinned_id: dict[int, PinnedBufferTarget] = {}
+    targets_by_name: dict[str, PinnedBufferTarget] = {}
+    for name, pinned in buffers.items():
+        key = id(pinned)
+        target = targets_by_pinned_id.get(key)
+        if target is None:
+            target = PinnedBufferTarget(
+                tensor=torch.empty_like(pinned.tensor, device=device),
+            )
+            targets_by_pinned_id[key] = target
+        targets_by_name[name] = target
+    return targets_by_name
+
+
+def _copy_params_to_target(
+    params: Mapping[str, PinnedParam],
+    targets: Mapping[str, PinnedParamTarget],
+    *,
+    non_blocking: bool,
+) -> None:
+    copied: set[int] = set()
+    for name, pinned in params.items():
+        key = id(pinned)
+        if key in copied:
+            continue
+        pinned.copy_to_gpu(targets[name]._state, non_blocking=non_blocking)
+        copied.add(key)
+
+
+def _copy_buffers_to_target(
+    buffers: Mapping[str, PinnedBuffer],
+    targets: Mapping[str, PinnedBufferTarget],
+    *,
+    non_blocking: bool,
+) -> None:
+    copied: set[int] = set()
+    for name, pinned in buffers.items():
+        key = id(pinned)
+        if key in copied:
+            continue
+        targets[name].tensor.copy_(pinned.tensor, non_blocking=non_blocking)
+        copied.add(key)
+
+
+def _run_post_copy_hooks(
+    params: Mapping[str, PinnedParam],
+    targets: Mapping[str, PinnedParamTarget],
+    hooks: Mapping[int, PostCopyHook] | None,
+) -> None:
+    if hooks is None:
+        return
+
+    seen: set[int] = set()
+    for name, pinned in params.items():
+        key = id(pinned)
+        if key in seen:
+            continue
+        seen.add(key)
+        hook = hooks.get(key)
+        if hook is not None:
+            hook(targets[name].param)
+
+
 def _restore_params(
     module: nn.Module,
     params: Mapping[str, PinnedParam],
     cpu_params_by_pinned_id: Mapping[int, nn.Parameter],
 ) -> None:
+    _set_params(
+        module,
+        params,
+        {
+            name: cpu_params_by_pinned_id[id(pinned)]
+            for name, pinned in params.items()
+        },
+    )
+
+
+def _set_params(
+    module: nn.Module,
+    params: Mapping[str, PinnedParam],
+    materialized_params: Mapping[str, nn.Parameter],
+) -> None:
     for name, pinned in params.items():
-        cpu_param = cpu_params_by_pinned_id[id(pinned)]
+        materialized = materialized_params[name]
         parent, leaf = _resolve_parent_leaf(module, name)
         if pinned.requires_grad:
             pinned.validate_parameter_data_swap_target()
-            _get_param(parent, leaf).data = cpu_param.data
+            _get_param(parent, leaf).data = materialized.data
         else:
-            _set_param(parent, leaf, cpu_param)
+            _set_param(parent, leaf, materialized)
 
 
 def _restore_buffers(
     module: nn.Module,
     buffers: Mapping[str, PinnedBuffer],
 ) -> None:
-    for name, pinned in buffers.items():
+    _set_buffers(
+        module,
+        {name: pinned.tensor for name, pinned in buffers.items()},
+    )
+
+
+def _set_buffers(
+    module: nn.Module,
+    buffers: Mapping[str, torch.Tensor],
+) -> None:
+    for name, tensor in buffers.items():
         parent, leaf = _resolve_parent_leaf(module, name)
         persistent = leaf not in parent._non_persistent_buffers_set
-        parent.register_buffer(leaf, pinned.tensor, persistent=persistent)
+        parent.register_buffer(leaf, tensor, persistent=persistent)
 
 
 def _make_cpu_params(
@@ -405,6 +661,10 @@ def _format_names(names: Iterable[str]) -> str:
 __all__ = [
     "ParamAliasMode",
     "ParamValidator",
+    "PinnedBufferTarget",
     "PinnedModuleInstance",
     "PinnedModuleStore",
+    "PinnedModuleTarget",
+    "PinnedParamTarget",
+    "PostCopyHook",
 ]
