@@ -24,7 +24,6 @@ from .lora import LoRA, LoRARouteHandle, LoRATransform
 from .pinned_weights import PinnedWeights
 from .protocols import ModelStrategyComponent, SlotKey
 from .slots import (
-    ParamSlot,
     buffer_storage_key,
     canonical_param_name,
     iter_buffer_slots,
@@ -826,18 +825,16 @@ class ModelOffloader:
                     components[key] = streamer
 
         if pinned_weights is not None:
-            slots_by_ref_key: dict[int, list[ParamSlot]] = {}
-            for slot in iter_param_slots(pinned_weights.model):
-                if slot.name not in pinned_weights.param_names:
-                    continue
-                ref_key = pinned_weights.post_copy_hook_key(slot.name)
-                slots_by_ref_key.setdefault(ref_key, []).append(slot)
+            names_by_hook_key: dict[int, list[str]] = {}
+            for name in pinned_weights.param_names:
+                hook_key = pinned_weights.post_copy_hook_key(name)
+                names_by_hook_key.setdefault(hook_key, []).append(name)
 
-            for slots in slots_by_ref_key.values():
-                parent_tuple = _unique_slot_parents(slots)
-                for slot in slots:
-                    key = canonical_param_name(slot.name)
-                    param_refs[key] = slot.name
+            for names in names_by_hook_key.values():
+                parent_tuple = _unique_named_param_parents(pinned_weights.model, names)
+                for name in names:
+                    key = canonical_param_name(name)
+                    param_refs[key] = name
                     parents[key] = parent_tuple
                     components[key] = pinned_weights
 
@@ -936,18 +933,6 @@ def _is_streamed_hook_target(value: object) -> TypeGuard[_StreamedHookTarget]:
         and isinstance(value[0], int)
         and isinstance(value[1], str)
     )
-
-
-def _unique_slot_parents(slots: Sequence[ParamSlot]) -> tuple[nn.Module, ...]:
-    seen_parent_ids: set[int] = set()
-    slot_parents: list[nn.Module] = []
-    for slot in slots:
-        parent_id = id(slot.parent)
-        if parent_id in seen_parent_ids:
-            continue
-        seen_parent_ids.add(parent_id)
-        slot_parents.append(slot.parent)
-    return tuple(slot_parents)
 
 
 def _unique_named_param_parents(
