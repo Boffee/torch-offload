@@ -28,7 +28,9 @@ class _FakePinnedParam:
     ) -> None:
         self.allocated = 0
         self.copied = 0
+        self.copied_back = 0
         self.validated = 0
+        self.copy_to_cpu_non_blocking: list[bool] = []
         self.requires_grad = requires_grad
         self.target_data = target_data
         self.target_layout = PinnedParam.target_layout_for(
@@ -64,6 +66,16 @@ class _FakePinnedParam:
     ) -> None:
         del target_state, non_blocking
         self.copied += 1
+
+    def copy_to_cpu(
+        self,
+        target_state: object,
+        *,
+        non_blocking: bool = False,
+    ) -> None:
+        del target_state
+        self.copied_back += 1
+        self.copy_to_cpu_non_blocking.append(non_blocking)
 
     def validate_parameter_data_swap_target(self) -> None:
         self.validated += 1
@@ -118,6 +130,32 @@ class TestPinnedModuleStore:
         assert store.params["a"] is not store.params["b"]
         assert module.a is not module.b
         assert module.a.data_ptr() != module.b.data_ptr()
+
+    def test_rejects_storage_aliases_with_mixed_requires_grad(self) -> None:
+        module = nn.Module()
+        shared = torch.randn(2, 2)
+        module.frozen = nn.Parameter(shared, requires_grad=False)
+        module.trainable = nn.Parameter(shared, requires_grad=True)
+
+        with pytest.raises(ValueError, match="mixed requires_grad"):
+            PinnedModuleStore.from_module(module)
+
+        assert module.frozen.requires_grad is False
+        assert module.trainable.requires_grad is True
+
+    def test_object_alias_mode_allows_mixed_requires_grad_storage_aliases(
+        self,
+    ) -> None:
+        module = nn.Module()
+        shared = torch.randn(2, 2)
+        module.frozen = nn.Parameter(shared, requires_grad=False)
+        module.trainable = nn.Parameter(shared, requires_grad=True)
+
+        store = PinnedModuleStore.from_module(module, param_alias_mode="object")
+
+        assert store.params["frozen"] is not store.params["trainable"]
+        assert store.params["frozen"].requires_grad is False
+        assert store.params["trainable"].requires_grad is True
 
     def test_keeps_distinct_param_backings_separate(self) -> None:
         module = nn.Module()
@@ -441,6 +479,71 @@ class TestPinnedModuleInstance:
 
         with pytest.raises(ValueError, match="Buffer target 'running' layout mismatch"):
             instance.load_to_target(target)
+
+    def test_copy_trainables_from_target_copies_once_for_aliases(self) -> None:
+        pinned = _FakePinnedParam(torch.ones(2), requires_grad=True)
+        store = PinnedModuleStore(
+            params={
+                "left.weight": cast(PinnedParam, pinned),
+                "right.weight": cast(PinnedParam, pinned),
+            },
+            buffers={},
+        )
+        instance = PinnedModuleInstance(
+            module=nn.Module(),
+            store=store,
+            cpu_params_by_pinned_id={id(pinned): pinned.make_cpu_param()},
+        )
+        target = instance.allocate_target(torch.device("cuda"))
+
+        instance.copy_trainables_from_target(target, non_blocking=True)
+
+        assert pinned.copied_back == 1
+        assert pinned.copy_to_cpu_non_blocking == [True]
+
+    def test_copy_trainables_from_target_skips_frozen_params(self) -> None:
+        frozen = _FakePinnedParam(torch.ones(2), requires_grad=False)
+        trainable = _FakePinnedParam(torch.ones(2), requires_grad=True)
+        store = PinnedModuleStore(
+            params={
+                "frozen": cast(PinnedParam, frozen),
+                "trainable": cast(PinnedParam, trainable),
+            },
+            buffers={},
+        )
+        instance = PinnedModuleInstance(
+            module=nn.Module(),
+            store=store,
+            cpu_params_by_pinned_id={
+                id(frozen): frozen.make_cpu_param(),
+                id(trainable): trainable.make_cpu_param(),
+            },
+        )
+        target = instance.allocate_target(torch.device("cuda"))
+
+        instance.copy_trainables_from_target(target)
+
+        assert frozen.copied_back == 0
+        assert trainable.copied_back == 1
+
+    def test_copy_trainables_from_target_validates_before_copying(self) -> None:
+        pinned = _FakePinnedParam(torch.ones(2), requires_grad=True)
+        store = PinnedModuleStore(
+            params={"weight": cast(PinnedParam, pinned)},
+            buffers={},
+        )
+        instance = PinnedModuleInstance(
+            module=nn.Module(),
+            store=store,
+            cpu_params_by_pinned_id={id(pinned): pinned.make_cpu_param()},
+        )
+
+        with pytest.raises(ValueError, match="param target names mismatch"):
+            instance.copy_trainables_from_target(
+                PinnedModuleTarget(param_targets={}, buffer_targets={}),
+            )
+
+        assert pinned.copied_back == 0
 
     def test_binds_same_store_to_multiple_modules(self) -> None:
         prototype = nn.Module()

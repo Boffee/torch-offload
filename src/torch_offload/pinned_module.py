@@ -196,6 +196,24 @@ class PinnedModuleInstance:
             },
         )
 
+    def copy_trainables_from_target(
+        self,
+        target: PinnedModuleTarget,
+        *,
+        non_blocking: bool = False,
+    ) -> None:
+        """Copy trainable target params back into pinned host storage.
+
+        This is the explicit pinned-cache mutation path for optimizer-step
+        sync. Frozen params and buffers are intentionally not copied back.
+        """
+        _validate_target_matches_store(self.store, target)
+        _copy_trainable_params_from_target(
+            self.store.params,
+            target.param_targets,
+            non_blocking=non_blocking,
+        )
+
 
 def _pin_params(
     params: Mapping[str, nn.Parameter],
@@ -206,6 +224,7 @@ def _pin_params(
         params,
         lambda name: _param_alias_key(params[name], alias_mode),
     ):
+        _validate_param_alias_requires_grad(names, params)
         pinned = PinnedParam(params[names[0]])
         for name in names:
             pinned_by_name[name] = pinned
@@ -299,6 +318,20 @@ def _validate_target_matches_store(
                 f"Buffer target {name!r} layout mismatch: store has "
                 f"{pinned.target_layout!r}, target has {layout!r}."
             )
+
+
+def _validate_param_alias_requires_grad(
+    names: Iterable[str],
+    params: Mapping[str, nn.Parameter],
+) -> None:
+    names = list(names)
+    requires_grad = {params[name].requires_grad for name in names}
+    if len(requires_grad) <= 1:
+        return
+    raise ValueError(
+        "PinnedModuleStore cannot group params with mixed requires_grad: "
+        f"{_format_names(names)}."
+    )
 
 
 def _validate_store_names(store: PinnedModuleStore) -> None:
@@ -428,6 +461,23 @@ def _copy_buffers_to_target(
         if key in copied:
             continue
         targets[name].tensor.copy_(pinned.tensor, non_blocking=non_blocking)
+        copied.add(key)
+
+
+def _copy_trainable_params_from_target(
+    params: Mapping[str, PinnedParam],
+    targets: Mapping[str, PinnedParamTarget],
+    *,
+    non_blocking: bool,
+) -> None:
+    copied: set[int] = set()
+    for name, pinned in params.items():
+        if not pinned.requires_grad:
+            continue
+        key = id(pinned)
+        if key in copied:
+            continue
+        pinned.copy_to_cpu(targets[name]._state, non_blocking=non_blocking)
         copied.add(key)
 
 
