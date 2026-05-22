@@ -21,7 +21,7 @@ This is the sharp, low-level primitive. It does NOT manage:
 
 - Non-block parts of the model (parent-module state, sibling
   modules) — caller derives :class:`PinnedWeights` include-name sets
-  by excluding the streamer's :attr:`slot_filter`.
+  by excluding the streamer's owned block-local names.
 - Out-of-block trainable parameter movement — caller handles a
   separate :class:`~torch_offload.trainable_weights.TrainableWeights`.
 - Cross-region tied-weight detection — that's a composer concern
@@ -43,9 +43,9 @@ import functools
 import logging
 import weakref
 from collections import OrderedDict
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Hashable, Iterable, Iterator, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import cast
+from typing import TypeVar, cast
 
 import torch
 from torch import nn
@@ -60,17 +60,14 @@ from .pinned_module import (
     PostCopyHookHandle,
 )
 from .pinned_param import PinnedParam
-from .protocols import SlotKey
-from .slots import (
-    ModuleSlotCollection,
-    collect_module_slots,
-    set_tensor_data,
-)
+from .tensor_adapter_factory import storage_key
 
 logger = logging.getLogger(__name__)
 
 StreamedParamRef = tuple[int, str]
 _LoadedTrainableBlock = tuple[PinnedModuleInstance, PinnedModuleTarget]
+_NamedT = TypeVar("_NamedT")
+_KeyForName = Callable[[str], Hashable]
 
 
 def _release_cuda_cache_on_drop(is_cuda: bool) -> None:
@@ -157,40 +154,46 @@ def _buffer_target_layout(buffer: torch.Tensor) -> tuple[object, ...]:
 
 
 def _check_block_layouts_match(
-    block_slot_collections: Sequence[ModuleSlotCollection],
+    block_params: Sequence[dict[str, nn.Parameter]],
+    block_buffers: Sequence[dict[str, torch.Tensor]],
 ) -> None:
     """Raise if blocks have mismatched param/buffer layouts. Called before
-    pinning so layout failures leave parameter slots and storage
-    untouched.
+    pinning so layout failures leave parameters, buffers, and storage untouched.
 
     See :func:`_param_target_layout` for what counts as "matched."
     """
-    if len(block_slot_collections) <= 1:
+    if len(block_params) <= 1:
         return
 
-    def sig(collection: ModuleSlotCollection) -> tuple:
+    def sig(params: dict[str, nn.Parameter]) -> tuple:
         return tuple(
             (
-                tuple(slot.name for slot in slots),
-                slots[0].get().requires_grad,
-                _param_target_layout(slots[0].get()),
+                tuple(names),
+                params[names[0]].requires_grad,
+                _param_target_layout(params[names[0]]),
             )
-            for slots in collection.param_slot_groups
+            for names in _group_names(
+                params,
+                lambda name: _param_storage_key(params[name]),
+            )
         )
 
-    def buffer_sig(collection: ModuleSlotCollection) -> tuple:
+    def buffer_sig(buffers: dict[str, torch.Tensor]) -> tuple:
         return tuple(
             (
-                tuple(slot.name for slot in slots),
-                _buffer_target_layout(slots[0].get()),
+                tuple(names),
+                _buffer_target_layout(buffers[names[0]]),
             )
-            for slots in collection.buffer_slot_groups
+            for names in _group_names(
+                buffers,
+                lambda name: _buffer_storage_key(buffers[name]),
+            )
         )
 
-    ref = sig(block_slot_collections[0])
-    ref_buffers = buffer_sig(block_slot_collections[0])
-    for i in range(1, len(block_slot_collections)):
-        if sig(block_slot_collections[i]) != ref:
+    ref = sig(block_params[0])
+    ref_buffers = buffer_sig(block_buffers[0])
+    for i in range(1, len(block_params)):
+        if sig(block_params[i]) != ref:
             raise ValueError(
                 f"Block {i} param layout differs from block 0. "
                 "All blocks in a StreamedWeights group must share the "
@@ -200,7 +203,7 @@ def _check_block_layouts_match(
                 "across separate `layers_attr=[...]` groups in "
                 "ModelOffloader."
             )
-        if buffer_sig(block_slot_collections[i]) != ref_buffers:
+        if buffer_sig(block_buffers[i]) != ref_buffers:
             raise ValueError(
                 f"Block {i} buffer layout differs from block 0. "
                 "All blocks in a StreamedWeights group must share the "
@@ -211,30 +214,98 @@ def _check_block_layouts_match(
             )
 
 
-def _collect_block_slot_collections(
+def _collect_streamed_entries(
     blocks: list[nn.Module],
-    skip: set[SlotKey],
-) -> tuple[list[ModuleSlotCollection], frozenset[SlotKey]]:
-    slot_collections: list[ModuleSlotCollection] = []
-    slot_filter: set[SlotKey] = set()
+    stream_param_names: set[str] | None,
+    stream_buffer_names: set[str] | None,
+) -> tuple[list[dict[str, nn.Parameter]], list[dict[str, torch.Tensor]]]:
+    block_params: list[dict[str, nn.Parameter]] = []
+    block_buffers: list[dict[str, torch.Tensor]] = []
 
     for block in blocks:
-        collection = collect_module_slots(
+        params, buffers = _select_streamed_entries(
             block,
-            skip_slots=skip,
-            param_group_by="storage",
+            stream_param_names,
+            stream_buffer_names,
         )
-        slot_collections.append(collection)
-        slot_filter.update(collection.slot_filter)
+        block_params.append(params)
+        block_buffers.append(buffers)
 
-    return slot_collections, frozenset(slot_filter)
+    return block_params, block_buffers
+
+
+def _select_streamed_entries(
+    block: nn.Module,
+    stream_param_names: set[str] | None,
+    stream_buffer_names: set[str] | None,
+) -> tuple[dict[str, nn.Parameter], dict[str, torch.Tensor]]:
+    params: dict[str, nn.Parameter] = {}
+    all_param_names: set[str] = set()
+    for name, param in block.named_parameters(remove_duplicate=False):
+        all_param_names.add(name)
+        if stream_param_names is not None and name not in stream_param_names:
+            continue
+        params[name] = param
+    _validate_streamed_names_known(stream_param_names, all_param_names)
+
+    buffers: dict[str, torch.Tensor] = {}
+    all_buffer_names: set[str] = set()
+    for name, buffer in block.named_buffers(remove_duplicate=False):
+        all_buffer_names.add(name)
+        if stream_buffer_names is not None and name not in stream_buffer_names:
+            continue
+        buffers[name] = buffer
+    _validate_streamed_names_known(stream_buffer_names, all_buffer_names)
+
+    return params, buffers
+
+
+def _group_names(
+    items: dict[str, _NamedT],
+    key_for_name: _KeyForName,
+) -> list[list[str]]:
+    groups_by_key: dict[Hashable, list[str]] = {}
+    for name in items:
+        groups_by_key.setdefault(key_for_name(name), []).append(name)
+    return list(groups_by_key.values())
+
+
+def _param_storage_key(param: nn.Parameter) -> Hashable:
+    if param.numel() == 0:
+        return ("empty-param", id(param))
+    return storage_key(param.data)
+
+
+def _buffer_storage_key(buffer: torch.Tensor) -> Hashable:
+    if buffer.numel() == 0:
+        return ("empty-buffer", id(buffer))
+    return storage_key(buffer)
+
+
+def _validate_streamed_names_known(
+    names: set[str] | None,
+    known_names: set[str],
+) -> None:
+    if names is None:
+        return
+    missing = sorted(names - known_names)
+    if missing:
+        raise ValueError(
+            "StreamedWeights cannot select unknown block-local names: "
+            f"{_format_names(missing)}."
+        )
+
+
+def _format_names(names: Sequence[str]) -> str:
+    return ", ".join(repr(name) for name in names)
 
 
 def _pin_block_module_instances(
     blocks: Sequence[nn.Module],
     *,
-    skip_slots: set[SlotKey] | None = None,
-) -> tuple[list[PinnedModuleInstance], frozenset[SlotKey]]:
+    stream_param_names: set[str] | None = None,
+    stream_buffer_names: set[str] | None = None,
+) -> list[PinnedModuleInstance]:
     """Collect, validate, and pin one :class:`PinnedModuleInstance` per block.
 
     Pre-pin validation failures do not pin and do not mutate model
@@ -242,51 +313,37 @@ def _pin_block_module_instances(
     low-peak ``Parameter.data`` repointing optimization; recovery from
     a pin-time failure is unsupported, matching :class:`PinnedWeights`.
     """
-    skip: set[SlotKey] = skip_slots or set()
-
-    # Walk each block to collect param/buffer slots WITHOUT pinning
-    # anything. Pinning runs only after the block layout check
+    # Walk each block to collect selected param/buffer names WITHOUT
+    # pinning anything. Pinning runs only after the block layout check
     # passes, so invalid configurations raise before model mutation.
-    block_slot_collections, slot_filter = _collect_block_slot_collections(
-        list(blocks), skip,
+    block_params, block_buffers = _collect_streamed_entries(
+        list(blocks),
+        stream_param_names,
+        stream_buffer_names,
     )
 
     # Validate before pinning. ``Tensor.copy_`` silently casts dtype and
     # silently broadcasts compatible shapes, so any block N with
     # mismatched dtype, name, or wrapper metadata would otherwise load
     # into block 0's pool slot without raising and corrupt forward.
-    _check_block_layouts_match(block_slot_collections)
+    _check_block_layouts_match(block_params, block_buffers)
 
     block_stores = [
         PinnedModuleStore.from_module(
             block,
-            include_param_names=_param_names(collection),
-            include_buffer_names=_buffer_names(collection),
+            include_param_names=params,
+            include_buffer_names=buffers,
         )
-        for block, collection in zip(blocks, block_slot_collections, strict=True)
+        for block, params, buffers in zip(
+            blocks, block_params, block_buffers, strict=True,
+        )
     ]
 
     block_instances = [
         PinnedModuleInstance.from_store(store, block)
         for store, block in zip(block_stores, blocks, strict=True)
     ]
-    return block_instances, slot_filter
-
-
-def _param_names(collection: ModuleSlotCollection) -> set[str]:
-    return {
-        slot.name
-        for slots in collection.param_slot_groups
-        for slot in slots
-    }
-
-
-def _buffer_names(collection: ModuleSlotCollection) -> set[str]:
-    return {
-        slot.name
-        for slots in collection.buffer_slot_groups
-        for slot in slots
-    }
+    return block_instances
 
 
 def _iter_instance_trainable_params(
@@ -321,7 +378,7 @@ def _move_instance_trainable_grads_to(
             # and GPU grads while active between block loads, so move
             # the grad storage in place when the data is currently
             # offloaded.
-            set_tensor_data(param.grad, moved.data)
+            param.grad.data = moved.data
 
 
 # ---------------------------------------------------------------------------
@@ -374,8 +431,9 @@ class StreamedWeights:
     owned params and buffers: pins them to CPU at construction time,
     streams them to CUDA via forward-pre hooks on :meth:`activate`.
     CPU activation is pass-through over that pinned host-backed state:
-    no pool, no hooks, no copies. Frozen params use slot replacement;
-    trainable params keep Parameter identity and swap only ``.data``.
+    no pool, no hooks, no copies. Frozen params use parameter
+    replacement; trainable params keep Parameter identity and swap only
+    ``.data``.
     Does not touch parent modules, sibling modules, or out-of-block
     trainable parameters — those are the composer's responsibility.
 
@@ -390,9 +448,9 @@ class StreamedWeights:
     Lifecycle is uniform with :class:`PinnedWeights`: ``__init__``
     pins (so ``cache_bytes`` is final at construction time, ready
     for :class:`~torch_offload.model_cache.ModelCache` admission),
-    ``activate`` brings to CUDA or marks CPU active, ``deactivate`` returns slots to
+    ``activate`` brings to CUDA or marks CPU active, ``deactivate`` returns state to
     pinned CPU and removes hooks. There is no ``close()``; pinned
-    memory in module slots is freed when the caller drops the
+    memory in module state is freed when the caller drops the
     strategy and model references.
 
     **Calling deactivate() before dropping the strategy is preferred**
@@ -436,16 +494,12 @@ class StreamedWeights:
         deactivate/activate cycle.
     name:
         Optional human-readable label for log messages.
-    skip_slots:
-        Optional set of :class:`SlotKey` values identifying
-        ``(parent_module, leaf, kind)`` slots inside the blocks that
-        the streamer should not pin / stream. Used by composers
-        (typically :class:`ModelOffloader`) to surgically exclude
-        slots that need a different lifecycle. The streamer manages
-        the rest — both frozen params (slot replacement) and
-        trainable params (``.data`` swap, identity-preserving) flow
-        through the same slot pool.
-
+    stream_param_names:
+        Optional set of block-local parameter names to stream from
+        every block. ``None`` streams all parameters.
+    stream_buffer_names:
+        Optional set of block-local buffer names to stream from every
+        block. ``None`` streams all registered buffers.
         Trainable streaming requires activation checkpointing on
         every block (the ``.data`` swap bypasses autograd's
         version-counter check). The streamer doesn't enforce that
@@ -460,7 +514,8 @@ class StreamedWeights:
         prefetch_count: int = 2,
         cyclic: bool = False,
         name: str | None = None,
-        skip_slots: set[SlotKey] | None = None,
+        stream_param_names: Iterable[str] | None = None,
+        stream_buffer_names: Iterable[str] | None = None,
     ) -> None:
         self._blocks: list[nn.Module] = list(blocks)
         self._active_device: torch.device | None = None
@@ -481,16 +536,20 @@ class StreamedWeights:
         # Pin in __init__ — uniform lifecycle with PinnedWeights, and
         # ModelCache integration sees a final `cache_bytes` immediately.
         # Block instance construction validates that every block shares
-        # the same pool-compatible layout before any model slot is
+        # the same pool-compatible layout before any model state is
         # mutated, then clones directly from the source device into
         # pinned CPU storage. Heterogeneous block lists split across
         # separate `layers_attr=[...]` entries in ModelOffloader.
-        self._block_instances, self._slot_filter = _pin_block_module_instances(
-            self._blocks, skip_slots=skip_slots,
+        self._block_instances = _pin_block_module_instances(
+            self._blocks,
+            stream_param_names=(
+                None if stream_param_names is None else set(stream_param_names)
+            ),
+            stream_buffer_names=(
+                None if stream_buffer_names is None else set(stream_buffer_names)
+            ),
         )
         self._post_copy_hooks: dict[int, PostCopyHook] = {}
-        for instance in self._block_instances:
-            instance.restore_pinned()
         self._move_trainable_grads_to(torch.device("cpu"))
 
         # Active resources allocated on CUDA activate().
@@ -521,16 +580,6 @@ class StreamedWeights:
         )
 
     @property
-    def slot_filter(self) -> frozenset[SlotKey]:
-        """``SlotKey`` set covering every (parent, leaf, kind)
-        slot the streamer owns. Stable across the streamer's
-        lifetime — safe to read at any point and survives slot
-        mutation, so a consumer can derive non-streamed
-        :class:`PinnedWeights` include-name sets regardless of order
-        relative to the streamer."""
-        return self._slot_filter
-
-    @property
     def param_refs_per_block(self) -> list[list[StreamedParamRef]]:
         """Per-block streamed parameter refs.
 
@@ -548,6 +597,22 @@ class StreamedWeights:
                 for name in instance.store.params
             ]
             for block_idx, instance in enumerate(self._block_instances)
+        ]
+
+    @property
+    def streamed_param_names_by_block(self) -> list[list[str]]:
+        """Per-block streamed parameter names."""
+        return [
+            list(instance.store.params)
+            for instance in self._block_instances
+        ]
+
+    @property
+    def streamed_buffer_names_by_block(self) -> list[list[str]]:
+        """Per-block streamed buffer names."""
+        return [
+            list(instance.store.buffers)
+            for instance in self._block_instances
         ]
 
     def param_alias_names(self, ref: StreamedParamRef) -> tuple[str, ...]:

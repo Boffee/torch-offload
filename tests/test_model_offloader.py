@@ -23,12 +23,11 @@ from torch_offload import (
     ModelOffloader,
     ModelStrategy,
     PinnedWeights,
-    SlotKey,
     StreamedWeights,
     TrainableWeights,
 )
 from torch_offload.model_offloader import detect_streaming_region_ties
-from torch_offload.slots import iter_buffer_slots, iter_param_slots
+from torch_offload.slots import iter_param_slots
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -1002,7 +1001,7 @@ class TestPrefetchFailureOnDeactivate:
 
 class TestConstructedStateIsInactive:
     """Verifies the 'constructed but not active' state has no GPU
-    footprint — the payoff of the SlotKey-based composition.
+    footprint — the payoff of composer-owned stream/non-block partitioning.
     Without it, non-block siblings (embed, head, norms) would sit on
     the activation device permanently, defeating ModelCache eviction."""
 
@@ -1356,7 +1355,7 @@ class TestCrossRegionTiedDetection:
 
 
 # ---------------------------------------------------------------------------
-# Direct-parent state handling — via SlotKey skip filter
+# Direct-parent state handling
 # ---------------------------------------------------------------------------
 
 
@@ -1879,88 +1878,86 @@ class TestTrainableWeights:
 
 
 # ---------------------------------------------------------------------------
-# SlotKey-based filter survives slot mutation
+# StreamedWeights name selection
 # ---------------------------------------------------------------------------
 
 
-class TestSlotKeyFilter:
-    """The SlotKey skip filter is the design fix that decouples
-    construction order. It identifies slots by (id(parent), leaf, kind)
-    so PinnedWeights's skip check still matches even after a streamer
-    has swapped the Parameter object at that slot."""
-
-    def test_streamed_weights_slot_filter_is_slot_key_set(self) -> None:
+class TestStreamedNameSelection:
+    def test_streamed_weights_exposes_owned_block_local_names(self) -> None:
         m = _make_block_model()
         streamer = StreamedWeights(
             blocks=list(m.transformer_blocks),
             blocks_to_swap=2,
         )
         try:
-            sf = streamer.slot_filter
-            assert isinstance(sf, frozenset)
-            for s in sf:
-                assert isinstance(s, SlotKey)
-                assert s.kind in ("param", "buffer")
-        finally:
-            streamer.deactivate()
-
-    def test_pinned_weights_skips_slots_after_streamer_swapped_them(self) -> None:
-        # Constructor order independence: build PinnedWeights AFTER
-        # the streamer has already mutated slots. With id()-based
-        # filter, this would fail (the original Parameter ids no
-        # longer match what's in the slots). With SlotKey it
-        # works because (parent, leaf) is stable.
-        m = _make_block_model()
-        # Build the streamer first — this swaps block slots to pinned
-        # cpu_params (different Python objects than the originals).
-        streamer = StreamedWeights(
-            blocks=list(m.transformer_blocks),
-            blocks_to_swap=2,
-        )
-        try:
-            skip_slots = set(streamer.slot_filter)
-
-            # Build PinnedWeights AFTER the streamer mutated slots.
-            # The skip filter must still correctly exclude block-owned
-            # slots, even though the Parameter objects changed.
-            include_param_names = {
-                slot.name
-                for slot in iter_param_slots(m)
-                if slot.key not in skip_slots
-            }
-            include_buffer_names = {
-                slot.name
-                for slot in iter_buffer_slots(m)
-                if slot.key not in skip_slots
-            }
-            non_block = PinnedWeights(
-                m,
-                include_param_names=include_param_names,
-                include_buffer_names=include_buffer_names,
+            assert streamer.streamed_param_names_by_block == [["weight"]] * len(
+                m.transformer_blocks
             )
-            try:
-                # Non-block slots (embed, head) are pinned by
-                # PinnedWeights; block slots are skipped (already
-                # owned by streamer).
-                names_managed_by_pinned = non_block.param_names
-                # Block-owned slots NOT in the PinnedWeights set.
-                for s in skip_slots:
-                    if s.kind != "param":
-                        continue
-                    skipped_names = [
-                        slot.name
-                        for slot in iter_param_slots(m)
-                        if slot.key == s
-                    ]
-                    assert not (names_managed_by_pinned & set(skipped_names)), (
-                        f"PinnedWeights tried to manage block-owned slot {s}"
-                    )
-                # Non-block slots present.
-                assert "embed.weight" in names_managed_by_pinned
-            finally:
-                non_block.deactivate()
+            assert streamer.streamed_buffer_names_by_block == [[]] * len(
+                m.transformer_blocks
+            )
         finally:
             streamer.deactivate()
+
+    def test_streamed_weights_include_names_select_owned_entries(self) -> None:
+        class Block(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.keep = nn.Parameter(torch.randn(4, 4), requires_grad=False)
+                self.skip = nn.Parameter(torch.randn(4, 4), requires_grad=False)
+                self.register_buffer("keep_buffer", torch.randn(4))
+                self.register_buffer("skip_buffer", torch.randn(4))
+
+        blocks = [Block(), Block()]
+        skipped_params = [block.skip for block in blocks]
+        skipped_buffer_ptrs = [block.skip_buffer.data_ptr() for block in blocks]
+
+        streamer = StreamedWeights(
+            blocks=blocks,
+            blocks_to_swap=1,
+            stream_param_names={"keep"},
+            stream_buffer_names={"keep_buffer"},
+        )
+        try:
+            assert streamer.streamed_param_names_by_block == [["keep"], ["keep"]]
+            assert streamer.streamed_buffer_names_by_block == [
+                ["keep_buffer"],
+                ["keep_buffer"],
+            ]
+            assert [block.skip for block in blocks] == skipped_params
+            assert [block.skip_buffer.data_ptr() for block in blocks] == (
+                skipped_buffer_ptrs
+            )
+        finally:
+            streamer.deactivate()
+
+    def test_model_offloader_slot_shim_partitions_streamed_and_non_block_names(
+        self,
+    ) -> None:
+        m = _make_block_model()
+        strategy = ModelOffloader(
+            m,
+            layers_attr="transformer_blocks",
+            blocks_to_swap=2,
+        )
+        try:
+            streamer = next(
+                c for c in strategy._components if isinstance(c, StreamedWeights)
+            )
+            non_block = next(
+                c for c in strategy._components if isinstance(c, PinnedWeights)
+            )
+
+            assert streamer.streamed_param_names_by_block == [["weight"]] * len(
+                m.transformer_blocks
+            )
+            assert non_block.param_names == {"embed.weight", "head.weight"}
+            assert all(
+                not name.startswith("transformer_blocks.")
+                for name in non_block.param_names
+            )
+        finally:
+            strategy.deactivate()
 
 
 # ---------------------------------------------------------------------------
@@ -2007,58 +2004,36 @@ class TestDetectStreamingRegionTies:
 class TestStreamedWeightsContractGuard:
     """StreamedWeights now handles in-block trainables natively via
     ``.data`` swap (preserves user Parameter identity for autograd /
-    optimizer state); skip_slots is the surgical-exclude knob, not a
-    trainable-required filter. The composer still routes out-of-block
-    trainables to ``TrainableWeights`` via skip_slots."""
+    optimizer state). The composer still routes out-of-block
+    trainables to ``TrainableWeights`` through its temporary slot shim."""
 
     def test_direct_unskipped_trainable_constructs(self) -> None:
-        # Build a trainable block with no skip_slots. The streamer
-        # accepts the trainable slot (handled via ``.data`` swap inside
-        # ``PinnedModuleInstance``). The slot appears in the streamer's
-        # slot_filter just like a frozen slot would.
-        from torch_offload.slots import iter_param_slots
-
         block_0 = nn.Linear(4, 4, bias=False)  # default requires_grad=True
         block_1 = nn.Linear(4, 4, bias=False)
-        trainable_slots = {
-            s.key for s in iter_param_slots(block_0) if s.get().requires_grad
-        } | {
-            s.key for s in iter_param_slots(block_1) if s.get().requires_grad
-        }
         streamer = StreamedWeights(
             blocks=[block_0, block_1],
             blocks_to_swap=1,
         )
-        assert trainable_slots.issubset(streamer.slot_filter)
+        assert streamer.streamed_param_names_by_block == [["weight"], ["weight"]]
         # The user's Parameter object survives pinning — .data has been
         # repointed at the pinned clone, but the wrapper is unchanged
         # so optimizer state attached to it would still apply.
         assert isinstance(block_0.weight, nn.Parameter)
         assert block_0.weight.requires_grad
 
-    def test_direct_skipped_trainable_constructs(self) -> None:
-        # With the trainable slot in skip_slots, construction succeeds
-        # and the slot is excluded from slot_filter.
-        from torch_offload.slots import iter_param_slots
-
+    def test_direct_empty_param_name_selection_constructs(self) -> None:
         block_0 = nn.Linear(4, 4, bias=False)  # trainable
         block_1 = nn.Linear(4, 4, bias=False)  # trainable
-        # Snapshot trainable slots before StreamedWeights construction.
-        trainable_slots = {
-            s.key for s in iter_param_slots(block_0) if s.get().requires_grad
-        } | {
-            s.key for s in iter_param_slots(block_1) if s.get().requires_grad
-        }
-        # No frozen content remains, so the streamer's pinning walk
-        # produces empty buffers but no contract violation.
         streamer = StreamedWeights(
             blocks=[block_0, block_1],
             blocks_to_swap=1,
-            skip_slots=trainable_slots,
+            stream_param_names=set(),
+            stream_buffer_names=set(),
         )
-        assert streamer.slot_filter.isdisjoint(trainable_slots)
+        assert streamer.streamed_param_names_by_block == [[], []]
+        assert streamer.streamed_buffer_names_by_block == [[], []]
 
-    def test_direct_skipped_buffers_are_not_pinned_or_owned(self) -> None:
+    def test_direct_empty_buffer_name_selection_does_not_pin_buffer(self) -> None:
         class BufferBlock(nn.Module):
             def __init__(self):
                 super().__init__()
@@ -2066,20 +2041,31 @@ class TestStreamedWeightsContractGuard:
                 self.register_buffer("table", torch.randn(8))
 
         blocks = [BufferBlock(), BufferBlock()]
-        buffer_slots = {
-            s.key for block in blocks for s in iter_buffer_slots(block)
-        }
         buffer_ptrs = [block.table.data_ptr() for block in blocks]
 
         streamer = StreamedWeights(
             blocks=blocks,
             blocks_to_swap=1,
-            skip_slots=buffer_slots,
+            stream_buffer_names=set(),
         )
 
-        assert streamer.slot_filter.isdisjoint(buffer_slots)
+        assert streamer.streamed_buffer_names_by_block == [[], []]
         assert [block.table.data_ptr() for block in blocks] == buffer_ptrs
         assert all(not block.table.is_pinned() for block in blocks)
+
+    def test_direct_include_names_reject_unknown_names_before_pinning(self) -> None:
+        block_0 = nn.Linear(4, 4, bias=False)
+        block_1 = nn.Linear(4, 4, bias=False)
+        original_params = [block_0.weight, block_1.weight]
+
+        with pytest.raises(ValueError, match="unknown block-local names"):
+            StreamedWeights(
+                blocks=[block_0, block_1],
+                blocks_to_swap=1,
+                stream_param_names={"missing"},
+            )
+
+        assert [block_0.weight, block_1.weight] == original_params
 
 
 class TestMixedGradTieDetection:
@@ -2371,8 +2357,8 @@ class TestLoRAInBlockRouting:
         # In the .data-only redesign, in-block trainables (LoRA adapters
         # nested inside streamed blocks) are managed by the streamer
         # itself via ``.data`` swap — no longer routed to
-        # ``TrainableWeights``. The streamer's slot_filter therefore
-        # covers BOTH frozen base slots AND trainable lora_a/lora_b.
+        # ``TrainableWeights``. The streamer therefore owns BOTH frozen
+        # base.weight and trainable lora_a/lora_b names.
         class M(nn.Module):
             def __init__(self, blocks):
                 super().__init__()
@@ -2385,26 +2371,15 @@ class TestLoRAInBlockRouting:
             stream_trainable_weights=True,
         )
         try:
-            # Each StreamedWeights's slot_filter contains BOTH frozen
-            # base.weight and trainable lora_a/lora_b — the streamer
-            # handles them uniformly.
             streamers = [
                 c for c in strat._components if isinstance(c, StreamedWeights)
             ]
             assert len(streamers) == 1
             streamer = streamers[0]
-            from torch_offload.slots import iter_param_slots
-            for s in iter_param_slots(m):
-                if "transformer_blocks" in s.name:
-                    assert s.key in streamer.slot_filter, (
-                        f"in-block slot {s.name} (trainable={s.get().requires_grad}) "
-                        f"missing from streamer's slot_filter"
-                    )
-                else:
-                    assert s.key not in streamer.slot_filter, (
-                        f"out-of-block slot {s.name} leaked into streamer's "
-                        f"slot_filter"
-                    )
+            assert streamer.streamed_param_names_by_block == [
+                ["base.weight", "lora_a.weight", "lora_b.weight"],
+                ["base.weight", "lora_a.weight", "lora_b.weight"],
+            ]
         finally:
             strat.deactivate()
 
@@ -2428,12 +2403,10 @@ class TestLoRAInBlockRouting:
             ]
             assert len(streamers) == 1
             streamer = streamers[0]
-            from torch_offload.slots import iter_param_slots
-            for s in iter_param_slots(m):
-                if "transformer_blocks" in s.name and s.get().requires_grad:
-                    assert s.key not in streamer.slot_filter
-                elif "transformer_blocks" in s.name:
-                    assert s.key in streamer.slot_filter
+            assert streamer.streamed_param_names_by_block == [
+                ["base.weight"],
+                ["base.weight"],
+            ]
         finally:
             strat.deactivate()
 
@@ -3185,8 +3158,8 @@ class TestBlockGroupsDisjoint:
 
     def test_parent_child_overlap_raises(self) -> None:
         # group_a has a parent block whose child is also referenced
-        # directly by group_b. Different block ids; same SlotKey
-        # for the child's slots in both regions.
+        # directly by group_b. Different block ids; same child slots
+        # in both regions.
         child = nn.Linear(4, 4, bias=False)
 
         class Parent(nn.Module):

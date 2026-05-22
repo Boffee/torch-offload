@@ -25,9 +25,11 @@ from .lora import LoRA, LoRARouteHandle, LoRATransform
 from .pinned_weights import PinnedWeights
 from .protocols import ModelStrategyComponent, SlotKey
 from .slots import (
+    ModuleSlotCollection,
     ParamSlot,
     buffer_storage_key,
     canonical_param_name,
+    collect_module_slots,
     iter_buffer_slots,
     iter_param_slots,
     param_storage_key,
@@ -247,13 +249,24 @@ class ModelOffloader:
 
         # By default, streamers skip trainables and TrainableWeights keeps
         # them all GPU-resident. With stream_trainable_weights=True,
-        # streamers handle in-block params of both kinds: frozen via slot
-        # replacement and trainable via identity-preserving ``.data`` swap.
+        # streamers handle in-block params of both kinds: frozen via
+        # parameter replacement and trainable via identity-preserving
+        # ``.data`` swap.
         # Gradients are NOT streamed — they live on GPU during backward via
         # PyTorch's native ``AccumulateGrad`` mechanism.
-        streamer_skip_slots = None if stream_trainable_weights else trainable_slots
+        stream_slot_exclusions = None if stream_trainable_weights else trainable_slots
         streamers: list[StreamedWeights] = []
+        streamer_slots: set[SlotKey] = set()
         for i, blocks in enumerate(block_groups):
+            (
+                stream_param_names,
+                stream_buffer_names,
+                owned_slots,
+            ) = _streamed_ownership_from_slot_exclusions(
+                blocks,
+                stream_slot_exclusions,
+            )
+            streamer_slots.update(owned_slots)
             streamers.append(
                 StreamedWeights(
                     blocks=blocks,
@@ -261,20 +274,16 @@ class ModelOffloader:
                     prefetch_count=pf_list[i],
                     cyclic=cyclic,
                     name=f"StreamedWeights[{layer_paths[i]}]",
-                    skip_slots=streamer_skip_slots,
+                    stream_param_names=stream_param_names,
+                    stream_buffer_names=stream_buffer_names,
                 )
             )
 
-        streamer_slots: set[SlotKey] = set()
-        for s in streamers:
-            streamer_slots |= s.slot_filter
-
         # PinnedWeights manages frozen non-block params/buffers. Skip
-        # everything the streamers own (in-block, frozen + trainable)
-        # plus any remaining out-of-block trainables (those go to
-        # TrainableWeights). Equivalent to ``streamer_slots |
-        # trainable_slots`` since streamer_slots already covers in-
-        # block trainables.
+        # streamed block-owned slots plus every trainable slot; the
+        # latter are owned by TrainableWeights in default mode and by
+        # either StreamedWeights or TrainableWeights in trainable-streaming
+        # mode.
         pinned_skip_slots = streamer_slots | trainable_slots
 
         pinned_param_names, pinned_buffer_names = _pinned_weight_names(
@@ -288,11 +297,9 @@ class ModelOffloader:
                 include_buffer_names=pinned_buffer_names,
             )
 
-        # TrainableWeights handles only out-of-block trainables (in-
-        # block trainables stream through the slot pool with .data
-        # swap). Skip the streamer's territory; the requires_grad
-        # filter inside TrainableWeights handles frozen slots in
-        # streamer_slots automatically.
+        # TrainableWeights handles all trainables in default mode. In
+        # trainable-streaming mode it skips streamer-owned slots, leaving
+        # only out-of-block trainables.
         components: list[ModelStrategyComponent] = []
         if non_block is not None:
             components.append(non_block)
@@ -854,6 +861,67 @@ class ModelOffloader:
 # ---------------------------------------------------------------------------
 # Module-private helpers (used only by ModelOffloader constructor)
 # ---------------------------------------------------------------------------
+
+
+def _streamed_ownership_from_slot_exclusions(
+    blocks: Sequence[nn.Module],
+    slot_exclusions: set[SlotKey] | None,
+) -> tuple[set[str], set[str], set[SlotKey]]:
+    """Translate composer slot exclusions into streamer-owned names.
+
+    ``StreamedWeights`` is intentionally name-based. During the migration,
+    ``ModelOffloader`` still owns slot-level composition because
+    ``TrainableWeights`` and the legacy pinned path use ``SlotKey``. Keep
+    that compatibility bridge here instead of leaking slots back into the
+    streamer.
+    """
+    skip = slot_exclusions or set()
+    collections: list[ModuleSlotCollection] = []
+    owned_slots: set[SlotKey] = set()
+    for block in blocks:
+        collection = collect_module_slots(
+            block,
+            skip_slots=skip,
+            param_group_by="storage",
+        )
+        collections.append(collection)
+        owned_slots.update(collection.slot_filter)
+
+    if not collections:
+        return set(), set(), owned_slots
+
+    param_names = _selected_param_names(collections[0])
+    buffer_names = _selected_buffer_names(collections[0])
+    for i, collection in enumerate(collections[1:], start=1):
+        if (
+            _selected_param_names(collection) != param_names
+            or _selected_buffer_names(collection) != buffer_names
+        ):
+            raise ValueError(
+                f"Block {i} selected names differ from block 0 after "
+                "ModelOffloader slot filtering. All blocks in a "
+                "StreamedWeights group must select the same parameter "
+                "and buffer names."
+            )
+
+    return param_names, buffer_names, owned_slots
+
+
+def _selected_param_names(collection: ModuleSlotCollection) -> set[str]:
+    return {
+        slot.name
+        for slots in collection.param_slot_groups
+        for slot in slots
+    }
+
+
+def _selected_buffer_names(collection: ModuleSlotCollection) -> set[str]:
+    return {
+        slot.name
+        for slots in collection.buffer_slot_groups
+        for slot in slots
+    }
+
 
 def _pinned_weight_names(
     model: nn.Module,
