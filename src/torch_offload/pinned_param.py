@@ -52,8 +52,9 @@ class PinnedParam:
     :meth:`copy_to_gpu`, :meth:`copy_to_cpu`) all dispatch through the
     adapter. This primitive works with the opaque state returned by
     :meth:`allocate_gpu_storage`; model-bound callers should normally
-    use :class:`PinnedParamBinding`, which wraps that state in a
-    binding-owned target object.
+    use :class:`~torch_offload.pinned_module.PinnedModuleStore` and
+    :class:`~torch_offload.pinned_module.PinnedModuleInstance`, which wrap
+    active storage in target objects.
 
     The pinned parameter captures the source parameter's ``requires_grad`` at
     construction time and threads it through to the adapter when

@@ -11,7 +11,7 @@ pinned state is used directly without streaming. Heterogeneous block lists
 :class:`StreamedWeights` instances composed via :class:`ModelOffloader`.
 
 In-block trainable params (LoRA adapters) flow through the same slot
-pool; parameter bindings branch on the source trainable flag to swap
+pool; pinned module instances branch on the source trainable flag to swap
 ``.data`` (preserves user Parameter identity for autograd / optimizer
 state) instead of replacing the Parameter wrapper. Gradients live on GPU
 during backward via PyTorch's native ``AccumulateGrad``; only ``.data``
@@ -51,42 +51,26 @@ import torch
 from torch import nn
 
 from ._devices import canonical_device
-from .pinned_bindings import (
-    PinnedModuleBinding,
+from .pinned_buffer import PinnedBuffer
+from .pinned_module import (
+    PinnedModuleInstance,
+    PinnedModuleStore,
     PinnedModuleTarget,
-    PinnedParamBinding,
-    PinnedParamTarget,
     PostCopyHook,
     PostCopyHookHandle,
-    pin_module_slot_collection,
 )
-from .pinned_buffer import PinnedBuffer
 from .pinned_param import PinnedParam
 from .protocols import SlotKey
 from .slots import (
     ModuleSlotCollection,
     collect_module_slots,
-    get_param_slot,
-    set_param_data,
     set_tensor_data,
 )
 
 logger = logging.getLogger(__name__)
 
-_MaterializedTrainable = tuple[nn.Parameter, PinnedParamBinding, PinnedParamTarget]
-
-
-def _repoint_data_to_cpu_param(
-    param: nn.Parameter, cpu_param: nn.Parameter
-) -> None:
-    """ExitStack callback used by :meth:`StreamedWeights.optimizer_step`.
-
-    Repoints ``param.data`` at the pinned host clone, releasing the
-    optimizer-step GPU allocation that was assigned to ``param.data``
-    on enter. Defined at module scope so the closure registered with
-    ``ExitStack.callback`` doesn't capture a streamer reference.
-    """
-    set_param_data(param, cpu_param.data)
+StreamedParamRef = tuple[int, str]
+_LoadedTrainableBlock = tuple[PinnedModuleInstance, PinnedModuleTarget]
 
 
 def _release_cuda_cache_on_drop(is_cuda: bool) -> None:
@@ -116,12 +100,12 @@ class _PinnedModuleTargetPool:
 
     def __init__(
         self,
-        template_binding: PinnedModuleBinding,
+        template_store: PinnedModuleStore,
         num_slots: int,
         device: torch.device,
     ) -> None:
         self._targets = [
-            template_binding.allocate_target(device)
+            template_store.allocate_target(device)
             for _ in range(num_slots)
         ]
         self._free: list[int] = list(range(num_slots))
@@ -148,7 +132,7 @@ class _PinnedModuleTargetPool:
 
 
 # ---------------------------------------------------------------------------
-# Streamed block bindings
+# Streamed block instances
 # ---------------------------------------------------------------------------
 
 
@@ -186,13 +170,20 @@ def _check_block_layouts_match(
 
     def sig(collection: ModuleSlotCollection) -> tuple:
         return tuple(
-            (slots[0].name, _param_target_layout(slots[0].get()))
+            (
+                tuple(slot.name for slot in slots),
+                slots[0].get().requires_grad,
+                _param_target_layout(slots[0].get()),
+            )
             for slots in collection.param_slot_groups
         )
 
     def buffer_sig(collection: ModuleSlotCollection) -> tuple:
         return tuple(
-            (slots[0].name, _buffer_target_layout(slots[0].get()))
+            (
+                tuple(slot.name for slot in slots),
+                _buffer_target_layout(slots[0].get()),
+            )
             for slots in collection.buffer_slot_groups
         )
 
@@ -203,10 +194,11 @@ def _check_block_layouts_match(
             raise ValueError(
                 f"Block {i} param layout differs from block 0. "
                 "All blocks in a StreamedWeights group must share the "
-                "same param structure (names, shapes, dtypes, and any "
-                "tensor-adapter wrapper metadata). Split heterogeneous "
-                "block lists across separate `layers_attr=[...]` "
-                "groups in ModelOffloader."
+                "same param structure (names, alias topology, "
+                "requires_grad, shapes, dtypes, and any tensor-adapter "
+                "wrapper metadata). Split heterogeneous block lists "
+                "across separate `layers_attr=[...]` groups in "
+                "ModelOffloader."
             )
         if buffer_sig(block_slot_collections[i]) != ref_buffers:
             raise ValueError(
@@ -216,81 +208,6 @@ def _check_block_layouts_match(
                 "tensor layouts). Split heterogeneous block lists "
                 "across separate `layers_attr=[...]` groups in "
                 "ModelOffloader."
-            )
-
-
-def _check_block_binding_target_layouts_match(
-    block_bindings: Sequence[PinnedModuleBinding],
-) -> None:
-    """Raise if pinned binding target contracts differ from block 0.
-
-    This post-pin internal invariant keeps the GPU pool's layout-matching
-    contract explicit without putting validation on the block-load hot
-    path. The pre-pin layout check catches user-facing name mismatches
-    before mutation; this validates the actual pinned param/buffer name
-    keys and target layouts that will address :class:`PinnedModuleTarget`
-    storage.
-    """
-    if len(block_bindings) <= 1:
-        return
-
-    ref_params = tuple(
-        binding.name for binding in block_bindings[0].param_bindings
-    )
-    ref_param_layouts = tuple(
-        (binding.name, binding.target_layout)
-        for binding in block_bindings[0].param_bindings
-    )
-    ref_buffers = tuple(
-        binding.name for binding in block_bindings[0].buffer_bindings
-    )
-    ref_buffer_layouts = tuple(
-        (binding.name, binding.target_layout)
-        for binding in block_bindings[0].buffer_bindings
-    )
-    for i in range(1, len(block_bindings)):
-        param_names = tuple(
-            binding.name for binding in block_bindings[i].param_bindings
-        )
-        if param_names != ref_params:
-            raise ValueError(
-                f"Block {i} pinned param target names differ from block 0. "
-                "All blocks in a StreamedWeights group must share the "
-                "same ordered pinned param target names. Expected "
-                f"{ref_params!r}; got {param_names!r}."
-            )
-        param_layouts = tuple(
-            (binding.name, binding.target_layout)
-            for binding in block_bindings[i].param_bindings
-        )
-        if param_layouts != ref_param_layouts:
-            raise ValueError(
-                f"Block {i} pinned param target layouts differ from block 0. "
-                "All blocks in a StreamedWeights group must share the "
-                "same ordered pinned param target layouts. Expected "
-                f"{ref_param_layouts!r}; got {param_layouts!r}."
-            )
-
-        buffer_names = tuple(
-            binding.name for binding in block_bindings[i].buffer_bindings
-        )
-        if buffer_names != ref_buffers:
-            raise ValueError(
-                f"Block {i} pinned buffer target names differ from block 0. "
-                "All blocks in a StreamedWeights group must share the "
-                "same ordered pinned buffer target names. Expected "
-                f"{ref_buffers!r}; got {buffer_names!r}."
-            )
-        buffer_layouts = tuple(
-            (binding.name, binding.target_layout)
-            for binding in block_bindings[i].buffer_bindings
-        )
-        if buffer_layouts != ref_buffer_layouts:
-            raise ValueError(
-                f"Block {i} pinned buffer target layouts differ from block 0. "
-                "All blocks in a StreamedWeights group must share the "
-                "same ordered pinned buffer target layouts. Expected "
-                f"{ref_buffer_layouts!r}; got {buffer_layouts!r}."
             )
 
 
@@ -305,7 +222,7 @@ def _collect_block_slot_collections(
         collection = collect_module_slots(
             block,
             skip_slots=skip,
-            param_group_by="object",
+            param_group_by="storage",
         )
         slot_collections.append(collection)
         slot_filter.update(collection.slot_filter)
@@ -313,27 +230,12 @@ def _collect_block_slot_collections(
     return slot_collections, frozenset(slot_filter)
 
 
-def _validate_streamed_param(binding: PinnedParamBinding) -> None:
-    # Trainable streaming uses ``.data`` swap to preserve the user's
-    # Parameter identity. Only adapters that explicitly opt into that
-    # capability are allowed.
-    if not binding.requires_grad:
-        return
-    try:
-        binding.validate_parameter_data_swap_target()
-    except NotImplementedError as exc:
-        raise NotImplementedError(
-            f"Trainable streaming slot {binding.name!r} "
-            f"cannot be streamed: {exc}"
-        ) from exc
-
-
-def _pin_block_module_bindings(
+def _pin_block_module_instances(
     blocks: Sequence[nn.Module],
     *,
     skip_slots: set[SlotKey] | None = None,
-) -> tuple[list[PinnedModuleBinding], frozenset[SlotKey]]:
-    """Collect, validate, and pin one :class:`PinnedModuleBinding` per block.
+) -> tuple[list[PinnedModuleInstance], frozenset[SlotKey]]:
+    """Collect, validate, and pin one :class:`PinnedModuleInstance` per block.
 
     Pre-pin validation failures do not pin and do not mutate model
     slots. Once pinning starts, :class:`PinnedParam` may use its
@@ -343,7 +245,7 @@ def _pin_block_module_bindings(
     skip: set[SlotKey] = skip_slots or set()
 
     # Walk each block to collect param/buffer slots WITHOUT pinning
-    # anything. Pinning runs only after the layout-signature check
+    # anything. Pinning runs only after the block layout check
     # passes, so invalid configurations raise before model mutation.
     block_slot_collections, slot_filter = _collect_block_slot_collections(
         list(blocks), skip,
@@ -355,16 +257,71 @@ def _pin_block_module_bindings(
     # into block 0's pool slot without raising and corrupt forward.
     _check_block_layouts_match(block_slot_collections)
 
-    block_bindings = [
-        pin_module_slot_collection(
-            collection,
-            validate_param=_validate_streamed_param,
+    block_stores = [
+        PinnedModuleStore.from_module(
+            block,
+            include_param_names=_param_names(collection),
+            include_buffer_names=_buffer_names(collection),
         )
-        for collection in block_slot_collections
+        for block, collection in zip(blocks, block_slot_collections, strict=True)
     ]
-    _check_block_binding_target_layouts_match(block_bindings)
 
-    return block_bindings, slot_filter
+    block_instances = [
+        PinnedModuleInstance.from_store(store, block)
+        for store, block in zip(block_stores, blocks, strict=True)
+    ]
+    return block_instances, slot_filter
+
+
+def _param_names(collection: ModuleSlotCollection) -> set[str]:
+    return {
+        slot.name
+        for slots in collection.param_slot_groups
+        for slot in slots
+    }
+
+
+def _buffer_names(collection: ModuleSlotCollection) -> set[str]:
+    return {
+        slot.name
+        for slots in collection.buffer_slot_groups
+        for slot in slots
+    }
+
+
+def _iter_instance_trainable_params(
+    instance: PinnedModuleInstance,
+) -> Iterator[nn.Parameter]:
+    params = dict(instance.module.named_parameters(remove_duplicate=False))
+    seen: set[int] = set()
+    for name, pinned in instance.store.params.items():
+        if not pinned.requires_grad:
+            continue
+        param = params[name]
+        param_id = id(param)
+        if param_id in seen:
+            continue
+        seen.add(param_id)
+        yield param
+
+
+def _move_instance_trainable_grads_to(
+    instance: PinnedModuleInstance,
+    device: torch.device,
+) -> None:
+    for param in _iter_instance_trainable_params(instance):
+        if param.grad is None or param.grad.device == device:
+            continue
+        moved = param.grad.to(device)
+        if param.data.device == device:
+            param.grad = moved
+        else:
+            # PyTorch's grad setter rejects cross-device grad/data
+            # pairs. Streamed trainables intentionally have CPU data
+            # and GPU grads while active between block loads, so move
+            # the grad storage in place when the data is currently
+            # offloaded.
+            set_tensor_data(param.grad, moved.data)
 
 
 # ---------------------------------------------------------------------------
@@ -523,17 +480,17 @@ class StreamedWeights:
 
         # Pin in __init__ — uniform lifecycle with PinnedWeights, and
         # ModelCache integration sees a final `cache_bytes` immediately.
-        # Block binding construction validates that every block shares
-        # the same param-layout signature before any model slot is
+        # Block instance construction validates that every block shares
+        # the same pool-compatible layout before any model slot is
         # mutated, then clones directly from the source device into
         # pinned CPU storage. Heterogeneous block lists split across
         # separate `layers_attr=[...]` entries in ModelOffloader.
-        self._block_bindings, self._slot_filter = _pin_block_module_bindings(
+        self._block_instances, self._slot_filter = _pin_block_module_instances(
             self._blocks, skip_slots=skip_slots,
         )
         self._post_copy_hooks: dict[int, PostCopyHook] = {}
-        for binding in self._block_bindings:
-            binding.restore_pinned()
+        for instance in self._block_instances:
+            instance.restore_pinned()
         self._move_trainable_grads_to(torch.device("cpu"))
 
         # Active resources allocated on CUDA activate().
@@ -574,57 +531,81 @@ class StreamedWeights:
         return self._slot_filter
 
     @property
-    def param_bindings_per_block(self) -> list[list[PinnedParamBinding]]:
-        """Per-block streamed parameter bindings.
+    def param_refs_per_block(self) -> list[list[StreamedParamRef]]:
+        """Per-block streamed parameter refs.
 
-        Each binding is a :class:`PinnedParamBinding`: one pinned
-        parameter backing plus every parameter slot that should use it.
-        Used by
+        Each ref is ``(block_idx, block_local_param_name)``. Used by
         :class:`~torch_offload.ModelOffloader` to build its target-name
-        index.
+        index without exposing the pinned store internals.
 
         .. warning::
-           Returned list shares internal binding state. Treat it as
-           read-only — mutating the outer list, inner lists, or bindings
-           will corrupt streaming bookkeeping.
+           The outer list is a snapshot, but refs point at this
+           streamer's internal stores. Treat them as streamer-local.
         """
         return [
-            binding.param_bindings for binding in self._block_bindings
+            [
+                (block_idx, name)
+                for name in instance.store.params
+            ]
+            for block_idx, instance in enumerate(self._block_instances)
         ]
+
+    def param_alias_names(self, ref: StreamedParamRef) -> tuple[str, ...]:
+        """Return block-local names that share ``ref``'s pinned backing."""
+        instance, name = self._resolve_param_ref(ref)
+        pinned = instance.store.params[name]
+        return tuple(
+            candidate
+            for candidate, candidate_pinned in instance.store.params.items()
+            if candidate_pinned is pinned
+        )
 
     @property
     def cache_bytes(self) -> int:
-        return sum(binding.cache_bytes for binding in self._block_bindings)
+        return sum(instance.cache_bytes for instance in self._block_instances)
 
     @property
     def has_trainables(self) -> bool:
-        return any(binding.has_trainables() for binding in self._block_bindings)
+        return any(instance.store.has_trainables for instance in self._block_instances)
 
     def register_post_copy_hook(
-        self, binding: PinnedParamBinding, hook: PostCopyHook,
+        self, ref: StreamedParamRef, hook: PostCopyHook,
     ) -> PostCopyHookHandle:
-        """Register a hook after this component copies ``binding`` to GPU.
+        """Register a hook after this component copies ``ref`` to GPU.
 
         Package-internal: used by :class:`ModelOffloader` for merge-mode
         LoRA. Mirrors PyTorch's hook registration pattern by returning a
         handle whose :meth:`remove` method unregisters the hook.
         """
-        if not any(
-            block_binding.contains_param_binding(binding)
-            for block_binding in self._block_bindings
-        ):
-            raise ValueError(
-                "param binding "
-                f"{binding.name!r} is not owned by this StreamedWeights"
-            )
-        key = id(binding)
+        key = self.post_copy_hook_key(ref)
         if key in self._post_copy_hooks:
             raise RuntimeError(
                 "post-copy hook already registered for "
-                f"param binding {binding.name!r}"
+                f"streamed param {ref!r}"
             )
         self._post_copy_hooks[key] = hook
         return PostCopyHookHandle(self._post_copy_hooks, key)
+
+    def post_copy_hook_key(self, ref: StreamedParamRef) -> int:
+        """Stable hook/dedup key for a streamed parameter ref."""
+        instance, name = self._resolve_param_ref(ref)
+        return id(instance.store.params[name])
+
+    def _resolve_param_ref(
+        self,
+        ref: StreamedParamRef,
+    ) -> tuple[PinnedModuleInstance, str]:
+        block_idx, name = ref
+        if block_idx < 0 or block_idx >= len(self._block_instances):
+            raise ValueError(
+                f"streamed param ref block index {block_idx} is out of range"
+            )
+        instance = self._block_instances[block_idx]
+        if name not in instance.store.params:
+            raise ValueError(
+                f"param name {name!r} is not owned by streamed block {block_idx}"
+            )
+        return instance, name
 
     def _resolve_device(self, device: torch.device | str | None) -> torch.device:
         if device is not None:
@@ -766,7 +747,7 @@ class StreamedWeights:
              eviction still ran first so the streamer is in a
              consistent baseline.
           2. On the streamer's private ``self._stream``, H2D each
-             trainable's pinned ``.data`` to a fresh binding-owned GPU
+             trainable's pinned ``.data`` to fresh instance-owned GPU
              target. Each H2D registers a rollback (repoint ``.data`` at
              pinned) on an :class:`~contextlib.ExitStack`.
           3. Have the user's current CUDA stream wait on
@@ -868,7 +849,7 @@ class StreamedWeights:
         self._optimizer_step_active = True
         try:
             with contextlib.ExitStack() as stack:
-                materialized = self._materialize_trainables_for_step(
+                loaded = self._load_trainables_for_step(
                     target, step_stream, stack,
                 )
 
@@ -876,7 +857,7 @@ class StreamedWeights:
                     yield
                 finally:
                     self._scatter_trainables_after_step(
-                        materialized, step_stream, target,
+                        loaded, step_stream, target,
                     )
         finally:
             self._optimizer_step_active = False
@@ -903,53 +884,42 @@ class StreamedWeights:
     # Trainable helpers
     # ------------------------------------------------------------------
 
-    def _iter_trainables(
+    def _load_trainables_for_step(
         self,
-    ) -> Iterator[tuple[PinnedParamBinding, nn.Module, str]]:
-        """Yield every trainable binding across all streamed blocks."""
-        for binding in self._block_bindings:
-            yield from binding.iter_trainables()
-
-    def _materialize_trainables_for_step(
-        self,
-        target: torch.device,
+        device: torch.device,
         step_stream: torch.cuda.Stream,
         stack: contextlib.ExitStack,
-    ) -> list[_MaterializedTrainable]:
-        """Move trainable ``.data`` to ``target`` for optimizer.step()."""
-        # Each materialization registers a rollback that repoints the
-        # user's Parameter's .data back at its binding-owned CPU param.
-        # ExitStack unwinds these on the way out whether enter failed
-        # mid-loop (no scatter), the body exited cleanly (scatter, then
-        # rollback), or the body raised after yield (still scatter, then
-        # rollback). The rollback is idempotent after a successful copy.
-        materialized: list[_MaterializedTrainable] = []
+    ) -> list[_LoadedTrainableBlock]:
+        """Move trainable ``.data`` to ``device`` for optimizer.step()."""
+        # Each block load registers a rollback that restores the block
+        # instance to pinned host storage. ExitStack unwinds
+        # these on the way out whether enter failed mid-loop, the body
+        # exited cleanly, or the body raised after yield.
+        loaded: list[_LoadedTrainableBlock] = []
         with torch.cuda.stream(step_stream):
-            for binding, parent, leaf in self._iter_trainables():
-                param = get_param_slot(parent, leaf)
-                stack.callback(
-                    _repoint_data_to_cpu_param, param, binding.cpu_param
+            for instance in self._block_instances:
+                if not instance.store.has_trainables:
+                    continue
+                stack.callback(instance.restore_pinned)
+                trainable_target = instance.allocate_target(
+                    device,
+                    param_names=instance.store.trainable_param_names,
+                    buffer_names=(),
                 )
-                param_target = binding.allocate_target(target)
-                binding.copy_to_target(param_target, non_blocking=True)
-                set_param_data(
-                    param,
-                    param_target.param.data,
-                )
-                if param.grad is not None and param.grad.device != target:
-                    param.grad = param.grad.to(target, non_blocking=True)
-                materialized.append((param, binding, param_target))
+                instance.load_to_target(trainable_target, non_blocking=True)
+                _move_instance_trainable_grads_to(instance, device)
+                loaded.append((instance, trainable_target))
         # User's current stream now waits for step_stream's H2D. After
         # this point the optimizer can safely read param.data on its own
         # stream.
-        torch.cuda.current_stream(target).wait_stream(step_stream)
-        return materialized
+        torch.cuda.current_stream(device).wait_stream(step_stream)
+        return loaded
 
     def _scatter_trainables_after_step(
         self,
-        materialized: list[_MaterializedTrainable],
+        loaded: list[_LoadedTrainableBlock],
         step_stream: torch.cuda.Stream,
-        target: torch.device,
+        device: torch.device,
     ) -> None:
         """Copy optimizer-updated trainable ``.data`` back to pinned CPU."""
         # Scatter on body-exit (clean OR exception). On body exception
@@ -957,38 +927,30 @@ class StreamedWeights:
         # preserve that partial state rather than silently rolling back
         # to pre-step pinned bytes. The blocking copy + sync guarantees
         # the next prefetch reads stable bytes.
-        step_stream.wait_stream(torch.cuda.current_stream(target))
+        step_stream.wait_stream(torch.cuda.current_stream(device))
         with torch.cuda.stream(step_stream):
-            for _param, binding, param_target in materialized:
-                binding.copy_from_target(param_target, non_blocking=False)
+            for instance, trainable_target in loaded:
+                instance.copy_trainables_from_target(
+                    trainable_target,
+                    non_blocking=False,
+                )
         step_stream.synchronize()
         # ExitStack unwinds after this returns: each materialized
-        # param's .data is repointed at its binding-owned CPU param
-        # data, releasing the optimizer-step GPU allocation.
+        # block instance restores trainable .data to pinned CPU storage,
+        # releasing the optimizer-step GPU allocation.
 
     def _move_trainable_grads_to(self, device: torch.device) -> None:
         """Move each trainable's ``.grad`` (if any) to ``device``.
 
         During backward, PyTorch's native ``AccumulateGrad`` writes
         grads on the param's data device, which is GPU at that point
-        because the ``.data`` swap in :meth:`PinnedModuleBinding.load_to_target`
+        because the ``.data`` swap in :meth:`PinnedModuleInstance.load_to_target`
         repointed ``.data`` at slot storage. Eviction restores ``.data``
         to pinned CPU, but ``.grad`` keeps living wherever AccumulateGrad
         placed it.
         """
-        for _binding, parent, leaf in self._iter_trainables():
-            param = get_param_slot(parent, leaf)
-            if param.grad is not None and param.grad.device != device:
-                moved = param.grad.to(device)
-                if param.data.device == device:
-                    param.grad = moved
-                else:
-                    # PyTorch's grad setter rejects cross-device grad/data
-                    # pairs. Streamed trainables intentionally have CPU
-                    # data and GPU grads while active between block loads,
-                    # so move the grad storage in place when the data is
-                    # currently offloaded.
-                    set_tensor_data(param.grad, moved.data)
+        for instance in self._block_instances:
+            _move_instance_trainable_grads_to(instance, device)
 
     # ------------------------------------------------------------------
     # Pool and block movement
@@ -1014,7 +976,7 @@ class StreamedWeights:
         # Pool template comes from block 0. The constructor's layout
         # check has already verified every other block matches.
         self._pool = _PinnedModuleTargetPool(
-            self._block_bindings[0],
+            self._block_instances[0].store,
             num_gpu_slots,
             device,
         )
@@ -1034,7 +996,7 @@ class StreamedWeights:
     ) -> None:
         assert self._pool is not None, "_activate_pool not called"
 
-        binding = self._block_bindings[block_idx]
+        instance = self._block_instances[block_idx]
 
         slot_id = self._block_to_slot.get(block_idx)
         if slot_id is None:
@@ -1043,14 +1005,14 @@ class StreamedWeights:
 
         self._pool.wait_if_needed(slot_id, stream)
         target = self._pool.target(slot_id)
-        binding.load_to_target(
+        instance.load_to_target(
             target,
             post_copy_hooks=self._post_copy_hooks,
             non_blocking=non_blocking,
         )
 
     def _release_block(self, block_idx: int) -> None:
-        self._block_bindings[block_idx].restore_pinned()
+        self._block_instances[block_idx].restore_pinned()
         if self._pool is None:
             return
         slot_id = self._block_to_slot.pop(block_idx, None)
@@ -1289,7 +1251,7 @@ class StreamedWeights:
                 # Strategy was dropped without deactivate. Hook is
                 # orphaned — no-op. Forward through this block uses
                 # whatever the slot currently holds: GPU param if it
-                # was resident at drop-time, binding cpu_param if it
+                # was resident at drop-time, instance cpu_param if it
                 # had been evicted. Both are functional (CPU forward
                 # is slower but works on pinned tensors).
                 return
@@ -1310,5 +1272,6 @@ class StreamedWeights:
 
 
 __all__ = [
+    "StreamedParamRef",
     "StreamedWeights",
 ]

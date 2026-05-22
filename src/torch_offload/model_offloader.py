@@ -15,14 +15,13 @@ import contextlib
 import logging
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
-from typing import Literal, Protocol
+from typing import Literal, Protocol, TypeGuard
 
 import torch
 from torch import nn
 
 from ._devices import canonical_device
 from .lora import LoRA, LoRARouteHandle, LoRATransform
-from .pinned_bindings import PinnedParamBinding
 from .pinned_weights import PinnedWeights
 from .protocols import ModelStrategyComponent, SlotKey
 from .slots import (
@@ -34,7 +33,7 @@ from .slots import (
     param_storage_key,
     walk_attr_path,
 )
-from .streamed_weights import StreamedWeights
+from .streamed_weights import StreamedParamRef, StreamedWeights
 from .tensor_adapter_factory import select_adapter
 from .trainable_weights import TrainableWeights
 
@@ -43,7 +42,7 @@ logger = logging.getLogger(__name__)
 LoraMode = Literal["merge", "routed"]
 _LoraFactorRef = tuple[torch.Tensor, torch.Tensor, float]
 _LoraTargetMap = dict[str, list[_LoraFactorRef]]
-_TargetParamRef = PinnedParamBinding | str
+_TargetParamRef = StreamedParamRef | str
 
 
 class _RemovableHook(Protocol):
@@ -315,7 +314,12 @@ class ModelOffloader:
             self._target_to_param_ref,
             self._target_to_parents,
             self._target_to_component,
-        ) = self._build_target_index(streamers, layer_paths, non_block)
+        ) = self._build_target_index(
+            streamers,
+            layer_paths,
+            block_groups,
+            non_block,
+        )
         self._lora_hook_handles: list[_RemovableHook] = []
         self._block_groups: list[list[nn.Module]] = block_groups
         self._warned_about_checkpointing: bool = False
@@ -463,8 +467,8 @@ class ModelOffloader:
                     param_ref, transform.apply,
                 )
             else:
-                if not isinstance(param_ref, PinnedParamBinding):
-                    raise TypeError("StreamedWeights merge target must be a binding.")
+                if not _is_streamed_param_ref(param_ref):
+                    raise TypeError("StreamedWeights merge target must be a ref.")
                 handle = component.register_post_copy_hook(
                     param_ref, transform.apply,
                 )
@@ -778,6 +782,7 @@ class ModelOffloader:
     def _build_target_index(
         streamers: list[StreamedWeights],
         layer_paths: list[str],
+        block_groups: list[list[nn.Module]],
         non_block: PinnedWeights | None,
     ) -> tuple[
         dict[str, _TargetParamRef],
@@ -796,39 +801,36 @@ class ModelOffloader:
         names) match regardless of whether the model is PEFT-wrapped.
 
         Parents are stored as a tuple to preserve tied-weight
-        information. Streamed-block targets always have exactly one
-        parent (each ``(layer_path, block_idx, qual_name)`` is unique;
+        information. Streamed-block targets can have multiple parents
+        when aliases inside the same block share pinned storage;
         cross-region ties are rejected upstream by
-        :func:`detect_streaming_region_ties`). Non-block targets may
-        have more than one parent — e.g., the standard tied
-        embed/head pattern — which routed mode rejects (merge mode
-        handles tied storage uniformly because it mutates the shared
-        bytes).
+        :func:`detect_streaming_region_ties`. Routed mode rejects tied
+        targets, while merge mode handles tied storage uniformly because
+        it mutates the shared bytes.
         """
         param_refs: dict[str, _TargetParamRef] = {}
         parents: dict[str, tuple[nn.Module, ...]] = {}
         components: dict[str, PinnedWeights | StreamedWeights] = {}
 
-        for streamer, layer_path in zip(streamers, layer_paths, strict=True):
-            for block_idx, block_param_bindings in enumerate(
-                streamer.param_bindings_per_block
+        for streamer, layer_path, blocks in zip(
+            streamers,
+            layer_paths,
+            block_groups,
+            strict=True,
+        ):
+            for block_idx, block_param_refs in enumerate(
+                streamer.param_refs_per_block
             ):
-                for param_binding in block_param_bindings:
-                    seen_parent_ids: set[int] = set()
-                    slot_parents: list[nn.Module] = []
-                    for slot in param_binding.slots:
-                        parent_id = id(slot.parent)
-                        if parent_id in seen_parent_ids:
-                            continue
-                        seen_parent_ids.add(parent_id)
-                        slot_parents.append(slot.parent)
-                    parent_tuple = tuple(slot_parents)
-                    for slot in param_binding.slots:
-                        full_name = f"{layer_path}.{block_idx}.{slot.name}"
-                        key = canonical_param_name(full_name)
-                        param_refs[key] = param_binding
-                        parents[key] = parent_tuple
-                        components[key] = streamer
+                block = blocks[block_idx]
+                for param_ref in block_param_refs:
+                    _, local_name = param_ref
+                    alias_names = streamer.param_alias_names(param_ref)
+                    parent_tuple = _unique_named_param_parents(block, alias_names)
+                    full_name = f"{layer_path}.{block_idx}.{local_name}"
+                    key = canonical_param_name(full_name)
+                    param_refs[key] = param_ref
+                    parents[key] = parent_tuple
+                    components[key] = streamer
 
         if non_block is not None:
             slots_by_ref_key: dict[int, list[ParamSlot]] = {}
@@ -874,9 +876,18 @@ def _post_copy_hook_key(
         if not isinstance(param_ref, str):
             raise TypeError("PinnedWeights merge target must be a name.")
         return component.post_copy_hook_key(param_ref)
-    if not isinstance(param_ref, PinnedParamBinding):
-        raise TypeError("StreamedWeights merge target must be a binding.")
-    return id(param_ref)
+    if not _is_streamed_param_ref(param_ref):
+        raise TypeError("StreamedWeights merge target must be a ref.")
+    return component.post_copy_hook_key(param_ref)
+
+
+def _is_streamed_param_ref(value: object) -> TypeGuard[StreamedParamRef]:
+    return (
+        isinstance(value, tuple)
+        and len(value) == 2
+        and isinstance(value[0], int)
+        and isinstance(value[1], str)
+    )
 
 
 def _unique_slot_parents(slots: Sequence[ParamSlot]) -> tuple[nn.Module, ...]:
@@ -889,6 +900,35 @@ def _unique_slot_parents(slots: Sequence[ParamSlot]) -> tuple[nn.Module, ...]:
         seen_parent_ids.add(parent_id)
         slot_parents.append(slot.parent)
     return tuple(slot_parents)
+
+
+def _unique_named_param_parents(
+    block: nn.Module,
+    names: Sequence[str],
+) -> tuple[nn.Module, ...]:
+    seen_parent_ids: set[int] = set()
+    parents: list[nn.Module] = []
+    for name in names:
+        parent = _resolve_param_parent(block, name)
+        parent_id = id(parent)
+        if parent_id in seen_parent_ids:
+            continue
+        seen_parent_ids.add(parent_id)
+        parents.append(parent)
+    return tuple(parents)
+
+
+def _resolve_param_parent(block: nn.Module, name: str) -> nn.Module:
+    parent_path, sep, _leaf = name.rpartition(".")
+    if not sep:
+        return block
+    parent = walk_attr_path(block, parent_path)
+    if not isinstance(parent, nn.Module):
+        raise TypeError(
+            f"Path {parent_path!r} resolved to {type(parent).__name__}, "
+            "expected nn.Module."
+        )
+    return parent
 
 
 def _resolve_layers_attr(module: nn.Module, dotted_path: str) -> nn.ModuleList:
@@ -950,7 +990,7 @@ def _validate_block_groups_disjoint(
       slots and swap ``.data`` redundantly.
 
     This validation is the precondition for
-    :func:`detect_streaming_region_ties` and the per-block binding
+    :func:`detect_streaming_region_ties` and the per-block instance
     construction inside :class:`StreamedWeights` to be unambiguous; it lives
     at the composer because it is about how the caller composed
     ``layers_attr`` paths, not about parameter aliasing.
@@ -997,7 +1037,6 @@ class _ParamStorageMember:
     region: str
     name: str
     requires_grad: bool
-    slot_key: SlotKey
     param_id: int
 
 
@@ -1036,11 +1075,11 @@ def detect_streaming_region_ties(
       ``stream_trainables=True``. The same Parameter object is safe
       under default all-trainables-on-GPU movement, but unsafe when
       one streamed region owns a distinct pinned clone.
-    - **Unsupported intra-block parameter ties** (two distinct slots in the
-      same block sharing storage). Same-Parameter all-trainable
-      aliases are safe because a single ``.data`` swap reaches every
-      alias slot; frozen aliases and distinct-Parameter trainable
-      aliases are rejected.
+    - **Unsupported intra-block trainable ties** with distinct Parameter
+      objects. Same-Parameter all-trainable aliases are safe because a
+      single ``.data`` swap reaches every alias slot. Frozen aliases are
+      safe because streamed stores deduplicate by storage within each
+      block.
     - **Cross-region buffer ties**. Per-block buffer clones and
       composed non-block pinning cannot coordinate to preserve the
       alias.
@@ -1112,7 +1151,6 @@ def _param_storage_groups(
                 region=region,
                 name=slot.name,
                 requires_grad=param.requires_grad,
-                slot_key=slot.key,
                 param_id=id(param),
             )
         )
@@ -1161,7 +1199,6 @@ def _validate_param_storage_group(
         )
         return
     _validate_frozen_param_storage_group(
-        members,
         regions=regions,
         names=names,
     )
@@ -1187,7 +1224,7 @@ def _validate_all_trainable_param_storage_group(
     # across regions because TrainableWeights owns the single Parameter
     # object directly. With stream_trainable_weights=True, cross-region
     # aliasing is NOT fine: each region builds its own streamed block
-    # bindings (or composes TrainableWeights for ``non_block``) with an
+    # instance (or composes TrainableWeights for ``non_block``) with an
     # independent pinned clone.
     if stream_trainables and len(regions) > 1:
         raise ValueError(
@@ -1203,7 +1240,6 @@ def _validate_all_trainable_param_storage_group(
 
 
 def _validate_frozen_param_storage_group(
-    members: list[_ParamStorageMember],
     *,
     regions: set[str],
     names: list[str],
@@ -1216,18 +1252,6 @@ def _validate_frozen_param_storage_group(
             "whole-model PinnedWeights, disable block streaming, or "
             "untie the parameters."
         )
-    sole_region = next(iter(regions))
-    if sole_region.startswith(_BLOCK_REGION_PREFIX):
-        slot_keys = {member.slot_key for member in members}
-        if len(slot_keys) > 1:
-            raise ValueError(
-                f"Block streaming does not support intra-block tied "
-                f"parameters: storage shared by {names} within "
-                f"{sole_region}. Streamed block bindings cannot preserve "
-                "the tying invariant — one alias would stay pointing "
-                "at non-pinned data. Untie the parameters or use "
-                "whole-model PinnedWeights instead."
-            )
 
 
 def _validate_buffer_storage_group(

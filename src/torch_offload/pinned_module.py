@@ -8,7 +8,14 @@ between a store and an instance.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Hashable, Iterable, Iterator, Mapping
+from collections.abc import (
+    Callable,
+    Hashable,
+    Iterable,
+    Iterator,
+    Mapping,
+    MutableMapping,
+)
 from dataclasses import dataclass
 from typing import TypeVar
 
@@ -43,12 +50,34 @@ class PinnedBufferTarget:
 class PinnedModuleTarget:
     """Name-keyed active storage for a :class:`PinnedModuleStore`.
 
-    Aliased names point at the same target object, mirroring the store's
-    ``name -> pinned`` topology.
+    Targets may contain the whole store or a validated subset of it.
+    Aliased selected names point at the same target object, mirroring
+    the store's ``name -> pinned`` topology.
     """
 
     param_targets: dict[str, PinnedParamTarget]
     buffer_targets: dict[str, PinnedBufferTarget]
+
+
+class PostCopyHookHandle:
+    """Removal handle returned by post-copy hook registration."""
+
+    __slots__ = ("_hooks", "_key")
+
+    def __init__(
+        self,
+        hooks: MutableMapping[int, PostCopyHook],
+        key: int,
+    ) -> None:
+        self._hooks: MutableMapping[int, PostCopyHook] | None = hooks
+        self._key = key
+
+    def remove(self) -> None:
+        hooks = self._hooks
+        if hooks is None:
+            return
+        hooks.pop(self._key, None)
+        self._hooks = None
 
 
 @dataclass(slots=True)
@@ -77,21 +106,12 @@ class PinnedModuleStore:
         Store construction is intentionally side-effecting like the
         existing pinning path: after bytes are pinned, the prototype
         module is restored to the store-backed pinned CPU state.
-        Included names must select whole alias groups, because
-        partially restoring an alias group would change the prototype's
-        alias topology.
         """
         all_params = _named_parameters(module)
         params = _select_named_items(
             "param",
             all_params,
             include_param_names,
-        )
-        _validate_selection_preserves_alias_groups(
-            "param",
-            all_params,
-            params,
-            lambda name: _param_storage_key(all_params[name]),
         )
 
         all_buffers = _named_buffers(module)
@@ -100,17 +120,12 @@ class PinnedModuleStore:
             all_buffers,
             include_buffer_names,
         )
-        _validate_selection_preserves_alias_groups(
-            "buffer",
-            all_buffers,
-            buffers,
-            lambda name: _buffer_storage_key(all_buffers[name]),
-        )
 
         store = cls(
             params=_pin_params(params),
             buffers=_pin_buffers(buffers),
         )
+        _validate_trainable_param_data_swaps(store.params)
         _restore_params(module, store.params, _make_cpu_params(store.params))
         _restore_buffers(module, store.buffers)
         return store
@@ -118,6 +133,34 @@ class PinnedModuleStore:
     @property
     def cache_bytes(self) -> int:
         return _unique_cache_bytes(self.params) + _unique_cache_bytes(self.buffers)
+
+    @property
+    def has_trainables(self) -> bool:
+        return bool(self.trainable_param_names)
+
+    @property
+    def trainable_param_names(self) -> tuple[str, ...]:
+        return tuple(
+            name
+            for name, pinned in self.params.items()
+            if pinned.requires_grad
+        )
+
+    def allocate_target(
+        self,
+        device: torch.device,
+        *,
+        param_names: Iterable[str] | None = None,
+        buffer_names: Iterable[str] | None = None,
+    ) -> PinnedModuleTarget:
+        """Allocate active storage for selected store entries on ``device``."""
+        _validate_cuda_device(device)
+        params = _select_named_items("param target", self.params, param_names)
+        buffers = _select_named_items("buffer target", self.buffers, buffer_names)
+        return PinnedModuleTarget(
+            param_targets=_allocate_param_targets(params, device),
+            buffer_targets=_allocate_buffer_targets(buffers, device),
+        )
 
 
 @dataclass(slots=True)
@@ -157,17 +200,18 @@ class PinnedModuleInstance:
         )
         _restore_buffers(self.module, self.store.buffers)
 
-    def allocate_target(self, device: torch.device) -> PinnedModuleTarget:
-        """Allocate active storage for this instance's store on ``device``."""
-        if device.type != "cuda":
-            raise ValueError(
-                "PinnedModuleTarget requires a CUDA device; "
-                f"got {device}."
-            )
-
-        return PinnedModuleTarget(
-            param_targets=_allocate_param_targets(self.store.params, device),
-            buffer_targets=_allocate_buffer_targets(self.store.buffers, device),
+    def allocate_target(
+        self,
+        device: torch.device,
+        *,
+        param_names: Iterable[str] | None = None,
+        buffer_names: Iterable[str] | None = None,
+    ) -> PinnedModuleTarget:
+        """Allocate active storage for selected store entries on ``device``."""
+        return self.store.allocate_target(
+            device,
+            param_names=param_names,
+            buffer_names=buffer_names,
         )
 
     def load_to_target(
@@ -177,32 +221,34 @@ class PinnedModuleInstance:
         post_copy_hooks: Mapping[int, PostCopyHook] | None = None,
         non_blocking: bool = False,
     ) -> None:
-        """Copy pinned bytes into ``target`` and install target storage.
+        """Copy selected pinned bytes into ``target`` and install them.
 
         Copying and hooks complete before any module mutation, so a copy
         failure does not leave the instance partially active.
         """
-        _validate_target_matches_store(self.store, target)
+        _validate_target_names_known(self.store, target)
+        params = _items_for_names(self.store.params, target.param_targets)
+        buffers = _items_for_names(self.store.buffers, target.buffer_targets)
 
         _copy_params_to_target(
-            self.store.params,
+            params,
             target.param_targets,
             non_blocking=non_blocking,
         )
         _run_post_copy_hooks(
-            self.store.params,
+            params,
             target.param_targets,
             post_copy_hooks,
         )
         _copy_buffers_to_target(
-            self.store.buffers,
+            buffers,
             target.buffer_targets,
             non_blocking=non_blocking,
         )
 
         _set_params(
             self.module,
-            self.store.params,
+            params,
             {
                 name: param_target.param
                 for name, param_target in target.param_targets.items()
@@ -227,7 +273,8 @@ class PinnedModuleInstance:
         This is the explicit pinned-cache mutation path for optimizer-step
         sync. Frozen params and buffers are intentionally not copied back.
         """
-        _validate_target_matches_store(self.store, target)
+        _validate_target_names_known(self.store, target)
+        _validate_target_has_trainable_params(self.store, target)
         _copy_trainable_params_from_target(
             self.store.params,
             target.param_targets,
@@ -272,20 +319,12 @@ def _select_named_items(
     return {name: value for name, value in items.items() if name in included}
 
 
-def _validate_selection_preserves_alias_groups(
-    kind: str,
-    all_items: Mapping[str, object],
-    included_items: Mapping[str, object],
-    key_for_name: _KeyForName,
-) -> None:
-    included_names = set(included_items)
-    for names in _group_names(all_items, key_for_name):
-        selected = [name for name in names if name in included_names]
-        if selected and len(selected) != len(names):
-            raise ValueError(
-                f"PinnedModuleStore {kind} include names cannot split an alias group; "
-                f"selected {_format_names(selected)} from {_format_names(names)}."
-            )
+def _items_for_names(
+    items: Mapping[str, _NamedT],
+    names: Iterable[str],
+) -> dict[str, _NamedT]:
+    included = set(names)
+    return {name: value for name, value in items.items() if name in included}
 
 
 def _validate_module_matches_store(
@@ -331,41 +370,39 @@ def _validate_module_matches_store(
     )
 
 
-def _validate_target_matches_store(
-    store: PinnedModuleStore, target: PinnedModuleTarget,
+def _validate_target_has_trainable_params(
+    store: PinnedModuleStore,
+    target: PinnedModuleTarget,
 ) -> None:
-    _validate_names_match("param target", store.params, target.param_targets)
-    _validate_names_match("buffer target", store.buffers, target.buffer_targets)
+    trainable_params = _trainable_params(store.params)
+    expected_names = set(trainable_params)
+    actual_names = set(target.param_targets)
+    missing = sorted(expected_names - actual_names)
+    if missing:
+        raise ValueError(
+            "PinnedModuleTarget trainable param target names mismatch: "
+            f"missing {_format_names(missing)}."
+        )
 
-    _validate_alias_topology(
-        "param target",
-        _pinned_alias_groups(store.params),
-        _alias_groups(target.param_targets, lambda name: id(target.param_targets[name])),
-    )
-    _validate_alias_topology(
-        "buffer target",
-        _pinned_alias_groups(store.buffers),
-        _alias_groups(
-            target.buffer_targets,
-            lambda name: id(target.buffer_targets[name]),
-        ),
-    )
 
-    for name, pinned in store.params.items():
-        layout = PinnedParam.target_layout_for(target.param_targets[name].param)
-        if layout != pinned.target_layout:
-            raise ValueError(
-                f"Param target {name!r} layout mismatch: store has "
-                f"{pinned.target_layout!r}, target has {layout!r}."
-            )
+def _validate_target_names_known(
+    store: PinnedModuleStore,
+    target: PinnedModuleTarget,
+) -> None:
+    _validate_no_extra_names("param target", target.param_targets, store.params)
+    _validate_no_extra_names("buffer target", target.buffer_targets, store.buffers)
 
-    for name, pinned in store.buffers.items():
-        layout = PinnedBuffer.target_layout_for(target.buffer_targets[name].tensor)
-        if layout != pinned.target_layout:
-            raise ValueError(
-                f"Buffer target {name!r} layout mismatch: store has "
-                f"{pinned.target_layout!r}, target has {layout!r}."
-            )
+
+def _validate_no_extra_names(
+    kind: str,
+    target_items: Mapping[str, object],
+    store_items: Mapping[str, object],
+) -> None:
+    extra = sorted(set(target_items) - set(store_items))
+    if extra:
+        raise ValueError(
+            f"PinnedModuleTarget has unknown {kind} names: {_format_names(extra)}."
+        )
 
 
 def _validate_param_alias_requires_grad(
@@ -382,6 +419,25 @@ def _validate_param_alias_requires_grad(
     )
 
 
+def _validate_trainable_param_data_swaps(
+    params: Mapping[str, PinnedParam],
+) -> None:
+    seen: set[int] = set()
+    for name, pinned in params.items():
+        if not pinned.requires_grad:
+            continue
+        key = id(pinned)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            pinned.validate_parameter_data_swap_target()
+        except NotImplementedError as exc:
+            raise NotImplementedError(
+                f"Trainable param {name!r} cannot use Parameter.data swap: {exc}"
+            ) from exc
+
+
 def _validate_store_names(store: PinnedModuleStore) -> None:
     overlap = sorted(set(store.params) & set(store.buffers))
     if overlap:
@@ -389,26 +445,6 @@ def _validate_store_names(store: PinnedModuleStore) -> None:
             "PinnedModuleStore cannot bind names as both params and buffers: "
             f"{_format_names(overlap)}."
         )
-
-
-def _validate_names_match(
-    kind: str,
-    store_items: Mapping[str, object],
-    target_items: Mapping[str, object],
-) -> None:
-    expected = set(store_items)
-    actual = set(target_items)
-    if actual == expected:
-        return
-
-    missing = sorted(expected - actual)
-    extra = sorted(actual - expected)
-    details = []
-    if missing:
-        details.append(f"missing {_format_names(missing)}")
-    if extra:
-        details.append(f"extra {_format_names(extra)}")
-    raise ValueError(f"PinnedModuleTarget {kind} names mismatch: {'; '.join(details)}.")
 
 
 def _validate_names_present(
@@ -462,6 +498,24 @@ def _allocate_param_targets(
             targets_by_pinned_id[key] = target
         targets_by_name[name] = target
     return targets_by_name
+
+
+def _validate_cuda_device(device: torch.device) -> None:
+    if device.type != "cuda":
+        raise ValueError(
+            "PinnedModuleTarget requires a CUDA device; "
+            f"got {device}."
+        )
+
+
+def _trainable_params(
+    params: Mapping[str, PinnedParam],
+) -> dict[str, PinnedParam]:
+    return {
+        name: pinned
+        for name, pinned in params.items()
+        if pinned.requires_grad
+    }
 
 
 def _allocate_buffer_targets(
@@ -572,7 +626,6 @@ def _set_params(
         materialized = materialized_params[name]
         parent, leaf = _resolve_parent_leaf(module, name)
         if pinned.requires_grad:
-            pinned.validate_parameter_data_swap_target()
             _get_param(parent, leaf).data = materialized.data
         else:
             _set_param(parent, leaf, materialized)
@@ -748,4 +801,5 @@ __all__ = [
     "PinnedModuleTarget",
     "PinnedParamTarget",
     "PostCopyHook",
+    "PostCopyHookHandle",
 ]

@@ -13,15 +13,12 @@ from __future__ import annotations
 
 import logging
 from concurrent.futures import Future
-from types import SimpleNamespace
-from typing import cast
 
 import pytest
 import torch
 import torch.utils.checkpoint
 from torch import nn
 
-import torch_offload.streamed_weights as streamed_weights_module
 from torch_offload import (
     ModelOffloader,
     ModelStrategy,
@@ -31,11 +28,7 @@ from torch_offload import (
     TrainableWeights,
 )
 from torch_offload.model_offloader import detect_streaming_region_ties
-from torch_offload.pinned_bindings import PinnedModuleBinding
 from torch_offload.slots import iter_buffer_slots, iter_param_slots
-from torch_offload.streamed_weights import (
-    _check_block_binding_target_layouts_match,
-)
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -1171,11 +1164,12 @@ class TestCrossRegionTiedDetection:
                 layers_attr="transformer_blocks", blocks_to_swap=1,
             )
 
-    def test_intra_block_tied_params_raises(self) -> None:
-        shared = torch.randn(8, 8)
+    def test_intra_block_tied_params_are_preserved(self) -> None:
+        shared_0 = torch.randn(8, 8)
+        shared_1 = torch.randn(8, 8)
 
         class TiedBlock(nn.Module):
-            def __init__(self):
+            def __init__(self, shared: torch.Tensor):
                 super().__init__()
                 self.attn_q = nn.Linear(8, 8, bias=False)
                 self.attn_k = nn.Linear(8, 8, bias=False)
@@ -1186,17 +1180,21 @@ class TestCrossRegionTiedDetection:
             def __init__(self):
                 super().__init__()
                 self.transformer_blocks = nn.ModuleList(
-                    [TiedBlock(), nn.Linear(8, 8, bias=False)]
+                    [TiedBlock(shared_0), TiedBlock(shared_1)]
                 )
 
         m = M()
         for p in m.parameters():
             p.requires_grad = False
-        with pytest.raises(ValueError, match="intra-block tied"):
-            ModelOffloader(
-                m,
-                layers_attr="transformer_blocks", blocks_to_swap=1,
-            )
+        strategy = ModelOffloader(
+            m,
+            layers_attr="transformer_blocks", blocks_to_swap=1,
+        )
+        try:
+            for block in m.transformer_blocks:
+                assert block.attn_q.weight is block.attn_k.weight
+        finally:
+            strategy.deactivate()
 
     def test_cross_region_tied_buffers_raises(self) -> None:
         shared = torch.randn(8)
@@ -1580,170 +1578,16 @@ class TestActivatePoolIdempotency:
 
 
 # ---------------------------------------------------------------------------
-# StreamedWeights pool target-name validation
+# Block layout check rejects heterogeneous block layouts
 # ---------------------------------------------------------------------------
 
 
-class TestStreamedTargetPoolValidation:
-    @staticmethod
-    def _binding(
-        param_names: tuple[str, ...],
-        buffer_names: tuple[str, ...] = (),
-        param_layouts: tuple[object, ...] | None = None,
-        buffer_layouts: tuple[object, ...] | None = None,
-    ) -> PinnedModuleBinding:
-        param_layout_values = param_layouts or (("param-layout",),) * len(
-            param_names
-        )
-        buffer_layout_values = buffer_layouts or (("buffer-layout",),) * len(
-            buffer_names
-        )
-        return cast(
-            PinnedModuleBinding,
-            SimpleNamespace(
-                param_bindings=[
-                    SimpleNamespace(name=name, target_layout=layout)
-                    for name, layout in zip(
-                        param_names, param_layout_values, strict=True,
-                    )
-                ],
-                buffer_bindings=[
-                    SimpleNamespace(name=name, target_layout=layout)
-                    for name, layout in zip(
-                        buffer_names, buffer_layout_values, strict=True,
-                    )
-                ],
-            ),
-        )
-
-    def test_binding_name_mismatch_check_raises(self) -> None:
-        bindings = [
-            self._binding(("weight", "bias")),
-            self._binding(("weight", "other")),
-        ]
-
-        with pytest.raises(
-            ValueError,
-            match="Block 1 pinned param target names differ from block 0",
-        ):
-            _check_block_binding_target_layouts_match(bindings)
-
-    def test_binding_buffer_name_mismatch_check_raises(self) -> None:
-        bindings = [
-            self._binding(("weight",), ("table", "mask")),
-            self._binding(("weight",), ("table", "other")),
-        ]
-
-        with pytest.raises(
-            ValueError,
-            match="Block 1 pinned buffer target names differ from block 0",
-        ):
-            _check_block_binding_target_layouts_match(bindings)
-
-    def test_binding_param_layout_mismatch_check_raises(self) -> None:
-        bindings = [
-            self._binding(("weight",), param_layouts=(("shape", 1),)),
-            self._binding(("weight",), param_layouts=(("shape", 2),)),
-        ]
-
-        with pytest.raises(
-            ValueError,
-            match="Block 1 pinned param target layouts differ from block 0",
-        ):
-            _check_block_binding_target_layouts_match(bindings)
-
-    def test_binding_buffer_layout_mismatch_check_raises(self) -> None:
-        bindings = [
-            self._binding(("weight",), ("table",), buffer_layouts=(("shape", 1),)),
-            self._binding(("weight",), ("table",), buffer_layouts=(("shape", 2),)),
-        ]
-
-        with pytest.raises(
-            ValueError,
-            match="Block 1 pinned buffer target layouts differ from block 0",
-        ):
-            _check_block_binding_target_layouts_match(bindings)
-
-    def test_constructor_validates_pinned_binding_names(
-        self, monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        m = _make_block_model(num_blocks=2)
-        bindings = iter(
-            [
-                self._binding(("weight",)),
-                self._binding(("other",)),
-            ]
-        )
-
-        def fake_pin_module_slot_collection(
-            _collection: object,
-            *,
-            validate_param: object | None = None,
-        ) -> PinnedModuleBinding:
-            del validate_param
-            return cast(PinnedModuleBinding, next(bindings))
-
-        monkeypatch.setattr(
-            streamed_weights_module,
-            "pin_module_slot_collection",
-            fake_pin_module_slot_collection,
-        )
-
-        with pytest.raises(
-            ValueError,
-            match="Block 1 pinned param target names differ from block 0",
-        ):
-            StreamedWeights(
-                list(m.transformer_blocks),
-                blocks_to_swap=1,
-            )
-
-    def test_constructor_validates_pinned_buffer_names(
-        self, monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        m = _make_block_model(num_blocks=2)
-        bindings = iter(
-            [
-                self._binding(("weight",), ("table",)),
-                self._binding(("weight",), ("other",)),
-            ]
-        )
-
-        def fake_pin_module_slot_collection(
-            _collection: object,
-            *,
-            validate_param: object | None = None,
-        ) -> PinnedModuleBinding:
-            del validate_param
-            return next(bindings)
-
-        monkeypatch.setattr(
-            streamed_weights_module,
-            "pin_module_slot_collection",
-            fake_pin_module_slot_collection,
-        )
-
-        with pytest.raises(
-            ValueError,
-            match="Block 1 pinned buffer target names differ from block 0",
-        ):
-            StreamedWeights(
-                list(m.transformer_blocks),
-                blocks_to_swap=1,
-            )
-
-
-# ---------------------------------------------------------------------------
-# Layout-signature check rejects heterogeneous block layouts
-# ---------------------------------------------------------------------------
-
-
-class TestBlockLayoutSignature:
+class TestBlockLayoutCompatibility:
     """Block 0 is the pool template; later blocks copy raw bytes into
     its slot. ``Tensor.copy_`` silently casts dtype and silently
     broadcasts compatible shapes, so mismatches that don't trip the
     copy_ shape check would silently corrupt forward. The constructor's
-    layout-signature check rejects them up front."""
+    block layout check rejects them up front."""
 
     def test_shape_mismatch_raises(self) -> None:
         class M(nn.Module):
@@ -1792,6 +1636,41 @@ class TestBlockLayoutSignature:
         with pytest.raises(ValueError, match="layout differs"):
             StreamedWeights(
                 blocks=[A(), B()],
+                blocks_to_swap=1,
+            )
+
+    def test_requires_grad_mismatch_raises(self) -> None:
+        block_0 = nn.Linear(4, 4, bias=False)
+        block_1 = nn.Linear(4, 4, bias=False)
+        block_0.weight.requires_grad_(False)
+        block_1.weight.requires_grad_(True)
+
+        with pytest.raises(ValueError, match="layout differs"):
+            StreamedWeights(
+                blocks=[block_0, block_1],
+                blocks_to_swap=1,
+            )
+
+    def test_param_alias_topology_mismatch_raises(self) -> None:
+        class TiedBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                shared = nn.Linear(4, 4, bias=False)
+                shared.weight.requires_grad_(False)
+                self.q = shared
+                self.k = shared
+
+        class UntiedBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.q = nn.Linear(4, 4, bias=False)
+                self.k = nn.Linear(4, 4, bias=False)
+                self.q.weight.requires_grad_(False)
+                self.k.weight.requires_grad_(False)
+
+        with pytest.raises(ValueError, match="layout differs"):
+            StreamedWeights(
+                blocks=[TiedBlock(), UntiedBlock()],
                 blocks_to_swap=1,
             )
 
@@ -2135,7 +2014,7 @@ class TestStreamedWeightsContractGuard:
     def test_direct_unskipped_trainable_constructs(self) -> None:
         # Build a trainable block with no skip_slots. The streamer
         # accepts the trainable slot (handled via ``.data`` swap inside
-        # ``PinnedModuleBinding``). The slot appears in the streamer's
+        # ``PinnedModuleInstance``). The slot appears in the streamer's
         # slot_filter just like a frozen slot would.
         from torch_offload.slots import iter_param_slots
 
@@ -2334,10 +2213,10 @@ class TestMixedGradTieDetection:
         # Pure intra-block aliasing (no cross-region): two slots inside
         # each block share the same trainable Parameter, but block 0's
         # shared Parameter is distinct from block 1's. Streamed block
-        # bindings dedup by ``id(param)`` per block, and the .data swap reaches
+        # stores dedup by storage per block, and the .data swap reaches
         # the shared Parameter so every aliased slot sees the update.
-        # Layout signatures match because both blocks dedup to a single
-        # entry (``a``) of identical shape/dtype.
+        # The pool layout matches because both blocks dedup to a single
+        # storage group of identical shape/dtype.
         shared_0 = nn.Parameter(torch.randn(4, 4), requires_grad=True)
         shared_1 = nn.Parameter(torch.randn(4, 4), requires_grad=True)
 
@@ -2459,7 +2338,7 @@ class TestMixedGradTieDetection:
         m = M()
         for p in m.transformer_blocks[1].parameters():
             p.requires_grad = False
-        with pytest.raises(ValueError, match="trainable and frozen|intra-block tied"):
+        with pytest.raises(ValueError, match="trainable and frozen"):
             ModelOffloader(
                 m,
                 layers_attr="transformer_blocks", blocks_to_swap=1,

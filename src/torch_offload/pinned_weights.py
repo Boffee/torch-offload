@@ -63,7 +63,7 @@ Class-specific caveats
 from __future__ import annotations
 
 import contextlib
-from collections.abc import Iterable, Iterator, MutableMapping
+from collections.abc import Iterable, Iterator
 
 import torch
 from torch import nn
@@ -74,24 +74,8 @@ from .pinned_module import (
     PinnedModuleStore,
     PinnedModuleTarget,
     PostCopyHook,
+    PostCopyHookHandle,
 )
-
-
-class _PostCopyHookHandle:
-    __slots__ = ("_hooks", "_key")
-
-    def __init__(
-        self, hooks: MutableMapping[int, PostCopyHook], key: int,
-    ) -> None:
-        self._hooks: MutableMapping[int, PostCopyHook] | None = hooks
-        self._key = key
-
-    def remove(self) -> None:
-        hooks = self._hooks
-        if hooks is None:
-            return
-        hooks.pop(self._key, None)
-        self._hooks = None
 
 
 class PinnedWeights:
@@ -211,7 +195,7 @@ class PinnedWeights:
 
     def register_post_copy_hook(
         self, name: str, hook: PostCopyHook,
-    ) -> _PostCopyHookHandle:
+    ) -> PostCopyHookHandle:
         """Register a hook after this component copies ``name`` to GPU.
 
         Package-internal: used by :class:`ModelOffloader` for merge-mode
@@ -229,7 +213,7 @@ class PinnedWeights:
                 f"param name {name!r}"
             )
         self._post_copy_hooks[key] = hook
-        return _PostCopyHookHandle(self._post_copy_hooks, key)
+        return PostCopyHookHandle(self._post_copy_hooks, key)
 
     def post_copy_hook_key(self, name: str) -> int:
         """Stable hook/dedup key for a managed parameter name."""

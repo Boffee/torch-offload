@@ -551,14 +551,20 @@ class TestMixedTrainableFrozenTied:
         with pytest.raises(ValueError, match="mixed requires_grad"):
             PinnedWeights(m)
 
-    def test_rejects_include_names_that_split_tied_storage(self) -> None:
+    def test_include_names_can_select_one_storage_alias(self) -> None:
         shared = torch.randn(8, dtype=torch.bfloat16)
         m = nn.Module()
         m.keep = nn.Parameter(shared, requires_grad=False)
         m.skip = nn.Parameter(shared, requires_grad=False)
+        skipped = m.skip
 
-        with pytest.raises(ValueError, match="param include names cannot split"):
-            PinnedWeights(m, include_param_names={"keep"})
+        pw = PinnedWeights(m, include_param_names={"keep"})
+        try:
+            assert set(pw._store.params) == {"keep"}
+            assert m.keep.data_ptr() == pw._store.params["keep"].make_cpu_param().data_ptr()
+            assert m.skip is skipped
+        finally:
+            pw.deactivate()
 
 
 class TestZeroSizedParams:
