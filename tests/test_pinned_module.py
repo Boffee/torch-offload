@@ -184,6 +184,23 @@ class TestPinnedModuleStore:
         assert module.keep.data_ptr() == store.params["keep"].make_cpu_param().data_ptr()
         assert module.skip is skipped_param
 
+    def test_rejects_param_include_names_that_split_shared_params(self) -> None:
+        module = nn.Module()
+        shared = nn.Linear(2, 2, bias=False)
+        shared.weight.requires_grad_(False)
+        module.left = shared
+        module.right = shared
+        original = shared.weight
+
+        with pytest.raises(ValueError, match="cannot split shared tensors"):
+            PinnedModuleStore.from_module(
+                module,
+                include_param_names={"left.weight"},
+            )
+
+        assert module.left.weight is original
+        assert module.right.weight is original
+
     def test_empty_include_name_sets_pin_nothing(self) -> None:
         module = nn.Module()
         param = nn.Parameter(torch.randn(2, 2), requires_grad=False)
@@ -227,6 +244,21 @@ class TestPinnedModuleStore:
         assert set(store.buffers) == {"keep"}
         assert module.keep is store.buffers["keep"].tensor
         assert module.skip is skipped_buffer
+
+    def test_rejects_buffer_include_names_that_split_shared_buffers(self) -> None:
+        module = nn.Module()
+        shared = torch.randn(2)
+        module.register_buffer("running", shared)
+        module.register_buffer("running_alias", shared)
+
+        with pytest.raises(ValueError, match="cannot split shared tensors"):
+            PinnedModuleStore.from_module(
+                module,
+                include_buffer_names={"running"},
+            )
+
+        assert module.running is shared
+        assert module.running_alias is shared
 
     def test_rejects_unknown_buffer_include_names(self) -> None:
         module = nn.Module()

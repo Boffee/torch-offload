@@ -112,11 +112,21 @@ class PinnedModuleStore:
             all_params,
             include_param_names,
         )
+        _validate_shared_tensors_included_together(
+            all_params,
+            set(params),
+            lambda name: _param_storage_key(all_params[name]),
+        )
 
         all_buffers = _named_buffers(module)
         buffers = _select_known_names(
             all_buffers,
             include_buffer_names,
+        )
+        _validate_shared_tensors_included_together(
+            all_buffers,
+            set(buffers),
+            lambda name: _buffer_storage_key(all_buffers[name]),
         )
 
         store = cls(
@@ -311,6 +321,24 @@ def _select_known_names(
     if missing:
         raise ValueError(f"Cannot select unknown names: {_format_names(missing)}.")
     return {name: value for name, value in items.items() if name in included}
+
+
+def _validate_shared_tensors_included_together(
+    all_items: Mapping[str, object],
+    included_names: set[str],
+    key_for_name: _KeyForName,
+) -> None:
+    for names in _group_names(all_items, key_for_name):
+        included = [name for name in names if name in included_names]
+        if not included or len(included) == len(names):
+            continue
+
+        missing = sorted(set(names) - included_names)
+        raise ValueError(
+            "PinnedModuleStore cannot split shared tensors: "
+            f"included {_format_names(included)} but missing "
+            f"{_format_names(missing)}."
+        )
 
 
 def _items_for_names(
