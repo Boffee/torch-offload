@@ -1,6 +1,6 @@
 """Whole-model pinned-CPU weight cache for fast bulk DMA to GPU.
 
-Holds a model's frozen weights in pinned CPU memory so subsequent GPU
+Holds a model's weights in pinned CPU memory so subsequent GPU
 loads are bulk DMA (~200 ms for a 12 GB text encoder at PCIe Gen5 x16) instead
 of re-reading the safetensors from disk (~3-5 s per call).
 
@@ -9,8 +9,8 @@ between calls — text encoder during diffusion, VAE between encode and
 decode phases, etc. Different from :func:`ModelOffloader`: no per-block
 streaming, no forward hooks, no LRU. The whole model goes to GPU on
 :meth:`PinnedWeights.activate` and the GPU storage is released on
-:meth:`PinnedWeights.deactivate` by repointing each module's parameter
-slot back at a Parameter that wraps pinned CPU storage.
+:meth:`PinnedWeights.deactivate` by restoring each managed parameter
+or buffer to pinned CPU storage.
 
 Implements :class:`~torch_offload.protocols.ModelStrategy` so it plugs
 into a model cache directly.
@@ -21,11 +21,12 @@ DDP/FSDP wrap-before requirement, single-thread contract) live in the
 
 Class-specific caveats
 ----------------------
-- The constructor *mutates* the wrapped ``model`` — each frozen
-  parameter slot (``module._parameters[leaf]``) is replaced with a
-  Parameter wrapping pinned CPU storage, and registered buffers are
-  replaced with pinned copies. Only use the model via :meth:`activate`
-  or :meth:`use` after wrapping.
+- The constructor *mutates* the wrapped ``model`` — frozen parameter
+  slots (``module._parameters[leaf]``) are replaced with Parameters
+  wrapping pinned CPU storage, trainable parameter ``.data`` points at
+  pinned CPU storage while preserving the user's Parameter objects, and
+  registered buffers are replaced with pinned copies. Only use the
+  model via :meth:`activate` or :meth:`use` after wrapping.
 - Slot replacement (rather than ``param.data`` swap) is required for
   correctness with quanto ``WeightQBytesTensor``: assigning
   ``param.data = new_quanto_tensor`` is a no-op for the inner ``_data``
@@ -35,6 +36,9 @@ Class-specific caveats
   training-mode BatchNorm running stats) are *discarded* on
   :meth:`deactivate`. Suitable for inference of stateless modules; not
   suitable for models that need persistent buffer state across calls.
+- Trainable parameter updates on CUDA must run inside
+  :meth:`optimizer_step`. Without that boundary, deactivation restores
+  older pinned CPU bytes and discards active GPU updates.
 - **Caller owns lifecycle correctness.** Calling :meth:`activate`
   twice without an intervening :meth:`deactivate` raises before slot
   movement or GPU allocation. Construction optimizes peak host memory
@@ -52,15 +56,14 @@ Class-specific caveats
   share underlying storage — whether the standard ``tie_weights()``
   pattern (one ``Parameter`` under multiple names) or the rarer case
   of distinct quanto wrappers around shared inner ``_data`` — share a
-  single :class:`PinnedParam` and a single Parameter wrapper on
+  single :class:`PinnedParam` and a single target storage on
   activation, preserving the tying invariant on GPU.
 """
 
 from __future__ import annotations
 
 import contextlib
-from collections.abc import Iterable, Iterator, Mapping, MutableMapping
-from typing import TypeVar
+from collections.abc import Iterable, Iterator, MutableMapping
 
 import torch
 from torch import nn
@@ -72,8 +75,6 @@ from .pinned_module import (
     PinnedModuleTarget,
     PostCopyHook,
 )
-
-_NamedT = TypeVar("_NamedT")
 
 
 class _PostCopyHookHandle:
@@ -98,28 +99,25 @@ class PinnedWeights:
 
     Implements :class:`~torch_offload.protocols.ModelStrategy`.
 
-    On construction, every frozen parameter slot is replaced with a
-    Parameter wrapping pinned CPU storage (handling quanto decomposition
-    and tied-weight dedup). :meth:`activate` allocates GPU tensors for
-    each unique pinned parameter, swaps the matching Parameter into every
-    slot that pointed at that pinned parameter, and returns the model;
-    :meth:`deactivate` swaps the slots back at the pinned-CPU
-    Parameters so the GPU storage is released by refcount.
+    On construction, every managed parameter is backed by pinned CPU
+    storage (handling quanto decomposition and tied-weight dedup).
+    :meth:`activate` allocates GPU tensors for each unique pinned
+    parameter, installs that active storage into the model, and returns
+    the model. Frozen parameters use slot replacement; trainable
+    parameters preserve the user's Parameter objects and swap only
+    ``.data`` so optimizer state remains valid. :meth:`deactivate`
+    restores pinned CPU storage so GPU storage is released by refcount.
 
-    Frozen-only by strategy contract. The lower pinned-module
-    primitives can represent trainable params, but this whole-model
-    strategy has no optimizer-step copy-back boundary: a CUDA optimizer
-    update would mutate active target storage, then :meth:`deactivate`
-    would restore the older pinned CPU bytes. Trainable parameters must
-    be excluded via ``include_param_names`` (the composer routes them to
-    a separate strategy automatically; direct users are on the hook).
-    An included trainable parameter raises at construction.
+    If trainable params are active on CUDA, run ``optimizer.step()``
+    inside :meth:`optimizer_step` so updated GPU bytes are copied back
+    into the pinned CPU cache before the next deactivate/reactivate
+    cycle.
 
-    Buffer-only modules (only registered buffers, no frozen params)
+    Buffer-only modules (only registered buffers, no params)
     are valid — common for sibling tables like RoPE/positional
     embeddings managed via :func:`ModelOffloader`'s non-block
     composition. Construction raises only if there is *nothing* to
-    manage — neither selected frozen params nor selected registered buffers.
+    manage — neither selected params nor selected registered buffers.
 
     Parameters
     ----------
@@ -144,56 +142,43 @@ class PinnedWeights:
         self._model: nn.Module | None = model
         self._active_device: torch.device | None = None
         self._active_target: PinnedModuleTarget | None = None
+        self._optimizer_step_active: bool = False
         self._post_copy_hooks: dict[int, PostCopyHook] = {}
 
-        params = _named_parameters(model)
-        buffers = _named_buffers(model)
-        selected_param_names = _select_names(
-            "param",
-            params,
-            include_param_names,
+        # Pin selected names without replacing module slots.
+        # PinnedParam intentionally repoints plain Parameter.data at each
+        # pinned clone during this phase to keep construction peak memory
+        # low. If a later pin fails, the caller must drop the partially
+        # constructed model/strategy and rebuild from a fresh model instance.
+        self._store = PinnedModuleStore.from_module(
+            model,
+            include_param_names=include_param_names,
+            include_buffer_names=include_buffer_names,
         )
-        selected_buffer_names = _select_names(
-            "buffer",
-            buffers,
-            include_buffer_names,
-        )
-        _validate_frozen_params(params, selected_param_names)
 
-        # Reject before pinning if there is nothing at all to manage —
-        # neither frozen params nor selected registered buffers.
+        # Reject if there is nothing at all to manage — neither selected
+        # params nor selected registered buffers.
         # Buffer-only modules (e.g., a pure RoPE/positional table sibling)
         # are valid: PinnedWeights still gives them pinned-CPU storage and
         # the activate/deactivate round-trip, which is exactly what
         # ModelOffloader non-block composition needs.
-        if not selected_param_names and not selected_buffer_names:
+        if not self._store.params and not self._store.buffers:
             raise ValueError(
-                "PinnedWeights requires at least one frozen parameter or, "
+                "PinnedWeights requires at least one parameter or, "
                 "at least one registered buffer to cache. The selected "
-                "model names contain neither — for training flows use "
-                "torch_offload.ModelOffloader instead, or leave the model "
-                "unwrapped."
+                "model names contain neither — leave the model unwrapped."
             )
 
-        # Phase 2: pin selected names without replacing module slots.
-        # PinnedParam intentionally repoints
-        # plain Parameter.data at each pinned clone during this phase to
-        # keep construction peak memory low. If a later pin fails, the
-        # caller must drop the partially constructed model/strategy and
-        # rebuild from a fresh model instance.
-        self._store = PinnedModuleStore.from_module(
-            model,
-            include_param_names=selected_param_names,
-            include_buffer_names=selected_buffer_names,
-        )
-
-        # Phase 3: bind this concrete model instance to the store. This
-        # applies the module slot/register_buffer mutations after all
-        # pinning succeeded. Construction is still not fully rollback-safe
-        # because of the low-peak Parameter.data repointing described above.
+        # Bind this concrete model instance to the store. This applies the
+        # module slot/register_buffer mutations after all pinning succeeded.
+        # Construction is still not fully rollback-safe because of the
+        # low-peak Parameter.data repointing described above.
         self._instance = PinnedModuleInstance.from_store(self._store, model)
         self._param_names = frozenset(self._store.params)
         self._buffer_names = frozenset(self._store.buffers)
+        self._has_trainables = any(
+            pinned.requires_grad for pinned in self._store.params.values()
+        )
 
     # ------------------------------------------------------------------
     # ModelStrategy protocol
@@ -312,6 +297,51 @@ class PinnedWeights:
             self._active_device = None
 
     @contextlib.contextmanager
+    def optimizer_step(self) -> Iterator[None]:
+        """Optimizer-step boundary for managed trainable parameters.
+
+        On CUDA activation, the model's trainable ``.data`` points at
+        active GPU target storage. Wrap ``optimizer.step()`` in this
+        context so updated trainable bytes are copied back into pinned
+        CPU storage before the model is deactivated or reactivated.
+
+        On CPU activation, or when inactive, this is a guarded no-op
+        because trainable data is already resident in pinned CPU storage.
+        ``param.grad`` is untouched.
+        """
+        if self._optimizer_step_active:
+            raise RuntimeError(
+                "PinnedWeights.optimizer_step() does not support reentrant entry."
+            )
+
+        self._optimizer_step_active = True
+        try:
+            active_device = self._active_device
+            target = self._active_target
+            if (
+                self._has_trainables
+                and active_device is not None
+                and active_device.type == "cuda"
+            ):
+                if target is None:
+                    raise RuntimeError(
+                        "PinnedWeights optimizer-step state is inconsistent: "
+                        "CUDA active without an active target."
+                    )
+                try:
+                    yield
+                finally:
+                    self._instance.copy_trainables_from_target(
+                        target,
+                        non_blocking=True,
+                    )
+                    torch.cuda.synchronize(active_device)
+            else:
+                yield
+        finally:
+            self._optimizer_step_active = False
+
+    @contextlib.contextmanager
     def use(self, device: torch.device | str) -> Iterator[nn.Module]:
         """Activate on ``device`` for the duration of the context."""
         self.activate(device)
@@ -332,69 +362,3 @@ class PinnedWeights:
             "activate(device) or use this strategy through "
             "ModelCache.use(..., device=...)"
         )
-
-
-def _named_parameters(module: nn.Module) -> dict[str, nn.Parameter]:
-    return _unique_name_dict(
-        module.named_parameters(remove_duplicate=False),
-        kind="parameter",
-    )
-
-
-def _named_buffers(module: nn.Module) -> dict[str, torch.Tensor]:
-    return _unique_name_dict(
-        module.named_buffers(remove_duplicate=False),
-        kind="buffer",
-    )
-
-
-def _unique_name_dict(
-    items: Iterable[tuple[str, _NamedT]],
-    *,
-    kind: str,
-) -> dict[str, _NamedT]:
-    values: dict[str, _NamedT] = {}
-    for name, value in items:
-        if name in values:
-            raise ValueError(f"Module yielded duplicate {kind} name {name!r}.")
-        values[name] = value
-    return values
-
-
-def _select_names(
-    kind: str,
-    items: Mapping[str, object],
-    names: Iterable[str] | None,
-) -> set[str]:
-    if names is None:
-        return set(items)
-
-    selected = set(names)
-    missing = sorted(selected - set(items))
-    if missing:
-        raise ValueError(
-            f"PinnedWeights cannot include unknown {kind} names: "
-            f"{_format_names(missing)}."
-        )
-    return selected
-
-
-def _validate_frozen_params(
-    params: dict[str, nn.Parameter],
-    names: set[str],
-) -> None:
-    for name, param in params.items():
-        if name not in names or not param.requires_grad:
-            continue
-        raise ValueError(
-            f"PinnedWeights cannot manage trainable param {name!r}: "
-            "this strategy has no optimizer-step copy-back boundary, "
-            "so CUDA updates could be lost on deactivate. Use ModelOffloader "
-            "(which partitions trainables into TrainableWeights "
-            "automatically), or exclude the name and route it to a "
-            "separate trainable mover."
-        )
-
-
-def _format_names(names: Iterable[str]) -> str:
-    return ", ".join(repr(name) for name in names)

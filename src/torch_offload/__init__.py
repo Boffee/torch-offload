@@ -16,8 +16,11 @@ Top-level offload strategies:
 - :class:`PinnedWeights` — whole-model pinned-CPU bulk cache. Use for
   models that fit on GPU when active but should be evicted between
   calls (e.g., text encoder during diffusion). One CPU->GPU transfer
-  per use; on deactivate, parameter slots are repointed at pinned
-  CPU storage and the GPU storage is released by refcount.
+  per use; on deactivate, managed parameters and buffers are restored
+  to pinned CPU storage and the GPU storage is released by refcount.
+  CUDA training updates to managed trainable params must run inside
+  ``PinnedWeights.optimizer_step()`` so the pinned CPU cache receives
+  the updated bytes.
 
 - :class:`MpsWeights` — whole-model CPU->MPS materializer. Use for
   frozen models that should become MPS-resident without retaining a

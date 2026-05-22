@@ -23,13 +23,14 @@ __all__ = ["TrainableWeights"]
 class TrainableWeights:
     """Strategy component for the model's trainable parameters.
 
-    The trainable counterpart to :class:`PinnedWeights`. Both components
-    bring their managed params to the activation device on
-    :meth:`activate` and return them to CPU on :meth:`deactivate`,
-    but the mechanisms are mirror images:
+    A zero-cache counterpart to :class:`PinnedWeights` for trainables
+    that do not need a pinned CPU clone. Both components bring their
+    managed params to the activation device on :meth:`activate` and
+    return them to CPU on :meth:`deactivate`, but the ownership model
+    differs:
 
-    - :class:`PinnedWeights` owns pinned-CPU clones and is currently
-      frozen-only because it has no optimizer-step copy-back boundary.
+    - :class:`PinnedWeights` owns pinned-CPU clones and uses an explicit
+      optimizer-step copy-back boundary for CUDA trainable updates.
     - :class:`TrainableWeights` owns nothing (``cache_bytes=0``); the
       user's Parameter objects stay alive in their slots, and only
       ``p.data`` storage moves via ``p.data = p.data.to(device)``.

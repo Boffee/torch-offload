@@ -1280,9 +1280,9 @@ class TestRoutedMode:
     @pytest.mark.parametrize("target", ["embed", "head"])
     def test_routed_tied_weight_target_raises(self, target: str) -> None:
         # Standard tied embed/head pattern: one Parameter aliased at
-        # multiple slots. PinnedWeights dedupes them into one binding
-        # with multiple parent modules. Routed mode would only hook
-        # one module and silently miss the others — reject explicitly.
+        # multiple names. PinnedWeights dedupes them into one backing
+        # with multiple parent modules. Routed mode would only hook one
+        # module and silently miss the others — reject explicitly.
         model = _make_tied_non_block_model(dtype=torch.bfloat16)
 
         s = ModelOffloader(

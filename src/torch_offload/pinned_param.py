@@ -57,11 +57,9 @@ class PinnedParam:
 
     The pinned parameter captures the source parameter's ``requires_grad`` at
     construction time and threads it through to the adapter when
-    building CPU and GPU parameter wrappers. Frozen
-    callers (:class:`PinnedWeights`, ``PinnedModuleBinding`` for
-    ``requires_grad=False`` slots) get the historic behavior. Trainable
-    callers can either request the wrapper preserve ``requires_grad``
-    or skip the wrapper entirely and ``.data``-swap into their own
+    building CPU and GPU parameter wrappers. Model-bound callers can
+    either slot-replace frozen params with those wrappers or preserve
+    trainable Parameter identity by ``.data``-swapping into the user's
     persistent Parameter — both are supported.
 
     Low-peak construction behavior: for plain ``torch.Tensor`` parameters,

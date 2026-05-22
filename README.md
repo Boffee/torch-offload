@@ -42,7 +42,7 @@ same host-memory budget.
 
 This library gives you:
 
-1. **Strategies** that pin a model's frozen weights to host RAM and
+1. **Strategies** that pin a model's weights to host RAM and
    bulk-DMA them to GPU on demand.
 2. **A cache** that holds multiple pinned models, evicts least-recently-
    used inactive entries when a new model needs room, and tracks active
@@ -64,7 +64,7 @@ This library gives you:
 import torch
 from torch_offload import PinnedWeights
 
-model = build_my_model()  # any nn.Module with frozen params
+model = build_my_model()  # any nn.Module
 strategy = PinnedWeights(model)
 device = torch.device("cuda")
 
@@ -79,11 +79,15 @@ with strategy.use(device) as gpu_model:
 del strategy, model  # drop refs to free pinned host memory
 ```
 
-`PinnedWeights` mutates the model in place: every frozen
-`nn.Parameter` slot gets repointed at a Parameter wrapping pinned CPU
-storage. After construction, only access the model through the
-strategy's `use(device)` context manager (or `activate(device)` /
-`deactivate()`).
+`PinnedWeights` mutates the model in place: frozen `nn.Parameter`
+slots get repointed at Parameters wrapping pinned CPU storage,
+trainable Parameter objects keep their identity and point their
+`.data` at pinned CPU storage, and buffers are replaced with pinned
+copies. After construction, only access the model through the strategy's
+`use(device)` context manager (or `activate(device)` / `deactivate()`).
+For CUDA training, wrap `optimizer.step()` in
+`strategy.optimizer_step()` so trainable GPU updates are copied back to
+the pinned CPU cache before deactivation.
 **Drop the strategy and model references to release pinned host
 memory** — there's no `close()`; resource cleanup is reference-drop
 + GC.

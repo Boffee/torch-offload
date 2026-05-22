@@ -115,9 +115,9 @@ class TensorAdapter(Protocol[PinnedStateT, GpuStateT]):
         Used as the deactivated-state slot value
         (``module._parameters[leaf] = cpu_param``).
 
-        ``requires_grad`` defaults to ``False`` to match the historic
-        frozen-only callers; pass ``True`` when building a wrapper for
-        a trainable param the caller intends to keep in the model tree.
+        ``requires_grad`` defaults to ``False`` to match frozen
+        slot-replacement callers; pass ``True`` when building a wrapper
+        for trainable storage.
         """
         ...
 
@@ -316,14 +316,11 @@ class RegularAdapter:
     """Adapter for plain ``torch.Tensor`` (no subclass machinery).
 
     Builds fresh :class:`nn.Parameter` objects wrapping the pinned-CPU
-    and GPU storages. The frozen-only callers (:class:`PinnedWeights`,
-    ``PinnedModuleBinding``) slot-replace via ``module._parameters[leaf]
-    = ...`` with the binding's ``cpu_param`` or its pool-slot
-    ``gpu_param``; the user's original Parameter object is orphaned,
-    so optimizer state keyed on the pre-wrap object is lost. Trainable
-    callers can either request ``requires_grad=True`` wrappers or skip
-    the slot replacement entirely and ``.data``-swap into their own
-    persistent Parameter — both are supported by the shape of this
+    and GPU storages. Frozen model-bound callers slot-replace via
+    ``module._parameters[leaf] = ...`` with a pinned CPU wrapper or
+    active GPU wrapper; trainable callers preserve Parameter identity
+    by skipping slot replacement and ``.data``-swapping into their own
+    persistent Parameter. Both paths are supported by the shape of this
     adapter (plain tensors round-trip through ``.data =`` cleanly).
 
     Conservative on dispatch: only matches exactly

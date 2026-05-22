@@ -52,6 +52,105 @@ class TestModelStrategyConformance:
 
 
 # ---------------------------------------------------------------------------
+# Trainable params
+# ---------------------------------------------------------------------------
+
+
+class TestTrainableParams:
+    def test_accepts_trainable_param_and_preserves_identity_on_cpu(self) -> None:
+        m = nn.Linear(4, 2, bias=False)
+        param = m.weight
+        opt = torch.optim.SGD(m.parameters(), lr=0.1)
+
+        pw = PinnedWeights(m)
+        try:
+            assert m.weight is param
+            assert m.weight.requires_grad
+            assert m.weight.is_pinned()
+
+            before = m.weight.detach().clone()
+            with pw.use("cpu"):
+                loss = m(torch.ones(1, 4)).sum()
+                loss.backward()
+                with pw.optimizer_step():
+                    opt.step()
+                opt.zero_grad(set_to_none=True)
+
+            assert m.weight is param
+            assert m.weight.is_pinned()
+            assert not torch.equal(m.weight.detach(), before)
+        finally:
+            pw.deactivate()
+
+    def test_optimizer_step_rejects_reentrant_entry(self) -> None:
+        pw = PinnedWeights(nn.Linear(4, 2, bias=False))
+        try:
+            with pytest.raises(RuntimeError, match="reentrant"):
+                with pw.optimizer_step():
+                    with pw.optimizer_step():
+                        pass
+        finally:
+            pw.deactivate()
+
+    @CUDA
+    def test_cuda_trainable_identity_survives_activate_deactivate(self) -> None:
+        m = nn.Linear(4, 2, bias=False)
+        param = m.weight
+
+        pw = PinnedWeights(m)
+        try:
+            with pw.use("cuda"):
+                assert m.weight is param
+                assert m.weight.is_cuda
+                assert m.weight.requires_grad
+            assert m.weight is param
+            assert m.weight.is_pinned()
+        finally:
+            pw.deactivate()
+
+    @CUDA
+    def test_cuda_optimizer_step_copies_updates_back_to_pinned(self) -> None:
+        m = nn.Linear(4, 1, bias=False)
+        param = m.weight
+        opt = torch.optim.SGD(m.parameters(), lr=0.25)
+
+        pw = PinnedWeights(m)
+        try:
+            with pw.use("cuda"):
+                loss = m(torch.ones(1, 4, device="cuda")).sum()
+                loss.backward()
+                with pw.optimizer_step():
+                    opt.step()
+                opt.zero_grad(set_to_none=True)
+                updated = m.weight.detach().cpu().clone()
+
+            assert m.weight is param
+            assert m.weight.is_pinned()
+            assert torch.equal(m.weight.detach(), updated)
+
+            with pw.use("cuda"):
+                assert torch.equal(m.weight.detach().cpu(), updated)
+        finally:
+            pw.deactivate()
+
+    @CUDA
+    def test_cuda_optimizer_step_copies_back_on_body_exception(self) -> None:
+        m = nn.Linear(4, 1, bias=False)
+        pw = PinnedWeights(m)
+        try:
+            with pw.use("cuda"):
+                with pytest.raises(RuntimeError, match="boom"):
+                    with pw.optimizer_step():
+                        m.weight.data.add_(1)
+                        updated = m.weight.detach().cpu().clone()
+                        raise RuntimeError("boom")
+
+            assert torch.equal(m.weight.detach(), updated)
+        finally:
+            pw.deactivate()
+
+
+# ---------------------------------------------------------------------------
 # Lifecycle: activate / deactivate
 # ---------------------------------------------------------------------------
 
@@ -164,21 +263,12 @@ class TestCleanup:
 
 
 class TestConstruction:
-    def test_rejects_unskipped_trainable_param(self) -> None:
-        # Direct use without a composer: a trainable param must hit the
-        # contract guard. PinnedWeights has no optimizer-step copy-back
-        # boundary, so accepting it would risk silently dropping CUDA
-        # optimizer updates on deactivate.
-        m = nn.Linear(4, 4)  # default requires_grad=True, no buffers
-        with pytest.raises(ValueError, match="cannot manage trainable param"):
-            PinnedWeights(m)
-
     def test_rejects_empty_model(self) -> None:
         # Frozen but with no params or buffers — nothing to manage.
         class Empty(nn.Module):
             pass
         m = Empty()
-        with pytest.raises(ValueError, match="at least one frozen parameter"):
+        with pytest.raises(ValueError, match="at least one parameter"):
             PinnedWeights(m)
 
     def test_accepts_buffer_only_module(self) -> None:
@@ -450,18 +540,15 @@ class TestSharedSubmoduleAlias:
 class TestMixedTrainableFrozenTied:
     def test_raises_when_tied_group_has_mixed_grad(self) -> None:
         # Two distinct Parameter objects sharing storage, one trainable
-        # and one frozen. The contract guard fires on the trainable
-        # alias the iteration encounters first; the composer's
-        # detect_streaming_region_ties is the upstream layer that
-        # rejects this with a tied-storage-specific message before
-        # any pinning runs.
+        # and one frozen. One pinned backing cannot preserve both
+        # requires_grad values, so the store rejects the alias group.
         shared = torch.randn(8, dtype=torch.bfloat16)
         a = nn.Parameter(shared, requires_grad=True)
         b = nn.Parameter(shared, requires_grad=False)
         m = nn.Module()
         m.a = a
         m.b = b
-        with pytest.raises(ValueError, match="cannot manage trainable param"):
+        with pytest.raises(ValueError, match="mixed requires_grad"):
             PinnedWeights(m)
 
     def test_rejects_include_names_that_split_tied_storage(self) -> None:
