@@ -21,7 +21,7 @@ from .tensor_adapter_factory import storage_key
 
 ParamAliasMode = Literal["storage", "object"]
 PostCopyHook = Callable[[nn.Parameter], None]
-ParamValidator = Callable[[str, nn.Parameter], None]
+_KeyForName = Callable[[str], Hashable]
 _NamedT = TypeVar("_NamedT")
 
 
@@ -71,24 +71,48 @@ class PinnedModuleStore:
         cls,
         module: nn.Module,
         *,
-        include_buffers: bool = True,
         param_alias_mode: ParamAliasMode = "storage",
-        validate_param: ParamValidator | None = None,
+        include_param_names: Iterable[str] | None = None,
+        include_buffer_names: Iterable[str] | None = None,
     ) -> PinnedModuleStore:
         """Pin ``module`` into a name-keyed store.
 
         Store construction is intentionally side-effecting like the
         existing pinning path: after bytes are pinned, the prototype
         module is restored to the store-backed pinned CPU state.
+        Included names must select whole alias groups, because
+        partially restoring an alias group would change the prototype's
+        alias topology.
         """
-        params = _named_parameters(module)
-        if validate_param is not None:
-            for name, param in params.items():
-                validate_param(name, param)
+        all_params = _named_parameters(module)
+        params = _select_named_items(
+            "param",
+            all_params,
+            include_param_names,
+        )
+        _validate_selection_preserves_alias_groups(
+            "param",
+            all_params,
+            params,
+            lambda name: _param_alias_key(all_params[name], param_alias_mode),
+        )
+
+        all_buffers = _named_buffers(module)
+        buffers = _select_named_items(
+            "buffer",
+            all_buffers,
+            include_buffer_names,
+        )
+        _validate_selection_preserves_alias_groups(
+            "buffer",
+            all_buffers,
+            buffers,
+            lambda name: _buffer_storage_key(all_buffers[name]),
+        )
 
         store = cls(
             params=_pin_params(params, param_alias_mode),
-            buffers=_pin_buffers(_named_buffers(module) if include_buffers else {}),
+            buffers=_pin_buffers(buffers),
             param_alias_mode=param_alias_mode,
         )
         _restore_params(module, store.params, _make_cpu_params(store.params))
@@ -238,6 +262,40 @@ def _pin_buffers(buffers: Mapping[str, torch.Tensor]) -> dict[str, PinnedBuffer]
         for name in names:
             pinned_by_name[name] = pinned
     return pinned_by_name
+
+
+def _select_named_items(
+    kind: str,
+    items: Mapping[str, _NamedT],
+    names: Iterable[str] | None,
+) -> dict[str, _NamedT]:
+    if names is None:
+        return dict(items)
+
+    included = set(names)
+    missing = sorted(included - set(items))
+    if missing:
+        raise ValueError(
+            f"PinnedModuleStore cannot include unknown {kind} names: "
+            f"{_format_names(missing)}."
+        )
+    return {name: value for name, value in items.items() if name in included}
+
+
+def _validate_selection_preserves_alias_groups(
+    kind: str,
+    all_items: Mapping[str, object],
+    included_items: Mapping[str, object],
+    key_for_name: _KeyForName,
+) -> None:
+    included_names = set(included_items)
+    for names in _group_names(all_items, key_for_name):
+        selected = [name for name in names if name in included_names]
+        if selected and len(selected) != len(names):
+            raise ValueError(
+                f"PinnedModuleStore {kind} include names cannot split an alias group; "
+                f"selected {_format_names(selected)} from {_format_names(names)}."
+            )
 
 
 def _validate_module_matches_store(
@@ -636,7 +694,7 @@ def _pinned_alias_groups(
 
 def _alias_groups(
     items: Mapping[str, object],
-    key_for_name: Callable[[str], Hashable],
+    key_for_name: _KeyForName,
 ) -> dict[str, frozenset[str]]:
     groups_by_name: dict[str, frozenset[str]] = {}
     for names in _group_names(items, key_for_name):
@@ -648,7 +706,7 @@ def _alias_groups(
 
 def _group_names(
     items: Mapping[str, object],
-    key_for_name: Callable[[str], Hashable],
+    key_for_name: _KeyForName,
 ) -> list[list[str]]:
     groups_by_key: dict[Hashable, list[str]] = {}
     for name in items:
@@ -710,7 +768,6 @@ def _format_names(names: Iterable[str]) -> str:
 
 __all__ = [
     "ParamAliasMode",
-    "ParamValidator",
     "PinnedBufferTarget",
     "PinnedModuleInstance",
     "PinnedModuleStore",

@@ -193,27 +193,127 @@ class TestPinnedModuleStore:
         module.weight = nn.Parameter(torch.randn(2, 2), requires_grad=False)
         module.register_buffer("running", torch.randn(2))
 
-        store = PinnedModuleStore.from_module(module, include_buffers=False)
+        store = PinnedModuleStore.from_module(module, include_buffer_names=set())
 
         assert set(store.params) == {"weight"}
         assert store.buffers == {}
         assert store.cache_bytes == store.params["weight"].cache_bytes
 
-    def test_runs_param_validation_before_pinning(self) -> None:
+    def test_can_include_params_by_name(self) -> None:
         module = nn.Module()
-        original = nn.Parameter(torch.randn(2, 2), requires_grad=False)
-        module.weight = original
+        module.keep = nn.Parameter(torch.randn(2, 2), requires_grad=False)
+        module.skip = nn.Parameter(torch.randn(2, 2), requires_grad=False)
+        skipped_param = module.skip
 
-        def reject(name: str, param: nn.Parameter) -> None:
-            assert name == "weight"
-            assert param is original
-            raise ValueError("rejected")
+        store = PinnedModuleStore.from_module(
+            module,
+            include_param_names={"keep"},
+        )
 
-        with pytest.raises(ValueError, match="rejected"):
-            PinnedModuleStore.from_module(module, validate_param=reject)
+        assert set(store.params) == {"keep"}
+        assert module.keep.data_ptr() == store.params["keep"].make_cpu_param().data_ptr()
+        assert module.skip is skipped_param
 
-        assert module.weight is original
+    def test_empty_include_name_sets_pin_nothing(self) -> None:
+        module = nn.Module()
+        param = nn.Parameter(torch.randn(2, 2), requires_grad=False)
+        buffer = torch.randn(2)
+        module.weight = param
+        module.register_buffer("running", buffer)
 
+        store = PinnedModuleStore.from_module(
+            module,
+            include_param_names=set(),
+            include_buffer_names=set(),
+        )
+
+        assert store.params == {}
+        assert store.buffers == {}
+        assert module.weight is param
+        assert module.running is buffer
+
+    def test_param_include_names_reject_split_alias_groups(self) -> None:
+        module = nn.Module()
+        shared = nn.Parameter(torch.randn(2, 2), requires_grad=False)
+        module.keep = shared
+        module.skip = shared
+
+        with pytest.raises(ValueError, match="param include names cannot split"):
+            PinnedModuleStore.from_module(
+                module,
+                include_param_names={"keep"},
+            )
+
+        assert module.keep is shared
+        assert module.skip is shared
+
+    def test_object_alias_mode_can_include_one_storage_alias(self) -> None:
+        module = nn.Module()
+        shared = torch.randn(2, 2)
+        module.keep = nn.Parameter(shared, requires_grad=False)
+        module.skip = nn.Parameter(shared, requires_grad=False)
+        skipped_param = module.skip
+
+        store = PinnedModuleStore.from_module(
+            module,
+            param_alias_mode="object",
+            include_param_names={"keep"},
+        )
+
+        assert set(store.params) == {"keep"}
+        assert module.keep.data_ptr() == store.params["keep"].make_cpu_param().data_ptr()
+        assert module.skip is skipped_param
+
+    def test_rejects_unknown_param_include_names(self) -> None:
+        module = nn.Module()
+        module.weight = nn.Parameter(torch.randn(2, 2), requires_grad=False)
+
+        with pytest.raises(ValueError, match="unknown param names: 'missing'"):
+            PinnedModuleStore.from_module(
+                module,
+                include_param_names={"missing"},
+            )
+
+    def test_can_include_buffers_by_name(self) -> None:
+        module = nn.Module()
+        skipped_buffer = torch.randn(2)
+        module.register_buffer("keep", torch.randn(2))
+        module.register_buffer("skip", skipped_buffer)
+
+        store = PinnedModuleStore.from_module(
+            module,
+            include_buffer_names={"keep"},
+        )
+
+        assert store.params == {}
+        assert set(store.buffers) == {"keep"}
+        assert module.keep is store.buffers["keep"].tensor
+        assert module.skip is skipped_buffer
+
+    def test_buffer_include_names_reject_split_alias_groups(self) -> None:
+        module = nn.Module()
+        shared = torch.randn(2)
+        module.register_buffer("keep", shared)
+        module.register_buffer("skip", shared)
+
+        with pytest.raises(ValueError, match="buffer include names cannot split"):
+            PinnedModuleStore.from_module(
+                module,
+                include_buffer_names={"keep"},
+            )
+
+        assert module.keep is shared
+        assert module.skip is shared
+
+    def test_rejects_unknown_buffer_include_names(self) -> None:
+        module = nn.Module()
+        module.register_buffer("running", torch.randn(2))
+
+        with pytest.raises(ValueError, match="unknown buffer names: 'missing'"):
+            PinnedModuleStore.from_module(
+                module,
+                include_buffer_names={"missing"},
+            )
 
 class TestPinnedModuleInstance:
     def test_allocate_target_dedupes_alias_backings(
