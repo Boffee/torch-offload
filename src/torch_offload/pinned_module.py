@@ -108,13 +108,13 @@ class PinnedModuleStore:
         module is restored to the store-backed pinned CPU state.
         """
         all_params = _named_parameters(module)
-        params = _select_named_items(
+        params = _select_known_names(
             all_params,
             include_param_names,
         )
 
         all_buffers = _named_buffers(module)
-        buffers = _select_named_items(
+        buffers = _select_known_names(
             all_buffers,
             include_buffer_names,
         )
@@ -153,8 +153,8 @@ class PinnedModuleStore:
     ) -> PinnedModuleTarget:
         """Allocate active storage for selected store entries on ``device``."""
         _validate_cuda_device(device)
-        params = _select_named_items(self.params, param_names)
-        buffers = _select_named_items(self.buffers, buffer_names)
+        params = _select_known_names(self.params, param_names)
+        buffers = _select_known_names(self.buffers, buffer_names)
         return PinnedModuleTarget(
             param_targets=_allocate_param_targets(params, device),
             buffer_targets=_allocate_buffer_targets(buffers, device),
@@ -299,7 +299,7 @@ def _pin_buffers(buffers: Mapping[str, torch.Tensor]) -> dict[str, PinnedBuffer]
     return pinned_by_name
 
 
-def _select_named_items(
+def _select_known_names(
     items: Mapping[str, _NamedT],
     names: Iterable[str] | None,
 ) -> dict[str, _NamedT]:
@@ -309,9 +309,7 @@ def _select_named_items(
     included = set(names)
     missing = sorted(included - set(items))
     if missing:
-        raise ValueError(
-            f"PinnedModuleStore cannot select unknown names: {_format_names(missing)}."
-        )
+        raise ValueError(f"Cannot select unknown names: {_format_names(missing)}.")
     return {name: value for name, value in items.items() if name in included}
 
 
@@ -359,7 +357,7 @@ def _validate_module_matches_store(
     )
     _validate_alias_topology(
         _pinned_alias_groups(store.buffers),
-        _alias_groups(buffers, lambda name: _buffer_storage_key(buffers[name])),
+        _module_buffer_alias_groups(buffers),
     )
 
 
@@ -712,6 +710,12 @@ def _module_param_alias_groups(
     params: Mapping[str, nn.Parameter],
 ) -> dict[str, frozenset[str]]:
     return _alias_groups(params, lambda name: _param_storage_key(params[name]))
+
+
+def _module_buffer_alias_groups(
+    buffers: Mapping[str, torch.Tensor],
+) -> dict[str, frozenset[str]]:
+    return _alias_groups(buffers, lambda name: _buffer_storage_key(buffers[name]))
 
 
 def _pinned_alias_groups(
