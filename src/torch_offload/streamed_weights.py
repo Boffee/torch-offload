@@ -64,7 +64,6 @@ from .tensor_adapter_factory import storage_key
 
 logger = logging.getLogger(__name__)
 
-StreamedParamRef = tuple[int, str]
 _LoadedTrainableBlock = tuple[PinnedModuleInstance, PinnedModuleTarget]
 _KeyForName = Callable[[str], Hashable]
 
@@ -579,26 +578,6 @@ class StreamedWeights:
         )
 
     @property
-    def param_refs_per_block(self) -> list[list[StreamedParamRef]]:
-        """Per-block streamed parameter refs.
-
-        Each ref is ``(block_idx, block_local_param_name)``. Used by
-        :class:`~torch_offload.ModelOffloader` to build its target-name
-        index without exposing the pinned store internals.
-
-        .. warning::
-           The outer list is a snapshot, but refs point at this
-           streamer's internal stores. Treat them as streamer-local.
-        """
-        return [
-            [
-                (block_idx, name)
-                for name in instance.store.params
-            ]
-            for block_idx, instance in enumerate(self._block_instances)
-        ]
-
-    @property
     def streamed_param_names_by_block(self) -> list[list[str]]:
         """Per-block streamed parameter names."""
         return [
@@ -614,9 +593,9 @@ class StreamedWeights:
             for instance in self._block_instances
         ]
 
-    def param_alias_names(self, ref: StreamedParamRef) -> tuple[str, ...]:
-        """Return block-local names that share ``ref``'s pinned backing."""
-        instance, name = self._resolve_param_ref(ref)
+    def param_alias_names(self, block_idx: int, name: str) -> tuple[str, ...]:
+        """Return block-local names that share ``name``'s pinned backing."""
+        instance, name = self._resolve_param(block_idx, name)
         pinned = instance.store.params[name]
         return tuple(
             candidate
@@ -633,36 +612,36 @@ class StreamedWeights:
         return any(instance.store.has_trainables for instance in self._block_instances)
 
     def register_post_copy_hook(
-        self, ref: StreamedParamRef, hook: PostCopyHook,
+        self, block_idx: int, name: str, hook: PostCopyHook,
     ) -> PostCopyHookHandle:
-        """Register a hook after this component copies ``ref`` to GPU.
+        """Register a hook after this component copies ``name`` to GPU.
 
         Package-internal: used by :class:`ModelOffloader` for merge-mode
         LoRA. Mirrors PyTorch's hook registration pattern by returning a
         handle whose :meth:`remove` method unregisters the hook.
         """
-        key = self.post_copy_hook_key(ref)
+        key = self.post_copy_hook_key(block_idx, name)
         if key in self._post_copy_hooks:
             raise RuntimeError(
                 "post-copy hook already registered for "
-                f"streamed param {ref!r}"
+                f"streamed param ({block_idx}, {name!r})"
             )
         self._post_copy_hooks[key] = hook
         return PostCopyHookHandle(self._post_copy_hooks, key)
 
-    def post_copy_hook_key(self, ref: StreamedParamRef) -> int:
-        """Stable hook/dedup key for a streamed parameter ref."""
-        instance, name = self._resolve_param_ref(ref)
+    def post_copy_hook_key(self, block_idx: int, name: str) -> int:
+        """Stable hook/dedup key for a streamed parameter."""
+        instance, name = self._resolve_param(block_idx, name)
         return id(instance.store.params[name])
 
-    def _resolve_param_ref(
+    def _resolve_param(
         self,
-        ref: StreamedParamRef,
+        block_idx: int,
+        name: str,
     ) -> tuple[PinnedModuleInstance, str]:
-        block_idx, name = ref
         if block_idx < 0 or block_idx >= len(self._block_instances):
             raise ValueError(
-                f"streamed param ref block index {block_idx} is out of range"
+                f"streamed block index {block_idx} is out of range"
             )
         instance = self._block_instances[block_idx]
         if name not in instance.store.params:
@@ -1336,6 +1315,5 @@ class StreamedWeights:
 
 
 __all__ = [
-    "StreamedParamRef",
     "StreamedWeights",
 ]

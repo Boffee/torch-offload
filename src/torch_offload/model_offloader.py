@@ -32,7 +32,7 @@ from .slots import (
     param_storage_key,
     walk_attr_path,
 )
-from .streamed_weights import StreamedParamRef, StreamedWeights
+from .streamed_weights import StreamedWeights
 from .tensor_adapter_factory import select_adapter
 
 logger = logging.getLogger(__name__)
@@ -40,7 +40,8 @@ logger = logging.getLogger(__name__)
 LoraMode = Literal["merge", "routed"]
 _LoraFactorRef = tuple[torch.Tensor, torch.Tensor, float]
 _LoraTargetMap = dict[str, list[_LoraFactorRef]]
-_TargetParamRef = StreamedParamRef | str
+_StreamedHookTarget = tuple[int, str]
+_TargetParamRef = _StreamedHookTarget | str
 
 
 class _RemovableHook(Protocol):
@@ -461,10 +462,11 @@ class ModelOffloader:
                     param_ref, transform.apply,
                 )
             else:
-                if not _is_streamed_param_ref(param_ref):
+                if not _is_streamed_hook_target(param_ref):
                     raise TypeError("StreamedWeights merge target must be a ref.")
+                block_idx, name = param_ref
                 handle = component.register_post_copy_hook(
-                    param_ref, transform.apply,
+                    block_idx, name, transform.apply,
                 )
             self._lora_hook_handles.append(handle)
 
@@ -809,13 +811,13 @@ class ModelOffloader:
             block_groups,
             strict=True,
         ):
-            for block_idx, block_param_refs in enumerate(
-                streamer.param_refs_per_block
+            for block_idx, local_names in enumerate(
+                streamer.streamed_param_names_by_block
             ):
                 block = blocks[block_idx]
-                for param_ref in block_param_refs:
-                    _, local_name = param_ref
-                    alias_names = streamer.param_alias_names(param_ref)
+                for local_name in local_names:
+                    param_ref = (block_idx, local_name)
+                    alias_names = streamer.param_alias_names(block_idx, local_name)
                     parent_tuple = _unique_named_param_parents(block, alias_names)
                     full_name = f"{layer_path}.{block_idx}.{local_name}"
                     key = canonical_param_name(full_name)
@@ -921,12 +923,13 @@ def _post_copy_hook_key(
         if not isinstance(param_ref, str):
             raise TypeError("PinnedWeights merge target must be a name.")
         return component.post_copy_hook_key(param_ref)
-    if not _is_streamed_param_ref(param_ref):
+    if not _is_streamed_hook_target(param_ref):
         raise TypeError("StreamedWeights merge target must be a ref.")
-    return component.post_copy_hook_key(param_ref)
+    block_idx, name = param_ref
+    return component.post_copy_hook_key(block_idx, name)
 
 
-def _is_streamed_param_ref(value: object) -> TypeGuard[StreamedParamRef]:
+def _is_streamed_hook_target(value: object) -> TypeGuard[_StreamedHookTarget]:
     return (
         isinstance(value, tuple)
         and len(value) == 2

@@ -203,7 +203,12 @@ def _has_post_copy_hook(strategy: ModelOffloader, target_key: str) -> bool:
         assert isinstance(param_ref, str)
         return component.post_copy_hook_key(param_ref) in component._post_copy_hooks
     if isinstance(component, StreamedWeights):
-        return component.post_copy_hook_key(param_ref) in component._post_copy_hooks
+        assert isinstance(param_ref, tuple)
+        block_idx, name = param_ref
+        return (
+            component.post_copy_hook_key(block_idx, name)
+            in component._post_copy_hooks
+        )
     return False
 
 
