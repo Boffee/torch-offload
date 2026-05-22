@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Hashable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
-from typing import Literal, TypeVar
+from typing import TypeVar
 
 import torch
 from torch import nn
@@ -19,7 +19,6 @@ from .pinned_buffer import PinnedBuffer
 from .pinned_param import PinnedParam
 from .tensor_adapter_factory import storage_key
 
-ParamAliasMode = Literal["storage", "object"]
 PostCopyHook = Callable[[nn.Parameter], None]
 _KeyForName = Callable[[str], Hashable]
 _NamedT = TypeVar("_NamedT")
@@ -64,14 +63,12 @@ class PinnedModuleStore:
 
     params: dict[str, PinnedParam]
     buffers: dict[str, PinnedBuffer]
-    param_alias_mode: ParamAliasMode = "storage"
 
     @classmethod
     def from_module(
         cls,
         module: nn.Module,
         *,
-        param_alias_mode: ParamAliasMode = "storage",
         include_param_names: Iterable[str] | None = None,
         include_buffer_names: Iterable[str] | None = None,
     ) -> PinnedModuleStore:
@@ -94,7 +91,7 @@ class PinnedModuleStore:
             "param",
             all_params,
             params,
-            lambda name: _param_alias_key(all_params[name], param_alias_mode),
+            lambda name: _param_storage_key(all_params[name]),
         )
 
         all_buffers = _named_buffers(module)
@@ -111,9 +108,8 @@ class PinnedModuleStore:
         )
 
         store = cls(
-            params=_pin_params(params, param_alias_mode),
+            params=_pin_params(params),
             buffers=_pin_buffers(buffers),
-            param_alias_mode=param_alias_mode,
         )
         _restore_params(module, store.params, _make_cpu_params(store.params))
         _restore_buffers(module, store.buffers)
@@ -239,15 +235,9 @@ class PinnedModuleInstance:
         )
 
 
-def _pin_params(
-    params: Mapping[str, nn.Parameter],
-    alias_mode: ParamAliasMode,
-) -> dict[str, PinnedParam]:
+def _pin_params(params: Mapping[str, nn.Parameter]) -> dict[str, PinnedParam]:
     pinned_by_name: dict[str, PinnedParam] = {}
-    for names in _group_names(
-        params,
-        lambda name: _param_alias_key(params[name], alias_mode),
-    ):
+    for names in _group_names(params, lambda name: _param_storage_key(params[name])):
         _validate_param_alias_requires_grad(names, params)
         pinned = PinnedParam(params[names[0]])
         for name in names:
@@ -332,7 +322,7 @@ def _validate_module_matches_store(
     _validate_alias_topology(
         "param",
         _pinned_alias_groups(store.params),
-        _module_param_alias_groups(params, store.param_alias_mode),
+        _module_param_alias_groups(params),
     )
     _validate_alias_topology(
         "buffer",
@@ -677,13 +667,8 @@ def _set_param(parent: nn.Module, leaf: str, param: nn.Parameter) -> None:
 
 def _module_param_alias_groups(
     params: Mapping[str, nn.Parameter],
-    alias_mode: ParamAliasMode,
 ) -> dict[str, frozenset[str]]:
-    if alias_mode == "storage":
-        return _alias_groups(params, lambda name: _param_storage_key(params[name]))
-    if alias_mode == "object":
-        return _alias_groups(params, lambda name: id(params[name]))
-    raise ValueError(f"Unsupported param alias mode {alias_mode!r}.")
+    return _alias_groups(params, lambda name: _param_storage_key(params[name]))
 
 
 def _pinned_alias_groups(
@@ -712,16 +697,6 @@ def _group_names(
     for name in items:
         groups_by_key.setdefault(key_for_name(name), []).append(name)
     return list(groups_by_key.values())
-
-
-def _param_alias_key(
-    param: nn.Parameter, alias_mode: ParamAliasMode,
-) -> Hashable:
-    if alias_mode == "storage":
-        return _param_storage_key(param)
-    if alias_mode == "object":
-        return id(param)
-    raise ValueError(f"Unsupported param alias mode {alias_mode!r}.")
 
 
 def _param_storage_key(param: nn.Parameter) -> Hashable:
@@ -767,7 +742,6 @@ def _format_names(names: Iterable[str]) -> str:
 
 
 __all__ = [
-    "ParamAliasMode",
     "PinnedBufferTarget",
     "PinnedModuleInstance",
     "PinnedModuleStore",

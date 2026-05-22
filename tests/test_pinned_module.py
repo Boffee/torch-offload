@@ -99,7 +99,7 @@ class TestPinnedModuleStore:
         )
         assert store.cache_bytes == store.params["left.weight"].cache_bytes
 
-    def test_storage_alias_mode_shares_distinct_params_with_same_storage(
+    def test_shares_distinct_params_with_same_storage(
         self,
     ) -> None:
         module = nn.Module()
@@ -114,23 +114,6 @@ class TestPinnedModuleStore:
         assert module.a is module.b
         assert module.a.data_ptr() == store.params["a"].make_cpu_param().data_ptr()
 
-    def test_object_alias_mode_keeps_distinct_param_objects_separate(
-        self,
-    ) -> None:
-        module = nn.Module()
-        shared = torch.randn(2, 2)
-        module.a = nn.Parameter(shared, requires_grad=False)
-        module.b = nn.Parameter(shared, requires_grad=False)
-
-        store = PinnedModuleStore.from_module(
-            module,
-            param_alias_mode="object",
-        )
-
-        assert store.params["a"] is not store.params["b"]
-        assert module.a is not module.b
-        assert module.a.data_ptr() != module.b.data_ptr()
-
     def test_rejects_storage_aliases_with_mixed_requires_grad(self) -> None:
         module = nn.Module()
         shared = torch.randn(2, 2)
@@ -142,20 +125,6 @@ class TestPinnedModuleStore:
 
         assert module.frozen.requires_grad is False
         assert module.trainable.requires_grad is True
-
-    def test_object_alias_mode_allows_mixed_requires_grad_storage_aliases(
-        self,
-    ) -> None:
-        module = nn.Module()
-        shared = torch.randn(2, 2)
-        module.frozen = nn.Parameter(shared, requires_grad=False)
-        module.trainable = nn.Parameter(shared, requires_grad=True)
-
-        store = PinnedModuleStore.from_module(module, param_alias_mode="object")
-
-        assert store.params["frozen"] is not store.params["trainable"]
-        assert store.params["frozen"].requires_grad is False
-        assert store.params["trainable"].requires_grad is True
 
     def test_keeps_distinct_param_backings_separate(self) -> None:
         module = nn.Module()
@@ -247,22 +216,20 @@ class TestPinnedModuleStore:
         assert module.keep is shared
         assert module.skip is shared
 
-    def test_object_alias_mode_can_include_one_storage_alias(self) -> None:
+    def test_include_names_reject_distinct_storage_alias_split(self) -> None:
         module = nn.Module()
         shared = torch.randn(2, 2)
         module.keep = nn.Parameter(shared, requires_grad=False)
         module.skip = nn.Parameter(shared, requires_grad=False)
-        skipped_param = module.skip
 
-        store = PinnedModuleStore.from_module(
-            module,
-            param_alias_mode="object",
-            include_param_names={"keep"},
-        )
+        with pytest.raises(ValueError, match="param include names cannot split"):
+            PinnedModuleStore.from_module(
+                module,
+                include_param_names={"keep"},
+            )
 
-        assert set(store.params) == {"keep"}
-        assert module.keep.data_ptr() == store.params["keep"].make_cpu_param().data_ptr()
-        assert module.skip is skipped_param
+        assert module.keep is not module.skip
+        assert module.keep.data_ptr() == module.skip.data_ptr()
 
     def test_rejects_unknown_param_include_names(self) -> None:
         module = nn.Module()
