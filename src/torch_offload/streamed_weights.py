@@ -22,8 +22,8 @@ This is the sharp, low-level primitive. It does NOT manage:
 - Non-block parts of the model (parent-module state, sibling
   modules) — caller derives :class:`PinnedWeights` include-name sets
   by excluding the streamer's owned block-local names.
-- Out-of-block trainable parameter movement — caller handles a
-  separate :class:`~torch_offload.trainable_weights.TrainableWeights`.
+- Out-of-block trainable parameter movement — caller handles that
+  alongside non-streamed parameters, usually with :class:`PinnedWeights`.
 - Cross-region tied-weight detection — that's a composer concern
   (see :func:`ModelOffloader` /
   :class:`~torch_offload.model_offloader.ModelOffloader`).

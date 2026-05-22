@@ -1,8 +1,7 @@
 """Unified block-streaming strategy with optional LoRA application.
 
-Composes block streaming, non-block pinning, trainable parameter
-movement, and optional per-weight LoRA application into a single
-:class:`ModelOffloader` class.
+Composes block streaming, non-streamed pinning, and optional per-weight
+LoRA application into a single :class:`ModelOffloader` class.
 
 Also provides :func:`detect_streaming_region_ties`
 (construction-time validation), used internally by
@@ -37,7 +36,6 @@ from .slots import (
 )
 from .streamed_weights import StreamedParamRef, StreamedWeights
 from .tensor_adapter_factory import select_adapter
-from .trainable_weights import TrainableWeights
 
 logger = logging.getLogger(__name__)
 
@@ -92,9 +90,9 @@ class ModelOffloader:
     movement. CPU activation is pass-through over the pinned
     host-backed module slots.
 
-    Composes :class:`PinnedWeights` (non-block frozen params),
-    :class:`TrainableWeights` (LoRA / adapter params), and one or more
-    :class:`StreamedWeights`\\ s internally. LoRA requests are recorded via
+    Composes :class:`PinnedWeights` (non-streamed params and buffers)
+    and one or more :class:`StreamedWeights`\\ s internally. LoRA requests
+    are recorded via
     :meth:`set_loras` and applied on :meth:`activate`, where merge mode
     installs activation-scoped post-copy hooks so the merge fires
     immediately after each CPU->GPU weight copy — no separate merge
@@ -128,11 +126,12 @@ class ModelOffloader:
     ``RuntimeError`` from autograd's saved-tensor check, so a warning
     suffices.
 
-    By default, trainable params keep the historical CUDA behavior:
-    all trainables, including adapters inside streamed blocks, stay
-    GPU-resident while the offloader is active on CUDA and work with
-    normal PyTorch optimizers. CPU activation leaves them in the
-    host-backed module slots.
+    By default, trainable params are not streamed through the block
+    residency pool. They are managed by :class:`PinnedWeights`, stay
+    GPU-resident while the offloader is active on CUDA, and must be
+    updated inside :meth:`optimizer_step` so CUDA updates are copied
+    back to the pinned CPU cache. CPU activation leaves them in the
+    host-backed module state.
 
     Pass ``stream_trainable_weights=True`` to stream in-block
     trainable parameter data through the CUDA block slot pool. In that
@@ -179,12 +178,12 @@ class ModelOffloader:
         keeps streaming the next iteration's leading blocks. Leave
         ``False`` for single-shot inference or training.
     stream_trainable_weights:
-        Default ``False`` preserves the historical contract:
-        all trainable params are skipped by block streaming and managed
-        by :class:`TrainableWeights`, so normal ``optimizer.step()``
-        works unchanged. ``True`` streams in-block trainable parameter
-        data with the block residency manager; use :meth:`optimizer_step`
-        around the optimizer update.
+        Default ``False`` skips trainable params in block streaming and
+        manages them with :class:`PinnedWeights`. ``True`` streams
+        in-block trainable parameter data with the block residency
+        manager. In both modes, wrap optimizer updates in
+        :meth:`optimizer_step` so trainable CUDA updates are copied back
+        to pinned CPU storage.
     skip_checkpointing_check:
         Default ``False``. Suppresses the activate-time checkpointing
         guard/warning entirely. Pass ``True`` only if you wrap each
@@ -247,8 +246,8 @@ class ModelOffloader:
             s.key for s in iter_param_slots(model) if s.get().requires_grad
         }
 
-        # By default, streamers skip trainables and TrainableWeights keeps
-        # them all GPU-resident. With stream_trainable_weights=True,
+        # By default, streamers skip trainables and PinnedWeights keeps
+        # them GPU-resident while active. With stream_trainable_weights=True,
         # streamers handle in-block params of both kinds: frozen via
         # parameter replacement and trainable via identity-preserving
         # ``.data`` swap.
@@ -279,41 +278,31 @@ class ModelOffloader:
                 )
             )
 
-        # PinnedWeights manages frozen non-block params/buffers. Skip
-        # streamed block-owned slots plus every trainable slot; the
-        # latter are owned by TrainableWeights in default mode and by
-        # either StreamedWeights or TrainableWeights in trainable-streaming
-        # mode.
-        pinned_skip_slots = streamer_slots | trainable_slots
+        # PinnedWeights manages every non-streamed param and buffer,
+        # including trainables. In default mode that includes in-block
+        # trainables because streamers skipped them above.
+        pinned_skip_slots = streamer_slots
 
         pinned_param_names, pinned_buffer_names = _pinned_weight_names(
             model, pinned_skip_slots,
         )
-        non_block: PinnedWeights | None = None
+        pinned_weights: PinnedWeights | None = None
         if pinned_param_names or pinned_buffer_names:
-            non_block = PinnedWeights(
+            pinned_weights = PinnedWeights(
                 model,
                 include_param_names=pinned_param_names,
                 include_buffer_names=pinned_buffer_names,
             )
 
-        # TrainableWeights handles all trainables in default mode. In
-        # trainable-streaming mode it skips streamer-owned slots, leaving
-        # only out-of-block trainables.
         components: list[ModelStrategyComponent] = []
-        if non_block is not None:
-            components.append(non_block)
-        if stream_trainable_weights:
-            trainable_weights = TrainableWeights(model, skip_slots=streamer_slots)
-        else:
-            trainable_weights = TrainableWeights(model)
-        trainable_weights.deactivate()
-        components.append(trainable_weights)
+        if pinned_weights is not None:
+            components.append(pinned_weights)
         components.extend(streamers)
 
         self._model = model
         self._active_device: torch.device | None = None
         self._components = components
+        self._pinned_weights = pinned_weights
         self._streamers = streamers
         self._teardown_stack: contextlib.ExitStack | None = None
 
@@ -325,7 +314,7 @@ class ModelOffloader:
             streamers,
             layer_paths,
             block_groups,
-            non_block,
+            pinned_weights,
         )
         self._lora_hook_handles: list[_RemovableHook] = []
         self._block_groups: list[list[nn.Module]] = block_groups
@@ -597,14 +586,13 @@ class ModelOffloader:
     @contextlib.contextmanager
     def optimizer_step(self) -> Iterator[None]:
         """Context manager wrapping the optimizer-step boundary for
-        streamed trainable weights.
+        managed trainable weights.
 
-        On CUDA activation, brings every streamer-managed trainable's
-        ``.data`` to GPU on enter (force-evicting any currently-loaded
-        blocks first to normalize state), yields, and on exit D2H's the
-        post-step ``.data`` back to the pinned host clones (blocking, to
-        avoid racing the next iteration's prefetch). On CPU activation,
-        this is a guarded no-op.
+        On CUDA activation, non-streamed trainables are already active
+        through :class:`PinnedWeights`, while streamer-managed trainables
+        are materialized on enter after force-evicting loaded blocks.
+        On exit, updated trainable bytes are copied back to their pinned
+        CPU storage. On CPU activation, this is a guarded no-op.
 
         ``param.grad`` is unaffected throughout. On CUDA, it lives on
         GPU during backward via PyTorch's native ``AccumulateGrad`` and
@@ -612,11 +600,6 @@ class ModelOffloader:
         ``clip_grad_norm_``, AMP's ``GradScaler.unscale_`` and other
         grad-walking tools work as in vanilla PyTorch — they don't need
         to be inside this context.
-
-        Out-of-block trainables (handled by ``TrainableWeights``) are
-        also unaffected; on CUDA they're GPU-resident across the whole
-        activation cycle, just like the default
-        ``stream_trainable_weights=False`` path.
 
         Typical loop::
 
@@ -629,8 +612,11 @@ class ModelOffloader:
             yield
             return
         with contextlib.ExitStack() as stack:
+            if self._pinned_weights is not None:
+                stack.enter_context(self._pinned_weights.optimizer_step())
             for streamer in self._streamers:
-                stack.enter_context(streamer.optimizer_step())
+                if streamer.has_trainables:
+                    stack.enter_context(streamer.optimizer_step())
             yield
 
     @contextlib.contextmanager
@@ -790,7 +776,7 @@ class ModelOffloader:
         streamers: list[StreamedWeights],
         layer_paths: list[str],
         block_groups: list[list[nn.Module]],
-        non_block: PinnedWeights | None,
+        pinned_weights: PinnedWeights | None,
     ) -> tuple[
         dict[str, _TargetParamRef],
         dict[str, tuple[nn.Module, ...]],
@@ -839,12 +825,12 @@ class ModelOffloader:
                     parents[key] = parent_tuple
                     components[key] = streamer
 
-        if non_block is not None:
+        if pinned_weights is not None:
             slots_by_ref_key: dict[int, list[ParamSlot]] = {}
-            for slot in iter_param_slots(non_block.model):
-                if slot.name not in non_block.param_names:
+            for slot in iter_param_slots(pinned_weights.model):
+                if slot.name not in pinned_weights.param_names:
                     continue
-                ref_key = non_block.post_copy_hook_key(slot.name)
+                ref_key = pinned_weights.post_copy_hook_key(slot.name)
                 slots_by_ref_key.setdefault(ref_key, []).append(slot)
 
             for slots in slots_by_ref_key.values():
@@ -853,7 +839,7 @@ class ModelOffloader:
                     key = canonical_param_name(slot.name)
                     param_refs[key] = slot.name
                     parents[key] = parent_tuple
-                    components[key] = non_block
+                    components[key] = pinned_weights
 
         return param_refs, parents, components
 
@@ -871,7 +857,7 @@ def _streamed_ownership_from_slot_exclusions(
 
     ``StreamedWeights`` is intentionally name-based. During the migration,
     ``ModelOffloader`` still owns slot-level composition because
-    ``TrainableWeights`` and the legacy pinned path use ``SlotKey``. Keep
+    default trainable exclusion and the legacy pinned path use ``SlotKey``. Keep
     that compatibility bridge here instead of leaking slots back into the
     streamer.
     """
@@ -1105,7 +1091,6 @@ class _ParamStorageMember:
     region: str
     name: str
     requires_grad: bool
-    param_id: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -1136,18 +1121,12 @@ def detect_streaming_region_ties(
       replaced while the trainable side is moved via storage swap on
       activate; the two mechanisms cannot share a tied storage
       without breaking aliasing invariants silently.
-    - **All-trainable ties with distinct Parameter objects** anywhere.
-      ``TrainableWeights`` moves each Parameter independently via
-      ``p.data = ...`` and would break the storage alias on GPU.
     - **Streamed trainable ties across regions** when
-      ``stream_trainables=True``. The same Parameter object is safe
-      under default all-trainables-on-GPU movement, but unsafe when
-      one streamed region owns a distinct pinned clone.
-    - **Unsupported intra-block trainable ties** with distinct Parameter
-      objects. Same-Parameter all-trainable aliases are safe because a
-      single ``.data`` swap reaches every alias slot. Frozen aliases are
-      safe because streamed stores deduplicate by storage within each
-      block.
+      ``stream_trainables=True``. Each streamed region owns independent
+      pinned storage and cannot coordinate optimizer-step copy-back for
+      shared trainable storage. Intra-region trainable ties are safe:
+      pinned module stores deduplicate them by storage and install a
+      single active target.
     - **Cross-region buffer ties**. Per-block buffer clones and
       composed non-block pinning cannot coordinate to preserve the
       alias.
@@ -1219,7 +1198,6 @@ def _param_storage_groups(
                 region=region,
                 name=slot.name,
                 requires_grad=param.requires_grad,
-                param_id=id(param),
             )
         )
     return groups
@@ -1259,52 +1237,21 @@ def _validate_param_storage_group(
         )
     requires_grad = next(iter(grad_flags))
     if requires_grad:
-        _validate_all_trainable_param_storage_group(
-            members,
-            regions=regions,
-            names=names,
-            stream_trainables=stream_trainables,
-        )
+        if stream_trainables and len(regions) > 1:
+            raise ValueError(
+                f"All-trainable tied storage spans streamed regions "
+                f"{sorted(regions)}: {names}. Shared trainable storage "
+                "across independently streamed regions creates divergent "
+                "pinned clones; per-block .data swap and optimizer-step "
+                "copy-back cannot coordinate to preserve the alias. Untie "
+                "the parameters, refactor so the alias is intra-region, or use "
+                "stream_trainable_weights=False."
+            )
         return
     _validate_frozen_param_storage_group(
         regions=regions,
         names=names,
     )
-
-
-def _validate_all_trainable_param_storage_group(
-    members: list[_ParamStorageMember],
-    *,
-    regions: set[str],
-    names: list[str],
-    stream_trainables: bool,
-) -> None:
-    param_ids = {member.param_id for member in members}
-    if len(param_ids) > 1:
-        raise ValueError(
-            f"All-trainable tied storage with distinct Parameter "
-            f"objects: {names}. TrainableWeights moves each Parameter "
-            "independently via p.data = ... and would break the "
-            "storage alias on GPU. Untie the parameters or use "
-            "tie_weights() to share a single Parameter object."
-        )
-    # Same Parameter object, all-trainable. In default mode this is fine
-    # across regions because TrainableWeights owns the single Parameter
-    # object directly. With stream_trainable_weights=True, cross-region
-    # aliasing is NOT fine: each region builds its own streamed block
-    # instance (or composes TrainableWeights for ``non_block``) with an
-    # independent pinned clone.
-    if stream_trainables and len(regions) > 1:
-        raise ValueError(
-            f"All-trainable tied storage spans streamed regions "
-            f"{sorted(regions)}: {names}. The same trainable "
-            "Parameter aliased across regions creates divergent "
-            "per-region pinned clones; per-block .data swap and "
-            "optimizer-step materialize/scatter cannot coordinate to "
-            "preserve the alias. Untie the parameters, refactor "
-            "so the alias is intra-region, or use "
-            "stream_trainable_weights=False."
-        )
 
 
 def _validate_frozen_param_storage_group(

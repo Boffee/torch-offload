@@ -7,10 +7,10 @@ Top-level offload strategies:
   individual blocks fit on GPU but the whole model does not.
   Hooks-based, prefetches upcoming blocks on a secondary CUDA stream,
   supports gradient checkpointing through autograd backward. By
-  default, trainable params stay GPU-resident while active; set
-  ``stream_trainable_weights=True`` to stream in-block trainable
-  weights and materialize them only around ``optimizer.step()``. Composes
-  :class:`PinnedWeights` + :class:`TrainableWeights` +
+  default, trainable params are managed by :class:`PinnedWeights` and
+  stay GPU-resident while active; set ``stream_trainable_weights=True``
+  to stream in-block trainable weights and materialize them only around
+  ``optimizer.step()``. Composes :class:`PinnedWeights` +
   :class:`StreamedWeights` internally.
 
 - :class:`PinnedWeights` — whole-model pinned-CPU bulk cache. Use for
@@ -58,14 +58,9 @@ recovery of the partially constructed strategy/model is unsupported;
 drop those references and rebuild from a fresh model instance.
 
 :class:`ModelOffloader` composes (in order):
-  1. A non-block :class:`PinnedWeights` for frozen params/buffers
-     outside streamed and trainable ownership. The composer derives
-     its include-name sets from the streamers' :class:`SlotKey`
-     filters and the model's trainable params.
-  2. A :class:`TrainableWeights` for LoRA / adapter weights
-     (or only out-of-block trainables when
-     ``stream_trainable_weights=True``).
-  3. One :class:`StreamedWeights` per ``layers_attr`` path.
+  1. A :class:`PinnedWeights` for every non-streamed parameter and
+     buffer, including trainables skipped by block streaming.
+  2. One :class:`StreamedWeights` per ``layers_attr`` path.
 
 Optional LoRA merging is requested via :meth:`ModelOffloader.set_loras`
 and resolved on activation by installing post-copy hooks for the matched

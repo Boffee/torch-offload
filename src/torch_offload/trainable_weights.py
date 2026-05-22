@@ -38,9 +38,8 @@ class TrainableWeights:
 
     Each transition walks the model and moves every currently
     trainable Parameter. With ``skip_slots`` the walk is slot-aware,
-    which lets :class:`ModelOffloader` route in-block streamed
-    trainable weights to the streamer while leaving out-of-block
-    trainables here. Keeping the walk dynamic preserves the historical
+    which lets custom composers route some trainables to another
+    component. Keeping the walk dynamic preserves the historical
     behavior for late ``requires_grad`` changes.
 
     Parameters
@@ -50,10 +49,7 @@ class TrainableWeights:
     skip_slots:
         Optional set of :class:`SlotKey` values identifying
         ``(parent_module, leaf, kind)`` slots to skip — used by
-        composers that route some trainables to a different mover
-        (e.g., :class:`ModelOffloader` routes in-block trainables to
-        the streamer's per-block ``.data``-swap path and only hands
-        out-of-block trainables to ``TrainableWeights``).
+        composers that route some trainables to a different mover.
     """
 
     def __init__(

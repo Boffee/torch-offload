@@ -21,13 +21,13 @@ Top-level :class:`CachedResource` implementations in this package:
 :class:`~torch_offload.PinnedWeights` (whole-model bulk DMA between
 pinned CPU and GPU), :class:`~torch_offload.MpsWeights` (whole-model
 CPU->MPS materialization without a second CPU cache),
-:class:`ModelOffloader` (composite of streamers + pinning + trainable
-handling), and :class:`~torch_offload.LoRA` (pinned LoRA factor storage).
+:class:`ModelOffloader` (composite of streamers + pinning), and
+:class:`~torch_offload.LoRA` (pinned LoRA factor storage).
 Future resources (disk-mmap, NVMe-paged, multi-GPU shard) just satisfy
 :class:`CachedResource`.
 
-Component implementations: :class:`~torch_offload.StreamedWeights`,
-:class:`~torch_offload.TrainableWeights`. (And :class:`PinnedWeights`
+Component implementations include :class:`~torch_offload.StreamedWeights`
+and :class:`~torch_offload.TrainableWeights`. (And :class:`PinnedWeights`
 also satisfies the component shape — composites use it inline.)
 
 Lifecycle

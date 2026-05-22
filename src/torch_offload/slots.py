@@ -119,10 +119,8 @@ def assert_frozen(
     msg = (
         f"{owner} cannot manage trainable slot {slot.name!r}: slot "
         "replacement installs a fresh frozen Parameter wrapper, "
-        "breaking optimizer/grad identity. Use ModelOffloader (which "
-        "partitions trainables into TrainableWeights automatically), "
-        "or pass the slot in skip_slots and route it to a separate "
-        "trainable mover."
+        "breaking optimizer/grad identity. Use PinnedWeights or "
+        "ModelOffloader, which preserve trainable Parameter identity."
     )
     if extra:
         msg = f"{msg} {extra}"

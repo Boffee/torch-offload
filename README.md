@@ -16,7 +16,7 @@ to be lifted into its own package when a second consumer appears.
 | `protocols.py` | `CachedResource` (generic), `ModelStrategy` / `ModelStrategyComponent` plug-in contracts; `SlotKey` skip-filter type |
 | `pinned_weights.py` | `PinnedWeights` — whole-model bulk pinned-CPU↔GPU strategy |
 | `streamed_weights.py` | `StreamedWeights` — sharp per-block-list streaming primitive (component) |
-| `model_offloader.py` | `ModelOffloader` — unified composite: block streaming + non-block pinning + trainable params + optional LoRA merge |
+| `model_offloader.py` | `ModelOffloader` — unified composite: block streaming + non-streamed pinning + optional LoRA merge |
 | `trainable_weights.py` | `TrainableWeights` — identity-preserving trainable parameter mover |
 | `lora.py` | `LoRA`, `LoRATransform`, `LoRARouteHandle` — pinned factor storage + merge / routed-hook application |
 | `merge.py` | `merge_lora()` — permanent in-place LoRA merge into base weights (alternative to `set_loras`) |
@@ -125,13 +125,12 @@ no slot pool, no streaming hooks, no weight copies.
 CPU activation. Routed LoRA still installs forward hooks and materializes
 LoRA factors on the activation device.
 
-By default, trainable parameters (e.g. LoRA adapters) move to GPU on
-CUDA activation and back to CPU on deactivate via the bundled
-`TrainableWeights` component. On CPU activation they stay in the
-host-backed module slots. This preserves ordinary PyTorch optimizer
-behavior: `optimizer.step()`, gradient accumulation, AMP unscale, and
-grad clipping see normal trainables on the activation device while the
-offloader is active.
+By default, trainable parameters (e.g. LoRA adapters) are managed by
+the composed `PinnedWeights`: they move to GPU on CUDA activation and
+back to pinned CPU storage on deactivate. On CPU activation they stay in
+the host-backed module slots. Wrap CUDA optimizer updates in
+`offloader.optimizer_step()` so updated trainable bytes are copied back
+to pinned CPU storage before deactivation.
 
 To reduce trainable-weight residency during training, opt into
 streaming in-block trainable weights:
@@ -308,9 +307,10 @@ call sites is invisible from the module tree; pass
 `skip_checkpointing_check=True` only after verifying every streamed
 training block is checkpointed.
 
-For `stream_trainable_weights=True`, wrap the optimizer update
-so streamed trainable weights are materialized on GPU while a normal
-PyTorch optimizer mutates it:
+Wrap CUDA optimizer updates so managed trainable weights are synced back
+to pinned CPU storage. With `stream_trainable_weights=True`, this also
+materializes streamed trainable weights on GPU while a normal PyTorch
+optimizer mutates them:
 
 ```python
 with offloader.use(device) as gpu_model:
@@ -324,10 +324,9 @@ with offloader.use(device) as gpu_model:
         optimizer.zero_grad()
 ```
 
-This boundary is not optimizer-specific. It temporarily materializes
-the streamed trainable `.data` tensors on GPU, runs whatever
-`optimizer.step()` does, copies updated data back to pinned CPU, and
-leaves gradients on GPU.
+This boundary is not optimizer-specific. It runs whatever
+`optimizer.step()` does, copies updated trainable data back to pinned
+CPU storage, and leaves gradients on GPU.
 
 ## Quick start: ModelCache
 
@@ -412,9 +411,8 @@ the cache lock. `choose_victims()` must return unique keys from
             │                                        │
             │             ┌──────────────────────────┴──────────┐
             │             │  components (ordered):              │
-            │             │  • PinnedWeights (non-block,        │
+            │             │  • PinnedWeights (non-streamed,     │
             │             │    include names from composition)  │
-            │             │  • TrainableWeights                 │
             │             │  • N × StreamedWeights              │
             │             │                                     │
             │             │  optional LoRA:                     │
@@ -451,7 +449,7 @@ class MyStrategy:
 A narrower `ModelStrategyComponent` Protocol (just `cache_bytes` +
 `activate` + `deactivate`, no `model`) describes pieces composable
 inside a top-level strategy — `StreamedWeights`, `TrainableWeights`,
-and a `PinnedWeights` used as a non-block sibling all satisfy it.
+and `PinnedWeights` all satisfy it.
 
 `TensorAdapter` is the per-parameter extension point. Its base contract
 only covers inference movement: clone/pin, H2D copy, GPU wrapper rebuild,

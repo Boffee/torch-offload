@@ -2,7 +2,7 @@
 
 Covers ``ModelOffloader`` (the public composite),
 ``StreamedWeights`` (the per-block-list primitive),
-``TrainableWeights`` (the trainable-param component),
+``TrainableWeights`` (standalone legacy trainable-param mover),
 and the cross-region tied-weight detector.
 
 CUDA-only tests gate on availability. CPU activation is pass-through
@@ -888,8 +888,8 @@ class TestActivateFailureCleanup:
     @CUDA
     def test_partial_activate_failure_rolls_back_other_components(self, monkeypatch) -> None:
         # If a streamer's activate raises, the composite's `with stack:`
-        # rolls back the already-activated components (PinnedWeights,
-        # TrainableWeights). _teardown_stack stays None because pop_all()
+        # rolls back the already-activated components. _teardown_stack stays
+        # None because pop_all()
         # was never reached. Caller's responsibility to drop the
         # strategy reference for full cleanup.
         m = _make_block_model()
@@ -1038,7 +1038,7 @@ class TestConstructedStateIsInactive:
             layers_attr="transformer_blocks", blocks_to_swap=2,
         )
         try:
-            # No PinnedWeights component, just TrainableWeights + StreamedWeights.
+            # No PinnedWeights component, just StreamedWeights.
             non_block_components = [
                 c for c in strategy._components if isinstance(c, PinnedWeights)
             ]
@@ -1775,32 +1775,36 @@ class TestBlockLayoutCompatibility:
 
 class TestMultiComponentCleanup:
     @CUDA
-    def test_trainable_move_failure_still_runs_other_deactivates(self) -> None:
+    def test_pinned_deactivate_failure_still_runs_streamer_deactivate(
+        self, monkeypatch,
+    ) -> None:
         # ExitStack continues unwinding callbacks even when one raises.
-        # If TrainableWeights's deactivate raises, StreamedWeights (earlier
-        # in unwind order) and non_block PinnedWeights (later in unwind)
-        # still get their deactivate called.
-        from unittest.mock import patch
+        # If non-block PinnedWeights raises during deactivate, streamers
+        # earlier in unwind order have still been deactivated.
 
         m = _make_block_model()
         strategy = ModelOffloader(
             m,
             layers_attr="transformer_blocks", blocks_to_swap=2,
         )
+        original_deactivate = PinnedWeights.deactivate
+
+        def broken_deactivate(component: PinnedWeights) -> None:
+            original_deactivate(component)
+            raise RuntimeError("simulated pinned deactivate failure")
+
+        monkeypatch.setattr(PinnedWeights, "deactivate", broken_deactivate)
         try:
             strategy.activate("cuda")
             assert m.embed.weight.is_cuda  # type: ignore[union-attr]
 
-            with patch.object(
-                TrainableWeights, "_move",
-                side_effect=RuntimeError("simulated trainable move failure"),
-            ), pytest.raises(RuntimeError, match="simulated trainable move failure"):
+            with pytest.raises(RuntimeError, match="simulated pinned deactivate failure"):
                 strategy.deactivate()
 
-            # Despite the trainable-move failure, non_block was
-            # deactivated (slots back to pinned CPU) — proves
-            # ExitStack continued past the raising callback.
+            # PinnedWeights restored slots before raising, and streamers
+            # were already unwound in LIFO order.
             assert m.embed.weight.is_pinned()  # type: ignore[union-attr]
+            assert not strategy._streamers[0]._hooks
             assert strategy._teardown_stack is None
         finally:
             strategy.deactivate()
@@ -2003,8 +2007,8 @@ class TestDetectStreamingRegionTies:
 class TestStreamedWeightsContractGuard:
     """StreamedWeights now handles in-block trainables natively via
     ``.data`` swap (preserves user Parameter identity for autograd /
-    optimizer state). The composer still routes out-of-block
-    trainables to ``TrainableWeights`` through its temporary slot shim."""
+    optimizer state). The composer routes any non-streamed trainables to
+    ``PinnedWeights``."""
 
     def test_direct_unskipped_trainable_constructs(self) -> None:
         block_0 = nn.Linear(4, 4, bias=False)  # default requires_grad=True
@@ -2102,11 +2106,10 @@ class TestMixedGradTieDetection:
                 layers_attr="transformer_blocks", blocks_to_swap=1,
             )
 
-    def test_all_trainable_distinct_parameter_tie_raises(self) -> None:
+    def test_all_trainable_distinct_parameter_tie_constructs(self) -> None:
         # Two distinct Parameter objects sharing storage, both trainable.
-        # TrainableWeights walks model.parameters() (deduped by id(p)) and
-        # would move each Parameter independently, breaking the storage
-        # alias on GPU. Reject upfront.
+        # Default mode skips trainables in StreamedWeights, so PinnedWeights
+        # owns and deduplicates the shared storage.
         shared = torch.randn(4, 4)
         a = nn.Parameter(shared, requires_grad=True)
         b = nn.Parameter(shared, requires_grad=True)
@@ -2125,13 +2128,73 @@ class TestMixedGradTieDetection:
         m = M()
         for p in m.transformer_blocks.parameters():
             p.requires_grad = False
-        with pytest.raises(
-            ValueError, match="distinct Parameter objects|tie_weights",
-        ):
-            ModelOffloader(
-                m,
-                layers_attr="transformer_blocks", blocks_to_swap=1,
-            )
+        strategy = ModelOffloader(
+            m,
+            layers_attr="transformer_blocks", blocks_to_swap=1,
+        )
+        strategy.deactivate()
+
+    @CUDA
+    def test_all_trainable_distinct_parameter_tie_optimizer_step(
+        self,
+    ) -> None:
+        # Exercise the exact storage-sharing shape allowed above through
+        # CUDA activation and optimizer sync. The two Parameter wrappers
+        # stay distinct for optimizer identity, but their data storage must
+        # remain shared across activate/deactivate.
+        shared = torch.randn(4, 4)
+        a = nn.Parameter(shared, requires_grad=True)
+        b = nn.Parameter(shared, requires_grad=True)
+
+        class M(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.transformer_blocks = nn.ModuleList(
+                    [nn.Linear(4, 4, bias=False), nn.Linear(4, 4, bias=False)]
+                )
+                self.alias_a = nn.Module()
+                self.alias_b = nn.Module()
+                self.alias_a.weight = a
+                self.alias_b.weight = b
+
+        m = M()
+        m.eval()
+        for p in m.transformer_blocks.parameters():
+            p.requires_grad = False
+        optimizer = torch.optim.SGD([a, b], lr=0.1)
+        strategy = ModelOffloader(
+            m,
+            layers_attr="transformer_blocks", blocks_to_swap=1,
+        )
+        try:
+            assert m.alias_a.weight is a
+            assert m.alias_b.weight is b
+            assert a.data_ptr() == b.data_ptr()
+
+            with strategy.use("cuda"):
+                assert a.is_cuda
+                assert b.is_cuda
+                assert a.data_ptr() == b.data_ptr()
+                a.grad = torch.ones_like(a)
+                b.grad = torch.full_like(b, 2.0)
+                with strategy.optimizer_step():
+                    optimizer.step()
+                    expected = a.detach().cpu().clone()
+                    torch.testing.assert_close(b.detach().cpu(), expected)
+                optimizer.zero_grad(set_to_none=True)
+
+            assert a.is_pinned()
+            assert b.is_pinned()
+            assert a.data_ptr() == b.data_ptr()
+            torch.testing.assert_close(a.detach(), expected)
+            torch.testing.assert_close(b.detach(), expected)
+
+            with strategy.use("cuda"):
+                assert a.data_ptr() == b.data_ptr()
+                torch.testing.assert_close(a.detach().cpu(), expected)
+                torch.testing.assert_close(b.detach().cpu(), expected)
+        finally:
+            strategy.deactivate()
 
     def test_all_trainable_same_parameter_cross_region_tie_raises(self) -> None:
         # The SAME trainable Parameter object aliased into two streamed
@@ -2168,9 +2231,9 @@ class TestMixedGradTieDetection:
             )
 
     def test_all_trainable_same_parameter_default_mode_constructs(self) -> None:
-        # Legacy/default mode skips all trainables in StreamedWeights and
-        # moves the single shared Parameter through TrainableWeights, so
-        # same-Parameter all-trainable cross-region ties remain valid.
+        # Default mode skips all trainables in StreamedWeights and manages
+        # them through PinnedWeights, so all-trainable cross-region ties
+        # remain valid.
         shared = nn.Parameter(torch.randn(4, 4), requires_grad=True)
 
         class TiedTrainableBlock(nn.Module):
@@ -2333,7 +2396,7 @@ class TestMixedGradTieDetection:
 class TestLoRAInBlockRouting:
     """LoRA-shaped models: blocks contain frozen base layers plus
     trainable adapter layers. The composer must route the base to
-    StreamedWeights and the adapters to TrainableWeights; neither
+    StreamedWeights and, in default mode, the adapters to PinnedWeights; neither
     strategy's contract guard should fire on a well-formed LoRA model.
     """
 
@@ -2355,9 +2418,8 @@ class TestLoRAInBlockRouting:
     def test_composer_routes_in_block_lora_to_streamer(self) -> None:
         # In the .data-only redesign, in-block trainables (LoRA adapters
         # nested inside streamed blocks) are managed by the streamer
-        # itself via ``.data`` swap — no longer routed to
-        # ``TrainableWeights``. The streamer therefore owns BOTH frozen
-        # base.weight and trainable lora_a/lora_b names.
+        # itself via ``.data`` swap. The streamer therefore owns BOTH
+        # frozen base.weight and trainable lora_a/lora_b names.
         class M(nn.Module):
             def __init__(self, blocks):
                 super().__init__()
@@ -2382,10 +2444,9 @@ class TestLoRAInBlockRouting:
         finally:
             strat.deactivate()
 
-    def test_default_routes_in_block_lora_to_trainable_weights(self) -> None:
-        # Default mode preserves the historical contract: in-block
-        # trainables are skipped by StreamedWeights and kept GPU-resident
-        # by TrainableWeights while active.
+    def test_default_routes_in_block_lora_to_pinned_weights(self) -> None:
+        # Default mode skips in-block trainables in StreamedWeights and
+        # keeps them GPU-resident through PinnedWeights while active.
         class M(nn.Module):
             def __init__(self, blocks):
                 super().__init__()
@@ -2406,13 +2467,22 @@ class TestLoRAInBlockRouting:
                 ["base.weight"],
                 ["base.weight"],
             ]
+            pinned = next(
+                c for c in strat._components if isinstance(c, PinnedWeights)
+            )
+            assert pinned.param_names == {
+                "transformer_blocks.0.lora_a.weight",
+                "transformer_blocks.0.lora_b.weight",
+                "transformer_blocks.1.lora_a.weight",
+                "transformer_blocks.1.lora_b.weight",
+            }
         finally:
             strat.deactivate()
 
     def test_composer_partitions_skip_slots_correctly(self) -> None:
-        # Through-test: the composer converts block/trainable skip slots
-        # into PinnedWeights include-name sets. Verify that no trainable
-        # param name and no block-internal param name is pinned.
+        # Through-test: the composer converts streamed slots into
+        # PinnedWeights include-name sets. Verify that streamed block
+        # names are excluded and non-streamed trainables are included.
         class M(nn.Module):
             def __init__(self):
                 super().__init__()
@@ -2437,11 +2507,11 @@ class TestLoRAInBlockRouting:
             pinned = next(
                 c for c in strat._components if isinstance(c, PinnedWeights)
             )
-            # PinnedWeights manages frozen_head.weight only — block content
-            # routed to StreamedWeights, trainable_bias to TrainableWeights.
-            assert pinned.param_names == {"frozen_head.weight"}
+            # PinnedWeights manages every non-streamed parameter, including
+            # trainable_bias.
+            assert pinned.param_names == {"frozen_head.weight", "trainable_bias"}
             for s in iter_param_slots(m):
-                if s.name == "frozen_head.weight":
+                if s.name in {"frozen_head.weight", "trainable_bias"}:
                     assert s.name in pinned.param_names
                 else:
                     assert s.name not in pinned.param_names, (
@@ -2932,6 +3002,66 @@ class TestInBlockTrainableStreamingEndToEnd:
         for name, g_baseline in baseline_grads.items():
             torch.testing.assert_close(
                 streamed_grads[name], g_baseline, atol=1e-5, rtol=1e-5,
+            )
+
+    @CUDA
+    def test_default_optimizer_step_updates_match_baseline(self) -> None:
+        # Default mode keeps in-block LoRA trainables out of the streamer;
+        # ModelOffloader.optimizer_step must still sync their PinnedWeights
+        # CPU cache after the optimizer mutates CUDA data.
+        torch.manual_seed(0)
+        m_baseline = _make_lora_in_block_model(num_blocks=4, width=8, rank=2)
+        m_offloaded = _make_lora_in_block_model(num_blocks=4, width=8, rank=2)
+        m_offloaded.load_state_dict(m_baseline.state_dict())
+
+        for block in m_offloaded.transformer_blocks:
+            block.gradient_checkpointing = True
+
+        opt_baseline = torch.optim.SGD(
+            [p for p in m_baseline.parameters() if p.requires_grad], lr=0.1,
+        )
+        opt_offloaded = torch.optim.SGD(
+            [p for p in m_offloaded.parameters() if p.requires_grad], lr=0.1,
+        )
+
+        x = torch.randn(2, 8, device="cuda")
+        target = torch.randn(2, 8, device="cuda")
+
+        m_baseline.to("cuda")
+        out_b = m_baseline(x, use_checkpoint=True)
+        ((out_b - target) ** 2).mean().backward()
+        opt_baseline.step()
+        baseline_after = {
+            n: p.detach().clone().cpu()
+            for n, p in m_baseline.named_parameters()
+            if p.requires_grad
+        }
+
+        offloader = ModelOffloader(
+            m_offloaded,
+            layers_attr="transformer_blocks",
+            blocks_to_swap=2, prefetch_count=0,
+        )
+        try:
+            with offloader.use("cuda") as gpu_model:
+                out_s = gpu_model(x, use_checkpoint=True)
+                ((out_s - target) ** 2).mean().backward()
+                with offloader.optimizer_step():
+                    opt_offloaded.step()
+                opt_offloaded.zero_grad()
+        finally:
+            offloader.deactivate()
+
+        offloaded_after = {
+            n: p.detach().clone().cpu()
+            for n, p in m_offloaded.named_parameters()
+            if p.requires_grad
+        }
+
+        assert set(baseline_after) == set(offloaded_after)
+        for name, baseline_t in baseline_after.items():
+            torch.testing.assert_close(
+                offloaded_after[name], baseline_t, atol=1e-5, rtol=1e-5,
             )
 
     @CUDA
