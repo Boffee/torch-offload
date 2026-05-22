@@ -209,6 +209,18 @@ class TestPinnedModuleInstance:
         assert target.running is store.buffers["running"].tensor
         assert "running" in target._non_persistent_buffers_set
 
+    def test_non_contiguous_buffer_can_bind_after_store_restore(self) -> None:
+        module = nn.Module()
+        source = torch.randn(2, 3).t()
+        module.register_buffer("table", source)
+
+        store = PinnedModuleStore.from_module(module)
+        instance = PinnedModuleInstance.from_store(store, module)
+
+        assert not source.is_contiguous()
+        assert store.buffers["table"].tensor.is_contiguous()
+        assert instance.module.table is store.buffers["table"].tensor
+
     def test_rejects_missing_param_name(self) -> None:
         prototype = nn.Module()
         prototype.weight = nn.Parameter(torch.randn(2, 2), requires_grad=False)

@@ -19,12 +19,13 @@ class PinnedBuffer:
     @classmethod
     def clone(cls, buffer: torch.Tensor) -> PinnedBuffer:
         """Clone ``buffer`` into pinned CPU storage."""
+        tensor = clone_to_pinned_cpu(
+            buffer,
+            memory_format=torch.contiguous_format,
+        )
         return cls(
-            tensor=clone_to_pinned_cpu(
-                buffer,
-                memory_format=torch.contiguous_format,
-            ),
-            target_layout=cls.target_layout_for(buffer),
+            tensor=tensor,
+            target_layout=cls.target_layout_for(tensor),
         )
 
     @staticmethod

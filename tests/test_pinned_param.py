@@ -525,6 +525,19 @@ class TestPinnedBindings:
 
         torch.testing.assert_close(target.tensor, pinned.tensor)
 
+    def test_pinned_buffer_target_layout_matches_pinned_tensor_layout(
+        self,
+    ) -> None:
+        source = torch.randn(2, 3).t()
+
+        pinned = PinnedBuffer.clone(source)
+
+        assert not source.is_contiguous()
+        assert pinned.tensor.is_contiguous()
+        assert pinned.target_layout == PinnedBuffer.target_layout_for(
+            pinned.tensor,
+        )
+
     def test_module_binding_load_to_target_copies_before_setting_slots(
         self,
     ) -> None:
