@@ -184,22 +184,21 @@ class TestPinnedModuleStore:
         assert module.keep.data_ptr() == store.params["keep"].make_cpu_param().data_ptr()
         assert module.skip is skipped_param
 
-    def test_rejects_param_include_names_that_split_shared_params(self) -> None:
+    def test_param_include_names_can_split_shared_storage(self) -> None:
         module = nn.Module()
-        shared = nn.Linear(2, 2, bias=False)
-        shared.weight.requires_grad_(False)
-        module.left = shared
-        module.right = shared
-        original = shared.weight
+        shared = torch.randn(2, 2)
+        module.keep = nn.Parameter(shared, requires_grad=False)
+        module.skip = nn.Parameter(shared, requires_grad=False)
+        skipped_param = module.skip
 
-        with pytest.raises(ValueError, match="cannot split shared tensors"):
-            PinnedModuleStore.from_module(
-                module,
-                include_param_names={"left.weight"},
-            )
+        store = PinnedModuleStore.from_module(
+            module,
+            include_param_names={"keep"},
+        )
 
-        assert module.left.weight is original
-        assert module.right.weight is original
+        assert set(store.params) == {"keep"}
+        assert module.keep.data_ptr() == store.params["keep"].make_cpu_param().data_ptr()
+        assert module.skip is skipped_param
 
     def test_empty_include_name_sets_pin_nothing(self) -> None:
         module = nn.Module()
@@ -245,19 +244,19 @@ class TestPinnedModuleStore:
         assert module.keep is store.buffers["keep"].tensor
         assert module.skip is skipped_buffer
 
-    def test_rejects_buffer_include_names_that_split_shared_buffers(self) -> None:
+    def test_buffer_include_names_can_split_shared_storage(self) -> None:
         module = nn.Module()
         shared = torch.randn(2)
         module.register_buffer("running", shared)
         module.register_buffer("running_alias", shared)
 
-        with pytest.raises(ValueError, match="cannot split shared tensors"):
-            PinnedModuleStore.from_module(
-                module,
-                include_buffer_names={"running"},
-            )
+        store = PinnedModuleStore.from_module(
+            module,
+            include_buffer_names={"running"},
+        )
 
-        assert module.running is shared
+        assert set(store.buffers) == {"running"}
+        assert module.running is store.buffers["running"].tensor
         assert module.running_alias is shared
 
     def test_rejects_unknown_buffer_include_names(self) -> None:
@@ -837,7 +836,7 @@ class TestPinnedModuleInstance:
         with pytest.raises(ValueError, match="Buffer 'running' layout mismatch"):
             PinnedModuleInstance.from_store(store, target)
 
-    def test_rejects_param_alias_topology_mismatch(self) -> None:
+    def test_from_store_allows_param_sharing_mismatch(self) -> None:
         prototype = nn.Module()
         shared = nn.Linear(2, 2, bias=False)
         shared.weight.requires_grad_(False)
@@ -851,10 +850,11 @@ class TestPinnedModuleInstance:
         target.left.weight.requires_grad_(False)
         target.right.weight.requires_grad_(False)
 
-        with pytest.raises(ValueError, match="alias topology mismatch"):
-            PinnedModuleInstance.from_store(store, target)
+        PinnedModuleInstance.from_store(store, target)
 
-    def test_rejects_untracked_param_alias(self) -> None:
+        assert target.left.weight is target.right.weight
+
+    def test_from_store_allows_untracked_param_sharing(self) -> None:
         prototype = nn.Module()
         prototype.weight = nn.Parameter(torch.randn(2, 2), requires_grad=False)
         store = PinnedModuleStore.from_module(prototype)
@@ -863,11 +863,14 @@ class TestPinnedModuleInstance:
         shared = torch.randn(2, 2)
         target.weight = nn.Parameter(shared, requires_grad=False)
         target.extra = nn.Parameter(shared, requires_grad=False)
+        extra = target.extra
 
-        with pytest.raises(ValueError, match="alias topology mismatch"):
-            PinnedModuleInstance.from_store(store, target)
+        PinnedModuleInstance.from_store(store, target)
 
-    def test_rejects_buffer_alias_topology_mismatch(self) -> None:
+        assert target.extra is extra
+        assert target.weight is not target.extra
+
+    def test_from_store_allows_buffer_sharing_mismatch(self) -> None:
         prototype = nn.Module()
         shared = torch.randn(2)
         prototype.register_buffer("running", shared)
@@ -878,5 +881,6 @@ class TestPinnedModuleInstance:
         target.register_buffer("running", torch.randn(2))
         target.register_buffer("running_alias", torch.randn(2))
 
-        with pytest.raises(ValueError, match="alias topology mismatch"):
-            PinnedModuleInstance.from_store(store, target)
+        PinnedModuleInstance.from_store(store, target)
+
+        assert target.running is target.running_alias

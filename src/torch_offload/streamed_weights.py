@@ -45,7 +45,7 @@ import weakref
 from collections import OrderedDict
 from collections.abc import Callable, Hashable, Iterable, Iterator, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import TypeVar, cast
+from typing import cast
 
 import torch
 from torch import nn
@@ -66,7 +66,6 @@ logger = logging.getLogger(__name__)
 
 StreamedParamRef = tuple[int, str]
 _LoadedTrainableBlock = tuple[PinnedModuleInstance, PinnedModuleTarget]
-_NamedT = TypeVar("_NamedT")
 _KeyForName = Callable[[str], Hashable]
 
 
@@ -173,7 +172,7 @@ def _check_block_layouts_match(
                 _param_target_layout(params[names[0]]),
             )
             for names in _group_names(
-                params,
+                params.keys(),
                 lambda name: _param_storage_key(params[name]),
             )
         )
@@ -185,7 +184,7 @@ def _check_block_layouts_match(
                 _buffer_target_layout(buffers[names[0]]),
             )
             for names in _group_names(
-                buffers,
+                buffers.keys(),
                 lambda name: _buffer_storage_key(buffers[name]),
             )
         )
@@ -197,7 +196,7 @@ def _check_block_layouts_match(
             raise ValueError(
                 f"Block {i} param layout differs from block 0. "
                 "All blocks in a StreamedWeights group must share the "
-                "same param structure (names, alias topology, "
+                "same param structure (names, storage grouping, "
                 "requires_grad, shapes, dtypes, and any tensor-adapter "
                 "wrapper metadata). Split heterogeneous block lists "
                 "across separate `layers_attr=[...]` groups in "
@@ -261,13 +260,13 @@ def _select_streamed_entries(
 
 
 def _group_names(
-    items: dict[str, _NamedT],
+    names: Iterable[str],
     key_for_name: _KeyForName,
-) -> list[list[str]]:
+) -> list[tuple[str, ...]]:
     groups_by_key: dict[Hashable, list[str]] = {}
-    for name in items:
+    for name in names:
         groups_by_key.setdefault(key_for_name(name), []).append(name)
-    return list(groups_by_key.values())
+    return [tuple(group) for group in groups_by_key.values()]
 
 
 def _param_storage_key(param: nn.Parameter) -> Hashable:
@@ -308,8 +307,8 @@ def _pin_block_module_instances(
 ) -> list[PinnedModuleInstance]:
     """Collect, validate, and pin one :class:`PinnedModuleInstance` per block.
 
-    Pre-pin validation failures do not pin and do not mutate model
-    slots. Once pinning starts, :class:`PinnedParam` may use its
+    Pre-pin validation failures do not pin and do not mutate module
+    parameters or buffers. Once pinning starts, :class:`PinnedParam` may use its
     low-peak ``Parameter.data`` repointing optimization; recovery from
     a pin-time failure is unsupported, matching :class:`PinnedWeights`.
     """
@@ -325,7 +324,7 @@ def _pin_block_module_instances(
     # Validate before pinning. ``Tensor.copy_`` silently casts dtype and
     # silently broadcasts compatible shapes, so any block N with
     # mismatched dtype, name, or wrapper metadata would otherwise load
-    # into block 0's pool slot without raising and corrupt forward.
+    # into block 0's pool target without raising and corrupt forward.
     _check_block_layouts_match(block_params, block_buffers)
 
     block_stores = [

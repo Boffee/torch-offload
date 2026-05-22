@@ -51,8 +51,8 @@ class PinnedModuleTarget:
     """Name-keyed active storage for a :class:`PinnedModuleStore`.
 
     Targets may contain the whole store or a validated subset of it.
-    Aliased selected names point at the same target object, mirroring
-    the store's ``name -> pinned`` topology.
+    Names mapped to the same pinned object also point at the same
+    target object.
     """
 
     param_targets: dict[str, PinnedParamTarget]
@@ -86,8 +86,8 @@ class PinnedModuleStore:
 
     ``params`` and ``buffers`` are keyed by PyTorch logical names from
     ``named_parameters(remove_duplicate=False)`` and
-    ``named_buffers(remove_duplicate=False)``. Aliased names point at the
-    same pinned object.
+    ``named_buffers(remove_duplicate=False)``. Selected names sharing
+    storage point at the same pinned object.
     """
 
     params: dict[str, PinnedParam]
@@ -104,29 +104,19 @@ class PinnedModuleStore:
         """Pin ``module`` into a name-keyed store.
 
         Store construction is intentionally side-effecting like the
-        existing pinning path: after bytes are pinned, the prototype
-        module is restored to the store-backed pinned CPU state.
+        existing pinning path: after bytes are pinned, selected module
+        state is restored to the store-backed pinned CPU state.
         """
         all_params = _named_parameters(module)
         params = _select_known_names(
             all_params,
             include_param_names,
         )
-        _validate_shared_tensors_included_together(
-            all_params,
-            set(params),
-            lambda name: _param_storage_key(all_params[name]),
-        )
 
         all_buffers = _named_buffers(module)
         buffers = _select_known_names(
             all_buffers,
             include_buffer_names,
-        )
-        _validate_shared_tensors_included_together(
-            all_buffers,
-            set(buffers),
-            lambda name: _buffer_storage_key(all_buffers[name]),
         )
 
         store = cls(
@@ -185,7 +175,7 @@ class PinnedModuleInstance:
         store: PinnedModuleStore,
         module: nn.Module,
     ) -> PinnedModuleInstance:
-        """Validate ``module`` against ``store`` and restore pinned CPU state."""
+        """Validate ``module`` names/layouts and restore pinned CPU state."""
         _validate_store_names(store)
         _validate_module_matches_store(store, module)
         instance = cls(
@@ -292,8 +282,11 @@ class PinnedModuleInstance:
 
 def _pin_params(params: Mapping[str, nn.Parameter]) -> dict[str, PinnedParam]:
     pinned_by_name: dict[str, PinnedParam] = {}
-    for names in _group_names(params, lambda name: _param_storage_key(params[name])):
-        _validate_param_alias_requires_grad(names, params)
+    for names in _group_names(
+        params.keys(),
+        lambda name: _param_storage_key(params[name]),
+    ):
+        _validate_param_storage_group_requires_grad(names, params)
         pinned = PinnedParam(params[names[0]])
         for name in names:
             pinned_by_name[name] = pinned
@@ -302,7 +295,10 @@ def _pin_params(params: Mapping[str, nn.Parameter]) -> dict[str, PinnedParam]:
 
 def _pin_buffers(buffers: Mapping[str, torch.Tensor]) -> dict[str, PinnedBuffer]:
     pinned_by_name: dict[str, PinnedBuffer] = {}
-    for names in _group_names(buffers, lambda name: _buffer_storage_key(buffers[name])):
+    for names in _group_names(
+        buffers.keys(),
+        lambda name: _buffer_storage_key(buffers[name]),
+    ):
         pinned = PinnedBuffer.clone(buffers[names[0]])
         for name in names:
             pinned_by_name[name] = pinned
@@ -321,24 +317,6 @@ def _select_known_names(
     if missing:
         raise ValueError(f"Cannot select unknown names: {_format_names(missing)}.")
     return {name: value for name, value in items.items() if name in included}
-
-
-def _validate_shared_tensors_included_together(
-    all_items: Mapping[str, object],
-    included_names: set[str],
-    key_for_name: _KeyForName,
-) -> None:
-    for names in _group_names(all_items, key_for_name):
-        included = [name for name in names if name in included_names]
-        if not included or len(included) == len(names):
-            continue
-
-        missing = sorted(set(names) - included_names)
-        raise ValueError(
-            "PinnedModuleStore cannot split shared tensors: "
-            f"included {_format_names(included)} but missing "
-            f"{_format_names(missing)}."
-        )
 
 
 def _items_for_names(
@@ -379,15 +357,6 @@ def _validate_module_matches_store(
                 f"{pinned.target_layout!r}, module has {layout!r}."
             )
 
-    _validate_alias_topology(
-        _pinned_alias_groups(store.params),
-        _module_param_alias_groups(params),
-    )
-    _validate_alias_topology(
-        _pinned_alias_groups(store.buffers),
-        _module_buffer_alias_groups(buffers),
-    )
-
 
 def _validate_target_has_trainable_params(
     store: PinnedModuleStore,
@@ -424,7 +393,7 @@ def _validate_target_names_known(
     )
 
 
-def _validate_param_alias_requires_grad(
+def _validate_param_storage_group_requires_grad(
     names: Iterable[str],
     params: Mapping[str, nn.Parameter],
 ) -> None:
@@ -482,26 +451,6 @@ def _validate_names_present(
     if missing_buffers:
         details.append(f"buffers {_format_names(missing_buffers)}")
     raise ValueError(f"Module is missing pinned names: {'; '.join(details)}.")
-
-
-def _validate_alias_topology(
-    store_groups: Mapping[str, frozenset[str]],
-    module_groups: Mapping[str, frozenset[str]],
-) -> None:
-    mismatched = sorted(
-        name
-        for name, store_group in store_groups.items()
-        if module_groups[name] != store_group
-    )
-    if not mismatched:
-        return
-
-    name = mismatched[0]
-    raise ValueError(
-        f"Pinned alias topology mismatch for {_format_names(mismatched)}; "
-        f"{name!r} store aliases {sorted(store_groups[name])!r}, "
-        f"module aliases {sorted(module_groups[name])!r}."
-    )
 
 
 def _allocate_param_targets(
@@ -734,44 +683,14 @@ def _set_param(parent: nn.Module, leaf: str, param: nn.Parameter) -> None:
     parent._parameters[leaf] = param
 
 
-def _module_param_alias_groups(
-    params: Mapping[str, nn.Parameter],
-) -> dict[str, frozenset[str]]:
-    return _alias_groups(params, lambda name: _param_storage_key(params[name]))
-
-
-def _module_buffer_alias_groups(
-    buffers: Mapping[str, torch.Tensor],
-) -> dict[str, frozenset[str]]:
-    return _alias_groups(buffers, lambda name: _buffer_storage_key(buffers[name]))
-
-
-def _pinned_alias_groups(
-    items: Mapping[str, PinnedParam] | Mapping[str, PinnedBuffer],
-) -> dict[str, frozenset[str]]:
-    return _alias_groups(items, lambda name: id(items[name]))
-
-
-def _alias_groups(
-    items: Mapping[str, object],
-    key_for_name: _KeyForName,
-) -> dict[str, frozenset[str]]:
-    groups_by_name: dict[str, frozenset[str]] = {}
-    for names in _group_names(items, key_for_name):
-        group = frozenset(names)
-        for name in names:
-            groups_by_name[name] = group
-    return groups_by_name
-
-
 def _group_names(
-    items: Mapping[str, object],
+    names: Iterable[str],
     key_for_name: _KeyForName,
-) -> list[list[str]]:
+) -> list[tuple[str, ...]]:
     groups_by_key: dict[Hashable, list[str]] = {}
-    for name in items:
+    for name in names:
         groups_by_key.setdefault(key_for_name(name), []).append(name)
-    return list(groups_by_key.values())
+    return [tuple(group) for group in groups_by_key.values()]
 
 
 def _param_storage_key(param: nn.Parameter) -> Hashable:

@@ -541,7 +541,7 @@ class TestMixedTrainableFrozenTied:
     def test_raises_when_tied_group_has_mixed_grad(self) -> None:
         # Two distinct Parameter objects sharing storage, one trainable
         # and one frozen. One pinned backing cannot preserve both
-        # requires_grad values, so the store rejects the alias group.
+        # requires_grad values, so the store rejects the storage group.
         shared = torch.randn(8, dtype=torch.bfloat16)
         a = nn.Parameter(shared, requires_grad=True)
         b = nn.Parameter(shared, requires_grad=False)
@@ -551,19 +551,20 @@ class TestMixedTrainableFrozenTied:
         with pytest.raises(ValueError, match="mixed requires_grad"):
             PinnedWeights(m)
 
-    def test_include_names_reject_one_storage_alias(self) -> None:
+    def test_include_names_can_select_one_storage_alias(self) -> None:
         shared = torch.randn(8, dtype=torch.bfloat16)
         m = nn.Module()
         m.keep = nn.Parameter(shared, requires_grad=False)
         m.skip = nn.Parameter(shared, requires_grad=False)
-        kept = m.keep
         skipped = m.skip
 
-        with pytest.raises(ValueError, match="cannot split shared tensors"):
-            PinnedWeights(m, include_param_names={"keep"})
-
-        assert m.keep is kept
-        assert m.skip is skipped
+        pw = PinnedWeights(m, include_param_names={"keep"})
+        try:
+            assert set(pw._store.params) == {"keep"}
+            assert m.keep.data_ptr() == pw._store.params["keep"].make_cpu_param().data_ptr()
+            assert m.skip is skipped
+        finally:
+            pw.deactivate()
 
 
 class TestZeroSizedParams:

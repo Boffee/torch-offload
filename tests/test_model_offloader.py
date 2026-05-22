@@ -1733,10 +1733,9 @@ class TestBlockLayoutCompatibility:
 
     def test_failure_leaves_model_unpinned_and_unmutated(self) -> None:
         # Strong-exception-safety: the validator runs in pass 1
-        # (collect slots) before pass 2 (pin) and pass 3 (apply slot
-        # mutations). On a layout mismatch, the user's Parameter
-        # objects must be the same identities and not pinned —
-        # neither pin_memory() nor _parameters[leaf] = ... fires.
+        # (collect names) before pass 2 (pin) and pass 3 (restore
+        # selected state). On a layout mismatch, the user's Parameter
+        # objects must be the same identities and not pinned.
         class M(nn.Module):
             def __init__(self):
                 super().__init__()
@@ -1761,7 +1760,7 @@ class TestBlockLayoutCompatibility:
             m.blocks, original_params, original_pinned, strict=True,
         ):
             assert block.weight is orig_p, (
-                "slot identity mutated despite pre-pin validation failure"
+                "parameter identity changed despite pre-pin validation failure"
             )
             assert block.weight.is_pinned() == orig_pin, (
                 "param was pinned despite pre-pin validation failure"
@@ -1930,49 +1929,6 @@ class TestStreamedNameSelection:
             )
         finally:
             streamer.deactivate()
-
-    def test_streamed_weights_rejects_split_shared_param_before_pinning(self) -> None:
-        class Block(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.a = nn.Linear(4, 4, bias=False)
-                self.a.weight.requires_grad_(False)
-                self.b = self.a
-
-        blocks = [Block(), Block()]
-        originals = [block.a.weight for block in blocks]
-
-        with pytest.raises(ValueError, match="cannot split shared tensors"):
-            StreamedWeights(
-                blocks=blocks,
-                blocks_to_swap=1,
-                stream_param_names={"a.weight"},
-            )
-
-        assert [block.a.weight for block in blocks] == originals
-        assert [block.b.weight for block in blocks] == originals
-
-    def test_streamed_weights_rejects_split_shared_buffer_before_pinning(self) -> None:
-        class Block(nn.Module):
-            def __init__(self):
-                super().__init__()
-                shared = torch.randn(4)
-                self.register_buffer("running", shared)
-                self.register_buffer("running_alias", shared)
-
-        blocks = [Block(), Block()]
-        originals = [block.running for block in blocks]
-
-        with pytest.raises(ValueError, match="cannot split shared tensors"):
-            StreamedWeights(
-                blocks=blocks,
-                blocks_to_swap=1,
-                stream_param_names=set(),
-                stream_buffer_names={"running"},
-            )
-
-        assert [block.running for block in blocks] == originals
-        assert [block.running_alias for block in blocks] == originals
 
     def test_model_offloader_slot_shim_partitions_streamed_and_non_block_names(
         self,
