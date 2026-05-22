@@ -109,14 +109,12 @@ class PinnedModuleStore:
         """
         all_params = _named_parameters(module)
         params = _select_named_items(
-            "param",
             all_params,
             include_param_names,
         )
 
         all_buffers = _named_buffers(module)
         buffers = _select_named_items(
-            "buffer",
             all_buffers,
             include_buffer_names,
         )
@@ -155,8 +153,8 @@ class PinnedModuleStore:
     ) -> PinnedModuleTarget:
         """Allocate active storage for selected store entries on ``device``."""
         _validate_cuda_device(device)
-        params = _select_named_items("param target", self.params, param_names)
-        buffers = _select_named_items("buffer target", self.buffers, buffer_names)
+        params = _select_named_items(self.params, param_names)
+        buffers = _select_named_items(self.buffers, buffer_names)
         return PinnedModuleTarget(
             param_targets=_allocate_param_targets(params, device),
             buffer_targets=_allocate_buffer_targets(buffers, device),
@@ -302,7 +300,6 @@ def _pin_buffers(buffers: Mapping[str, torch.Tensor]) -> dict[str, PinnedBuffer]
 
 
 def _select_named_items(
-    kind: str,
     items: Mapping[str, _NamedT],
     names: Iterable[str] | None,
 ) -> dict[str, _NamedT]:
@@ -313,8 +310,7 @@ def _select_named_items(
     missing = sorted(included - set(items))
     if missing:
         raise ValueError(
-            f"PinnedModuleStore cannot include unknown {kind} names: "
-            f"{_format_names(missing)}."
+            f"PinnedModuleStore cannot select unknown names: {_format_names(missing)}."
         )
     return {name: value for name, value in items.items() if name in included}
 
@@ -333,8 +329,7 @@ def _validate_module_matches_store(
     params = _named_parameters(module)
     buffers = _named_buffers(module)
 
-    _validate_names_present("param", store.params, params)
-    _validate_names_present("buffer", store.buffers, buffers)
+    _validate_names_present(store, params, buffers)
 
     for name, pinned in store.params.items():
         param = params[name]
@@ -359,12 +354,10 @@ def _validate_module_matches_store(
             )
 
     _validate_alias_topology(
-        "param",
         _pinned_alias_groups(store.params),
         _module_param_alias_groups(params),
     )
     _validate_alias_topology(
-        "buffer",
         _pinned_alias_groups(store.buffers),
         _alias_groups(buffers, lambda name: _buffer_storage_key(buffers[name])),
     )
@@ -389,20 +382,20 @@ def _validate_target_names_known(
     store: PinnedModuleStore,
     target: PinnedModuleTarget,
 ) -> None:
-    _validate_no_extra_names("param target", target.param_targets, store.params)
-    _validate_no_extra_names("buffer target", target.buffer_targets, store.buffers)
+    extra_params = sorted(set(target.param_targets) - set(store.params))
+    extra_buffers = sorted(set(target.buffer_targets) - set(store.buffers))
+    if not extra_params and not extra_buffers:
+        return
 
-
-def _validate_no_extra_names(
-    kind: str,
-    target_items: Mapping[str, object],
-    store_items: Mapping[str, object],
-) -> None:
-    extra = sorted(set(target_items) - set(store_items))
-    if extra:
-        raise ValueError(
-            f"PinnedModuleTarget has unknown {kind} names: {_format_names(extra)}."
-        )
+    details = []
+    if extra_params:
+        details.append(f"params {_format_names(extra_params)}")
+    if extra_buffers:
+        details.append(f"buffers {_format_names(extra_buffers)}")
+    raise ValueError(
+        "PinnedModuleTarget contains entries outside the store: "
+        f"{'; '.join(details)}."
+    )
 
 
 def _validate_param_alias_requires_grad(
@@ -448,19 +441,24 @@ def _validate_store_names(store: PinnedModuleStore) -> None:
 
 
 def _validate_names_present(
-    kind: str,
-    store_items: Mapping[str, object],
-    module_items: Mapping[str, object],
+    store: PinnedModuleStore,
+    params: Mapping[str, nn.Parameter],
+    buffers: Mapping[str, torch.Tensor],
 ) -> None:
-    missing = sorted(set(store_items) - set(module_items))
-    if missing:
-        raise ValueError(
-            f"Module is missing pinned {kind} names: {_format_names(missing)}."
-        )
+    missing_params = sorted(set(store.params) - set(params))
+    missing_buffers = sorted(set(store.buffers) - set(buffers))
+    if not missing_params and not missing_buffers:
+        return
+
+    details = []
+    if missing_params:
+        details.append(f"params {_format_names(missing_params)}")
+    if missing_buffers:
+        details.append(f"buffers {_format_names(missing_buffers)}")
+    raise ValueError(f"Module is missing pinned names: {'; '.join(details)}.")
 
 
 def _validate_alias_topology(
-    kind: str,
     store_groups: Mapping[str, frozenset[str]],
     module_groups: Mapping[str, frozenset[str]],
 ) -> None:
@@ -474,7 +472,7 @@ def _validate_alias_topology(
 
     name = mismatched[0]
     raise ValueError(
-        f"Pinned {kind} alias topology mismatch for {_format_names(mismatched)}; "
+        f"Pinned alias topology mismatch for {_format_names(mismatched)}; "
         f"{name!r} store aliases {sorted(store_groups[name])!r}, "
         f"module aliases {sorted(module_groups[name])!r}."
     )
@@ -658,28 +656,20 @@ def _make_cpu_params(
 
 
 def _named_parameters(module: nn.Module) -> dict[str, nn.Parameter]:
-    return _unique_name_dict(
-        module.named_parameters(remove_duplicate=False),
-        kind="parameter",
-    )
+    return _unique_name_dict(module.named_parameters(remove_duplicate=False))
 
 
 def _named_buffers(module: nn.Module) -> dict[str, torch.Tensor]:
-    return _unique_name_dict(
-        module.named_buffers(remove_duplicate=False),
-        kind="buffer",
-    )
+    return _unique_name_dict(module.named_buffers(remove_duplicate=False))
 
 
 def _unique_name_dict(
     items: Iterable[tuple[str, _NamedT]],
-    *,
-    kind: str,
 ) -> dict[str, _NamedT]:
     values: dict[str, _NamedT] = {}
     for name, value in items:
         if name in values:
-            raise ValueError(f"Module yielded duplicate {kind} name {name!r}.")
+            raise ValueError(f"Module yielded duplicate name {name!r}.")
         values[name] = value
     return values
 

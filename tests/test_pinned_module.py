@@ -206,7 +206,7 @@ class TestPinnedModuleStore:
         module = nn.Module()
         module.weight = nn.Parameter(torch.randn(2, 2), requires_grad=False)
 
-        with pytest.raises(ValueError, match="unknown param names: 'missing'"):
+        with pytest.raises(ValueError, match="unknown names: 'missing'"):
             PinnedModuleStore.from_module(
                 module,
                 include_param_names={"missing"},
@@ -232,7 +232,7 @@ class TestPinnedModuleStore:
         module = nn.Module()
         module.register_buffer("running", torch.randn(2))
 
-        with pytest.raises(ValueError, match="unknown buffer names: 'missing'"):
+        with pytest.raises(ValueError, match="unknown names: 'missing'"):
             PinnedModuleStore.from_module(
                 module,
                 include_buffer_names={"missing"},
@@ -442,7 +442,7 @@ class TestPinnedModuleInstance:
             buffer_targets={},
         )
 
-        with pytest.raises(ValueError, match="unknown param target names: 'extra'"):
+        with pytest.raises(ValueError, match="entries outside the store.*'extra'"):
             instance.load_to_target(target)
 
         assert pinned.copied == 0
@@ -470,7 +470,7 @@ class TestPinnedModuleInstance:
             },
         )
 
-        with pytest.raises(ValueError, match="unknown buffer target names: 'extra'"):
+        with pytest.raises(ValueError, match="entries outside the store.*'extra'"):
             instance.load_to_target(target)
 
         assert module.running is original
@@ -761,7 +761,7 @@ class TestPinnedModuleInstance:
         prototype.weight = nn.Parameter(torch.randn(2, 2), requires_grad=False)
         store = PinnedModuleStore.from_module(prototype)
 
-        with pytest.raises(ValueError, match="missing pinned param names"):
+        with pytest.raises(ValueError, match="missing pinned names.*weight"):
             PinnedModuleInstance.from_store(store, nn.Module())
 
     def test_rejects_missing_buffer_name(self) -> None:
@@ -769,7 +769,7 @@ class TestPinnedModuleInstance:
         prototype.register_buffer("running", torch.randn(2))
         store = PinnedModuleStore.from_module(prototype)
 
-        with pytest.raises(ValueError, match="missing pinned buffer names"):
+        with pytest.raises(ValueError, match="missing pinned names.*running"):
             PinnedModuleInstance.from_store(store, nn.Module())
 
     def test_rejects_requires_grad_mismatch(self) -> None:
@@ -819,7 +819,7 @@ class TestPinnedModuleInstance:
         target.left.weight.requires_grad_(False)
         target.right.weight.requires_grad_(False)
 
-        with pytest.raises(ValueError, match="param alias topology mismatch"):
+        with pytest.raises(ValueError, match="alias topology mismatch"):
             PinnedModuleInstance.from_store(store, target)
 
     def test_rejects_untracked_param_alias(self) -> None:
@@ -832,7 +832,7 @@ class TestPinnedModuleInstance:
         target.weight = nn.Parameter(shared, requires_grad=False)
         target.extra = nn.Parameter(shared, requires_grad=False)
 
-        with pytest.raises(ValueError, match="param alias topology mismatch"):
+        with pytest.raises(ValueError, match="alias topology mismatch"):
             PinnedModuleInstance.from_store(store, target)
 
     def test_rejects_buffer_alias_topology_mismatch(self) -> None:
@@ -846,5 +846,5 @@ class TestPinnedModuleInstance:
         target.register_buffer("running", torch.randn(2))
         target.register_buffer("running_alias", torch.randn(2))
 
-        with pytest.raises(ValueError, match="buffer alias topology mismatch"):
+        with pytest.raises(ValueError, match="alias topology mismatch"):
             PinnedModuleInstance.from_store(store, target)
