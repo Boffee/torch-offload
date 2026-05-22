@@ -55,8 +55,10 @@ recovery of the partially constructed strategy/model is unsupported;
 drop those references and rebuild from a fresh model instance.
 
 :class:`ModelOffloader` composes (in order):
-  1. A non-block :class:`PinnedWeights` with a :class:`SlotKey`
-     skip filter for everything outside the block list.
+  1. A non-block :class:`PinnedWeights` for frozen params/buffers
+     outside streamed and trainable ownership. The composer derives
+     its include-name sets from the streamers' :class:`SlotKey`
+     filters and the model's trainable params.
   2. A :class:`TrainableWeights` for LoRA / adapter weights
      (or only out-of-block trainables when
      ``stream_trainable_weights=True``).

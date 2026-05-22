@@ -408,7 +408,7 @@ the cache lock. `choose_victims()` must return unique keys from
             │             ┌──────────────────────────┴──────────┐
             │             │  components (ordered):              │
             │             │  • PinnedWeights (non-block,        │
-            │             │    skip_slots = streamers' slots)   │
+            │             │    include names from composition)  │
             │             │  • TrainableWeights                 │
             │             │  • N × StreamedWeights              │
             │             │                                     │

@@ -20,8 +20,8 @@ is materialized around ``optimizer.step()`` via :meth:`optimizer_step`.
 This is the sharp, low-level primitive. It does NOT manage:
 
 - Non-block parts of the model (parent-module state, sibling
-  modules) — caller composes :class:`PinnedWeights` with the
-  streamer's :attr:`slot_filter` for that.
+  modules) — caller derives :class:`PinnedWeights` include-name sets
+  by excluding the streamer's :attr:`slot_filter`.
 - Out-of-block trainable parameter movement — caller handles a
   separate :class:`~torch_offload.trainable_weights.TrainableWeights`.
 - Cross-region tied-weight detection — that's a composer concern
@@ -568,8 +568,8 @@ class StreamedWeights:
         """``SlotKey`` set covering every (parent, leaf, kind)
         slot the streamer owns. Stable across the streamer's
         lifetime — safe to read at any point and survives slot
-        mutation, so a consumer can construct a
-        :class:`PinnedWeights` with this filter regardless of order
+        mutation, so a consumer can derive non-streamed
+        :class:`PinnedWeights` include-name sets regardless of order
         relative to the streamer."""
         return self._slot_filter
 

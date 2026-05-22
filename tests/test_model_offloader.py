@@ -32,7 +32,7 @@ from torch_offload import (
 )
 from torch_offload.model_offloader import detect_streaming_region_ties
 from torch_offload.pinned_bindings import PinnedModuleBinding
-from torch_offload.slots import iter_buffer_slots
+from torch_offload.slots import iter_buffer_slots, iter_param_slots
 from torch_offload.streamed_weights import (
     _check_block_binding_target_layouts_match,
 )
@@ -1348,7 +1348,11 @@ class TestCrossRegionTiedDetection:
             non_block = next(
                 c for c in strategy._components if isinstance(c, PinnedWeights)
             )
-            assert len(non_block.param_bindings) == 1  # tie deduped
+            assert non_block.param_names == {"embed.weight", "head.weight"}
+            assert (
+                len({id(non_block._store.params[name]) for name in non_block.param_names})
+                == 1
+            )
         finally:
             strategy.deactivate()
 
@@ -2040,26 +2044,40 @@ class TestSlotKeyFilter:
             # Build PinnedWeights AFTER the streamer mutated slots.
             # The skip filter must still correctly exclude block-owned
             # slots, even though the Parameter objects changed.
+            include_param_names = {
+                slot.name
+                for slot in iter_param_slots(m)
+                if slot.key not in skip_slots
+            }
+            include_buffer_names = {
+                slot.name
+                for slot in iter_buffer_slots(m)
+                if slot.key not in skip_slots
+            }
             non_block = PinnedWeights(
-                m, torch.device("cpu"), skip_slots=skip_slots,
+                m,
+                include_param_names=include_param_names,
+                include_buffer_names=include_buffer_names,
             )
             try:
                 # Non-block slots (embed, head) are pinned by
                 # PinnedWeights; block slots are skipped (already
                 # owned by streamer).
-                slots_managed_by_pinned = {
-                    slot.key
-                    for param_binding in non_block.param_bindings
-                    for slot in param_binding.unique_slots
-                }
+                names_managed_by_pinned = non_block.param_names
                 # Block-owned slots NOT in the PinnedWeights set.
                 for s in skip_slots:
-                    assert s not in slots_managed_by_pinned, (
+                    if s.kind != "param":
+                        continue
+                    skipped_names = [
+                        slot.name
+                        for slot in iter_param_slots(m)
+                        if slot.key == s
+                    ]
+                    assert not (names_managed_by_pinned & set(skipped_names)), (
                         f"PinnedWeights tried to manage block-owned slot {s}"
                     )
                 # Non-block slots present.
-                non_block_slot = SlotKey(id(m.embed), "weight", "param")
-                assert non_block_slot in slots_managed_by_pinned
+                assert "embed.weight" in names_managed_by_pinned
             finally:
                 non_block.deactivate()
         finally:
@@ -2541,12 +2559,9 @@ class TestLoRAInBlockRouting:
             strat.deactivate()
 
     def test_composer_partitions_skip_slots_correctly(self) -> None:
-        # Through-test: the composer's PinnedWeights receives skip_slots
-        # = block_slots ∪ trainable_slots. Verify by checking that no
-        # trainable param slot appears in PinnedWeights' managed slots
-        # and no block-internal slot does either.
-        from torch_offload.slots import iter_param_slots
-
+        # Through-test: the composer converts block/trainable skip slots
+        # into PinnedWeights include-name sets. Verify that no trainable
+        # param name and no block-internal param name is pinned.
         class M(nn.Module):
             def __init__(self):
                 super().__init__()
@@ -2573,17 +2588,12 @@ class TestLoRAInBlockRouting:
             )
             # PinnedWeights manages frozen_head.weight only — block content
             # routed to StreamedWeights, trainable_bias to TrainableWeights.
-            managed_slot_ids = {
-                (id(slot.parent), slot.leaf)
-                for param_binding in pinned.param_bindings
-                for slot in param_binding.unique_slots
-            }
+            assert pinned.param_names == {"frozen_head.weight"}
             for s in iter_param_slots(m):
-                key = (id(s.parent), s.leaf)
                 if s.name == "frozen_head.weight":
-                    assert key in managed_slot_ids
+                    assert s.name in pinned.param_names
                 else:
-                    assert key not in managed_slot_ids, (
+                    assert s.name not in pinned.param_names, (
                         f"slot {s.name} (requires_grad={s.get().requires_grad}) "
                         f"leaked into PinnedWeights"
                     )

@@ -19,6 +19,14 @@ def _make_simple_model() -> nn.Module:
     return m
 
 
+def _unique_pinned_param_count(pw: PinnedWeights) -> int:
+    return len({id(pinned) for pinned in pw._store.params.values()})
+
+
+def _unique_pinned_buffer_count(pw: PinnedWeights) -> int:
+    return len({id(pinned) for pinned in pw._store.buffers.values()})
+
+
 # ---------------------------------------------------------------------------
 # ModelStrategy protocol conformance
 # ---------------------------------------------------------------------------
@@ -142,12 +150,10 @@ class TestCleanup:
 
         m = _make_simple_model()
         pw = PinnedWeights(m)
-        first = pw.param_bindings[0].unique_slots[0]
-        first_parent, first_leaf = first.parent, first.leaf
-        slot_param_ref = weakref.ref(first_parent._parameters[first_leaf])
+        slot_param_ref = weakref.ref(m[0]._parameters["weight"])
         pw.deactivate()
         assert slot_param_ref() is not None  # still alive via model slot
-        del m, pw, first, first_parent
+        del m, pw
         gc.collect()
         assert slot_param_ref() is None  # GC freed it
 
@@ -159,12 +165,12 @@ class TestCleanup:
 
 class TestConstruction:
     def test_rejects_unskipped_trainable_param(self) -> None:
-        # Direct use without a composer: a trainable slot must hit the
-        # contract guard. Slot replacement would orphan the user's
-        # Parameter and break optimizer state — fail loudly rather than
-        # silently freeze.
+        # Direct use without a composer: a trainable param must hit the
+        # contract guard. PinnedWeights has no optimizer-step copy-back
+        # boundary, so accepting it would risk silently dropping CUDA
+        # optimizer updates on deactivate.
         m = nn.Linear(4, 4)  # default requires_grad=True, no buffers
-        with pytest.raises(ValueError, match="cannot manage trainable slot"):
+        with pytest.raises(ValueError, match="cannot manage trainable param"):
             PinnedWeights(m)
 
     def test_rejects_empty_model(self) -> None:
@@ -248,16 +254,14 @@ class TestTiedWeightDedup:
         pw = PinnedWeights(m)
         try:
             # Exactly one unique pinned parameter for the tied weight.
-            assert len(pw.param_bindings) == 1
-            param_binding = pw.param_bindings[0]
-            leaves = {slot.leaf for slot in param_binding.unique_slots}
-            assert leaves == {"weight"}  # both 'embed.weight' and 'head.weight'
-            assert len(param_binding.unique_slots) == 2
+            assert _unique_pinned_param_count(pw) == 1
+            assert pw.param_names == {"embed.weight", "head.weight"}
             # After construction, both slots reference the same Parameter
-            # (the binding's cpu_param), preserving tying at the
-            # strongest level.
+            # object, preserving tying at the strongest level.
             assert m.embed._parameters["weight"] is m.head._parameters["weight"]
-            assert m.embed.weight is param_binding.cpu_param
+            pinned = pw._store.params["embed.weight"]
+            cpu_param = pw._instance.cpu_params_by_pinned_id[id(pinned)]
+            assert m.embed.weight is cpu_param
         finally:
             pw.deactivate()
 
@@ -265,8 +269,8 @@ class TestTiedWeightDedup:
         m, _, _ = self._make_distinct_param_tied_model()
         pw = PinnedWeights(m)
         try:
-            assert len(pw.param_bindings) == 1
-            assert {slot.leaf for slot in pw.param_bindings[0].unique_slots} == {"a", "b"}
+            assert _unique_pinned_param_count(pw) == 1
+            assert pw.param_names == {"a", "b"}
             # Both module slots now reference the same Parameter object.
             assert m._parameters["a"] is m._parameters["b"]
         finally:
@@ -280,7 +284,7 @@ class TestTiedWeightDedup:
 
         pw = PinnedWeights(m)
         try:
-            assert len(pw.param_bindings) == 1
+            assert _unique_pinned_param_count(pw) == 1
             assert m._parameters["a"] is m._parameters["b"]
         finally:
             pw.deactivate()
@@ -333,7 +337,7 @@ class TestTiedWeightDedup:
 
         pw = PinnedWeights(m)
         try:
-            assert len(pw.param_bindings) == 1
+            assert _unique_pinned_param_count(pw) == 1
             assert m._parameters["a"] is m._parameters["b"]
             assert m.a.is_pinned()
         finally:
@@ -359,24 +363,9 @@ class TestSharedSubmoduleAlias:
         m.b = shared
         pw = PinnedWeights(m)
         try:
-            # One pinned param binding (same Parameter via aliased module).
-            assert len(pw.param_bindings) == 1
-            param_binding = pw.param_bindings[0]
-            # Slots deduped by (id(parent), leaf) — only one physical
-            # slot even though there are two attribute paths.
-            assert len(param_binding.unique_slots) == 1
-            assert {slot.name for slot in param_binding.slots} == {
-                "a.weight",
-                "b.weight",
-            }
-            assert all(
-                (slot.parent, slot.leaf)
-                == (
-                    param_binding.unique_slots[0].parent,
-                    param_binding.unique_slots[0].leaf,
-                )
-                for slot in param_binding.slots
-            )
+            assert _unique_pinned_param_count(pw) == 1
+            assert pw.param_names == {"a.weight", "b.weight"}
+            assert m.a._parameters["weight"] is m.b._parameters["weight"]
         finally:
             pw.deactivate()
 
@@ -398,15 +387,14 @@ class TestSharedSubmoduleAlias:
         m.b = Inner(shared_buf)
         pw = PinnedWeights(m)
         try:
-            # One pinned buffer binding covers both alias paths.
-            assert len(pw.buffer_bindings) == 1
-            buffer_binding = pw.buffer_bindings[0]
-            assert buffer_binding.name == "a.buf"
-            assert buffer_binding.pinned.tensor.is_pinned()
-            assert len(buffer_binding.unique_slots) == 2
+            # One pinned buffer backing covers both alias paths.
+            assert _unique_pinned_buffer_count(pw) == 1
+            assert pw.buffer_names == {"a.buf", "b.buf"}
+            pinned_buffer = pw._store.buffers["a.buf"]
+            assert pinned_buffer.tensor.is_pinned()
             # Both module slots reference the SAME pinned tensor.
-            assert m.a.buf is buffer_binding.pinned.tensor
-            assert m.b.buf is buffer_binding.pinned.tensor
+            assert m.a.buf is pinned_buffer.tensor
+            assert m.b.buf is pinned_buffer.tensor
         finally:
             pw.deactivate()
 
@@ -424,10 +412,10 @@ class TestSharedSubmoduleAlias:
         m.b = Inner(shared_buf)
         pw = PinnedWeights(m)
         try:
-            assert len(pw.buffer_bindings) == 1
-            buffer_binding = pw.buffer_bindings[0]
-            assert m.a.buf is buffer_binding.pinned.tensor
-            assert m.b.buf is buffer_binding.pinned.tensor
+            assert _unique_pinned_buffer_count(pw) == 1
+            pinned_buffer = pw._store.buffers["a.buf"]
+            assert m.a.buf is pinned_buffer.tensor
+            assert m.b.buf is pinned_buffer.tensor
         finally:
             pw.deactivate()
 
@@ -450,10 +438,10 @@ class TestSharedSubmoduleAlias:
 
         pw = PinnedWeights(m)
         try:
-            assert len(pw.buffer_bindings) == 1
-            buffer_binding = pw.buffer_bindings[0]
-            assert m.a.buf is buffer_binding.pinned.tensor
-            assert m.b.buf is buffer_binding.pinned.tensor
+            assert _unique_pinned_buffer_count(pw) == 1
+            pinned_buffer = pw._store.buffers["a.buf"]
+            assert m.a.buf is pinned_buffer.tensor
+            assert m.b.buf is pinned_buffer.tensor
             assert m.a.buf.is_pinned()
         finally:
             pw.deactivate()
@@ -473,8 +461,17 @@ class TestMixedTrainableFrozenTied:
         m = nn.Module()
         m.a = a
         m.b = b
-        with pytest.raises(ValueError, match="cannot manage trainable slot"):
+        with pytest.raises(ValueError, match="cannot manage trainable param"):
             PinnedWeights(m)
+
+    def test_rejects_include_names_that_split_tied_storage(self) -> None:
+        shared = torch.randn(8, dtype=torch.bfloat16)
+        m = nn.Module()
+        m.keep = nn.Parameter(shared, requires_grad=False)
+        m.skip = nn.Parameter(shared, requires_grad=False)
+
+        with pytest.raises(ValueError, match="param include names cannot split"):
+            PinnedWeights(m, include_param_names={"keep"})
 
 
 class TestZeroSizedParams:
@@ -490,7 +487,7 @@ class TestZeroSizedParams:
         pw = PinnedWeights(m)
         try:
             # 3 slots: a, b, c — empties did not collapse.
-            assert len(pw.param_bindings) == 3
+            assert _unique_pinned_param_count(pw) == 3
         finally:
             pw.deactivate()
 
@@ -578,11 +575,11 @@ class TestCacheBytes:
         m = nn.Sequential(nn.Linear(4, 4, bias=False), nn.LayerNorm(4))
         for p in m.parameters():
             p.requires_grad = False
-        pw_with = PinnedWeights(m, include_buffers=True)
+        pw_with = PinnedWeights(m)
         with_bytes = pw_with.cache_bytes
 
         m2 = nn.Sequential(nn.Linear(4, 4, bias=False), nn.LayerNorm(4))
         for p in m2.parameters():
             p.requires_grad = False
-        pw_without = PinnedWeights(m2, include_buffers=False)
+        pw_without = PinnedWeights(m2, include_buffer_names=set())
         assert pw_without.cache_bytes <= with_bytes

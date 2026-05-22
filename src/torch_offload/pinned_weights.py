@@ -59,39 +59,38 @@ Class-specific caveats
 from __future__ import annotations
 
 import contextlib
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator, Mapping, MutableMapping
+from typing import TypeVar
 
 import torch
 from torch import nn
 
 from ._devices import canonical_device
-from .pinned_bindings import (
-    PinnedBufferBinding,
-    PinnedModuleBinding,
-    PinnedParamBinding,
+from .pinned_module import (
+    PinnedModuleInstance,
+    PinnedModuleStore,
+    PinnedModuleTarget,
     PostCopyHook,
-    PostCopyHookHandle,
-    pin_module_slot_collection,
-)
-from .protocols import SlotKey
-from .slots import (
-    ParamSlot,
-    assert_frozen,
-    collect_module_slots,
 )
 
+_NamedT = TypeVar("_NamedT")
 
-def _validate_frozen_param_slot(slot: ParamSlot) -> None:
-    assert_frozen(
-        slot,
-        owner="PinnedWeights",
-        extra=(
-            "Splitting a tied storage group between skip_slots "
-            "and PinnedWeights silently breaks the alias on "
-            "GPU — validate ties yourself if you go that route, "
-            "or use ModelOffloader which handles it upstream."
-        ),
-    )
+
+class _PostCopyHookHandle:
+    __slots__ = ("_hooks", "_key")
+
+    def __init__(
+        self, hooks: MutableMapping[int, PostCopyHook], key: int,
+    ) -> None:
+        self._hooks: MutableMapping[int, PostCopyHook] | None = hooks
+        self._key = key
+
+    def remove(self) -> None:
+        hooks = self._hooks
+        if hooks is None:
+            return
+        hooks.pop(self._key, None)
+        self._hooks = None
 
 
 class PinnedWeights:
@@ -107,124 +106,113 @@ class PinnedWeights:
     :meth:`deactivate` swaps the slots back at the pinned-CPU
     Parameters so the GPU storage is released by refcount.
 
-    Frozen-only by mechanism. Slot replacement installs fresh
-    ``requires_grad=False`` Parameter wrappers, which orphans any
-    optimizer state keyed by the user's pre-wrap Parameter — a
-    trainable slot here would silently break training. Trainable
-    slots must be partitioned out via ``skip_slots`` (the composer
-    routes them to a separate strategy automatically; direct users
-    are on the hook). An unskipped trainable slot raises at
-    construction.
+    Frozen-only by strategy contract. The lower pinned-module
+    primitives can represent trainable params, but this whole-model
+    strategy has no optimizer-step copy-back boundary: a CUDA optimizer
+    update would mutate active target storage, then :meth:`deactivate`
+    would restore the older pinned CPU bytes. Trainable parameters must
+    be excluded via ``include_param_names`` (the composer routes them to
+    a separate strategy automatically; direct users are on the hook).
+    An included trainable parameter raises at construction.
 
     Buffer-only modules (only registered buffers, no frozen params)
     are valid — common for sibling tables like RoPE/positional
     embeddings managed via :func:`ModelOffloader`'s non-block
     composition. Construction raises only if there is *nothing* to
-    manage — neither frozen params nor (with ``include_buffers=True``)
-    registered buffers.
+    manage — neither selected frozen params nor selected registered buffers.
 
     Parameters
     ----------
     model:
         The model to cache. Managed slots may start on CPU or CUDA;
         construction clones them directly into pinned CPU storage.
-    include_buffers:
-        Also cache registered buffers (LayerNorm running stats, position
-        embeddings stored as buffers, etc.). Default True. Set False
-        for models with very large mutable buffers you'd rather rebuild
-        on each call.
-    skip_slots:
-        Optional set of :class:`SlotKey` values identifying
-        ``(parent_module, leaf, kind)`` slots to skip during the
-        walk. Used by composers like :class:`ModelOffloader`
-        that want to hand the *outer* model to PinnedWeights but
-        manage some subset of slots themselves (block-streamed slots,
-        trainable slots routed to a separate mover). Skipped slots are
-        not pinned. Slot identity is based on
-        ``(id(parent), leaf, kind)`` rather than ``id(param)`` so the
-        filter survives slot-mutating strategies regardless of
-        construction order.
+    include_param_names:
+        Optional PyTorch parameter names to cache. ``None`` caches all
+        parameters. An empty set caches none.
+    include_buffer_names:
+        Optional PyTorch buffer names to cache. ``None`` caches all
+        registered buffers. An empty set caches none.
     """
 
     def __init__(
         self,
         model: nn.Module,
-        include_buffers: bool = True,
         *,
-        skip_slots: set[SlotKey] | None = None,
+        include_param_names: Iterable[str] | None = None,
+        include_buffer_names: Iterable[str] | None = None,
     ) -> None:
         self._model: nn.Module | None = model
         self._active_device: torch.device | None = None
+        self._active_target: PinnedModuleTarget | None = None
         self._post_copy_hooks: dict[int, PostCopyHook] = {}
-        skip: set[SlotKey] = skip_slots or set()
 
-        # Phase 1: collect the model slots to manage without pinning or
-        # slot mutation. This keeps skip/empty validation separate from
-        # pinned-memory allocation.
-        slot_collection = collect_module_slots(
-            model,
-            skip_slots=skip,
-            include_buffers=include_buffers,
-            param_group_by="storage",
-            validate_param=_validate_frozen_param_slot,
+        params = _named_parameters(model)
+        buffers = _named_buffers(model)
+        selected_param_names = _select_names(
+            "param",
+            params,
+            include_param_names,
         )
+        selected_buffer_names = _select_names(
+            "buffer",
+            buffers,
+            include_buffer_names,
+        )
+        _validate_frozen_params(params, selected_param_names)
+
         # Reject before pinning if there is nothing at all to manage —
-        # neither frozen params nor (when include_buffers=True)
-        # registered buffers. Buffer-only modules (e.g., a pure
-        # RoPE/positional table sibling) are valid: PinnedWeights still
-        # gives them pinned-CPU storage and the activate/deactivate
-        # round-trip, which is exactly what ModelOffloader non-block
-        # composition needs.
-        if (
-            not slot_collection.param_slot_groups
-            and not slot_collection.buffer_slot_groups
-        ):
+        # neither frozen params nor selected registered buffers.
+        # Buffer-only modules (e.g., a pure RoPE/positional table sibling)
+        # are valid: PinnedWeights still gives them pinned-CPU storage and
+        # the activate/deactivate round-trip, which is exactly what
+        # ModelOffloader non-block composition needs.
+        if not selected_param_names and not selected_buffer_names:
             raise ValueError(
                 "PinnedWeights requires at least one frozen parameter or, "
-                "when include_buffers=True, at least one registered buffer "
-                "to cache. The wrapped model has neither — for training "
-                "flows use torch_offload.ModelOffloader instead, or "
-                "leave the model unwrapped."
+                "at least one registered buffer to cache. The selected "
+                "model names contain neither — for training flows use "
+                "torch_offload.ModelOffloader instead, or leave the model "
+                "unwrapped."
             )
 
-        # Phase 2: pin collected slot groups into bindings without
-        # replacing module slots. PinnedParam intentionally repoints
+        # Phase 2: pin selected names without replacing module slots.
+        # PinnedParam intentionally repoints
         # plain Parameter.data at each pinned clone during this phase to
         # keep construction peak memory low. If a later pin fails, the
         # caller must drop the partially constructed model/strategy and
         # rebuild from a fresh model instance.
-        self._binding: PinnedModuleBinding = pin_module_slot_collection(
-            slot_collection,
+        self._store = PinnedModuleStore.from_module(
+            model,
+            include_param_names=selected_param_names,
+            include_buffer_names=selected_buffer_names,
         )
 
-        # Phase 3: apply slot replacement/register_buffer mutations after
-        # all pinning succeeded. This keeps module slot identity changes
-        # grouped, but construction is not fully rollback-safe because of
-        # the low-peak Parameter.data repointing described above.
-        self._binding.restore_pinned()
+        # Phase 3: bind this concrete model instance to the store. This
+        # applies the module slot/register_buffer mutations after all
+        # pinning succeeded. Construction is still not fully rollback-safe
+        # because of the low-peak Parameter.data repointing described above.
+        self._instance = PinnedModuleInstance.from_store(self._store, model)
+        self._param_names = frozenset(self._store.params)
+        self._buffer_names = frozenset(self._store.buffers)
 
     # ------------------------------------------------------------------
     # ModelStrategy protocol
     # ------------------------------------------------------------------
 
     @property
-    def param_bindings(self) -> list[PinnedParamBinding]:
-        """Pinned parameter bindings managed by this instance.
-
-        Used by :class:`~torch_offload.ModelOffloader` to build its
-        target-name to pinned-param map.
-        """
-        return self._binding.param_bindings
+    def param_names(self) -> frozenset[str]:
+        """Pinned parameter names managed by this instance."""
+        return self._param_names
 
     @property
-    def buffer_bindings(self) -> list[PinnedBufferBinding]:
-        """Pinned PyTorch buffer bindings managed by this instance."""
-        return self._binding.buffer_bindings
+    def buffer_names(self) -> frozenset[str]:
+        """Pinned buffer names managed by this instance."""
+        return self._buffer_names
 
     @property
     def cache_bytes(self) -> int:
         """Total pinned host bytes held. Tied weights counted once."""
-        return self._binding.cache_bytes
+        return self._store.cache_bytes
 
     @property
     def model(self) -> nn.Module:
@@ -237,27 +225,30 @@ class PinnedWeights:
         return self.model
 
     def register_post_copy_hook(
-        self, binding: PinnedParamBinding, hook: PostCopyHook,
-    ) -> PostCopyHookHandle:
-        """Register a hook after this component copies ``binding`` to GPU.
+        self, name: str, hook: PostCopyHook,
+    ) -> _PostCopyHookHandle:
+        """Register a hook after this component copies ``name`` to GPU.
 
         Package-internal: used by :class:`ModelOffloader` for merge-mode
         LoRA. Mirrors PyTorch's hook registration pattern by returning a
         handle whose :meth:`remove` method unregisters the hook.
         """
-        if not self._binding.contains_param_binding(binding):
+        if name not in self._store.params:
             raise ValueError(
-                "param binding "
-                f"{binding.name!r} is not owned by this PinnedWeights"
+                f"param name {name!r} is not owned by this PinnedWeights"
             )
-        key = id(binding)
+        key = self.post_copy_hook_key(name)
         if key in self._post_copy_hooks:
             raise RuntimeError(
                 "post-copy hook already registered for "
-                f"param binding {binding.name!r}"
+                f"param name {name!r}"
             )
         self._post_copy_hooks[key] = hook
-        return PostCopyHookHandle(self._post_copy_hooks, key)
+        return _PostCopyHookHandle(self._post_copy_hooks, key)
+
+    def post_copy_hook_key(self, name: str) -> int:
+        """Stable hook/dedup key for a managed parameter name."""
+        return id(self._store.params[name])
 
     def activate(self, device: torch.device | str | None = None) -> None:
         """Activate the wrapped model on ``device``.
@@ -288,18 +279,19 @@ class PinnedWeights:
             )
         active_device = self._resolve_device(device)
         if active_device.type == "cpu":
-            self._binding.restore_pinned()
+            self._instance.restore_pinned()
         elif active_device.type == "cuda":
             # One active-device Parameter per unique pinned parameter.
             # Tied slots all receive the same Parameter object so the
             # tying invariant survives on device.
-            target = self._binding.allocate_target(active_device)
-            self._binding.load_to_target(
+            target = self._instance.allocate_target(active_device)
+            self._instance.load_to_target(
                 target,
                 post_copy_hooks=self._post_copy_hooks,
                 non_blocking=True,
             )
             torch.cuda.synchronize(active_device)
+            self._active_target = target
         else:
             raise ValueError(
                 "PinnedWeights.activate() supports CUDA or CPU; "
@@ -314,8 +306,9 @@ class PinnedWeights:
         memory (and the model reference too if you don't need it
         anymore)."""
         try:
-            self._binding.restore_pinned()
+            self._instance.restore_pinned()
         finally:
+            self._active_target = None
             self._active_device = None
 
     @contextlib.contextmanager
@@ -339,3 +332,69 @@ class PinnedWeights:
             "activate(device) or use this strategy through "
             "ModelCache.use(..., device=...)"
         )
+
+
+def _named_parameters(module: nn.Module) -> dict[str, nn.Parameter]:
+    return _unique_name_dict(
+        module.named_parameters(remove_duplicate=False),
+        kind="parameter",
+    )
+
+
+def _named_buffers(module: nn.Module) -> dict[str, torch.Tensor]:
+    return _unique_name_dict(
+        module.named_buffers(remove_duplicate=False),
+        kind="buffer",
+    )
+
+
+def _unique_name_dict(
+    items: Iterable[tuple[str, _NamedT]],
+    *,
+    kind: str,
+) -> dict[str, _NamedT]:
+    values: dict[str, _NamedT] = {}
+    for name, value in items:
+        if name in values:
+            raise ValueError(f"Module yielded duplicate {kind} name {name!r}.")
+        values[name] = value
+    return values
+
+
+def _select_names(
+    kind: str,
+    items: Mapping[str, object],
+    names: Iterable[str] | None,
+) -> set[str]:
+    if names is None:
+        return set(items)
+
+    selected = set(names)
+    missing = sorted(selected - set(items))
+    if missing:
+        raise ValueError(
+            f"PinnedWeights cannot include unknown {kind} names: "
+            f"{_format_names(missing)}."
+        )
+    return selected
+
+
+def _validate_frozen_params(
+    params: dict[str, nn.Parameter],
+    names: set[str],
+) -> None:
+    for name, param in params.items():
+        if name not in names or not param.requires_grad:
+            continue
+        raise ValueError(
+            f"PinnedWeights cannot manage trainable param {name!r}: "
+            "this strategy has no optimizer-step copy-back boundary, "
+            "so CUDA updates could be lost on deactivate. Use ModelOffloader "
+            "(which partitions trainables into TrainableWeights "
+            "automatically), or exclude the name and route it to a "
+            "separate trainable mover."
+        )
+
+
+def _format_names(names: Iterable[str]) -> str:
+    return ", ".join(repr(name) for name in names)

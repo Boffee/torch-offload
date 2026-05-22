@@ -104,13 +104,11 @@ def assert_frozen(
 ) -> None:
     """Raise if ``slot`` is trainable.
 
-    Both :class:`PinnedWeights` and :class:`StreamedWeights` replace
-    the Parameter object at every slot they manage. That orphans
-    optimizer state keyed by the user's pre-wrap Parameter and breaks
-    grad identity, so trainable slots must be partitioned out by the
-    caller. The composer (:class:`ModelOffloader`) does this
-    automatically via ``skip_slots``; direct users are on the hook.
-    Fail loud rather than silently freeze.
+    Slot-replacing strategies must keep trainable params out of this
+    path. Replacing the Parameter object orphans optimizer state keyed
+    by the user's pre-wrap Parameter and breaks grad identity, so
+    trainable slots must be partitioned out by the caller. Fail loud
+    rather than silently freeze.
 
     ``owner`` is surfaced in the error message (e.g.
     ``"PinnedWeights"``, ``"StreamedWeights"``). ``extra`` is appended

@@ -26,6 +26,7 @@ from .pinned_bindings import PinnedParamBinding
 from .pinned_weights import PinnedWeights
 from .protocols import ModelStrategyComponent, SlotKey
 from .slots import (
+    ParamSlot,
     buffer_storage_key,
     canonical_param_name,
     iter_buffer_slots,
@@ -42,6 +43,7 @@ logger = logging.getLogger(__name__)
 LoraMode = Literal["merge", "routed"]
 _LoraFactorRef = tuple[torch.Tensor, torch.Tensor, float]
 _LoraTargetMap = dict[str, list[_LoraFactorRef]]
+_TargetParamRef = PinnedParamBinding | str
 
 
 class _RemovableHook(Protocol):
@@ -276,15 +278,15 @@ class ModelOffloader:
         # block trainables.
         pinned_skip_slots = streamer_slots | trainable_slots
 
-        non_block: PinnedWeights | None = None
-        has_pinnable = any(
-            s.key not in pinned_skip_slots for s in iter_param_slots(model)
-        ) or any(
-            s.key not in pinned_skip_slots for s in iter_buffer_slots(model)
+        pinned_param_names, pinned_buffer_names = _pinned_weight_names(
+            model, pinned_skip_slots,
         )
-        if has_pinnable:
+        non_block: PinnedWeights | None = None
+        if pinned_param_names or pinned_buffer_names:
             non_block = PinnedWeights(
-                model, skip_slots=pinned_skip_slots,
+                model,
+                include_param_names=pinned_param_names,
+                include_buffer_names=pinned_buffer_names,
             )
 
         # TrainableWeights handles only out-of-block trainables (in-
@@ -310,7 +312,7 @@ class ModelOffloader:
         self._teardown_stack: contextlib.ExitStack | None = None
 
         (
-            self._target_to_param_binding,
+            self._target_to_param_ref,
             self._target_to_parents,
             self._target_to_component,
         ) = self._build_target_index(streamers, layer_paths, non_block)
@@ -387,18 +389,20 @@ class ModelOffloader:
         self, loras: Sequence[tuple[LoRA, float]],
     ) -> _LoraTargetMap:
         per_target: _LoraTargetMap = {}
-        per_param_binding_target: dict[int, str] = {}
+        per_param_ref_target: dict[int, str] = {}
         total_targets = 0
         matched_targets = 0
         for lora, strength in loras:
             for target_key, (a, b) in lora.targets.items():
                 total_targets += 1
-                param_binding = self._target_to_param_binding.get(target_key)
-                if param_binding is None:
+                param_ref = self._target_to_param_ref.get(target_key)
+                component = self._target_to_component.get(target_key)
+                if param_ref is None or component is None:
                     continue
                 matched_targets += 1
-                existing_target = per_param_binding_target.setdefault(
-                    id(param_binding), target_key
+                ref_key = _post_copy_hook_key(component, param_ref)
+                existing_target = per_param_ref_target.setdefault(
+                    ref_key, target_key,
                 )
                 if existing_target != target_key:
                     raise ValueError(
@@ -414,7 +418,7 @@ class ModelOffloader:
 
         if matched_targets < total_targets:
             sample_lora = sorted(next(iter(loras))[0].targets)[:3]
-            sample_index = sorted(self._target_to_param_binding)[:3]
+            sample_index = sorted(self._target_to_param_ref)[:3]
             logger.warning(
                 "set_loras matched %d/%d targets. "
                 "Sample LoRA keys: %s ... Sample index keys: %s ...",
@@ -449,12 +453,21 @@ class ModelOffloader:
             )
 
         for target_key, refs in targets.items():
-            param_binding = self._target_to_param_binding[target_key]
+            param_ref = self._target_to_param_ref[target_key]
             component = self._target_to_component[target_key]
             transform = LoRATransform(refs)
-            handle = component.register_post_copy_hook(
-                param_binding, transform.apply,
-            )
+            if isinstance(component, PinnedWeights):
+                if not isinstance(param_ref, str):
+                    raise TypeError("PinnedWeights merge target must be a name.")
+                handle = component.register_post_copy_hook(
+                    param_ref, transform.apply,
+                )
+            else:
+                if not isinstance(param_ref, PinnedParamBinding):
+                    raise TypeError("StreamedWeights merge target must be a binding.")
+                handle = component.register_post_copy_hook(
+                    param_ref, transform.apply,
+                )
             self._lora_hook_handles.append(handle)
 
     def _register_routed_lora_hooks(
@@ -767,14 +780,14 @@ class ModelOffloader:
         layer_paths: list[str],
         non_block: PinnedWeights | None,
     ) -> tuple[
-        dict[str, PinnedParamBinding],
+        dict[str, _TargetParamRef],
         dict[str, tuple[nn.Module, ...]],
         dict[str, PinnedWeights | StreamedWeights],
     ]:
-        """Map canonical param names to their :class:`PinnedParamBinding`
+        """Map canonical param names to their component-local param ref
         and to the tuple of parent modules where the param is installed.
 
-        The param-binding map drives merge-mode LoRA post-copy hooks, the
+        The param-ref map drives merge-mode LoRA post-copy hooks, the
         component map identifies which component owns the copy loop,
         and the parents map drives routed-mode LoRA forward hooks.
 
@@ -792,7 +805,7 @@ class ModelOffloader:
         handles tied storage uniformly because it mutates the shared
         bytes).
         """
-        param_bindings: dict[str, PinnedParamBinding] = {}
+        param_refs: dict[str, _TargetParamRef] = {}
         parents: dict[str, tuple[nn.Module, ...]] = {}
         components: dict[str, PinnedWeights | StreamedWeights] = {}
 
@@ -813,35 +826,70 @@ class ModelOffloader:
                     for slot in param_binding.slots:
                         full_name = f"{layer_path}.{block_idx}.{slot.name}"
                         key = canonical_param_name(full_name)
-                        param_bindings[key] = param_binding
+                        param_refs[key] = param_binding
                         parents[key] = parent_tuple
                         components[key] = streamer
 
         if non_block is not None:
-            for param_binding in non_block.param_bindings:
-                if not param_binding.slots:
+            slots_by_ref_key: dict[int, list[ParamSlot]] = {}
+            for slot in iter_param_slots(non_block.model):
+                if slot.name not in non_block.param_names:
                     continue
-                seen_parent_ids: set[int] = set()
-                slot_parents: list[nn.Module] = []
-                for slot in param_binding.slots:
-                    parent_id = id(slot.parent)
-                    if parent_id in seen_parent_ids:
-                        continue
-                    seen_parent_ids.add(parent_id)
-                    slot_parents.append(slot.parent)
-                parent_tuple = tuple(slot_parents)
-                for slot in param_binding.slots:
+                ref_key = non_block.post_copy_hook_key(slot.name)
+                slots_by_ref_key.setdefault(ref_key, []).append(slot)
+
+            for slots in slots_by_ref_key.values():
+                parent_tuple = _unique_slot_parents(slots)
+                for slot in slots:
                     key = canonical_param_name(slot.name)
-                    param_bindings[key] = param_binding
+                    param_refs[key] = slot.name
                     parents[key] = parent_tuple
                     components[key] = non_block
 
-        return param_bindings, parents, components
+        return param_refs, parents, components
 
 
 # ---------------------------------------------------------------------------
 # Module-private helpers (used only by ModelOffloader constructor)
 # ---------------------------------------------------------------------------
+
+def _pinned_weight_names(
+    model: nn.Module,
+    skip_slots: set[SlotKey],
+) -> tuple[set[str], set[str]]:
+    param_names = {
+        slot.name for slot in iter_param_slots(model) if slot.key not in skip_slots
+    }
+    buffer_names = {
+        slot.name for slot in iter_buffer_slots(model) if slot.key not in skip_slots
+    }
+    return param_names, buffer_names
+
+
+def _post_copy_hook_key(
+    component: PinnedWeights | StreamedWeights,
+    param_ref: _TargetParamRef,
+) -> int:
+    if isinstance(component, PinnedWeights):
+        if not isinstance(param_ref, str):
+            raise TypeError("PinnedWeights merge target must be a name.")
+        return component.post_copy_hook_key(param_ref)
+    if not isinstance(param_ref, PinnedParamBinding):
+        raise TypeError("StreamedWeights merge target must be a binding.")
+    return id(param_ref)
+
+
+def _unique_slot_parents(slots: Sequence[ParamSlot]) -> tuple[nn.Module, ...]:
+    seen_parent_ids: set[int] = set()
+    slot_parents: list[nn.Module] = []
+    for slot in slots:
+        parent_id = id(slot.parent)
+        if parent_id in seen_parent_ids:
+            continue
+        seen_parent_ids.add(parent_id)
+        slot_parents.append(slot.parent)
+    return tuple(slot_parents)
+
 
 def _resolve_layers_attr(module: nn.Module, dotted_path: str) -> nn.ModuleList:
     obj = walk_attr_path(module, dotted_path)

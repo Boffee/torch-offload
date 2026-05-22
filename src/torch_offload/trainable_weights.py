@@ -28,9 +28,8 @@ class TrainableWeights:
     :meth:`activate` and return them to CPU on :meth:`deactivate`,
     but the mechanisms are mirror images:
 
-    - :class:`PinnedWeights` owns pinned-CPU clones, slot-replaces the
-      Parameter wrapper at every transition. Frozen-only — slot
-      replacement orphans optimizer state.
+    - :class:`PinnedWeights` owns pinned-CPU clones and is currently
+      frozen-only because it has no optimizer-step copy-back boundary.
     - :class:`TrainableWeights` owns nothing (``cache_bytes=0``); the
       user's Parameter objects stay alive in their slots, and only
       ``p.data`` storage moves via ``p.data = p.data.to(device)``.
