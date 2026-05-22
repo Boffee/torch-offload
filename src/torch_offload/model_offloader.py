@@ -24,11 +24,9 @@ from .lora import LoRA, LoRARouteHandle, LoRATransform
 from .pinned_weights import PinnedWeights
 from .protocols import ModelStrategyComponent, SlotKey
 from .slots import (
-    ModuleSlotCollection,
     ParamSlot,
     buffer_storage_key,
     canonical_param_name,
-    collect_module_slots,
     iter_buffer_slots,
     iter_param_slots,
     param_storage_key,
@@ -238,13 +236,15 @@ class ModelOffloader:
                 )
 
         _validate_block_groups_disjoint(block_groups, layer_paths)
+        _validate_streamed_block_names_are_exclusive(
+            model,
+            block_groups,
+            layer_paths,
+            stream_trainables=stream_trainable_weights,
+        )
         detect_streaming_region_ties(
             model, block_groups, stream_trainables=stream_trainable_weights,
         )
-
-        trainable_slots: set[SlotKey] = {
-            s.key for s in iter_param_slots(model) if s.get().requires_grad
-        }
 
         # By default, streamers skip trainables and PinnedWeights keeps
         # them GPU-resident while active. With stream_trainable_weights=True,
@@ -253,19 +253,20 @@ class ModelOffloader:
         # ``.data`` swap.
         # Gradients are NOT streamed — they live on GPU during backward via
         # PyTorch's native ``AccumulateGrad`` mechanism.
-        stream_slot_exclusions = None if stream_trainable_weights else trainable_slots
         streamers: list[StreamedWeights] = []
-        streamer_slots: set[SlotKey] = set()
+        streamed_param_names: set[str] = set()
+        streamed_buffer_names: set[str] = set()
         for i, blocks in enumerate(block_groups):
-            (
-                stream_param_names,
-                stream_buffer_names,
-                owned_slots,
-            ) = _streamed_ownership_from_slot_exclusions(
+            stream_param_names, stream_buffer_names = _streamed_names_for_blocks(
                 blocks,
-                stream_slot_exclusions,
+                stream_trainables=stream_trainable_weights,
             )
-            streamer_slots.update(owned_slots)
+            streamed_param_names.update(
+                _full_block_names(layer_paths[i], len(blocks), stream_param_names)
+            )
+            streamed_buffer_names.update(
+                _full_block_names(layer_paths[i], len(blocks), stream_buffer_names)
+            )
             streamers.append(
                 StreamedWeights(
                     blocks=blocks,
@@ -281,11 +282,8 @@ class ModelOffloader:
         # PinnedWeights manages every non-streamed param and buffer,
         # including trainables. In default mode that includes in-block
         # trainables because streamers skipped them above.
-        pinned_skip_slots = streamer_slots
-
-        pinned_param_names, pinned_buffer_names = _pinned_weight_names(
-            model, pinned_skip_slots,
-        )
+        pinned_param_names = _all_param_names(model) - streamed_param_names
+        pinned_buffer_names = _all_buffer_names(model) - streamed_buffer_names
         pinned_weights: PinnedWeights | None = None
         if pinned_param_names or pinned_buffer_names:
             pinned_weights = PinnedWeights(
@@ -849,77 +847,70 @@ class ModelOffloader:
 # ---------------------------------------------------------------------------
 
 
-def _streamed_ownership_from_slot_exclusions(
+def _streamed_names_for_blocks(
     blocks: Sequence[nn.Module],
-    slot_exclusions: set[SlotKey] | None,
-) -> tuple[set[str], set[str], set[SlotKey]]:
-    """Translate composer slot exclusions into streamer-owned names.
-
-    ``StreamedWeights`` is intentionally name-based. During the migration,
-    ``ModelOffloader`` still owns slot-level composition because
-    default trainable exclusion and the legacy pinned path use ``SlotKey``. Keep
-    that compatibility bridge here instead of leaking slots back into the
-    streamer.
-    """
-    skip = slot_exclusions or set()
-    collections: list[ModuleSlotCollection] = []
-    owned_slots: set[SlotKey] = set()
-    for block in blocks:
-        collection = collect_module_slots(
-            block,
-            skip_slots=skip,
-            param_group_by="storage",
-        )
-        collections.append(collection)
-        owned_slots.update(collection.slot_filter)
-
-    if not collections:
-        return set(), set(), owned_slots
-
-    param_names = _selected_param_names(collections[0])
-    buffer_names = _selected_buffer_names(collections[0])
-    for i, collection in enumerate(collections[1:], start=1):
+    *,
+    stream_trainables: bool,
+) -> tuple[set[str], set[str]]:
+    param_names = _block_param_names(blocks[0], stream_trainables=stream_trainables)
+    buffer_names = _block_buffer_names(blocks[0])
+    for i, block in enumerate(blocks[1:], start=1):
         if (
-            _selected_param_names(collection) != param_names
-            or _selected_buffer_names(collection) != buffer_names
+            _block_param_names(block, stream_trainables=stream_trainables)
+            != param_names
+            or _block_buffer_names(block) != buffer_names
         ):
             raise ValueError(
-                f"Block {i} selected names differ from block 0 after "
-                "ModelOffloader slot filtering. All blocks in a "
-                "StreamedWeights group must select the same parameter "
+                f"Block {i} selected names differ from block 0. All blocks "
+                "in a StreamedWeights group must select the same parameter "
                 "and buffer names."
             )
-
-    return param_names, buffer_names, owned_slots
-
-
-def _selected_param_names(collection: ModuleSlotCollection) -> set[str]:
-    return {
-        slot.name
-        for slots in collection.param_slot_groups
-        for slot in slots
-    }
-
-
-def _selected_buffer_names(collection: ModuleSlotCollection) -> set[str]:
-    return {
-        slot.name
-        for slots in collection.buffer_slot_groups
-        for slot in slots
-    }
-
-
-def _pinned_weight_names(
-    model: nn.Module,
-    skip_slots: set[SlotKey],
-) -> tuple[set[str], set[str]]:
-    param_names = {
-        slot.name for slot in iter_param_slots(model) if slot.key not in skip_slots
-    }
-    buffer_names = {
-        slot.name for slot in iter_buffer_slots(model) if slot.key not in skip_slots
-    }
     return param_names, buffer_names
+
+
+def _block_param_names(
+    block: nn.Module,
+    *,
+    stream_trainables: bool,
+) -> set[str]:
+    return {
+        name
+        for name, param in block.named_parameters(remove_duplicate=False)
+        if stream_trainables or not param.requires_grad
+    }
+
+
+def _block_buffer_names(block: nn.Module) -> set[str]:
+    return {
+        name
+        for name, _buffer in block.named_buffers(remove_duplicate=False)
+    }
+
+
+def _full_block_names(
+    layer_path: str,
+    block_count: int,
+    local_names: set[str],
+) -> set[str]:
+    return {
+        f"{layer_path}.{block_idx}.{local_name}"
+        for block_idx in range(block_count)
+        for local_name in local_names
+    }
+
+
+def _all_param_names(model: nn.Module) -> set[str]:
+    return {
+        name
+        for name, _param in model.named_parameters(remove_duplicate=False)
+    }
+
+
+def _all_buffer_names(model: nn.Module) -> set[str]:
+    return {
+        name
+        for name, _buffer in model.named_buffers(remove_duplicate=False)
+    }
 
 
 def _post_copy_hook_key(
@@ -1075,6 +1066,53 @@ def _validate_block_groups_disjoint(
             f"module that contains another resolved path, or a block "
             f"appears twice in a single `nn.ModuleList`."
         )
+
+
+def _validate_streamed_block_names_are_exclusive(
+    model: nn.Module,
+    block_groups: Sequence[Sequence[nn.Module]],
+    layer_paths: Sequence[str],
+    *,
+    stream_trainables: bool,
+) -> None:
+    """Reject params/buffers inside streamed blocks that have extra model names."""
+    expected_names_by_slot: dict[SlotKey, set[str]] = {}
+    for group_idx, blocks in enumerate(block_groups):
+        layer_path = layer_paths[group_idx]
+        for block_idx, block in enumerate(blocks):
+            prefix = f"{layer_path}.{block_idx}"
+            for slot in iter_param_slots(block):
+                if not stream_trainables and slot.get().requires_grad:
+                    continue
+                expected_names_by_slot.setdefault(slot.key, set()).add(
+                    f"{prefix}.{slot.name}"
+                )
+            for slot in iter_buffer_slots(block):
+                expected_names_by_slot.setdefault(slot.key, set()).add(
+                    f"{prefix}.{slot.name}"
+                )
+
+    for slot in iter_param_slots(model):
+        expected_names = expected_names_by_slot.get(slot.key)
+        if expected_names is not None and slot.name not in expected_names:
+            _raise_non_exclusive_streamed_block_name(slot.name, expected_names)
+    for slot in iter_buffer_slots(model):
+        expected_names = expected_names_by_slot.get(slot.key)
+        if expected_names is not None and slot.name not in expected_names:
+            _raise_non_exclusive_streamed_block_name(slot.name, expected_names)
+
+
+def _raise_non_exclusive_streamed_block_name(
+    name: str,
+    expected_names: set[str],
+) -> None:
+    raise ValueError(
+        "ModelOffloader requires streamed block names to be exclusive. "
+        f"Slot {name!r} is inside a configured streamed block but is also "
+        f"reachable outside its expected streamed name(s) "
+        f"{sorted(expected_names)!r}. Remove the extra module reference or "
+        "use whole-model PinnedWeights."
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -1161,6 +1161,48 @@ class TestCrossRegionTiedDetection:
                 layers_attr="transformer_blocks", blocks_to_swap=1,
             )
 
+    def test_streamed_block_name_must_be_exclusive(self) -> None:
+        block = nn.Linear(4, 4, bias=False)
+
+        class M(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.transformer_blocks = nn.ModuleList(
+                    [block, nn.Linear(4, 4, bias=False)]
+                )
+                self.first_block = block
+
+        m = M()
+        for p in m.parameters():
+            p.requires_grad = False
+
+        with pytest.raises(ValueError, match="streamed block names to be exclusive"):
+            ModelOffloader(
+                m,
+                layers_attr="transformer_blocks", blocks_to_swap=1,
+            )
+
+    def test_extra_name_for_unstreamed_trainable_block_param_is_allowed(
+        self,
+    ) -> None:
+        block = nn.Linear(4, 4, bias=False)
+
+        class M(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.transformer_blocks = nn.ModuleList(
+                    [block, nn.Linear(4, 4, bias=False)]
+                )
+                self.first_block = block
+
+        m = M()
+
+        strat = ModelOffloader(
+            m,
+            layers_attr="transformer_blocks", blocks_to_swap=1,
+        )
+        strat.deactivate()
+
     def test_intra_block_tied_params_are_preserved(self) -> None:
         shared_0 = torch.randn(8, 8)
         shared_1 = torch.randn(8, 8)
@@ -1862,7 +1904,7 @@ class TestStreamedNameSelection:
         finally:
             streamer.deactivate()
 
-    def test_model_offloader_slot_shim_partitions_streamed_and_non_block_names(
+    def test_model_offloader_partitions_streamed_and_pinned_names(
         self,
     ) -> None:
         m = _make_block_model()
@@ -2407,10 +2449,11 @@ class TestLoRAInBlockRouting:
         finally:
             strat.deactivate()
 
-    def test_composer_partitions_skip_slots_correctly(self) -> None:
-        # Through-test: the composer converts streamed slots into
-        # PinnedWeights include-name sets. Verify that streamed block
-        # names are excluded and non-streamed trainables are included.
+    def test_composer_partitions_names_correctly(self) -> None:
+        # Through-test: the composer subtracts streamed full names from
+        # model names to form PinnedWeights include-name sets. Verify that
+        # streamed block names are excluded and non-streamed trainables are
+        # included.
         class M(nn.Module):
             def __init__(self):
                 super().__init__()
