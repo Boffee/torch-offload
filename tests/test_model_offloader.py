@@ -2,7 +2,6 @@
 
 Covers ``ModelOffloader`` (the public composite),
 ``StreamedWeights`` (the per-block-list primitive),
-``TrainableWeights`` (standalone legacy trainable-param mover),
 and the cross-region tied-weight detector.
 
 CUDA-only tests gate on availability. CPU activation is pass-through
@@ -24,7 +23,6 @@ from torch_offload import (
     ModelStrategy,
     PinnedWeights,
     StreamedWeights,
-    TrainableWeights,
 )
 from torch_offload.model_offloader import detect_streaming_region_ties
 from torch_offload.slots import iter_param_slots
@@ -1808,76 +1806,6 @@ class TestMultiComponentCleanup:
             assert strategy._teardown_stack is None
         finally:
             strategy.deactivate()
-
-
-# ---------------------------------------------------------------------------
-# TrainableWeights (component-level tests)
-# ---------------------------------------------------------------------------
-
-
-class TestTrainableWeights:
-    def test_cache_bytes_is_zero(self) -> None:
-        m = _make_block_model()
-        mover = TrainableWeights(m)
-        assert mover.cache_bytes == 0
-        mover.deactivate()
-
-    def test_activate_and_deactivate_noop_when_no_trainable(self) -> None:
-        m = _make_block_model()  # all frozen
-        mover = TrainableWeights(m)
-        try:
-            mover.activate("cpu")
-            mover.deactivate()
-        finally:
-            mover.deactivate()
-
-    @CUDA
-    def test_moves_trainable_param_to_device_on_activate(self) -> None:
-        class M(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.lora = nn.Parameter(torch.randn(4))  # trainable
-
-        m = M()
-        target = torch.device("cuda")
-        mover = TrainableWeights(m)
-        try:
-            mover.activate(target)
-            assert m.lora.is_cuda
-            mover.deactivate()
-            assert not m.lora.is_cuda  # back to CPU
-        finally:
-            mover.deactivate()
-
-    def test_deactivate_idempotent(self) -> None:
-        m = _make_block_model()
-        mover = TrainableWeights(m)
-        mover.deactivate()
-        mover.deactivate()
-
-    def test_skip_slots_walk_observes_late_requires_grad_changes(self) -> None:
-        class M(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.streamed = nn.Linear(4, 4, bias=False)
-                self.out_of_block = nn.Linear(4, 4, bias=False)
-
-        m = M()
-        for p in m.parameters():
-            p.requires_grad = False
-
-        from torch_offload.slots import iter_param_slots
-
-        skip_slots = {
-            s.key for s in iter_param_slots(m.streamed)
-        }
-        mover = TrainableWeights(m, skip_slots=skip_slots)
-
-        # Flip requires_grad after construction. The filtered mover
-        # should preserve TrainableWeights' historical dynamic behavior
-        # and pick it up at transition time.
-        m.out_of_block.weight.requires_grad = True
-        assert list(mover._iter_trainable_params()) == [m.out_of_block.weight]
 
 
 # ---------------------------------------------------------------------------

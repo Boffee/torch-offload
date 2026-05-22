@@ -17,7 +17,6 @@ to be lifted into its own package when a second consumer appears.
 | `pinned_weights.py` | `PinnedWeights` — whole-model bulk pinned-CPU↔GPU strategy |
 | `streamed_weights.py` | `StreamedWeights` — sharp per-block-list streaming primitive (component) |
 | `model_offloader.py` | `ModelOffloader` — unified composite: block streaming + non-streamed pinning + optional LoRA merge |
-| `trainable_weights.py` | `TrainableWeights` — identity-preserving trainable parameter mover |
 | `lora.py` | `LoRA`, `LoRATransform`, `LoRARouteHandle` — pinned factor storage + merge / routed-hook application |
 | `merge.py` | `merge_lora()` — permanent in-place LoRA merge into base weights (alternative to `set_loras`) |
 | `pinned_param.py` | `PinnedParam` — per-parameter pinning primitive (handles quanto, GGUF, and TorchAO NVFP4 via adapters) |
@@ -448,8 +447,8 @@ class MyStrategy:
 
 A narrower `ModelStrategyComponent` Protocol (just `cache_bytes` +
 `activate` + `deactivate`, no `model`) describes pieces composable
-inside a top-level strategy — `StreamedWeights`, `TrainableWeights`,
-and `PinnedWeights` all satisfy it.
+inside a top-level strategy — `StreamedWeights` and `PinnedWeights`
+both satisfy it.
 
 `TensorAdapter` is the per-parameter extension point. Its base contract
 only covers inference movement: clone/pin, H2D copy, GPU wrapper rebuild,
@@ -469,9 +468,9 @@ constructed → activate ↔ deactivate → drop refs
 
 `activate(device=...)` makes the model usable for compute on the
 requested device. `PinnedWeights`, `ModelOffloader`, `StreamedWeights`,
-and `TrainableWeights` require an explicit device. CUDA activation uses
-the streaming/DMA path where applicable; CPU activation is pass-through
-over pinned host-backed storage.
+require an explicit device. CUDA activation uses the streaming/DMA path
+where applicable; CPU activation is pass-through over pinned host-backed
+storage.
 `deactivate()` releases transient device resources (the `cache_bytes`
 worth of pinned storage stays held in module slots, ready for fast
 re-activation).

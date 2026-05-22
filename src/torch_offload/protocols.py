@@ -26,9 +26,9 @@ CPU->MPS materialization without a second CPU cache),
 Future resources (disk-mmap, NVMe-paged, multi-GPU shard) just satisfy
 :class:`CachedResource`.
 
-Component implementations include :class:`~torch_offload.StreamedWeights`
-and :class:`~torch_offload.TrainableWeights`. (And :class:`PinnedWeights`
-also satisfies the component shape — composites use it inline.)
+Component implementations include :class:`~torch_offload.StreamedWeights`.
+:class:`PinnedWeights` also satisfies the component shape — composites
+use it inline.
 
 Lifecycle
 ---------
@@ -107,9 +107,7 @@ class ModelStrategyComponent(Protocol):
 
         Typically pinned host memory, but a strategy may report any
         resource it wants the cache to budget against — staging buffers,
-        mmap regions, etc. Components that don't consume cache budget
-        (e.g. :class:`TrainableWeights` which only nudges existing
-        params) should return 0.
+        mmap regions, etc.
         """
         ...
 

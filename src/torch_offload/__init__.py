@@ -118,7 +118,6 @@ from .mps_weights import MpsWeights
 from .pinned_weights import PinnedWeights
 from .protocols import CachedResource, ModelStrategy, ModelStrategyComponent, SlotKey
 from .streamed_weights import StreamedWeights
-from .trainable_weights import TrainableWeights
 
 __all__ = [
     "ActivationError",
@@ -146,7 +145,6 @@ __all__ = [
     "ResourceSpec",
     "SlotKey",
     "StreamedWeights",
-    "TrainableWeights",
     "detect_streaming_region_ties",
     "merge_lora",
 ]
