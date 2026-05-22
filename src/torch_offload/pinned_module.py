@@ -1,9 +1,8 @@
 """Name-based pinned module store and instance primitives.
 
-This module is the migration path for sharing one pinned CPU cache across
-multiple concrete model instances. It deliberately does not depend on the
-legacy binding/slot layer: names are the only durable relationship
-between a store and an instance.
+This module supports sharing one pinned CPU cache across multiple
+concrete model instances. Names are the durable relationship between a
+store and an instance.
 """
 
 from __future__ import annotations

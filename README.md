@@ -13,7 +13,7 @@ to be lifted into its own package when a second consumer appears.
 
 | Module | Role |
 |---|---|
-| `protocols.py` | `CachedResource` (generic), `ModelStrategy` / `ModelStrategyComponent` plug-in contracts; `SlotKey` skip-filter type |
+| `protocols.py` | `CachedResource` (generic), `ModelStrategy` / `ModelStrategyComponent` plug-in contracts; `SlotKey` topology key |
 | `pinned_weights.py` | `PinnedWeights` — whole-model bulk pinned-CPU↔GPU strategy |
 | `streamed_weights.py` | `StreamedWeights` — sharp per-block-list streaming primitive (component) |
 | `model_offloader.py` | `ModelOffloader` — unified composite: block streaming + non-streamed pinning + optional LoRA merge |
@@ -21,7 +21,6 @@ to be lifted into its own package when a second consumer appears.
 | `merge.py` | `merge_lora()` — permanent in-place LoRA merge into base weights (alternative to `set_loras`) |
 | `pinned_param.py` | `PinnedParam` — per-parameter pinning primitive (handles quanto, GGUF, and TorchAO NVFP4 via adapters) |
 | `pinned_module.py` | `PinnedModuleStore`, `PinnedModuleInstance` — name-keyed pinned module storage plus concrete model instances |
-| `pinned_bindings.py` | Legacy binding/slot layer kept for compatibility tests while strategies migrate to `pinned_module.py` |
 | `tensor_adapters.py`, `quanto_adapter.py`, `gguf_adapter.py`, `nvfp4_adapter.py`, `gguf_dequant.py` | Tensor-type adapter registry and optional optimum-quanto / gguf / torchao support |
 | `_quanto.py` | Internal: optimum-quanto optional-import + layout validation; consumed by `quanto_adapter.py` and `merge.py` |
 | `_torchao_nvfp4.py` | Internal: TorchAO NVFP4 optional-import + layout validation; consumed by `nvfp4_adapter.py` |
