@@ -1232,7 +1232,12 @@ class TestSharedStorageLocalBehavior:
             )
             assert non_block.param_names == {"embed.weight", "head.weight"}
             assert (
-                len({id(non_block._store.params[name]) for name in non_block.param_names})
+                len(
+                    {
+                        id(non_block._instance.params[name])
+                        for name in non_block.param_names
+                    }
+                )
                 == 1
             )
         finally:

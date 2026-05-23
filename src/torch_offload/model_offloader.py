@@ -23,7 +23,7 @@ from .module_names import (
     resolve_parent_leaf,
     walk_attr_path,
 )
-from .pinned_component import PinnedComponent
+from .pinned_component import PinnedComponent, PinnedComponentStore
 from .protocols import ModelStrategyComponent
 from .streamed_component import StreamedComponent
 from .tensor_adapter_registry import select_adapter
@@ -257,7 +257,6 @@ class ModelOffloader:
         self._pinned_component = pinned_component
         self._streamed_components = streamed_components
         if pinned_component is not None:
-            self._store = pinned_component._store
             self._instance = pinned_component._instance
         self._teardown_stack: contextlib.ExitStack | None = None
         lora_param_names: set[str] = set()
@@ -878,11 +877,12 @@ def _build_pinned_component(
         pinned_buffer_names = set(include_buffer_names)
     if not pinned_param_names and not pinned_buffer_names:
         return None
-    return PinnedComponent(
+    store = PinnedComponentStore.from_module(
         model,
         include_param_names=pinned_param_names,
         include_buffer_names=pinned_buffer_names,
     )
+    return store.bind(model)
 
 
 def _compose_components(

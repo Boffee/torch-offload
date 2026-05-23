@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from typing import Any, cast
 
 import pytest
 import torch
@@ -28,11 +29,11 @@ def _make_simple_model() -> nn.Module:
 
 
 def _unique_pinned_param_count(pw: ModelOffloader) -> int:
-    return len({id(pinned) for pinned in pw._store.params.values()})
+    return len({id(pinned) for pinned in pw._instance.params.values()})
 
 
 def _unique_pinned_buffer_count(pw: ModelOffloader) -> int:
-    return len({id(pinned) for pinned in pw._store.buffers.values()})
+    return len({id(pinned) for pinned in pw._instance.buffers.values()})
 
 
 # ---------------------------------------------------------------------------
@@ -49,11 +50,16 @@ class TestModelStrategyConformance:
             pw.deactivate()
 
     def test_component_is_not_top_level_strategy(self) -> None:
-        component = PinnedComponent(_make_simple_model())
+        model = _make_simple_model()
+        component = PinnedComponentStore.from_module(model).bind(model)
         try:
             assert not isinstance(component, ModelStrategy)
         finally:
             component.deactivate()
+
+    def test_component_constructor_is_not_public_factory(self) -> None:
+        with pytest.raises(TypeError, match="PinnedComponentStore.from_module"):
+            PinnedComponent(cast(Any, _make_simple_model()))
 
     def test_has_lifecycle_methods(self) -> None:
         pw = ModelOffloader(_make_simple_model())
@@ -66,8 +72,8 @@ class TestModelStrategyConformance:
             pw.deactivate()
 
 
-class TestPinnedComponentFromStore:
-    def test_from_store_allows_empty_noop_component(self) -> None:
+class TestPinnedComponentStoreBind:
+    def test_bind_allows_empty_noop_component(self) -> None:
         module = nn.Module()
         module.weight = nn.Parameter(torch.randn(2, 2), requires_grad=False)
         module.register_buffer("running", torch.randn(2))
@@ -82,7 +88,7 @@ class TestPinnedComponentFromStore:
         assert store.param_names == frozenset()
         assert store.buffer_names == frozenset()
 
-        component = PinnedComponent.from_store(store, module)
+        component = store.bind(module)
         try:
             assert component.cache_bytes == 0
             assert component.param_names == frozenset()
@@ -97,11 +103,11 @@ class TestPinnedComponentFromStore:
         prototype.register_buffer("running", torch.randn(2))
         store = PinnedComponentStore.from_module(prototype)
 
-        first = PinnedComponent.from_store(store, prototype)
+        first = store.bind(prototype)
         second_model = nn.Module()
         second_model.weight = nn.Parameter(torch.randn(2, 2), requires_grad=False)
         second_model.register_buffer("running", torch.randn(2))
-        second = PinnedComponent.from_store(store, second_model)
+        second = store.bind(second_model)
 
         try:
             assert first.cache_bytes == store.cache_bytes
@@ -123,7 +129,7 @@ class TestPinnedComponentFromStore:
             first.deactivate()
             second.deactivate()
 
-    def test_from_store_propagates_module_mismatch_errors(self) -> None:
+    def test_bind_propagates_module_mismatch_errors(self) -> None:
         prototype = nn.Module()
         prototype.weight = nn.Parameter(torch.randn(2, 2), requires_grad=False)
         store = PinnedComponentStore.from_module(prototype)
@@ -132,7 +138,7 @@ class TestPinnedComponentFromStore:
         target.weight = nn.Parameter(torch.randn(3, 2), requires_grad=False)
 
         with pytest.raises(ValueError, match="Param 'weight' layout mismatch"):
-            PinnedComponent.from_store(store, target)
+            store.bind(target)
 
 
 # ---------------------------------------------------------------------------
@@ -461,7 +467,7 @@ class TestTiedWeightDedup:
             # After construction, both names reference the same Parameter
             # object, preserving tying at the strongest level.
             assert m.embed._parameters["weight"] is m.head._parameters["weight"]
-            pinned = pw._store.params["embed.weight"]
+            pinned = pw._instance.params["embed.weight"]
             cpu_param = pw._instance.cpu_params_by_pinned_id[id(pinned)]
             assert m.embed.weight is cpu_param
         finally:
@@ -592,7 +598,7 @@ class TestSharedSubmoduleAlias:
             # One pinned buffer backing covers both alias paths.
             assert _unique_pinned_buffer_count(pw) == 1
             assert pw.buffer_names == {"a.buf", "b.buf"}
-            pinned_buffer = pw._store.buffers["a.buf"]
+            pinned_buffer = pw._instance.buffers["a.buf"]
             assert pinned_buffer.tensor.is_pinned()
             # Both module entries reference the SAME pinned tensor.
             assert m.a.buf is pinned_buffer.tensor
@@ -615,7 +621,7 @@ class TestSharedSubmoduleAlias:
         pw = ModelOffloader(m)
         try:
             assert _unique_pinned_buffer_count(pw) == 1
-            pinned_buffer = pw._store.buffers["a.buf"]
+            pinned_buffer = pw._instance.buffers["a.buf"]
             assert m.a.buf is pinned_buffer.tensor
             assert m.b.buf is pinned_buffer.tensor
         finally:
@@ -641,7 +647,7 @@ class TestSharedSubmoduleAlias:
         pw = ModelOffloader(m)
         try:
             assert _unique_pinned_buffer_count(pw) == 1
-            pinned_buffer = pw._store.buffers["a.buf"]
+            pinned_buffer = pw._instance.buffers["a.buf"]
             assert m.a.buf is pinned_buffer.tensor
             assert m.b.buf is pinned_buffer.tensor
             assert m.a.buf.is_pinned()
@@ -672,8 +678,11 @@ class TestMixedTrainableFrozenTied:
 
         pw = ModelOffloader(m, include_param_names={"keep"})
         try:
-            assert set(pw._store.params) == {"keep"}
-            assert m.keep.data_ptr() == pw._store.params["keep"].make_cpu_param().data_ptr()
+            assert set(pw._instance.params) == {"keep"}
+            assert (
+                m.keep.data_ptr()
+                == pw._instance.params["keep"].make_cpu_param().data_ptr()
+            )
             assert m.skip is skipped
         finally:
             pw.deactivate()

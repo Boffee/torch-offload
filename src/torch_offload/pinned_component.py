@@ -62,6 +62,7 @@ from torch import nn
 
 from ._devices import canonical_device
 from .pinned_module import (
+    PinnedModuleInstance,
     PinnedModuleStore,
     PinnedModuleTarget,
     PostCopyHook,
@@ -73,9 +74,9 @@ from .pinned_module import (
 class PinnedComponentStore:
     """Reusable pinned backing storage for :class:`PinnedComponent`.
 
-    Public component-level wrapper over the internal name-keyed module
-    store. Build once from a prototype module, then bind it to concrete
-    compatible modules with :meth:`PinnedComponent.from_store`.
+    Component-level wrapper over the internal name-keyed module store.
+    Build once from a prototype module, then bind it to concrete
+    compatible modules with :meth:`bind`.
     """
 
     _module_store: PinnedModuleStore
@@ -112,11 +113,16 @@ class PinnedComponentStore:
         """Total pinned host bytes held by this store."""
         return self._module_store.cache_bytes
 
+    def bind(self, model: nn.Module) -> PinnedComponent:
+        """Bind this store's pinned backing bytes to ``model``."""
+        return PinnedComponent(self._module_store.bind(model))
+
 
 class PinnedComponent:
     """Pinned-CPU component with bulk device transfer.
 
-    On construction, every managed parameter is backed by pinned CPU
+    Instances are created by binding a :class:`PinnedComponentStore` to a
+    compatible model. Every managed parameter is backed by pinned CPU
     storage (handling quanto decomposition and tied-weight dedup).
     :meth:`activate` allocates GPU tensors for each unique pinned
     parameter and installs that active storage into the managed model
@@ -138,74 +144,26 @@ class PinnedComponent:
     top-level :class:`ModelOffloader` still rejects configurations
     with no components to manage.
 
-    Parameters
-    ----------
-    model:
-        The model to cache. Managed tensors may start on CPU or CUDA;
-        construction clones them directly into pinned CPU storage.
-    include_param_names:
-        Optional PyTorch parameter names to cache. ``None`` caches all
-        parameters. An empty set caches none.
-    include_buffer_names:
-        Optional PyTorch buffer names to cache. ``None`` caches all
-        registered buffers. An empty set caches none.
+    Stores are constructed with :meth:`PinnedComponentStore.from_module`.
+    Managed tensors may start on CPU or CUDA; store construction clones
+    them directly into pinned CPU storage.
     """
 
-    def __init__(
-        self,
-        model: nn.Module,
-        *,
-        include_param_names: Iterable[str] | None = None,
-        include_buffer_names: Iterable[str] | None = None,
-    ) -> None:
-        # Pin selected names without replacing module registry entries.
-        # PinnedParam intentionally repoints plain Parameter.data at each
-        # pinned clone during this phase to keep construction peak memory
-        # low. If a later pin fails, the caller must drop the partially
-        # constructed model/strategy and rebuild from a fresh model instance.
-        store = PinnedComponentStore.from_module(
-            model,
-            include_param_names=include_param_names,
-            include_buffer_names=include_buffer_names,
-        )
-        self._init_from_store(store._module_store, model)
-
-    @classmethod
-    def from_store(
-        cls,
-        store: PinnedComponentStore,
-        model: nn.Module,
-    ) -> PinnedComponent:
-        """Bind an existing pinned component store to ``model``.
-
-        The store owns the pinned bytes, while the returned component
-        owns lifecycle state for this concrete module binding.
-        """
-        component = cls.__new__(cls)
-        component._init_from_store(store._module_store, model)
-        return component
-
-    def _init_from_store(
-        self,
-        store: PinnedModuleStore,
-        model: nn.Module,
-    ) -> None:
-        self._model: nn.Module | None = model
+    def __init__(self, instance: PinnedModuleInstance) -> None:
+        if not isinstance(instance, PinnedModuleInstance):
+            raise TypeError(
+                "PinnedComponent requires a PinnedModuleInstance; "
+                "use PinnedComponentStore.from_module(model).bind(model)."
+            )
+        self._model: nn.Module | None = instance.module
+        self._instance = instance
+        self._param_names = frozenset(instance.params)
+        self._buffer_names = frozenset(instance.buffers)
+        self._cache_bytes = instance.cache_bytes
+        self._has_trainables = instance.has_trainables
         self._active_device: torch.device | None = None
         self._active_target: PinnedModuleTarget | None = None
         self._optimizer_step_active: bool = False
-
-        # Bind this concrete model instance to the store. This applies the
-        # module registry/register_buffer mutations after all pinning succeeded.
-        # Construction is still not fully rollback-safe because of the
-        # low-peak Parameter.data repointing described above.
-        self._store = store
-        self._instance = store.bind(model)
-        self._param_names = frozenset(store.params)
-        self._buffer_names = frozenset(store.buffers)
-        self._has_trainables = any(
-            pinned.requires_grad for pinned in store.params.values()
-        )
 
     # ------------------------------------------------------------------
     # Component API
@@ -224,7 +182,7 @@ class PinnedComponent:
     @property
     def cache_bytes(self) -> int:
         """Total pinned host bytes held. Tied weights counted once."""
-        return self._store.cache_bytes
+        return self._cache_bytes
 
     def register_post_copy_hook(
         self, name: str, hook: PostCopyHook,
