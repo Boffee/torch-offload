@@ -18,17 +18,15 @@ Three Protocols form the contract:
   property for code that works specifically with model strategies.
 
 Top-level :class:`CachedResource` implementations in this package:
-:class:`~torch_offload.PinnedWeights` (whole-model bulk DMA between
-pinned CPU and GPU), :class:`~torch_offload.MpsWeights` (whole-model
-CPU->MPS materialization without a second CPU cache),
-:class:`ModelOffloader` (composite of streamers + pinning), and
-:class:`~torch_offload.LoRA` (pinned LoRA factor storage).
+:class:`~torch_offload.ModelOffloader` (whole-model bulk DMA or streamed
+block offload), :class:`~torch_offload.MpsWeights` (whole-model CPU->MPS
+materialization without a second CPU cache), and :class:`~torch_offload.LoRA`
+(pinned LoRA factor storage).
 Future resources (disk-mmap, NVMe-paged, multi-GPU shard) just satisfy
 :class:`CachedResource`.
 
-Component implementations include :class:`~torch_offload.StreamedWeights`.
-:class:`PinnedWeights` also satisfies the component shape — composites
-use it inline.
+Component implementations include :class:`~torch_offload.PinnedComponent`
+and :class:`~torch_offload.StreamedComponent`.
 
 Lifecycle
 ---------

@@ -20,9 +20,9 @@ from torch_offload import (
     LoRATransform,
     ModelCache,
     ModelOffloader,
-    PinnedWeights,
+    PinnedComponent,
     ResourceSpec,
-    StreamedWeights,
+    StreamedComponent,
     merge_lora,
 )
 from torch_offload.lora import KeyTransformT
@@ -199,12 +199,12 @@ def _has_post_copy_hook(strategy: ModelOffloader, target_key: str) -> bool:
     if param_name is None:
         return False
     component = strategy._component_for_param_name(param_name)
-    if isinstance(component, PinnedWeights):
+    if isinstance(component, PinnedComponent):
         return (
             component.post_copy_hook_key(param_name)
             in component._instance._post_copy_hooks
         )
-    if isinstance(component, StreamedWeights):
+    if isinstance(component, StreamedComponent):
         key = component.post_copy_hook_key(param_name)
         return (
             any(
@@ -920,7 +920,7 @@ class TestLoRATransform:
         s.set_loras([(lora, 0.5)], mode="merge")
         s.activate("cuda")
         try:
-            streamer = s._streamers[0]
+            streamer = s._streamed_components[0]
             streamer._load_block(0)
             merged_qt = m.transformer_blocks[0].attn.weight.data
             assert isinstance(merged_qt, WeightQBytesTensor)
@@ -1442,7 +1442,7 @@ class TestDeactivateCleanupInvariants:
         def streamer_boom() -> None:
             raise RuntimeError("streamer cleanup failed")
 
-        monkeypatch.setattr(s._streamers[0], "deactivate", streamer_boom)
+        monkeypatch.setattr(s._streamed_components[0], "deactivate", streamer_boom)
         s.activate("cuda")
 
         with pytest.raises(RuntimeError):

@@ -11,8 +11,8 @@ Design highlights
 -----------------
 - **Resource-agnostic.** The cache only talks to the
   :class:`CachedResource` protocol — lifecycle methods plus
-  ``cache_bytes`` accounting. Pluggable: today :class:`PinnedWeights`,
-  :class:`ModelOffloader`, and :class:`LoRA`; future resources
+  ``cache_bytes`` accounting. Pluggable: today :class:`ModelOffloader`,
+  :class:`MpsWeights`, and :class:`LoRA`; future resources
   (disk-mmap, NVMe-paged, multi-GPU shard) just satisfy the protocol.
 - **Active-set with refcount.** Multiple keys can be active
   simultaneously (e.g. text encoder and embedding processor in the
@@ -225,8 +225,8 @@ class ActivationError(ModelCacheError):
     entry (drops the strategy reference, removes it from cache state)
     regardless of whether the entry was freshly built or previously
     cached — strategies with multi-step ``activate()`` (e.g.
-    :func:`ModelOffloader`) can fail mid-way after partially
-    installing hooks/pool/composed PinnedWeights, and caching such an
+    :class:`ModelOffloader`) can fail mid-way after partially
+    installing hooks/pool/composed PinnedComponent, and caching such an
     entry as "ready to retry" lies about its state. The next acquire
     rebuilds via the registered factory. The original exception is
     chained via ``__cause__``."""

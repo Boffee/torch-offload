@@ -6,11 +6,11 @@ import pytest
 import torch
 from torch import nn
 
-from torch_offload import LoRA, ModelOffloader, PinnedWeights, merge_lora
+from torch_offload import LoRA, ModelOffloader, merge_lora
 from torch_offload.nvfp4_adapter import Nvfp4Adapter
 from torch_offload.pinned_param import PinnedParam
 from torch_offload.tensor_adapter_factory import storage_key
-from torch_offload.streamed_weights import _param_target_layout
+from torch_offload.streamed_component import _param_target_layout
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -174,7 +174,7 @@ class TestNvfp4Adapter:
         )
 
     @CUDA
-    def test_pinned_weights_cuda_forward_dynamic_nvfp4(self) -> None:
+    def test_model_offloader_cuda_forward_dynamic_nvfp4(self) -> None:
         nvfp4_mod = pytest.importorskip("torchao.prototype.mx_formats.nvfp4_tensor")
         _, kwargs_cls = _nvfp4_modules()
         layer = nn.Linear(64, 128, bias=False, dtype=torch.bfloat16)
@@ -196,7 +196,7 @@ class TestNvfp4Adapter:
             ),
             requires_grad=False,
         )
-        strategy = PinnedWeights(layer)
+        strategy = ModelOffloader(layer)
 
         try:
             x = torch.randn(128, 64, dtype=torch.bfloat16, device="cuda")

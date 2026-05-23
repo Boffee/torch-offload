@@ -102,7 +102,7 @@ def assert_frozen(
     rather than silently freeze.
 
     ``owner`` is surfaced in the error message (e.g.
-    ``"PinnedWeights"``, ``"StreamedWeights"``). ``extra`` is appended
+    ``"PinnedComponent"``, ``"StreamedComponent"``). ``extra`` is appended
     verbatim for owner-specific recovery guidance.
     """
     if not slot.get().requires_grad:
@@ -110,8 +110,8 @@ def assert_frozen(
     msg = (
         f"{owner} cannot manage trainable slot {slot.name!r}: slot "
         "replacement installs a fresh frozen Parameter wrapper, "
-        "breaking optimizer/grad identity. Use PinnedWeights or "
-        "ModelOffloader, which preserve trainable Parameter identity."
+        "breaking optimizer/grad identity. Use ModelOffloader, which "
+        "preserves trainable Parameter identity."
     )
     if extra:
         msg = f"{msg} {extra}"

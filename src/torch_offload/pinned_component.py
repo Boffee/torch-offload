@@ -1,19 +1,10 @@
-"""Whole-model pinned-CPU weight cache for fast bulk DMA to GPU.
+"""Pinned-CPU component for selected model parameters and buffers.
 
-Holds a model's weights in pinned CPU memory so subsequent GPU
-loads are bulk DMA (~200 ms for a 12 GB text encoder at PCIe Gen5 x16) instead
-of re-reading the safetensors from disk (~3-5 s per call).
-
-Use case: a model that fits on GPU when active but should be evicted
-between calls — text encoder during diffusion, VAE between encode and
-decode phases, etc. Different from :func:`ModelOffloader`: no per-block
-streaming, no forward hooks, no LRU. The whole model goes to GPU on
-:meth:`PinnedWeights.activate` and the GPU storage is released on
-:meth:`PinnedWeights.deactivate` by restoring each managed parameter
-or buffer to pinned CPU storage.
-
-Implements :class:`~torch_offload.protocols.ModelStrategy` so it plugs
-into a model cache directly.
+Holds selected slots in pinned CPU memory and bulk-copies them to the
+activation device. This is the component used by :class:`ModelOffloader`
+for both non-streamed slots and whole-model pinning. It satisfies
+:class:`~torch_offload.protocols.ModelStrategyComponent`, not the
+top-level model strategy protocol.
 
 Cross-cutting compatibility caveats (``torch.compile`` incompatibility,
 DDP/FSDP wrap-before requirement, single-thread contract) live in the
@@ -25,8 +16,7 @@ Class-specific caveats
   slots (``module._parameters[leaf]``) are replaced with Parameters
   wrapping pinned CPU storage, trainable parameter ``.data`` points at
   pinned CPU storage while preserving the user's Parameter objects, and
-  registered buffers are replaced with pinned copies. Only use the
-  model via :meth:`activate` or :meth:`use` after wrapping.
+  registered buffers are replaced with pinned copies.
 - Slot replacement (rather than ``param.data`` swap) is required for
   correctness with quanto ``WeightQBytesTensor``: assigning
   ``param.data = new_quanto_tensor`` is a no-op for the inner ``_data``
@@ -44,12 +34,12 @@ Class-specific caveats
   movement or GPU allocation. Construction optimizes peak host memory
   by letting :class:`PinnedParam` repoint plain ``Parameter.data``
   at pinned clones as each pinned parameter is created; if construction or
-  activation raises after that point, retrying the same model/strategy
+  activation raises after that point, retrying the same model/component
   is unsupported — drop references and rebuild from a fresh model
   instance.
 - There is no ``close()``. Pinned memory is freed when the caller
-  drops the strategy AND model references; Python's refcount-based
-  GC reclaims the pinned tensors immediately. The strategy releases
+  drops the component AND model references; Python's refcount-based
+  GC reclaims the pinned tensors immediately. The component releases
   what it owns (its internal slot tracking); the user's model is the
   user's concern.
 - Tied weights *are* deduplicated. Two parameter slots whose values
@@ -78,19 +68,17 @@ from .pinned_module import (
 )
 
 
-class PinnedWeights:
-    """Whole-model pinned-CPU weight cache with bulk GPU transfer.
-
-    Implements :class:`~torch_offload.protocols.ModelStrategy`.
+class PinnedComponent:
+    """Pinned-CPU slot component with bulk device transfer.
 
     On construction, every managed parameter is backed by pinned CPU
     storage (handling quanto decomposition and tied-weight dedup).
     :meth:`activate` allocates GPU tensors for each unique pinned
-    parameter, installs that active storage into the model, and returns
-    the model. Frozen parameters use slot replacement; trainable
-    parameters preserve the user's Parameter objects and swap only
-    ``.data`` so optimizer state remains valid. :meth:`deactivate`
-    restores pinned CPU storage so GPU storage is released by refcount.
+    parameter and installs that active storage into the managed model
+    slots. Frozen parameters use slot replacement; trainable parameters
+    preserve the user's Parameter objects and swap only ``.data`` so
+    optimizer state remains valid. :meth:`deactivate` restores pinned
+    CPU storage so GPU storage is released by refcount.
 
     If trainable params are active on CUDA, run ``optimizer.step()``
     inside :meth:`optimizer_step` so updated GPU bytes are copied back
@@ -99,7 +87,7 @@ class PinnedWeights:
 
     Buffer-only modules (only registered buffers, no params)
     are valid — common for sibling tables like RoPE/positional
-    embeddings managed via :func:`ModelOffloader`'s non-block
+    embeddings managed via :class:`ModelOffloader`'s non-block
     composition. Construction raises only if there is *nothing* to
     manage — neither selected params nor selected registered buffers.
 
@@ -142,12 +130,12 @@ class PinnedWeights:
         # Reject if there is nothing at all to manage — neither selected
         # params nor selected registered buffers.
         # Buffer-only modules (e.g., a pure RoPE/positional table sibling)
-        # are valid: PinnedWeights still gives them pinned-CPU storage and
+        # are valid: PinnedComponent still gives them pinned-CPU storage and
         # the activate/deactivate round-trip, which is exactly what
         # ModelOffloader non-block composition needs.
         if not self._store.params and not self._store.buffers:
             raise ValueError(
-                "PinnedWeights requires at least one parameter or, "
+                "PinnedComponent requires at least one parameter or, "
                 "at least one registered buffer to cache. The selected "
                 "model names contain neither — leave the model unwrapped."
             )
@@ -164,7 +152,7 @@ class PinnedWeights:
         )
 
     # ------------------------------------------------------------------
-    # ModelStrategy protocol
+    # Component API
     # ------------------------------------------------------------------
 
     @property
@@ -182,16 +170,6 @@ class PinnedWeights:
         """Total pinned host bytes held. Tied weights counted once."""
         return self._store.cache_bytes
 
-    @property
-    def model(self) -> nn.Module:
-        """The wrapped model. Stable across activate/deactivate cycles."""
-        assert self._model is not None
-        return self._model
-
-    @property
-    def value(self) -> nn.Module:
-        return self.model
-
     def register_post_copy_hook(
         self, name: str, hook: PostCopyHook,
     ) -> PostCopyHookHandle:
@@ -208,29 +186,28 @@ class PinnedWeights:
         return self._instance.post_copy_hook_key(name)
 
     def activate(self, device: torch.device | str | None = None) -> None:
-        """Activate the wrapped model on ``device``.
+        """Activate the managed slots on ``device``.
 
         CUDA activation bulk-DMAs pinned weights to GPU: per-tensor
         ``.to()`` (non-blocking), then a single ``cuda.synchronize`` to
         make the writes visible. Tied parameter slots all receive the
         same GPU Parameter. CPU activation repoints slots back to the
-        pinned CPU Parameters and performs no device copy. Reach the
-        wrapped model via :attr:`model` once activated.
+        pinned CPU Parameters and performs no device copy.
 
         Calling activate() twice without an intervening deactivate()
         raises before any slot movement or GPU allocation.
 
         **Activation failure semantics:** if CUDA activation fails
-        midway, the strategy is left in an undefined partial state —
+        midway, the component is left in an undefined partial state —
         some slots may be GPU, some pinned-CPU. Retrying activation on
-        that strategy is unsupported; the caller's only supported
+        that component is unsupported; the caller's only supported
         cleanup path is :meth:`deactivate` (which forces all slots back
-        to pinned-CPU) followed by dropping the strategy reference.
+        to pinned-CPU) followed by dropping the component reference.
         """
         assert self._model is not None
         if self._active_device is not None:
             raise RuntimeError(
-                "PinnedWeights.activate() called while already active "
+                "PinnedComponent.activate() called while already active "
                 f"on {self._active_device}. Deactivate first, or check "
                 "for a leaked context manager."
             )
@@ -251,7 +228,7 @@ class PinnedWeights:
             self._active_target = target
         else:
             raise ValueError(
-                "PinnedWeights.activate() supports CUDA or CPU; "
+                "PinnedComponent.activate() supports CUDA or CPU; "
                 f"got {active_device}."
             )
         self._active_device = active_device
@@ -259,7 +236,7 @@ class PinnedWeights:
     def deactivate(self) -> None:
         """Repoint slots back at pinned-CPU Parameters. Idempotent —
         safe to call before activate or multiple times. After
-        deactivate, drop the strategy reference to release pinned
+        deactivate, drop the component reference to release pinned
         memory (and the model reference too if you don't need it
         anymore)."""
         try:
@@ -283,7 +260,7 @@ class PinnedWeights:
         """
         if self._optimizer_step_active:
             raise RuntimeError(
-                "PinnedWeights.optimizer_step() does not support reentrant entry."
+                "PinnedComponent.optimizer_step() does not support reentrant entry."
             )
 
         self._optimizer_step_active = True
@@ -297,7 +274,7 @@ class PinnedWeights:
             ):
                 if target is None:
                     raise RuntimeError(
-                        "PinnedWeights optimizer-step state is inconsistent: "
+                        "PinnedComponent optimizer-step state is inconsistent: "
                         "CUDA active without an active target."
                     )
                 try:
@@ -313,15 +290,6 @@ class PinnedWeights:
         finally:
             self._optimizer_step_active = False
 
-    @contextlib.contextmanager
-    def use(self, device: torch.device | str) -> Iterator[nn.Module]:
-        """Activate on ``device`` for the duration of the context."""
-        self.activate(device)
-        try:
-            yield self.model
-        finally:
-            self.deactivate()
-
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
@@ -330,7 +298,11 @@ class PinnedWeights:
         if device is not None:
             return canonical_device(device)
         raise ValueError(
-            "PinnedWeights.activate() requires a device; pass "
-            "activate(device) or use this strategy through "
-            "ModelCache.use(..., device=...)"
+            "PinnedComponent.activate() requires a device; pass "
+            "activate(device) from the owning strategy/component."
         )
+
+
+__all__ = [
+    "PinnedComponent",
+]

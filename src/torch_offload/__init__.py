@@ -2,25 +2,15 @@
 
 Top-level offload strategies:
 
-- :class:`ModelOffloader` — per-block streaming with optional LoRA
-  merge and trainable-parameter support. Use for models whose
-  individual blocks fit on GPU but the whole model does not.
-  Hooks-based, prefetches upcoming blocks on a secondary CUDA stream,
-  supports gradient checkpointing through autograd backward. By
-  default, trainable params are managed by :class:`PinnedWeights` and
-  stay GPU-resident while active; set ``stream_trainable_weights=True``
-  to stream in-block trainable weights and materialize them only around
-  ``optimizer.step()``. Composes :class:`PinnedWeights` +
-  :class:`StreamedWeights` internally.
-
-- :class:`PinnedWeights` — whole-model pinned-CPU bulk cache. Use for
-  models that fit on GPU when active but should be evicted between
-  calls (e.g., text encoder during diffusion). One CPU->GPU transfer
-  per use; on deactivate, managed parameters and buffers are restored
-  to pinned CPU storage and the GPU storage is released by refcount.
-  CUDA training updates to managed trainable params must run inside
-  ``PinnedWeights.optimizer_step()`` so the pinned CPU cache receives
-  the updated bytes.
+- :class:`ModelOffloader` — whole-model pinned-CPU bulk cache when
+  constructed as ``ModelOffloader(model)``, or per-block streaming when
+  constructed with ``layers_attr`` and ``blocks_to_swap``. Streaming mode
+  supports optional LoRA merge, trainable-parameter support, CUDA
+  prefetch on a secondary stream, and activation checkpointing through
+  autograd backward. By default, trainable params are managed by
+  :class:`PinnedComponent` and stay GPU-resident while active; set
+  ``stream_trainable_weights=True`` to stream in-block trainable weights
+  and materialize them only around ``optimizer.step()``.
 
 - :class:`MpsWeights` — whole-model CPU->MPS materializer. Use for
   frozen models that should become MPS-resident without retaining a
@@ -28,22 +18,22 @@ Top-level offload strategies:
   and immediately replaces its module slot to keep peak host memory
   close to one model plus the current tensor.
 
-The CUDA-oriented :class:`PinnedWeights` and :class:`ModelOffloader`
-share the underlying per-parameter pinned storage from
+The CUDA-oriented :class:`ModelOffloader` shares the underlying
+per-parameter pinned storage from
 :class:`~torch_offload.pinned_param.PinnedParam` (clone + pin
 + optional quanto ``WeightQBytesTensor`` decomposition, GGUF packed
 weights, and TorchAO NVFP4 packed weights).
 
-:class:`PinnedWeights`, :class:`MpsWeights`, and
-:class:`ModelOffloader` implement the :class:`ModelStrategy` Protocol —
+:class:`ModelOffloader` and :class:`MpsWeights` implement the
+:class:`ModelStrategy` Protocol —
 the plug-in contract for storage strategies that :class:`ModelCache`
 consumes.
 
 Package strategies make ``cache_bytes`` final in their constructor, so
 :class:`ModelCache` can admit them without a factory-side ``prepare()``
 dance. ``activate(device)`` then makes the resource usable on the
-requested device. For :class:`PinnedWeights` and :class:`ModelOffloader`,
-``deactivate()`` returns slots to pinned CPU. For :class:`MpsWeights`,
+requested device. For :class:`ModelOffloader`, ``deactivate()`` returns
+slots to pinned CPU. For :class:`MpsWeights`,
 construction has already materialized the model on MPS, so
 ``activate('mps')`` and ``deactivate()`` are lifecycle-only.
 
@@ -58,9 +48,10 @@ recovery of the partially constructed strategy/model is unsupported;
 drop those references and rebuild from a fresh model instance.
 
 :class:`ModelOffloader` composes (in order):
-  1. A :class:`PinnedWeights` for every non-streamed parameter and
+  1. A :class:`PinnedComponent` for every non-streamed parameter and
      buffer, including trainables skipped by block streaming.
-  2. One :class:`StreamedWeights` per ``layers_attr`` path.
+  2. One :class:`StreamedComponent` per ``layers_attr`` path when
+     streaming is configured.
 
 Optional LoRA merging is requested via :meth:`ModelOffloader.set_loras`
 and resolved on activation by installing post-copy hooks for the matched
@@ -110,9 +101,9 @@ from .model_cache import (
 )
 from .model_offloader import ModelOffloader
 from .mps_weights import MpsWeights
-from .pinned_weights import PinnedWeights
+from .pinned_component import PinnedComponent
 from .protocols import CachedResource, ModelStrategy, ModelStrategyComponent, SlotKey
-from .streamed_weights import StreamedWeights
+from .streamed_component import StreamedComponent
 
 __all__ = [
     "ActivationError",
@@ -136,9 +127,9 @@ __all__ = [
     "ModelStrategyComponent",
     "ModelTooLargeError",
     "MpsWeights",
-    "PinnedWeights",
+    "PinnedComponent",
     "ResourceSpec",
     "SlotKey",
-    "StreamedWeights",
+    "StreamedComponent",
     "merge_lora",
 ]

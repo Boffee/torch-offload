@@ -1,14 +1,14 @@
-"""Unified block-streaming strategy with optional LoRA application.
+"""Unified CUDA offload strategy with optional LoRA application.
 
-Composes block streaming, non-streamed pinning, and optional per-weight
-LoRA application into a single :class:`ModelOffloader` class.
+Supports whole-model pinned bulk offload or block streaming, with optional
+per-weight LoRA application in both modes.
 """
 
 from __future__ import annotations
 
 import contextlib
 import logging
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from typing import Literal, Protocol
 
 import torch
@@ -16,9 +16,9 @@ from torch import nn
 
 from ._devices import canonical_device
 from .lora import LoRA, LoRARouteHandle, LoRATransform
-from .pinned_weights import PinnedWeights
+from .pinned_component import PinnedComponent
 from .protocols import ModelStrategyComponent
-from .streamed_weights import StreamedWeights
+from .streamed_component import StreamedComponent
 from .tensor_adapter_factory import select_adapter
 
 logger = logging.getLogger(__name__)
@@ -65,15 +65,17 @@ def _routed_factor_dtype(module: nn.Module) -> torch.dtype:
 
 
 class ModelOffloader:
-    """Stream transformer blocks between pinned CPU and CUDA with
-    optional LoRA merge and trainable-parameter support.
+    """Move a whole model or streamed block groups between pinned CPU and
+    CUDA, with optional LoRA merge and trainable-parameter support.
 
-    CUDA activation uses block streaming plus component-level device
-    movement. CPU activation is pass-through over the pinned
-    host-backed module state.
+    When ``layers_attr`` is omitted, CUDA activation bulk-copies every
+    managed parameter and buffer to CUDA. When ``layers_attr`` is set,
+    CUDA activation streams the selected block groups plus component-level
+    movement for non-streamed state. CPU activation is pass-through over
+    the pinned host-backed module state.
 
-    Composes :class:`PinnedWeights` (non-streamed params and buffers)
-    and one or more :class:`StreamedWeights`\\ s internally. LoRA requests
+    Composes :class:`PinnedComponent` (non-streamed params and buffers)
+    and one or more :class:`StreamedComponent`\\ s internally. LoRA requests
     are recorded via
     :meth:`set_loras` and applied on :meth:`activate`, where merge mode
     installs activation-scoped post-copy hooks so the merge fires
@@ -109,8 +111,8 @@ class ModelOffloader:
     suffices.
 
     By default, trainable params are not streamed through the block
-    residency pool. They are managed by :class:`PinnedWeights`, stay
-    GPU-resident while the offloader is active on CUDA, and must be
+    residency pool. They are managed by :class:`PinnedComponent`, stay
+    GPU-resident while the offload strategy is active on CUDA, and must be
     updated inside :meth:`optimizer_step` so CUDA updates are copied
     back to the pinned CPU cache. CPU activation leaves them in the
     host-backed module state.
@@ -144,16 +146,19 @@ class ModelOffloader:
         on CPU or CUDA; construction clones them directly into pinned
         CPU storage before activation.
     layers_attr:
-        Dotted attribute path(s) to ``nn.ModuleList`` block list(s).
-        Single string or sequence. For PEFT-wrapped models, include
-        the PEFT prefix (e.g. ``"base_model.model.transformer_blocks"``).
+        Optional dotted attribute path(s) to ``nn.ModuleList`` block
+        list(s). When omitted, :class:`ModelOffloader` performs whole-model
+        bulk pinning with no streamed block components. For PEFT-wrapped
+        models, include the PEFT prefix (e.g.
+        ``"base_model.model.transformer_blocks"``).
     blocks_to_swap:
-        Per-group count of blocks to keep on CPU. Single int (broadcast
-        to all groups) or one int per group.
+        Per-group count of blocks to keep on CPU. Required when
+        ``layers_attr`` is set. Single int (broadcast to all groups) or
+        one int per group.
     prefetch_count:
         Per-group prefetch depth. Same broadcasting as *blocks_to_swap*.
     cyclic:
-        Default ``False``. Forwarded to every :class:`StreamedWeights`.
+        Default ``False``. Forwarded to every :class:`StreamedComponent`.
         Set ``True`` for inference loops that iterate the model
         repeatedly (diffusion denoising, multi-step decoders); the
         prefetcher then treats end-of-iteration as wraparound and
@@ -161,7 +166,7 @@ class ModelOffloader:
         ``False`` for single-shot inference or training.
     stream_trainable_weights:
         Default ``False`` skips trainable params in block streaming and
-        manages them with :class:`PinnedWeights`. ``True`` streams
+        manages them with :class:`PinnedComponent`. ``True`` streams
         in-block trainable parameter data with the block residency
         manager. In both modes, wrap optimizer updates in
         :meth:`optimizer_step` so trainable CUDA updates are copied back
@@ -186,106 +191,73 @@ class ModelOffloader:
         the predicate sees the block module and should return
         ``True`` iff that block runs under activation checkpointing.
         Ignored when ``skip_checkpointing_check=True``.
+    include_param_names:
+        Optional PyTorch parameter names to manage in whole-model mode.
+        ``None`` manages all parameters. Only valid when ``layers_attr``
+        is omitted.
+    include_buffer_names:
+        Optional PyTorch buffer names to manage in whole-model mode.
+        ``None`` manages all registered buffers. Only valid when
+        ``layers_attr`` is omitted.
     """
 
     def __init__(
         self,
         model: nn.Module,
         *,
-        layers_attr: str | Sequence[str],
-        blocks_to_swap: int | Sequence[int],
+        layers_attr: str | Sequence[str] | None = None,
+        blocks_to_swap: int | Sequence[int] | None = None,
         prefetch_count: int | Sequence[int] = 2,
         cyclic: bool = False,
         stream_trainable_weights: bool = False,
         skip_checkpointing_check: bool = False,
         is_block_checkpointed: Callable[[nn.Module], bool] | None = None,
+        include_param_names: Iterable[str] | None = None,
+        include_buffer_names: Iterable[str] | None = None,
     ) -> None:
-        layer_paths: list[str] = (
-            [layers_attr] if isinstance(layers_attr, str) else list(layers_attr)
+        layer_paths = _normalize_layer_paths(layers_attr)
+        _validate_constructor_mode(
+            layer_paths=layer_paths,
+            blocks_to_swap=blocks_to_swap,
+            include_param_names=include_param_names,
+            include_buffer_names=include_buffer_names,
         )
-        if not layer_paths:
-            raise ValueError("layers_attr must contain at least one path")
-
-        n = len(layer_paths)
-        swap_list = _broadcast(blocks_to_swap, n, "blocks_to_swap")
-        pf_list = _broadcast(prefetch_count, n, "prefetch_count")
-
-        block_groups: list[list[nn.Module]] = [
-            list(_resolve_layers_attr(model, p)) for p in layer_paths
-        ]
-        for i, blocks in enumerate(block_groups):
-            if not blocks:
-                raise ValueError(
-                    f"layers_attr[{i}] = {layer_paths[i]!r} resolved to empty list"
-                )
-
-        streamed_name_selections = [
-            _streamed_names_for_blocks(
-                blocks,
-                stream_trainables=stream_trainable_weights,
-            )
-            for blocks in block_groups
-        ]
-
-        # By default, streamers skip trainables and PinnedWeights keeps
-        # them GPU-resident while active. With stream_trainable_weights=True,
-        # streamers handle in-block params of both kinds: frozen via
-        # parameter replacement and trainable via identity-preserving
-        # ``.data`` swap.
-        # Gradients are NOT streamed — they live on GPU during backward via
-        # PyTorch's native ``AccumulateGrad`` mechanism.
-        streamers: list[StreamedWeights] = []
-        streamed_param_names: set[str] = set()
-        streamed_buffer_names: set[str] = set()
-        for i, blocks in enumerate(block_groups):
-            stream_param_names, stream_buffer_names = streamed_name_selections[i]
-            streamed_param_names.update(
-                _full_block_names(layer_paths[i], len(blocks), stream_param_names)
-            )
-            streamed_buffer_names.update(
-                _full_block_names(layer_paths[i], len(blocks), stream_buffer_names)
-            )
-            streamers.append(
-                StreamedWeights(
-                    blocks=blocks,
-                    blocks_to_swap=swap_list[i],
-                    prefetch_count=pf_list[i],
-                    cyclic=cyclic,
-                    name=layer_paths[i],
-                    stream_param_names=stream_param_names,
-                    stream_buffer_names=stream_buffer_names,
-                )
-            )
-
-        # PinnedWeights manages every non-streamed param and buffer,
-        # including trainables. In default mode that includes in-block
-        # trainables because streamers skipped them above.
-        pinned_param_names = _all_param_names(model) - streamed_param_names
-        pinned_buffer_names = _all_buffer_names(model) - streamed_buffer_names
-        pinned_weights: PinnedWeights | None = None
-        if pinned_param_names or pinned_buffer_names:
-            pinned_weights = PinnedWeights(
-                model,
-                include_param_names=pinned_param_names,
-                include_buffer_names=pinned_buffer_names,
-            )
-
-        components: list[ModelStrategyComponent] = []
-        if pinned_weights is not None:
-            components.append(pinned_weights)
-        components.extend(streamers)
+        (
+            block_groups,
+            streamed_components,
+            streamed_param_names,
+            streamed_buffer_names,
+        ) = _build_streamed_components(
+            model,
+            layer_paths=layer_paths,
+            blocks_to_swap=blocks_to_swap,
+            prefetch_count=prefetch_count,
+            cyclic=cyclic,
+            stream_trainable_weights=stream_trainable_weights,
+        )
+        pinned_component = _build_pinned_component(
+            model,
+            streamed_param_names=streamed_param_names,
+            streamed_buffer_names=streamed_buffer_names,
+            include_param_names=include_param_names,
+            include_buffer_names=include_buffer_names,
+        )
+        components = _compose_components(pinned_component, streamed_components)
 
         self._model = model
         self._active_device: torch.device | None = None
         self._components = components
-        self._pinned_weights = pinned_weights
-        self._streamers = streamers
+        self._pinned_component = pinned_component
+        self._streamed_components = streamed_components
+        if pinned_component is not None:
+            self._store = pinned_component._store
+            self._instance = pinned_component._instance
         self._teardown_stack: contextlib.ExitStack | None = None
         lora_param_names: set[str] = set()
-        if pinned_weights is not None:
-            lora_param_names.update(pinned_weights.param_names)
-        for streamer in streamers:
-            lora_param_names.update(streamer.param_names)
+        if pinned_component is not None:
+            lora_param_names.update(pinned_component.param_names)
+        for streamed_component in streamed_components:
+            lora_param_names.update(streamed_component.param_names)
         self._lora_param_names = frozenset(lora_param_names)
         self._lora_hook_handles: list[_RemovableHook] = []
         self._block_groups: list[list[nn.Module]] = block_groups
@@ -348,7 +320,7 @@ class ModelOffloader:
         """
         if self._teardown_stack is not None:
             raise RuntimeError(
-                "ModelOffloader.set_loras() requires the offloader "
+                "ModelOffloader.set_loras() requires the strategy "
                 "to be inactive. Call deactivate() first."
             )
         if mode not in ("merge", "routed"):
@@ -462,19 +434,32 @@ class ModelOffloader:
         component = self._component_for_param_name(param_name)
         return component.register_post_copy_hook(param_name, hook)
 
+    def register_post_copy_hook(
+        self,
+        param_name: str,
+        hook: Callable[[nn.Parameter], None],
+    ) -> _RemovableHook:
+        """Register a hook after the owning component copies ``param_name``."""
+        return self._register_post_copy_hook(param_name, hook)
+
+    def post_copy_hook_key(self, param_name: str) -> int:
+        """Stable hook/dedup key for a managed parameter name."""
+        component = self._component_for_param_name(param_name)
+        return component.post_copy_hook_key(param_name)
+
     def _component_for_param_name(
         self,
         param_name: str,
-    ) -> PinnedWeights | StreamedWeights:
+    ) -> PinnedComponent | StreamedComponent:
         if (
-            self._pinned_weights is not None
-            and param_name in self._pinned_weights.param_names
+            self._pinned_component is not None
+            and param_name in self._pinned_component.param_names
         ):
-            return self._pinned_weights
-        for streamer in self._streamers:
-            if param_name in streamer.param_names:
-                return streamer
-        raise KeyError(f"param name {param_name!r} is not managed by this offloader")
+            return self._pinned_component
+        for streamed_component in self._streamed_components:
+            if param_name in streamed_component.param_names:
+                return streamed_component
+        raise KeyError(f"param name {param_name!r} is not managed by this ModelOffloader")
 
     def _clear_active_lora_hooks(self) -> None:
         while self._lora_hook_handles:
@@ -494,6 +479,20 @@ class ModelOffloader:
     @property
     def value(self) -> nn.Module:
         return self._model
+
+    @property
+    def param_names(self) -> frozenset[str]:
+        """Pinned parameter names managed by the non-streamed component."""
+        if self._pinned_component is None:
+            return frozenset()
+        return self._pinned_component.param_names
+
+    @property
+    def buffer_names(self) -> frozenset[str]:
+        """Pinned buffer names managed by the non-streamed component."""
+        if self._pinned_component is None:
+            return frozenset()
+        return self._pinned_component.buffer_names
 
     @property
     def cache_bytes(self) -> int:
@@ -562,7 +561,7 @@ class ModelOffloader:
         managed trainable weights.
 
         On CUDA activation, non-streamed trainables are already active
-        through :class:`PinnedWeights`, while streamer-managed trainables
+        through :class:`PinnedComponent`, while streamed-component trainables
         are materialized on enter after force-evicting loaded blocks.
         On exit, updated trainable bytes are copied back to their pinned
         CPU storage. On CPU activation, this is a guarded no-op.
@@ -577,19 +576,16 @@ class ModelOffloader:
         Typical loop::
 
             loss.backward()
-            with offloader.optimizer_step():
+            with offload.optimizer_step():
                 optimizer.step()
             optimizer.zero_grad()
         """
-        if self._active_device is not None and self._active_device.type == "cpu":
-            yield
-            return
         with contextlib.ExitStack() as stack:
-            if self._pinned_weights is not None:
-                stack.enter_context(self._pinned_weights.optimizer_step())
-            for streamer in self._streamers:
-                if streamer.has_trainables:
-                    stack.enter_context(streamer.optimizer_step())
+            if self._pinned_component is not None:
+                stack.enter_context(self._pinned_component.optimizer_step())
+            for streamed_component in self._streamed_components:
+                if streamed_component.has_trainables:
+                    stack.enter_context(streamed_component.optimizer_step())
             yield
 
     @contextlib.contextmanager
@@ -614,10 +610,28 @@ class ModelOffloader:
 
     # ----------------------------------------------------------- Internals
 
+    @property
+    def _has_streamed_blocks(self) -> bool:
+        return any(
+            _component_streams_tensor_state(component)
+            for component in self._streamed_components
+        )
+
+    def _iter_streamed_block_groups(
+        self,
+    ) -> Iterator[tuple[StreamedComponent, list[nn.Module]]]:
+        for streamed_component, blocks in zip(
+            self._streamed_components,
+            self._block_groups,
+            strict=True,
+        ):
+            if _component_streams_tensor_state(streamed_component):
+                yield streamed_component, blocks
+
     def _enforce_checkpointing_for_trainable_streaming(self) -> None:
-        """Hard-guard: refuse to activate if a streamer manages
+        """Hard-guard: refuse to activate if a streamed_component manages
         trainable params and the configured checkpointing predicate
-        returns ``False`` for any block in that streamer.
+        returns ``False`` for any block in that streamed_component.
 
         Trainable streaming uses ``.data`` swap on the user's
         ``Parameter`` (preserves identity for autograd / optimizer
@@ -652,6 +666,8 @@ class ModelOffloader:
         predicate that knows the framework's conventions, or
         ``skip_checkpointing_check=True`` after manually verifying.
         """
+        if not self._has_streamed_blocks:
+            return
         if self._skip_checkpointing_check:
             return
         if not self._stream_trainable_weights:
@@ -659,8 +675,8 @@ class ModelOffloader:
         if not self._model.training:
             return
 
-        for streamer, blocks in zip(self._streamers, self._block_groups, strict=True):
-            if not streamer.has_trainables:
+        for streamed_component, blocks in self._iter_streamed_block_groups():
+            if not streamed_component.has_trainables:
                 continue
             for block in blocks:
                 if not self._is_block_checkpointed(block):
@@ -675,7 +691,7 @@ class ModelOffloader:
                         "checkpointing — so this is a hard error, "
                         "not a warning.\n\n"
                         "Fix: call model.gradient_checkpointing_enable() "
-                        "before constructing the offloader (HF models, "
+                        "before constructing the ModelOffloader (HF models, "
                         "default detection); pass an "
                         "is_block_checkpointed predicate matching your "
                         "framework's conventions; or, if you wrap each "
@@ -698,6 +714,8 @@ class ModelOffloader:
         is invisible from the module tree, so callers using that style
         should pass ``skip_checkpointing_check=True``.
         """
+        if not self._has_streamed_blocks:
+            return
         if self._warned_about_checkpointing:
             return
         if self._skip_checkpointing_check:
@@ -712,7 +730,7 @@ class ModelOffloader:
 
         any_with = False
         any_without = False
-        for blocks in self._block_groups:
+        for _streamed_component, blocks in self._iter_streamed_block_groups():
             for block in blocks:
                 if self._is_block_checkpointed(block):
                     any_with = True
@@ -749,6 +767,137 @@ class ModelOffloader:
 # ---------------------------------------------------------------------------
 
 
+def _normalize_layer_paths(layers_attr: str | Sequence[str] | None) -> list[str]:
+    if layers_attr is None:
+        return []
+    layer_paths = [layers_attr] if isinstance(layers_attr, str) else list(layers_attr)
+    if not layer_paths:
+        raise ValueError("layers_attr must contain at least one path")
+    return layer_paths
+
+
+def _validate_constructor_mode(
+    *,
+    layer_paths: Sequence[str],
+    blocks_to_swap: int | Sequence[int] | None,
+    include_param_names: Iterable[str] | None,
+    include_buffer_names: Iterable[str] | None,
+) -> None:
+    if layer_paths and blocks_to_swap is None:
+        raise TypeError("ModelOffloader requires blocks_to_swap when layers_attr is set")
+    if not layer_paths and blocks_to_swap is not None:
+        raise ValueError("blocks_to_swap requires layers_attr")
+    if layer_paths and (
+        include_param_names is not None or include_buffer_names is not None
+    ):
+        raise ValueError(
+            "include_param_names/include_buffer_names are only valid "
+            "when layers_attr is omitted."
+        )
+
+
+def _build_streamed_components(
+    model: nn.Module,
+    *,
+    layer_paths: Sequence[str],
+    blocks_to_swap: int | Sequence[int] | None,
+    prefetch_count: int | Sequence[int],
+    cyclic: bool,
+    stream_trainable_weights: bool,
+) -> tuple[list[list[nn.Module]], list[StreamedComponent], set[str], set[str]]:
+    if not layer_paths:
+        return [], [], set(), set()
+
+    assert blocks_to_swap is not None
+    swap_list = _broadcast(blocks_to_swap, len(layer_paths), "blocks_to_swap")
+    pf_list = _broadcast(prefetch_count, len(layer_paths), "prefetch_count")
+    block_groups = _resolve_block_groups(model, layer_paths)
+    streamed_components: list[StreamedComponent] = []
+    streamed_param_names: set[str] = set()
+    streamed_buffer_names: set[str] = set()
+
+    for i, blocks in enumerate(block_groups):
+        stream_param_names, stream_buffer_names = _streamed_names_for_blocks(
+            blocks,
+            stream_trainables=stream_trainable_weights,
+        )
+        streamed_param_names.update(
+            _full_block_names(layer_paths[i], len(blocks), stream_param_names)
+        )
+        streamed_buffer_names.update(
+            _full_block_names(layer_paths[i], len(blocks), stream_buffer_names)
+        )
+        streamed_components.append(
+            StreamedComponent(
+                blocks=blocks,
+                blocks_to_swap=swap_list[i],
+                prefetch_count=pf_list[i],
+                cyclic=cyclic,
+                name=layer_paths[i],
+                stream_param_names=stream_param_names,
+                stream_buffer_names=stream_buffer_names,
+            )
+        )
+
+    return block_groups, streamed_components, streamed_param_names, streamed_buffer_names
+
+
+def _resolve_block_groups(
+    model: nn.Module,
+    layer_paths: Sequence[str],
+) -> list[list[nn.Module]]:
+    block_groups = [list(_resolve_layers_attr(model, p)) for p in layer_paths]
+    for i, blocks in enumerate(block_groups):
+        if not blocks:
+            raise ValueError(
+                f"layers_attr[{i}] = {layer_paths[i]!r} resolved to empty list"
+            )
+    return block_groups
+
+
+def _build_pinned_component(
+    model: nn.Module,
+    *,
+    streamed_param_names: set[str],
+    streamed_buffer_names: set[str],
+    include_param_names: Iterable[str] | None,
+    include_buffer_names: Iterable[str] | None,
+) -> PinnedComponent | None:
+    pinned_param_names = _all_param_names(model) - streamed_param_names
+    pinned_buffer_names = _all_buffer_names(model) - streamed_buffer_names
+    if include_param_names is not None:
+        pinned_param_names = set(include_param_names)
+    if include_buffer_names is not None:
+        pinned_buffer_names = set(include_buffer_names)
+    if not pinned_param_names and not pinned_buffer_names:
+        return None
+    return PinnedComponent(
+        model,
+        include_param_names=pinned_param_names,
+        include_buffer_names=pinned_buffer_names,
+    )
+
+
+def _compose_components(
+    pinned_component: PinnedComponent | None,
+    streamed_components: Sequence[StreamedComponent],
+) -> list[ModelStrategyComponent]:
+    components: list[ModelStrategyComponent] = []
+    if pinned_component is not None:
+        components.append(pinned_component)
+    components.extend(streamed_components)
+    if not components:
+        raise ValueError(
+            "ModelOffloader requires at least one parameter, registered "
+            "buffer, or streamed block to manage."
+        )
+    return components
+
+
+def _component_streams_tensor_state(component: StreamedComponent) -> bool:
+    return bool(component.param_names) or any(component.streamed_buffer_names_by_block)
+
+
 def _streamed_names_for_blocks(
     blocks: Sequence[nn.Module],
     *,
@@ -764,7 +913,7 @@ def _streamed_names_for_blocks(
         ):
             raise ValueError(
                 f"Block {i} selected names differ from block 0. All blocks "
-                "in a StreamedWeights group must select the same parameter "
+                "in a StreamedComponent group must select the same parameter "
                 "and buffer names."
             )
     return param_names, buffer_names

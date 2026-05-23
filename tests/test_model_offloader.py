@@ -1,7 +1,7 @@
 """Tests for the block-streaming machinery in ``torch_offload``.
 
 Covers ``ModelOffloader`` (the public composite),
-and ``StreamedWeights`` (the per-block-list primitive).
+and ``StreamedComponent`` (the per-block-list primitive).
 
 CUDA-only tests gate on availability. CPU activation is pass-through
 over the host-backed pinned state.
@@ -20,8 +20,8 @@ from torch import nn
 from torch_offload import (
     ModelOffloader,
     ModelStrategy,
-    PinnedWeights,
-    StreamedWeights,
+    PinnedComponent,
+    StreamedComponent,
 )
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -138,7 +138,7 @@ class TestConstructorPins:
             # Block weights are pinned via swapped slots.
             for block in m.transformer_blocks:
                 assert block.weight.is_pinned()
-            # Non-block (embed/head) also pinned via composed PinnedWeights.
+            # Non-block (embed/head) also pinned via composed PinnedComponent.
             assert m.embed.weight.is_pinned()
             assert m.head.weight.is_pinned()
             assert strategy.cache_bytes > 0
@@ -176,7 +176,7 @@ class TestLifecycle:
         try:
             strategy.activate("cuda")
             assert strategy._active_device == expected
-            assert strategy._streamers[0]._active_device == expected
+            assert strategy._streamed_components[0]._active_device == expected
         finally:
             strategy.deactivate()
 
@@ -202,9 +202,9 @@ class TestLifecycle:
                 assert strategy._active_device == torch.device("cpu")
                 assert all(
                     s._active_device == torch.device("cpu")
-                    for s in strategy._streamers
+                    for s in strategy._streamed_components
                 )
-                assert all(s._executor is None for s in strategy._streamers)
+                assert all(s._executor is None for s in strategy._streamed_components)
                 assert all(
                     block.weight is pinned
                     for block, pinned in zip(
@@ -305,7 +305,7 @@ class TestLifecycle:
             strategy.deactivate()
 
 
-class TestStreamedWeightsBackendActivation:
+class TestStreamedComponentBackendActivation:
     def test_direct_cpu_activation_uses_host_backed_weights(self) -> None:
         torch.manual_seed(42)
         m_eager = _make_block_model(num_blocks=4, width=8)
@@ -316,7 +316,7 @@ class TestStreamedWeightsBackendActivation:
         with torch.no_grad():
             expected = m_eager(x)
 
-        streamer = StreamedWeights(
+        streamer = StreamedComponent(
             blocks=list(m.transformer_blocks),
             blocks_to_swap=2,
         )
@@ -354,7 +354,7 @@ class TestStreamedWeightsBackendActivation:
         before = {i: block.weight.detach().clone() for i, block in enumerate(blocks)}
         optimizer = torch.optim.SGD(blocks.parameters(), lr=0.1)
 
-        streamer = StreamedWeights(
+        streamer = StreamedComponent(
             blocks=list(blocks),
             blocks_to_swap=1,
         )
@@ -394,7 +394,7 @@ class TestStreamedWeightsBackendActivation:
 
     def test_direct_cpu_double_activate_raises(self) -> None:
         m = _make_block_model(num_blocks=2)
-        streamer = StreamedWeights(
+        streamer = StreamedComponent(
             blocks=list(m.transformer_blocks),
             blocks_to_swap=1,
         )
@@ -449,7 +449,7 @@ class TestCleanup:
 
     @CUDA
     def test_drop_strategy_without_deactivate_does_not_cycle(self) -> None:
-        # Regression: StreamedWeights's forward-pre-hook closure used to
+        # Regression: StreamedComponent's forward-pre-hook closure used to
         # capture `self`, creating a refcount cycle:
         #     layer → _forward_pre_hooks → closure → streamer →
         #     _blocks → layer
@@ -563,7 +563,7 @@ class TestCyclicPrefetch:
     """
 
     def _record_prefetches(
-        self, streamer: StreamedWeights,
+        self, streamer: StreamedComponent,
     ) -> tuple[list[int], object]:
         """Wrap streamer._submit_prefetch to record idx without disabling
         the actual prefetch (so on-GPU residency stays consistent)."""
@@ -588,7 +588,7 @@ class TestCyclicPrefetch:
             layers_attr="transformer_blocks", blocks_to_swap=1,
             prefetch_count=2, cyclic=True,
         )
-        streamer: StreamedWeights = strategy._streamers[0]
+        streamer: StreamedComponent = strategy._streamed_components[0]
 
         with strategy.use("cuda"):
             recorded, _ = self._record_prefetches(streamer)
@@ -620,7 +620,7 @@ class TestCyclicPrefetch:
             layers_attr="transformer_blocks", blocks_to_swap=1,
             prefetch_count=2, cyclic=False,
         )
-        streamer: StreamedWeights = strategy._streamers[0]
+        streamer: StreamedComponent = strategy._streamed_components[0]
 
         with strategy.use("cuda"):
             recorded, _ = self._record_prefetches(streamer)
@@ -648,7 +648,7 @@ class TestCyclicPrefetch:
             layers_attr="transformer_blocks", blocks_to_swap=1,
             prefetch_count=1, cyclic=True,
         )
-        streamer: StreamedWeights = strategy._streamers[0]
+        streamer: StreamedComponent = strategy._streamed_components[0]
 
         with strategy.use("cuda"):
             recorded, _ = self._record_prefetches(streamer)
@@ -707,7 +707,7 @@ class TestCyclicPrefetch:
             layers_attr="transformer_blocks", blocks_to_swap=1,
             prefetch_count=1, cyclic=True,
         )
-        streamer: StreamedWeights = strategy._streamers[0]
+        streamer: StreamedComponent = strategy._streamed_components[0]
 
         with strategy.use("cuda"):
             recorded, _ = self._record_prefetches(streamer)
@@ -892,7 +892,7 @@ class TestActivateFailureCleanup:
             m,
             layers_attr="transformer_blocks", blocks_to_swap=2,
         )
-        streamer: StreamedWeights = strategy._components[-1]
+        streamer: StreamedComponent = strategy._components[-1]
         original_register_hooks = streamer._register_hooks
 
         def broken_register_hooks(*args, **kwargs):
@@ -973,7 +973,7 @@ class TestPrefetchFailureOnDeactivate:
             layers_attr="transformer_blocks", blocks_to_swap=2,
         )
         strategy.activate("cuda")
-        streamer: StreamedWeights = strategy._components[-1]
+        streamer: StreamedComponent = strategy._components[-1]
         # Inject a pre-failed Future so deactivate's drain loop hits it.
         bad_future: Future[None] = Future()
         bad_future.set_exception(RuntimeError("simulated prefetch failure"))
@@ -1017,7 +1017,7 @@ class TestConstructedStateIsInactive:
 
     def test_block_only_model_has_no_non_block_pinned(self) -> None:
         # Edge case: model whose only top-level child IS the block list.
-        # No non-block PinnedWeights in components; cache_bytes from blocks only.
+        # No non-block PinnedComponent in components; cache_bytes from blocks only.
         class BlockOnly(nn.Module):
             def __init__(self):
                 super().__init__()
@@ -1033,9 +1033,9 @@ class TestConstructedStateIsInactive:
             layers_attr="transformer_blocks", blocks_to_swap=2,
         )
         try:
-            # No PinnedWeights component, just StreamedWeights.
+            # No PinnedComponent component, just StreamedComponent.
             non_block_components = [
-                c for c in strategy._components if isinstance(c, PinnedWeights)
+                c for c in strategy._components if isinstance(c, PinnedComponent)
             ]
             assert non_block_components == []
             assert strategy.cache_bytes > 0  # block bytes only
@@ -1203,7 +1203,7 @@ class TestSharedStorageLocalBehavior:
             strategy.deactivate()
 
     def test_non_block_internal_tied_works(self) -> None:
-        # Tied embed↔head WITHIN PinnedWeights: PinnedWeights handles
+        # Tied embed↔head WITHIN PinnedComponent: PinnedComponent handles
         # this via storage-key dedup. Should not raise.
         embed = nn.Embedding(16, 8)
         head = nn.Linear(8, 16, bias=False)
@@ -1228,7 +1228,7 @@ class TestSharedStorageLocalBehavior:
         try:
             assert m.embed.weight is m.head.weight
             non_block = next(
-                c for c in strategy._components if isinstance(c, PinnedWeights)
+                c for c in strategy._components if isinstance(c, PinnedComponent)
             )
             assert non_block.param_names == {"embed.weight", "head.weight"}
             assert (
@@ -1430,7 +1430,7 @@ class TestBlockBuffersPinned:
 
 
 # ---------------------------------------------------------------------------
-# StreamedWeights _activate_pool idempotency
+# StreamedComponent _activate_pool idempotency
 # ---------------------------------------------------------------------------
 
 
@@ -1438,7 +1438,7 @@ class TestActivatePoolIdempotency:
     @CUDA
     def test_same_config_idempotent(self) -> None:
         m = _make_block_model()
-        streamer = StreamedWeights(
+        streamer = StreamedComponent(
             list(m.transformer_blocks),
             blocks_to_swap=1,
         )
@@ -1450,7 +1450,7 @@ class TestActivatePoolIdempotency:
     @CUDA
     def test_mismatched_config_raises(self) -> None:
         m = _make_block_model()
-        streamer = StreamedWeights(
+        streamer = StreamedComponent(
             list(m.transformer_blocks),
             blocks_to_swap=1,
         )
@@ -1485,7 +1485,7 @@ class TestBlockLayoutCompatibility:
         for p in m.parameters():
             p.requires_grad = False
         with pytest.raises(ValueError, match="layout differs"):
-            StreamedWeights(
+            StreamedComponent(
                 blocks=list(m.blocks),
                 blocks_to_swap=1,
             )
@@ -1499,7 +1499,7 @@ class TestBlockLayoutCompatibility:
             for p in b.parameters():
                 p.requires_grad = False
         with pytest.raises(ValueError, match="layout differs"):
-            StreamedWeights(
+            StreamedComponent(
                 blocks=[b0, b1],
                 blocks_to_swap=1,
             )
@@ -1518,7 +1518,7 @@ class TestBlockLayoutCompatibility:
                 self.bar = nn.Parameter(torch.randn(4, 4), requires_grad=False)
 
         with pytest.raises(ValueError, match="layout differs"):
-            StreamedWeights(
+            StreamedComponent(
                 blocks=[A(), B()],
                 blocks_to_swap=1,
             )
@@ -1530,7 +1530,7 @@ class TestBlockLayoutCompatibility:
         block_1.weight.requires_grad_(True)
 
         with pytest.raises(ValueError, match="layout differs"):
-            StreamedWeights(
+            StreamedComponent(
                 blocks=[block_0, block_1],
                 blocks_to_swap=1,
             )
@@ -1553,7 +1553,7 @@ class TestBlockLayoutCompatibility:
                 self.k.weight.requires_grad_(False)
 
         with pytest.raises(ValueError, match="layout differs"):
-            StreamedWeights(
+            StreamedComponent(
                 blocks=[TiedBlock(), UntiedBlock()],
                 blocks_to_swap=1,
             )
@@ -1568,7 +1568,7 @@ class TestBlockLayoutCompatibility:
                 self.register_buffer("table", torch.randn(buffer_size))
 
         with pytest.raises(ValueError, match="buffer layout differs"):
-            StreamedWeights(
+            StreamedComponent(
                 blocks=[Block(4), Block(8)],
                 blocks_to_swap=1,
             )
@@ -1588,7 +1588,7 @@ class TestBlockLayoutCompatibility:
         assert contiguous.stride() != non_contiguous.stride()
 
         with pytest.raises(ValueError, match="buffer layout differs"):
-            StreamedWeights(
+            StreamedComponent(
                 blocks=[Block(contiguous), Block(non_contiguous)],
                 blocks_to_swap=1,
             )
@@ -1611,7 +1611,7 @@ class TestBlockLayoutCompatibility:
                 self.register_buffer("bar", torch.randn(4))
 
         with pytest.raises(ValueError, match="buffer layout differs"):
-            StreamedWeights(
+            StreamedComponent(
                 blocks=[A(), B()],
                 blocks_to_swap=1,
             )
@@ -1636,7 +1636,7 @@ class TestBlockLayoutCompatibility:
         original_pinned = [b.weight.is_pinned() for b in m.blocks]
 
         with pytest.raises(ValueError, match="layout differs"):
-            StreamedWeights(
+            StreamedComponent(
                 blocks=list(m.blocks),
                 blocks_to_swap=1,
             )
@@ -1664,7 +1664,7 @@ class TestMultiComponentCleanup:
         self, monkeypatch,
     ) -> None:
         # ExitStack continues unwinding callbacks even when one raises.
-        # If non-block PinnedWeights raises during deactivate, streamers
+        # If non-block PinnedComponent raises during deactivate, streamers
         # earlier in unwind order have still been deactivated.
 
         m = _make_block_model()
@@ -1672,13 +1672,13 @@ class TestMultiComponentCleanup:
             m,
             layers_attr="transformer_blocks", blocks_to_swap=2,
         )
-        original_deactivate = PinnedWeights.deactivate
+        original_deactivate = PinnedComponent.deactivate
 
-        def broken_deactivate(component: PinnedWeights) -> None:
+        def broken_deactivate(component: PinnedComponent) -> None:
             original_deactivate(component)
             raise RuntimeError("simulated pinned deactivate failure")
 
-        monkeypatch.setattr(PinnedWeights, "deactivate", broken_deactivate)
+        monkeypatch.setattr(PinnedComponent, "deactivate", broken_deactivate)
         try:
             strategy.activate("cuda")
             assert m.embed.weight.is_cuda  # type: ignore[union-attr]
@@ -1686,24 +1686,24 @@ class TestMultiComponentCleanup:
             with pytest.raises(RuntimeError, match="simulated pinned deactivate failure"):
                 strategy.deactivate()
 
-            # PinnedWeights restored slots before raising, and streamers
+            # PinnedComponent restored slots before raising, and streamers
             # were already unwound in LIFO order.
             assert m.embed.weight.is_pinned()  # type: ignore[union-attr]
-            assert not strategy._streamers[0]._hooks
+            assert not strategy._streamed_components[0]._hooks
             assert strategy._teardown_stack is None
         finally:
             strategy.deactivate()
 
 
 # ---------------------------------------------------------------------------
-# StreamedWeights name selection
+# StreamedComponent name selection
 # ---------------------------------------------------------------------------
 
 
 class TestStreamedNameSelection:
-    def test_streamed_weights_exposes_owned_block_local_names(self) -> None:
+    def test_streamed_component_exposes_owned_block_local_names(self) -> None:
         m = _make_block_model()
-        streamer = StreamedWeights(
+        streamer = StreamedComponent(
             blocks=list(m.transformer_blocks),
             blocks_to_swap=2,
         )
@@ -1717,9 +1717,9 @@ class TestStreamedNameSelection:
         finally:
             streamer.deactivate()
 
-    def test_streamed_weights_exposes_addressable_param_names(self) -> None:
+    def test_streamed_component_exposes_addressable_param_names(self) -> None:
         m = _make_block_model()
-        streamer = StreamedWeights(
+        streamer = StreamedComponent(
             blocks=list(m.transformer_blocks),
             blocks_to_swap=2,
             name="transformer_blocks",
@@ -1732,9 +1732,9 @@ class TestStreamedNameSelection:
         finally:
             streamer.deactivate()
 
-    def test_streamed_weights_registers_post_copy_hook_by_param_name(self) -> None:
+    def test_streamed_component_registers_post_copy_hook_by_param_name(self) -> None:
         m = _make_block_model()
-        streamer = StreamedWeights(
+        streamer = StreamedComponent(
             blocks=list(m.transformer_blocks),
             blocks_to_swap=2,
             name="transformer_blocks",
@@ -1752,9 +1752,9 @@ class TestStreamedNameSelection:
         finally:
             streamer.deactivate()
 
-    def test_streamed_weights_rejects_unknown_post_copy_hook_name(self) -> None:
+    def test_streamed_component_rejects_unknown_post_copy_hook_name(self) -> None:
         m = _make_block_model()
-        streamer = StreamedWeights(
+        streamer = StreamedComponent(
             blocks=list(m.transformer_blocks),
             blocks_to_swap=2,
             name="transformer_blocks",
@@ -1768,7 +1768,7 @@ class TestStreamedNameSelection:
         finally:
             streamer.deactivate()
 
-    def test_streamed_weights_include_names_select_owned_entries(self) -> None:
+    def test_streamed_component_include_names_select_owned_entries(self) -> None:
         class Block(nn.Module):
             def __init__(self):
                 super().__init__()
@@ -1781,7 +1781,7 @@ class TestStreamedNameSelection:
         skipped_params = [block.skip for block in blocks]
         skipped_buffer_ptrs = [block.skip_buffer.data_ptr() for block in blocks]
 
-        streamer = StreamedWeights(
+        streamer = StreamedComponent(
             blocks=blocks,
             blocks_to_swap=1,
             stream_param_names={"keep"},
@@ -1811,10 +1811,10 @@ class TestStreamedNameSelection:
         )
         try:
             streamer = next(
-                c for c in strategy._components if isinstance(c, StreamedWeights)
+                c for c in strategy._components if isinstance(c, StreamedComponent)
             )
             non_block = next(
-                c for c in strategy._components if isinstance(c, PinnedWeights)
+                c for c in strategy._components if isinstance(c, PinnedComponent)
             )
 
             assert streamer.streamed_param_names_by_block == [["weight"]] * len(
@@ -1834,16 +1834,16 @@ class TestStreamedNameSelection:
 # ---------------------------------------------------------------------------
 
 
-class TestStreamedWeightsContractGuard:
-    """StreamedWeights now handles in-block trainables natively via
+class TestStreamedComponentContractGuard:
+    """StreamedComponent now handles in-block trainables natively via
     ``.data`` swap (preserves user Parameter identity for autograd /
     optimizer state). The composer routes any non-streamed trainables to
-    ``PinnedWeights``."""
+    ``PinnedComponent``."""
 
     def test_direct_unskipped_trainable_constructs(self) -> None:
         block_0 = nn.Linear(4, 4, bias=False)  # default requires_grad=True
         block_1 = nn.Linear(4, 4, bias=False)
-        streamer = StreamedWeights(
+        streamer = StreamedComponent(
             blocks=[block_0, block_1],
             blocks_to_swap=1,
         )
@@ -1857,7 +1857,7 @@ class TestStreamedWeightsContractGuard:
     def test_direct_empty_param_name_selection_constructs(self) -> None:
         block_0 = nn.Linear(4, 4, bias=False)  # trainable
         block_1 = nn.Linear(4, 4, bias=False)  # trainable
-        streamer = StreamedWeights(
+        streamer = StreamedComponent(
             blocks=[block_0, block_1],
             blocks_to_swap=1,
             stream_param_names=set(),
@@ -1876,7 +1876,7 @@ class TestStreamedWeightsContractGuard:
         blocks = [BufferBlock(), BufferBlock()]
         buffer_ptrs = [block.table.data_ptr() for block in blocks]
 
-        streamer = StreamedWeights(
+        streamer = StreamedComponent(
             blocks=blocks,
             blocks_to_swap=1,
             stream_buffer_names=set(),
@@ -1892,7 +1892,7 @@ class TestStreamedWeightsContractGuard:
         original_params = [block_0.weight, block_1.weight]
 
         with pytest.raises(ValueError, match="unknown block-local names"):
-            StreamedWeights(
+            StreamedComponent(
                 blocks=[block_0, block_1],
                 blocks_to_swap=1,
                 stream_param_names={"missing"},
@@ -1906,7 +1906,7 @@ class TestMixedGradTieDetection:
 
     def test_intra_non_block_mixed_grad_tie_raises(self) -> None:
         # Two distinct Parameter objects sharing storage, both in the
-        # PinnedWeights store, with mixed grad.
+        # PinnedComponent store, with mixed grad.
         shared = torch.randn(4, 4)
         a = nn.Parameter(shared, requires_grad=True)
         b = nn.Parameter(shared, requires_grad=False)
@@ -1933,7 +1933,7 @@ class TestMixedGradTieDetection:
 
     def test_all_trainable_distinct_parameter_tie_constructs(self) -> None:
         # Two distinct Parameter objects sharing storage, both trainable.
-        # Default mode skips trainables in StreamedWeights, so PinnedWeights
+        # Default mode skips trainables in StreamedComponent, so PinnedComponent
         # owns and deduplicates the shared storage.
         shared = torch.randn(4, 4)
         a = nn.Parameter(shared, requires_grad=True)
@@ -2022,8 +2022,8 @@ class TestMixedGradTieDetection:
             strategy.deactivate()
 
     def test_all_trainable_same_parameter_default_mode_constructs(self) -> None:
-        # Default mode skips all trainables in StreamedWeights and manages
-        # them through PinnedWeights, so all-trainable shared storage
+        # Default mode skips all trainables in StreamedComponent and manages
+        # them through PinnedComponent, so all-trainable shared storage
         # remain valid.
         shared = nn.Parameter(torch.randn(4, 4), requires_grad=True)
 
@@ -2125,7 +2125,7 @@ class TestMixedGradTieDetection:
 class TestLoRAInBlockRouting:
     """LoRA-shaped models: blocks contain frozen base layers plus
     trainable adapter layers. The composer must route the base to
-    StreamedWeights and, in default mode, the adapters to PinnedWeights; neither
+    StreamedComponent and, in default mode, the adapters to PinnedComponent; neither
     strategy's contract guard should fire on a well-formed LoRA model.
     """
 
@@ -2162,7 +2162,7 @@ class TestLoRAInBlockRouting:
         )
         try:
             streamers = [
-                c for c in strat._components if isinstance(c, StreamedWeights)
+                c for c in strat._components if isinstance(c, StreamedComponent)
             ]
             assert len(streamers) == 1
             streamer = streamers[0]
@@ -2173,9 +2173,9 @@ class TestLoRAInBlockRouting:
         finally:
             strat.deactivate()
 
-    def test_default_routes_in_block_lora_to_pinned_weights(self) -> None:
-        # Default mode skips in-block trainables in StreamedWeights and
-        # keeps them GPU-resident through PinnedWeights while active.
+    def test_default_routes_in_block_lora_to_pinned_component(self) -> None:
+        # Default mode skips in-block trainables in StreamedComponent and
+        # keeps them GPU-resident through PinnedComponent while active.
         class M(nn.Module):
             def __init__(self, blocks):
                 super().__init__()
@@ -2188,7 +2188,7 @@ class TestLoRAInBlockRouting:
         )
         try:
             streamers = [
-                c for c in strat._components if isinstance(c, StreamedWeights)
+                c for c in strat._components if isinstance(c, StreamedComponent)
             ]
             assert len(streamers) == 1
             streamer = streamers[0]
@@ -2197,7 +2197,7 @@ class TestLoRAInBlockRouting:
                 ["base.weight"],
             ]
             pinned = next(
-                c for c in strat._components if isinstance(c, PinnedWeights)
+                c for c in strat._components if isinstance(c, PinnedComponent)
             )
             assert pinned.param_names == {
                 "transformer_blocks.0.lora_a.weight",
@@ -2210,7 +2210,7 @@ class TestLoRAInBlockRouting:
 
     def test_composer_partitions_names_correctly(self) -> None:
         # Through-test: the composer subtracts streamed full names from
-        # model names to form PinnedWeights include-name sets. Verify that
+        # model names to form PinnedComponent include-name sets. Verify that
         # streamed block names are excluded and non-streamed trainables are
         # included.
         class M(nn.Module):
@@ -2235,9 +2235,9 @@ class TestLoRAInBlockRouting:
         )
         try:
             pinned = next(
-                c for c in strat._components if isinstance(c, PinnedWeights)
+                c for c in strat._components if isinstance(c, PinnedComponent)
             )
-            # PinnedWeights manages every non-streamed parameter, including
+            # PinnedComponent manages every non-streamed parameter, including
             # trainable_bias.
             assert pinned.param_names == {"frozen_head.weight", "trainable_bias"}
             for name, param in m.named_parameters(remove_duplicate=False):
@@ -2246,7 +2246,7 @@ class TestLoRAInBlockRouting:
                 else:
                     assert name not in pinned.param_names, (
                         f"param {name} (requires_grad={param.requires_grad}) "
-                        "leaked into PinnedWeights"
+                        "leaked into PinnedComponent"
                     )
         finally:
             strat.deactivate()
@@ -2421,6 +2421,39 @@ class TestTrainingWarning:
         assert not any(
             "gradient_checkpointing" in r.message for r in caplog.records
         )
+
+    def test_silent_when_default_mode_streams_no_block_state(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        class AllTrainableBlocks(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.transformer_blocks = nn.ModuleList(
+                    nn.Linear(4, 4, bias=False) for _ in range(2)
+                )
+
+        m = AllTrainableBlocks()
+        offloader = ModelOffloader(
+            m,
+            layers_attr="transformer_blocks",
+            blocks_to_swap=1,
+        )
+        try:
+            assert not offloader._has_streamed_blocks
+            assert offloader._streamed_components[0].param_names == frozenset()
+            assert offloader._streamed_components[0].streamed_buffer_names_by_block == [
+                [],
+                [],
+            ]
+
+            with caplog.at_level(logging.WARNING, logger=_OFFLOADER_LOGGER):
+                offloader._warn_if_training_without_checkpointing()
+
+            assert not any(
+                "gradient_checkpointing" in r.message for r in caplog.records
+            )
+        finally:
+            offloader.deactivate()
 
     def test_silent_when_hf_flag_set_on_all_blocks(
         self, caplog: pytest.LogCaptureFixture
@@ -2644,7 +2677,7 @@ class TestInBlockTrainableCheckpointingGuard:
         offloader._enforce_checkpointing_for_trainable_streaming()  # no raise
 
 
-class TestStreamedWeightsActivateTwice:
+class TestStreamedComponentActivateTwice:
     @CUDA
     def test_double_activate_raises(self) -> None:
         m = _make_block_model(num_blocks=4)
@@ -2658,7 +2691,7 @@ class TestStreamedWeightsActivateTwice:
             # composer's activate handles its own teardown ExitStack,
             # but the streamer itself must hard-guard against
             # double-install of forward-pre hooks.
-            streamer = offloader._streamers[0]
+            streamer = offloader._streamed_components[0]
             with pytest.raises(RuntimeError, match="already.*active"):
                 streamer.activate("cuda")
         finally:
@@ -2737,7 +2770,7 @@ class TestInBlockTrainableStreamingEndToEnd:
     @CUDA
     def test_default_optimizer_step_updates_match_baseline(self) -> None:
         # Default mode keeps in-block LoRA trainables out of the streamer;
-        # ModelOffloader.optimizer_step must still sync their PinnedWeights
+        # ModelOffloader.optimizer_step must still sync their PinnedComponent
         # CPU cache after the optimizer mutates CUDA data.
         torch.manual_seed(0)
         m_baseline = _make_lora_in_block_model(num_blocks=4, width=8, rank=2)

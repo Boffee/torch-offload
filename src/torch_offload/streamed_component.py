@@ -1,6 +1,6 @@
 """Block-streaming primitive for memory-efficient training and inference.
 
-A :class:`StreamedWeights` manages a single block list whose blocks
+A :class:`StreamedComponent` manages a single block list whose blocks
 share the same parameter layout (names, shapes, dtypes, and any
 tensor-adapter wrapper metadata): pins the params to CPU at
 construction time, streams them to GPU on demand via forward-pre
@@ -8,7 +8,7 @@ hooks, and uses a pre-allocated GPU slot pool plus a background
 prefetcher to overlap DMA with compute. On CPU, the host-backed
 pinned state is used directly without streaming. Heterogeneous block lists
 (e.g. Flux's two block kinds) split into multiple
-:class:`StreamedWeights` instances composed via :class:`ModelOffloader`.
+:class:`StreamedComponent` instances composed via :class:`ModelOffloader`.
 
 In-block trainable params (LoRA adapters) flow through the same slot
 pool; pinned module instances branch on the source trainable flag to swap
@@ -20,18 +20,18 @@ is materialized around ``optimizer.step()`` via :meth:`optimizer_step`.
 This is the sharp, low-level primitive. It does NOT manage:
 
 - Non-block parts of the model (parent-module state, sibling
-  modules) — caller derives :class:`PinnedWeights` include-name sets
+  modules) — caller derives :class:`PinnedComponent` include-name sets
   by excluding the streamer's owned block-local names.
 - Out-of-block trainable parameter movement — caller handles that
-  alongside non-streamed parameters, usually with :class:`PinnedWeights`.
+  alongside non-streamed parameters, usually with :class:`PinnedComponent`.
 - Shared storage with tensors outside the streamed block list — caller
   must choose a valid composition; use whole-model
-  :class:`PinnedWeights` if sharing must be preserved.
+  :class:`PinnedComponent` if sharing must be preserved.
 - Activation-checkpointing enforcement — required for in-block
   trainable streaming, but checked at the composer level.
 
-Most users want :func:`ModelOffloader` (the blessed safe
-API). Reach for :class:`StreamedWeights` directly only when you need
+Most users want :class:`ModelOffloader` (the blessed safe
+API). Reach for :class:`StreamedComponent` directly only when you need
 bespoke composition (e.g., multiple block lists like Flux's
 ``transformer_blocks`` + ``single_transformer_blocks``).
 """
@@ -194,7 +194,7 @@ def _check_block_layouts_match(
         if sig(block_params[i]) != ref:
             raise ValueError(
                 f"Block {i} param layout differs from block 0. "
-                "All blocks in a StreamedWeights group must share the "
+                "All blocks in a StreamedComponent group must share the "
                 "same param structure (names, storage grouping, "
                 "requires_grad, shapes, dtypes, and any tensor-adapter "
                 "wrapper metadata). Split heterogeneous block lists "
@@ -204,7 +204,7 @@ def _check_block_layouts_match(
         if buffer_sig(block_buffers[i]) != ref_buffers:
             raise ValueError(
                 f"Block {i} buffer layout differs from block 0. "
-                "All blocks in a StreamedWeights group must share the "
+                "All blocks in a StreamedComponent group must share the "
                 "same buffer structure (names, shapes, dtypes, and "
                 "tensor layouts). Split heterogeneous block lists "
                 "across separate `layers_attr=[...]` groups in "
@@ -289,7 +289,7 @@ def _validate_streamed_names_known(
     missing = sorted(names - known_names)
     if missing:
         raise ValueError(
-            "StreamedWeights cannot select unknown block-local names: "
+            "StreamedComponent cannot select unknown block-local names: "
             f"{_format_names(missing)}."
         )
 
@@ -309,7 +309,7 @@ def _pin_block_module_instances(
     Pre-pin validation failures do not pin and do not mutate module
     parameters or buffers. Once pinning starts, :class:`PinnedParam` may use its
     low-peak ``Parameter.data`` repointing optimization; recovery from
-    a pin-time failure is unsupported, matching :class:`PinnedWeights`.
+    a pin-time failure is unsupported, matching :class:`PinnedComponent`.
     """
     # Walk each block to collect selected param/buffer names WITHOUT
     # pinning anything. Pinning runs only after the block layout check
@@ -406,8 +406,8 @@ def _streamed_param_name(
 
 def _streamed_log_label(name: str | None, block_count: int) -> str:
     if name is None:
-        return f"StreamedWeights({block_count} blocks)"
-    return f"StreamedWeights[{name}]"
+        return f"StreamedComponent({block_count} blocks)"
+    return f"StreamedComponent[{name}]"
 
 
 # ---------------------------------------------------------------------------
@@ -449,11 +449,11 @@ class _BlockTracker:
 
 
 # ---------------------------------------------------------------------------
-# StreamedWeights — public block-streaming primitive
+# StreamedComponent — public block-streaming primitive
 # ---------------------------------------------------------------------------
 
 
-class StreamedWeights:
+class StreamedComponent:
     """Streams a single block list between pinned CPU and CUDA.
 
     The sharp, low-level streaming primitive. Manages the block list's
@@ -466,15 +466,15 @@ class StreamedWeights:
     Does not touch parent modules, sibling modules, or out-of-block
     trainable parameters — those are the composer's responsibility.
 
-    A :class:`StreamedWeights` is a *component* meant to be composed
+    A :class:`StreamedComponent` is a *component* meant to be composed
     inside a :class:`~torch_offload.model_offloader.ModelOffloader`.
     It deliberately does NOT implement
     :class:`~torch_offload.protocols.ModelStrategy` (its
     :meth:`activate` returns ``None`` because it doesn't own the
     model). For top-level use, build a strategy via
-    :func:`~torch_offload.model_offloader.ModelOffloader`.
+    :class:`~torch_offload.model_offloader.ModelOffloader`.
 
-    Lifecycle is uniform with :class:`PinnedWeights`: ``__init__``
+    Lifecycle is uniform with :class:`PinnedComponent`: ``__init__``
     pins (so ``cache_bytes`` is final at construction time, ready
     for :class:`~torch_offload.model_cache.ModelCache` admission),
     ``activate`` brings to CUDA or marks CPU active, ``deactivate`` returns state to
@@ -565,7 +565,7 @@ class StreamedWeights:
         if prefetch_count < 0:
             raise ValueError(f"prefetch_count ({prefetch_count}) must be >= 0")
 
-        # Pin in __init__ — uniform lifecycle with PinnedWeights, and
+        # Pin in __init__ — uniform lifecycle with PinnedComponent, and
         # ModelCache integration sees a final `cache_bytes` immediately.
         # Block instance construction validates that every block shares
         # the same pool-compatible layout before any model state is
@@ -693,13 +693,13 @@ class StreamedWeights:
         if device is not None:
             return canonical_device(device)
         raise ValueError(
-            "StreamedWeights.activate() requires a device"
+            "StreamedComponent.activate() requires a device"
         )
 
     def _require_active_device(self) -> torch.device:
         device = self._active_device
         if device is None:
-            raise RuntimeError("StreamedWeights has no active device")
+            raise RuntimeError("StreamedComponent has no active device")
         return device
 
     # ------------------------------------------------------------------
@@ -730,7 +730,7 @@ class StreamedWeights:
         # slot pool on top of an active one.
         if self._active_device is not None:
             raise RuntimeError(
-                "StreamedWeights.activate() called while already "
+                "StreamedComponent.activate() called while already "
                 "active. Deactivate first, or check for a leaked "
                 "context manager."
             )
@@ -740,7 +740,7 @@ class StreamedWeights:
             return
         if active_device.type != "cuda":
             raise ValueError(
-                "StreamedWeights.activate() supports CUDA or CPU; "
+                "StreamedComponent.activate() supports CUDA or CPU; "
                 f"got {active_device}."
             )
         self._activate_cuda_resolved(active_device)
@@ -884,7 +884,7 @@ class StreamedWeights:
             if self._active_device is not None and self._active_device.type == "cpu":
                 if self._optimizer_step_active:
                     raise RuntimeError(
-                        "StreamedWeights.optimizer_step() does not support "
+                        "StreamedComponent.optimizer_step() does not support "
                         "reentrant entry."
                     )
                 self._optimizer_step_active = True
@@ -894,13 +894,13 @@ class StreamedWeights:
                     self._optimizer_step_active = False
                 return
             raise RuntimeError(
-                "StreamedWeights.optimizer_step() called on inactive "
+                "StreamedComponent.optimizer_step() called on inactive "
                 "streamer. Use it inside the offloader's context "
                 "manager, between backward and the next forward."
             )
         if self._optimizer_step_active:
             raise RuntimeError(
-                "StreamedWeights.optimizer_step() does not support "
+                "StreamedComponent.optimizer_step() does not support "
                 "reentrant entry. A nested optimizer-step boundary would "
                 "scatter the outer step's stale pinned bytes on top of "
                 "the inner update."
@@ -1043,7 +1043,7 @@ class StreamedWeights:
             existing = self._pool_config
             if existing != (num_gpu_slots, device):
                 raise ValueError(
-                    f"StreamedWeights pool already activated with "
+                    f"StreamedComponent pool already activated with "
                     f"{existing}; cannot re-activate with ({num_gpu_slots}, "
                     f"{device}). Call _deactivate_pool() first."
                 )
@@ -1354,5 +1354,5 @@ class StreamedWeights:
 
 
 __all__ = [
-    "StreamedWeights",
+    "StreamedComponent",
 ]

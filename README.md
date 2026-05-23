@@ -14,9 +14,9 @@ to be lifted into its own package when a second consumer appears.
 | Module | Role |
 |---|---|
 | `protocols.py` | `CachedResource` (generic), `ModelStrategy` / `ModelStrategyComponent` plug-in contracts; `SlotKey` topology key |
-| `pinned_weights.py` | `PinnedWeights` — whole-model bulk pinned-CPU↔GPU strategy |
-| `streamed_weights.py` | `StreamedWeights` — sharp per-block-list streaming primitive (component) |
-| `model_offloader.py` | `ModelOffloader` — unified composite: block streaming + non-streamed pinning + optional LoRA merge |
+| `model_offloader.py` | `ModelOffloader` — whole-model bulk pinned-CPU↔GPU or streamed block offload strategy |
+| `pinned_component.py` | `PinnedComponent` — lifecycle-only pinned slot manager used by `ModelOffloader` |
+| `streamed_component.py` | `StreamedComponent` — sharp per-block-list streaming primitive (component) |
 | `lora.py` | `LoRA`, `LoRATransform`, `LoRARouteHandle` — pinned factor storage + merge / routed-hook application |
 | `merge.py` | `merge_lora()` — permanent in-place LoRA merge into base weights (alternative to `set_loras`) |
 | `pinned_param.py` | `PinnedParam` — per-parameter pinning primitive (handles quanto, GGUF, and TorchAO NVFP4 via adapters) |
@@ -53,18 +53,18 @@ This library gives you:
 
 | Situation | Use |
 |---|---|
-| Model fits on GPU when active; want fast eviction between calls | **`PinnedWeights`** — bulk DMA, ~200 ms for 12 GB at PCIe Gen5 x16 |
-| Model too big for a CUDA GPU even when active | **`ModelOffloader`** — streams transformer blocks via forward hooks |
+| Model fits on GPU when active; want fast eviction between calls | **`ModelOffloader(model)`** — bulk DMA, ~200 ms for 12 GB at PCIe Gen5 x16 |
+| Model too big for a CUDA GPU even when active | **`ModelOffloader(model, layers_attr=..., blocks_to_swap=...)`** — streams transformer blocks via forward hooks |
 | Multiple models swap in/out across a script | Wrap each in a strategy, hand to **`ModelCache`** |
 
-## Quick start: PinnedWeights
+## Quick start: whole-model offload
 
 ```python
 import torch
-from torch_offload import PinnedWeights
+from torch_offload import ModelOffloader
 
 model = build_my_model()  # any nn.Module
-strategy = PinnedWeights(model)
+strategy = ModelOffloader(model)
 device = torch.device("cuda")
 
 # Construction pays the pinning cost (clone + pin_memory).
@@ -78,7 +78,7 @@ with strategy.use(device) as gpu_model:
 del strategy, model  # drop refs to free pinned host memory
 ```
 
-`PinnedWeights` mutates the model in place: frozen `nn.Parameter`
+`ModelOffloader` mutates the model in place: frozen `nn.Parameter`
 slots get repointed at Parameters wrapping pinned CPU storage,
 trainable Parameter objects keep their identity and point their
 `.data` at pinned CPU storage, and buffers are replaced with pinned
@@ -102,7 +102,7 @@ import torch
 from torch_offload import ModelOffloader
 
 # Constructor pins everything; cache_bytes is final immediately.
-offloader = ModelOffloader(
+offload = ModelOffloader(
     model,
     layers_attr="transformer_blocks",  # path to the nn.ModuleList
     blocks_to_swap=24,                 # offload N blocks; rest GPU-resident
@@ -110,13 +110,13 @@ offloader = ModelOffloader(
 )
 device = torch.device("cuda")
 
-with offloader.use(device) as gpu_model:
+with offload.use(device) as gpu_model:
     output = gpu_model(input_tensor)
 
-del offloader, model  # drop refs to free pinned host memory
+del offload, model  # drop refs to free pinned host memory
 ```
 
-`ModelOffloader` only streams on CUDA. Activating the base offloader on
+`ModelOffloader` only streams on CUDA. Activating the strategy on
 `cpu` is a pass-through over the already-installed pinned CPU storage:
 no slot pool, no streaming hooks, no weight copies.
 `set_loras(..., mode="merge")` is CUDA-only; use routed LoRA mode for
@@ -124,17 +124,17 @@ CPU activation. Routed LoRA still installs forward hooks and materializes
 LoRA factors on the activation device.
 
 By default, trainable parameters (e.g. LoRA adapters) are managed by
-the composed `PinnedWeights`: they move to GPU on CUDA activation and
+the composed `PinnedComponent`: they move to GPU on CUDA activation and
 back to pinned CPU storage on deactivate. On CPU activation they stay in
 the host-backed module slots. Wrap CUDA optimizer updates in
-`offloader.optimizer_step()` so updated trainable bytes are copied back
+`offload.optimizer_step()` so updated trainable bytes are copied back
 to pinned CPU storage before deactivation.
 
 To reduce trainable-weight residency during training, opt into
 streaming in-block trainable weights:
 
 ```python
-offloader = ModelOffloader(
+offload = ModelOffloader(
     model,
     layers_attr="transformer_blocks",
     blocks_to_swap=24,
@@ -162,7 +162,7 @@ but still provide a compatible logical Linear weight shape and compute
 dtype. `PinnedParam` remains a storage primitive; LoRA merge mode asks
 the selected adapter for the required update capability.
 
-`set_loras()` records the replacement request while the offloader is
+`set_loras()` records the replacement request while the offload is
 inactive. Target matching is resolved during activation; target
 compatibility can be preflighted with `LoRATransform.validate_target()`
 or validated when the merge hook applies.
@@ -172,7 +172,7 @@ import torch
 from torch_offload import ModelOffloader, LoRA
 from safetensors.torch import load_file
 
-offloader = ModelOffloader(
+offload = ModelOffloader(
     model,
     layers_attr="transformer_blocks",
     blocks_to_swap=24,
@@ -181,16 +181,16 @@ offloader = ModelOffloader(
 device = torch.device("cuda")
 
 # Request LoRAs for the next activation (must be called while deactivated)
-offloader.set_loras([
+offload.set_loras([
     (LoRA(state_dict=load_file("lora_a.safetensors")), 0.8),
     (LoRA(state_dict=load_file("lora_b.safetensors")), 0.5),
 ])
 
-with offloader.use(device) as gpu_model:
+with offload.use(device) as gpu_model:
     output = gpu_model(input_tensor)
 
 # Switch to different LoRAs or clear (base-only)
-offloader.set_loras([])
+offload.set_loras([])
 ```
 
 Block reload from pristine pinned CPU storage automatically clears
@@ -236,7 +236,7 @@ same parameter layout (names/shapes/dtypes/quant-metadata) — split
 heterogeneous block lists into separate `layers_attr` entries:
 
 ```python
-offloader = ModelOffloader(
+offload = ModelOffloader(
     model,
     layers_attr=["transformer_blocks", "single_transformer_blocks"],
     blocks_to_swap=[8, 24],   # per-group; or pass a single int for both
@@ -277,7 +277,7 @@ safe because no autograd graph spans across reuses.
 import torch
 from torch_offload import ModelOffloader
 
-offloader = ModelOffloader(
+offload = ModelOffloader(
     model,
     layers_attr="transformer_blocks",
     blocks_to_swap=24,
@@ -287,11 +287,12 @@ device = torch.device("cuda")
 model.gradient_checkpointing_enable()  # required for training
 model.train()
 
-with offloader.use(device) as gpu_model:
+with offload.use(device) as gpu_model:
     for batch in loader:
         loss = gpu_model(**batch).loss
         loss.backward()
-        optimizer.step()
+        with offload.optimizer_step():
+            optimizer.step()
         optimizer.zero_grad()
 ```
 
@@ -311,12 +312,12 @@ materializes streamed trainable weights on GPU while a normal PyTorch
 optimizer mutates them:
 
 ```python
-with offloader.use(device) as gpu_model:
+with offload.use(device) as gpu_model:
     for batch in loader:
         loss = gpu_model(**batch).loss
         loss.backward()
 
-        with offloader.optimizer_step():
+        with offload.optimizer_step():
             optimizer.step()
 
         optimizer.zero_grad()
@@ -331,7 +332,7 @@ CPU storage, and leaves gradients on GPU.
 For multiple independent models swapping in and out of GPU.
 
 ```python
-from torch_offload import ModelCache, ModelSpec, PinnedWeights
+from torch_offload import ModelCache, ModelSpec, ModelOffloader
 
 cache = ModelCache(max_cache_bytes=80 * 1024**3)
 device = "cuda:0"
@@ -340,12 +341,12 @@ device = "cuda:0"
 cache.register(ModelSpec(
     key="text_encoder",
     estimated_cache_bytes=12 * 1024**3,
-    factory=lambda: PinnedWeights(build_text_encoder()),
+    factory=lambda: ModelOffloader(build_text_encoder()),
 ))
 cache.register(ModelSpec(
     key="diffusion_model",
     estimated_cache_bytes=24 * 1024**3,
-    factory=lambda: PinnedWeights(build_diffusion_model()),
+    factory=lambda: ModelOffloader(build_diffusion_model()),
 ))
 
 # First use builds via factory; subsequent uses hit the cache.
@@ -368,14 +369,14 @@ You can also auto-register at acquire time:
 
 ```python
 spec = ModelSpec(key="vae", estimated_cache_bytes=500*1024**2,
-                 factory=lambda: PinnedWeights(build_vae()))
+                 factory=lambda: ModelOffloader(build_vae()))
 with cache.use(spec, device=device) as vae:  # registers if missing, then uses
     decoded = vae.decode(latent)
 ```
 
 > **Anti-pattern:** the factory should build a fresh model each call,
 > not capture an externally-held one. With `factory=lambda:
-> PinnedWeights(my_kept_model)` the cache is no longer the
+> ModelOffloader(my_kept_model)` the cache is no longer the
 > sole owner of the model — eviction drops the strategy, but
 > `my_kept_model` keeps the pinned slots alive. `used_cache_bytes`
 > will lie about freed memory. Always have the factory build the
@@ -402,16 +403,16 @@ the cache lock. `choose_victims()` must return unique keys from
                                 ▼
             ┌───────────────────┴────────────────────┐
             │                                        │
-   ┌────────▼─────────┐                ┌─────────────▼──────────────┐
-   │  PinnedWeights   │                │      ModelOffloader        │
-   │  whole-model DMA │                │   (composes components)    │
+   ┌──────────────────┐                ┌────────────────────────────┐
+   │   ModelOffloader   │                │        ModelOffloader         │
+   │ whole-model DMA  │                │    streamed block mode      │
    └────────┬─────────┘                └─────────────┬──────────────┘
             │                                        │
             │             ┌──────────────────────────┴──────────┐
             │             │  components (ordered):              │
-            │             │  • PinnedWeights (non-streamed,     │
+            │             │  • PinnedComponent (non-streamed,   │
             │             │    include names from composition)  │
-            │             │  • N × StreamedWeights              │
+            │             │  • N × StreamedComponent            │
             │             │                                     │
             │             │  optional LoRA:                     │
             │             │  • post-copy hooks for merge mode   │
@@ -446,7 +447,7 @@ class MyStrategy:
 
 A narrower `ModelStrategyComponent` Protocol (just `cache_bytes` +
 `activate` + `deactivate`, no `model`) describes pieces composable
-inside a top-level strategy — `StreamedWeights` and `PinnedWeights`
+inside a top-level strategy — `StreamedComponent` and `PinnedComponent`
 both satisfy it.
 
 `TensorAdapter` is the per-parameter extension point. Its base contract
@@ -466,10 +467,10 @@ constructed → activate ↔ deactivate → drop refs
 ```
 
 `activate(device=...)` makes the model usable for compute on the
-requested device. `PinnedWeights`, `ModelOffloader`, `StreamedWeights`,
-require an explicit device. CUDA activation uses the streaming/DMA path
-where applicable; CPU activation is pass-through over pinned host-backed
-storage.
+requested device. `ModelOffloader`, `MpsWeights`, `PinnedComponent`, and
+`StreamedComponent` require an explicit device. CUDA activation uses the
+streaming/DMA path where applicable; CPU activation is pass-through over
+pinned host-backed storage.
 `deactivate()` releases transient device resources (the `cache_bytes`
 worth of pinned storage stays held in module slots, ready for fast
 re-activation).
@@ -500,12 +501,12 @@ This is a low-level library; we don't guard against caller misuse.
 
 ## Compatibility
 
-- **`torch.compile` is not supported** for managed modules. Both
-  strategies swap parameter slots (`module._parameters[leaf] = new_param`)
-  on every activate/deactivate, and `StreamedWeights` registers
-  forward-pre hooks that mutate slots on every block call. Both
-  invalidate the tensor-identity assumptions `torch.compile` makes
-  about its trace.
+- **`torch.compile` is not supported** for `ModelOffloader`-managed
+  modules. Its `PinnedComponent` swaps parameter slots
+  (`module._parameters[leaf] = new_param`) on activate/deactivate, and
+  `StreamedComponent` registers forward-pre hooks that mutate slots on
+  every block call. Both invalidate the tensor-identity assumptions
+  `torch.compile` makes about its trace.
 - **Wrap before DDP/FSDP**, not after. Those wrappers manage parameter
   storage themselves and conflict with the slot-swap pattern.
 - **Coarse cache concurrency.** `ModelCache` protects cache metadata,
@@ -530,19 +531,19 @@ This is a low-level library; we don't guard against caller misuse.
 
 ## Tied weights
 
-`PinnedWeights` handles the standard `tie_weights()` pattern (one
+`ModelOffloader` handles the standard `tie_weights()` pattern (one
 `Parameter` referenced under multiple names) plus the rarer case of
 distinct quanto wrappers around shared inner `_data` storage.
 
 `ModelOffloader` is intended for ordinary transformer block lists where
 the streamed block weights are independent. It does not prevalidate
 unusual shared-storage layouts that cross block/non-block boundaries;
-use whole-model `PinnedWeights` if that sharing must be preserved.
+use whole-model `ModelOffloader` if that sharing must be preserved.
 
 ## Quanto support
 
 Quanto-quantized models (`optimum.quanto.WeightQBytesTensor`) are
-handled correctly by both strategies. `PinnedParam` decomposes
+handled correctly by both `ModelOffloader` modes. `PinnedParam` decomposes
 the wrapper into its inner `_data` (int8/fp8) and `_scale` (fp16/fp32)
 tensors, pins each, and reconstructs the quanto wrapper around the GPU
 storage on activation.

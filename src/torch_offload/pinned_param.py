@@ -1,7 +1,7 @@
 """Per-parameter pinned-CPU storage primitive.
 
 Internal to the ``torch_offload`` subpackage. Shared by
-:class:`PinnedWeights` (whole-model bulk pin) and :class:`StreamedWeights`
+:class:`ModelOffloader` (whole-model bulk pin) and :class:`StreamedComponent`
 (per-block streaming). Both consumers reach this through the same
 abstraction so the addition of new tensor types only requires writing
 a new :class:`TensorAdapter`, not editing the consumers.
