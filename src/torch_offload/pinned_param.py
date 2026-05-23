@@ -23,18 +23,12 @@ import torch
 from torch import nn
 
 from .tensor_adapter_registry import select_adapter
-from .tensor_adapter_registry import storage_key as _storage_key
 from .tensor_adapters import (
     CpuRoundTripTensorAdapter,
     ParameterDataSwapTensorAdapter,
     TensorAdapter,
     adapter_name,
 )
-
-
-def storage_key(t: torch.Tensor) -> tuple[Any, ...]:
-    """Compatibility wrapper for :func:`tensor_adapter_registry.storage_key`."""
-    return _storage_key(t)
 
 
 class PinnedParam:
