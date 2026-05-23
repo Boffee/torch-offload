@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 
 LoraMode = Literal["merge", "routed"]
 _LoraFactorRef = tuple[torch.Tensor, torch.Tensor, float]
-_LoraTargetMap = dict[str, list[_LoraFactorRef]]
+_LoraParamMap = dict[str, list[_LoraFactorRef]]
 
 
 class _RemovableHook(Protocol):
@@ -301,17 +301,12 @@ class ModelOffloader:
         self._pinned_weights = pinned_weights
         self._streamers = streamers
         self._teardown_stack: contextlib.ExitStack | None = None
-
-        (
-            self._target_to_param_name,
-            self._target_to_parent,
-            self._target_to_component,
-        ) = self._build_target_index(
-            streamers,
-            layer_paths,
-            block_groups,
-            pinned_weights,
-        )
+        lora_param_names: set[str] = set()
+        if pinned_weights is not None:
+            lora_param_names.update(pinned_weights.param_names)
+        for streamer in streamers:
+            lora_param_names.update(streamer.param_names)
+        self._lora_param_names = frozenset(lora_param_names)
         self._lora_hook_handles: list[_RemovableHook] = []
         self._block_groups: list[list[nn.Module]] = block_groups
         self._warned_about_checkpointing: bool = False
@@ -384,25 +379,26 @@ class ModelOffloader:
         self._loras = configured_loras
         self._lora_mode = mode if configured_loras else "merge"
 
-    def _group_loras_by_target(
+    def _group_lora_factors_by_param_name(
         self, loras: Sequence[tuple[LoRA, float]],
-    ) -> _LoraTargetMap:
-        per_target: _LoraTargetMap = {}
+    ) -> _LoraParamMap:
+        per_param: _LoraParamMap = {}
         total_targets = 0
         matched_targets = 0
         for lora, strength in loras:
             for target_key, (a, b) in lora.targets.items():
                 total_targets += 1
-                if target_key not in self._target_to_param_name:
+                param_name = self._resolve_lora_param_name(target_key)
+                if param_name is None:
                     continue
                 matched_targets += 1
-                per_target.setdefault(target_key, []).append(
+                per_param.setdefault(param_name, []).append(
                     (a, b, strength)
                 )
 
         if matched_targets < total_targets:
             sample_lora = sorted(next(iter(loras))[0].targets)[:3]
-            sample_index = sorted(self._target_to_param_name)[:3]
+            sample_index = sorted(self._lora_param_names)[:3]
             logger.warning(
                 "set_loras matched %d/%d targets. "
                 "Sample LoRA keys: %s ... Sample index keys: %s ...",
@@ -411,10 +407,24 @@ class ModelOffloader:
         else:
             logger.debug("set_loras matched %d/%d targets", matched_targets, total_targets)
 
-        return per_target
+        return per_param
+
+    def _resolve_lora_param_name(self, target_key: str) -> str | None:
+        if target_key in self._lora_param_names:
+            return target_key
+
+        canonical_key = canonical_param_name(target_key)
+        matches = [
+            name
+            for name in self._lora_param_names
+            if canonical_param_name(name) == canonical_key
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        return None
 
     def _register_lora_hooks(
-        self, active_device: torch.device, targets: _LoraTargetMap,
+        self, active_device: torch.device, targets: _LoraParamMap,
     ) -> None:
         self._clear_active_lora_hooks()
         try:
@@ -427,7 +437,7 @@ class ModelOffloader:
             raise
 
     def _register_merge_lora_hooks(
-        self, active_device: torch.device, targets: _LoraTargetMap,
+        self, active_device: torch.device, targets: _LoraParamMap,
     ) -> None:
         if active_device.type != "cuda":
             raise ValueError(
@@ -436,11 +446,9 @@ class ModelOffloader:
                 "for CPU activation."
             )
 
-        for target_key, refs in targets.items():
-            param_name = self._target_to_param_name[target_key]
-            component = self._target_to_component[target_key]
+        for param_name, refs in targets.items():
             transform = LoRATransform(refs)
-            handle = component.register_post_copy_hook(
+            handle = self._register_post_copy_hook(
                 param_name, transform.apply,
             )
             self._lora_hook_handles.append(handle)
@@ -448,14 +456,14 @@ class ModelOffloader:
     def _register_routed_lora_hooks(
         self,
         active_device: torch.device,
-        targets: _LoraTargetMap,
+        targets: _LoraParamMap,
     ) -> None:
-        for target_key, refs in targets.items():
-            parent = self._target_to_parent[target_key]
+        for param_name, refs in targets.items():
+            parent = _resolve_param_parent(self._model, param_name)
             if not isinstance(parent, nn.Linear):
                 raise ValueError(
                     f"Routed LoRA mode requires nn.Linear targets; "
-                    f"target {target_key!r} has parent module of "
+                    f"target {param_name!r} has parent module of "
                     f"type {type(parent).__name__}. Use mode='merge' "
                     f"for non-Linear targets, or wrap the model with "
                     f"PEFT for richer per-type routing."
@@ -465,6 +473,28 @@ class ModelOffloader:
                 dtype=_routed_factor_dtype(parent),
             )
             self._lora_hook_handles.append(handle)
+
+    def _register_post_copy_hook(
+        self,
+        param_name: str,
+        hook: Callable[[nn.Parameter], None],
+    ) -> _RemovableHook:
+        component = self._component_for_param_name(param_name)
+        return component.register_post_copy_hook(param_name, hook)
+
+    def _component_for_param_name(
+        self,
+        param_name: str,
+    ) -> PinnedWeights | StreamedWeights:
+        if (
+            self._pinned_weights is not None
+            and param_name in self._pinned_weights.param_names
+        ):
+            return self._pinned_weights
+        for streamer in self._streamers:
+            if param_name in streamer.param_names:
+                return streamer
+        raise KeyError(f"param name {param_name!r} is not managed by this offloader")
 
     def _clear_active_lora_hooks(self) -> None:
         while self._lora_hook_handles:
@@ -518,7 +548,7 @@ class ModelOffloader:
         try:
             with contextlib.ExitStack() as stack:
                 targets = (
-                    self._group_loras_by_target(self._loras)
+                    self._group_lora_factors_by_param_name(self._loras)
                     if self._loras
                     else None
                 )
@@ -733,67 +763,6 @@ class ModelOffloader:
                 "module tree)."
             )
             self._warned_about_checkpointing = True
-
-    @staticmethod
-    def _build_target_index(
-        streamers: list[StreamedWeights],
-        layer_paths: list[str],
-        block_groups: list[list[nn.Module]],
-        pinned_weights: PinnedWeights | None,
-    ) -> tuple[
-        dict[str, str],
-        dict[str, nn.Module],
-        dict[str, PinnedWeights | StreamedWeights],
-    ]:
-        """Map canonical param names to their exact runtime param name
-        and to the exact parent module where the named param is installed.
-
-        The param-name map drives merge-mode LoRA post-copy hooks, the
-        component map identifies which component owns the copy loop, and
-        the parent map drives routed-mode LoRA forward hooks.
-
-        Keys are normalized to strip PEFT's ``.base_layer.`` segments
-        so that LoRA state-dict keys (which use the original model
-        names) match regardless of whether the model is PEFT-wrapped.
-
-        Routed LoRA is name-centric: it hooks the parent module for the
-        exact matched name. Shared parameter storage alone does not make
-        routed mode ambiguous because routed mode does not mutate the
-        parameter bytes.
-        """
-        param_names: dict[str, str] = {}
-        parent_by_key: dict[str, nn.Module] = {}
-        components: dict[str, PinnedWeights | StreamedWeights] = {}
-
-        for streamer, layer_path, blocks in zip(
-            streamers,
-            layer_paths,
-            block_groups,
-            strict=True,
-        ):
-            for block_idx, local_names in enumerate(
-                streamer.streamed_param_names_by_block
-            ):
-                block = blocks[block_idx]
-                for local_name in local_names:
-                    parent = _resolve_param_parent(block, local_name)
-                    full_name = f"{layer_path}.{block_idx}.{local_name}"
-                    key = canonical_param_name(full_name)
-                    param_names[key] = full_name
-                    parent_by_key[key] = parent
-                    components[key] = streamer
-
-        if pinned_weights is not None:
-            for name in pinned_weights.param_names:
-                key = canonical_param_name(name)
-                param_names[key] = name
-                parent_by_key[key] = _resolve_param_parent(
-                    pinned_weights.model, name,
-                )
-                components[key] = pinned_weights
-
-        return param_names, parent_by_key, components
-
 
 # ---------------------------------------------------------------------------
 # Module-private helpers (used only by ModelOffloader constructor)

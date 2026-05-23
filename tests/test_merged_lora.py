@@ -195,10 +195,10 @@ def _make_strategy(
 
 def _has_post_copy_hook(strategy: ModelOffloader, target_key: str) -> bool:
     """Check whether a merge hook is installed for the given target."""
-    param_name = strategy._target_to_param_name.get(target_key)
-    component = strategy._target_to_component.get(target_key)
-    if param_name is None or component is None:
+    param_name = strategy._resolve_lora_param_name(target_key)
+    if param_name is None:
         return False
+    component = strategy._component_for_param_name(param_name)
     if isinstance(component, PinnedWeights):
         return (
             component.post_copy_hook_key(param_name)
@@ -218,7 +218,7 @@ def _has_post_copy_hook(strategy: ModelOffloader, target_key: str) -> bool:
 def _activate_loras_for_test(
     strategy: ModelOffloader,
 ) -> int:
-    targets = strategy._group_loras_by_target(strategy._loras)
+    targets = strategy._group_lora_factors_by_param_name(strategy._loras)
     if strategy._lora_mode == "merge":
         strategy._register_lora_hooks(torch.device("cuda"), targets)
         return len(targets)
@@ -1306,7 +1306,7 @@ class TestRoutedMode:
         }
         lora = LoRA(state_dict=sd, key_transform=None)
         s.set_loras([(lora, 1.0)], mode="routed")
-        targets = s._group_loras_by_target(s._loras)
+        targets = s._group_lora_factors_by_param_name(s._loras)
         s._register_lora_hooks(torch.device("cpu"), targets)
         try:
             assert len(model.embed._forward_hooks) == (1 if target == "embed" else 0)
