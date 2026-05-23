@@ -21,7 +21,6 @@ from .module_names import (
     canonical_param_name,
     parameter_names,
     resolve_parent_leaf,
-    walk_attr_path,
 )
 from .pinned_component import PinnedComponent, PinnedComponentStore
 from .protocols import ModelStrategyComponent
@@ -817,51 +816,27 @@ def _build_streamed_components(
     assert blocks_to_swap is not None
     swap_list = _broadcast(blocks_to_swap, len(layer_paths), "blocks_to_swap")
     pf_list = _broadcast(prefetch_count, len(layer_paths), "prefetch_count")
-    block_groups = _resolve_block_groups(model, layer_paths)
     streamed_components: list[StreamedComponent] = []
+    block_groups: list[list[nn.Module]] = []
     streamed_param_names: set[str] = set()
     streamed_buffer_names: set[str] = set()
 
-    for i, blocks in enumerate(block_groups):
-        stream_param_names, stream_buffer_names = _streamed_names_for_blocks(
-            blocks,
-            stream_trainables=stream_trainable_weights,
-        )
-        streamed_param_names.update(
-            _full_block_names(layer_paths[i], len(blocks), stream_param_names)
-        )
-        streamed_buffer_names.update(
-            _full_block_names(layer_paths[i], len(blocks), stream_buffer_names)
-        )
-        store = StreamedComponentStore.from_blocks(
-            blocks,
+    for i, layer_path in enumerate(layer_paths):
+        store = StreamedComponentStore.from_module(
+            model,
+            layer_path=layer_path,
             blocks_to_swap=swap_list[i],
             prefetch_count=pf_list[i],
             cyclic=cyclic,
-            name=layer_paths[i],
-            stream_param_names=stream_param_names,
-            stream_buffer_names=stream_buffer_names,
+            stream_trainable_weights=stream_trainable_weights,
         )
-        streamed_components.append(
-            store.bind(
-                blocks=blocks,
-            )
-        )
+        blocks = store.resolve_blocks(model)
+        block_groups.append(blocks)
+        streamed_param_names.update(store.param_names)
+        streamed_buffer_names.update(store.buffer_names)
+        streamed_components.append(store.bind(model))
 
     return block_groups, streamed_components, streamed_param_names, streamed_buffer_names
-
-
-def _resolve_block_groups(
-    model: nn.Module,
-    layer_paths: Sequence[str],
-) -> list[list[nn.Module]]:
-    block_groups = [list(_resolve_layers_attr(model, p)) for p in layer_paths]
-    for i, blocks in enumerate(block_groups):
-        if not blocks:
-            raise ValueError(
-                f"layers_attr[{i}] = {layer_paths[i]!r} resolved to empty list"
-            )
-    return block_groups
 
 
 def _build_pinned_component(
@@ -906,67 +881,6 @@ def _compose_components(
 
 def _component_streams_tensor_state(component: StreamedComponent) -> bool:
     return bool(component.param_names) or any(component.streamed_buffer_names_by_block)
-
-
-def _streamed_names_for_blocks(
-    blocks: Sequence[nn.Module],
-    *,
-    stream_trainables: bool,
-) -> tuple[set[str], set[str]]:
-    param_names = _block_param_names(blocks[0], stream_trainables=stream_trainables)
-    buffer_names = _block_buffer_names(blocks[0])
-    for i, block in enumerate(blocks[1:], start=1):
-        if (
-            _block_param_names(block, stream_trainables=stream_trainables)
-            != param_names
-            or _block_buffer_names(block) != buffer_names
-        ):
-            raise ValueError(
-                f"Block {i} selected names differ from block 0. All blocks "
-                "in a StreamedComponent group must select the same parameter "
-                "and buffer names."
-            )
-    return param_names, buffer_names
-
-
-def _block_param_names(
-    block: nn.Module,
-    *,
-    stream_trainables: bool,
-) -> set[str]:
-    return {
-        name
-        for name, param in block.named_parameters(remove_duplicate=False)
-        if stream_trainables or not param.requires_grad
-    }
-
-
-def _block_buffer_names(block: nn.Module) -> set[str]:
-    return {
-        name
-        for name, _buffer in block.named_buffers(remove_duplicate=False)
-    }
-
-
-def _full_block_names(
-    layer_path: str,
-    block_count: int,
-    local_names: set[str],
-) -> set[str]:
-    return {
-        f"{layer_path}.{block_idx}.{local_name}"
-        for block_idx in range(block_count)
-        for local_name in local_names
-    }
-
-
-def _resolve_layers_attr(module: nn.Module, dotted_path: str) -> nn.ModuleList:
-    obj = walk_attr_path(module, dotted_path)
-    if not isinstance(obj, nn.ModuleList):
-        raise TypeError(
-            f"Expected nn.ModuleList at '{dotted_path}', got {type(obj).__name__}"
-        )
-    return obj
 
 
 def _broadcast(value: int | Sequence[int], n: int, name: str) -> list[int]:

@@ -1,13 +1,14 @@
 """Block-streaming primitive for memory-efficient training and inference.
 
-A :class:`StreamedComponent` manages a single block list whose blocks
-share the same parameter layout (names, shapes, dtypes, and any
-tensor-adapter wrapper metadata): pins the params to CPU at
-construction time, streams them to GPU on demand via forward-pre
-hooks, and uses a pre-allocated GPU target pool plus a background
-prefetcher to overlap DMA with compute. On CPU, the host-backed
-pinned state is used directly without streaming. Heterogeneous block lists
-(e.g. Flux's two block kinds) split into multiple
+A :class:`StreamedComponentStore` manages reusable pinned CPU backing
+storage for a single block list whose blocks share the same parameter
+layout (names, shapes, dtypes, and any tensor-adapter wrapper metadata).
+Binding that store to a compatible model creates a
+:class:`StreamedComponent` that streams the resolved blocks to GPU on
+demand via forward-pre hooks, and uses a pre-allocated GPU target pool plus
+a background prefetcher to overlap DMA with compute. On CPU, the
+host-backed pinned state is used directly without streaming. Heterogeneous
+block lists (e.g. Flux's two block kinds) split into multiple
 :class:`StreamedComponent` instances composed via :class:`ModelOffloader`.
 
 In-block trainable params (LoRA adapters) flow through the same target
@@ -21,7 +22,7 @@ This is the sharp, low-level primitive. It does NOT manage:
 
 - Non-block parts of the model (parent-module state, sibling
   modules) — caller derives :class:`PinnedComponent` include-name sets
-  by excluding the streamer's owned block-local names.
+  by excluding the streamer's owned names.
 - Out-of-block trainable parameter movement — caller handles that
   alongside non-streamed parameters, usually with :class:`PinnedComponent`.
 - Shared storage with tensors outside the streamed block list — caller
@@ -30,9 +31,9 @@ This is the sharp, low-level primitive. It does NOT manage:
 - Activation-checkpointing enforcement — required for in-block
   trainable streaming, but checked at the composer level.
 
-Most users want :class:`ModelOffloader` (the blessed safe
-API). Reach for :class:`StreamedComponent` directly only when you need
-bespoke composition (e.g., multiple block lists like Flux's
+Most users want :class:`ModelOffloader` (the blessed safe API). Reach for
+:class:`StreamedComponentStore` / :class:`StreamedComponent` directly only
+when you need bespoke composition (e.g., multiple block lists like Flux's
 ``transformer_blocks`` + ``single_transformer_blocks``).
 """
 
@@ -43,7 +44,7 @@ import functools
 import logging
 import weakref
 from collections import OrderedDict
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Iterator, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import cast
@@ -52,7 +53,7 @@ import torch
 from torch import nn
 
 from ._devices import canonical_device
-from .module_names import group_names
+from .module_names import group_names, walk_attr_path
 from .pinned_buffer import PinnedBuffer
 from .pinned_module import (
     PinnedModuleInstance,
@@ -401,6 +402,65 @@ def _validate_stream_config(
         raise ValueError(f"prefetch_count ({prefetch_count}) must be >= 0")
 
 
+def _resolve_layer_blocks(module: nn.Module, layer_path: str) -> list[nn.Module]:
+    obj = walk_attr_path(module, layer_path)
+    if not isinstance(obj, nn.ModuleList):
+        raise TypeError(
+            f"Expected nn.ModuleList at '{layer_path}', got {type(obj).__name__}"
+        )
+    blocks = list(obj)
+    if not blocks:
+        raise ValueError(f"layers_attr = {layer_path!r} resolved to empty list")
+    return blocks
+
+
+def _streamed_param_names_for_blocks(
+    blocks: Sequence[nn.Module],
+    *,
+    stream_trainables: bool,
+) -> set[str]:
+    param_names = _block_param_names(blocks[0], stream_trainables=stream_trainables)
+    for i, block in enumerate(blocks[1:], start=1):
+        if _block_param_names(block, stream_trainables=stream_trainables) != param_names:
+            raise ValueError(
+                f"Block {i} param layout differs from block 0: selected "
+                "parameter names differ. All blocks in a StreamedComponent "
+                "group must select the same parameter names."
+            )
+    return param_names
+
+
+def _streamed_buffer_names_for_blocks(blocks: Sequence[nn.Module]) -> set[str]:
+    buffer_names = _block_buffer_names(blocks[0])
+    for i, block in enumerate(blocks[1:], start=1):
+        if _block_buffer_names(block) != buffer_names:
+            raise ValueError(
+                f"Block {i} buffer layout differs from block 0: selected "
+                "buffer names differ. All blocks in a StreamedComponent "
+                "group must select the same buffer names."
+            )
+    return buffer_names
+
+
+def _block_param_names(
+    block: nn.Module,
+    *,
+    stream_trainables: bool,
+) -> set[str]:
+    return {
+        name
+        for name, param in block.named_parameters(remove_duplicate=False)
+        if stream_trainables or not param.requires_grad
+    }
+
+
+def _block_buffer_names(block: nn.Module) -> set[str]:
+    return {
+        name
+        for name, _buffer in block.named_buffers(remove_duplicate=False)
+    }
+
+
 # ---------------------------------------------------------------------------
 # LRU tracker
 # ---------------------------------------------------------------------------
@@ -444,45 +504,45 @@ class StreamedComponentStore:
     """Reusable pinned backing storage for a streamed block group."""
 
     _block_stores: tuple[PinnedModuleStore, ...]
+    layer_path: str
     blocks_to_swap: int
     prefetch_count: int = 2
     cyclic: bool = False
-    name: str | None = None
 
     @classmethod
-    def from_blocks(
+    def from_module(
         cls,
-        blocks: Sequence[nn.Module],
+        model: nn.Module,
         *,
+        layer_path: str,
         blocks_to_swap: int,
         prefetch_count: int = 2,
         cyclic: bool = False,
-        name: str | None = None,
-        stream_param_names: Iterable[str] | None = None,
-        stream_buffer_names: Iterable[str] | None = None,
+        stream_trainable_weights: bool = False,
     ) -> StreamedComponentStore:
-        """Pin selected state for a reusable streamed block group."""
-        block_list = list(blocks)
+        """Resolve ``layer_path`` on ``model`` and pin its streamed blocks."""
+        blocks = _resolve_layer_blocks(model, layer_path)
         _validate_stream_config(
-            num_blocks=len(block_list),
+            num_blocks=len(blocks),
             blocks_to_swap=blocks_to_swap,
             prefetch_count=prefetch_count,
         )
+        stream_param_names = _streamed_param_names_for_blocks(
+            blocks,
+            stream_trainables=stream_trainable_weights,
+        )
+        stream_buffer_names = _streamed_buffer_names_for_blocks(blocks)
         block_stores = _pin_block_module_stores(
-            block_list,
-            stream_param_names=(
-                None if stream_param_names is None else set(stream_param_names)
-            ),
-            stream_buffer_names=(
-                None if stream_buffer_names is None else set(stream_buffer_names)
-            ),
+            blocks,
+            stream_param_names=stream_param_names,
+            stream_buffer_names=stream_buffer_names,
         )
         return cls(
             _block_stores=tuple(block_stores),
+            layer_path=layer_path,
             blocks_to_swap=blocks_to_swap,
             prefetch_count=prefetch_count,
             cyclic=cyclic,
-            name=name,
         )
 
     @property
@@ -499,9 +559,19 @@ class StreamedComponentStore:
     def param_names(self) -> frozenset[str]:
         """Externally addressable streamed parameter names."""
         names = {
-            _streamed_param_name(self.name, block_idx, local_name)
+            _streamed_param_name(self.layer_path, block_idx, local_name)
             for block_idx, store in enumerate(self._block_stores)
             for local_name in store.params
+        }
+        return frozenset(names)
+
+    @property
+    def buffer_names(self) -> frozenset[str]:
+        """Externally addressable streamed buffer names."""
+        names = {
+            _streamed_param_name(self.layer_path, block_idx, local_name)
+            for block_idx, store in enumerate(self._block_stores)
+            for local_name in store.buffers
         }
         return frozenset(names)
 
@@ -513,9 +583,16 @@ class StreamedComponentStore:
     def has_trainables(self) -> bool:
         return any(store.has_trainables for store in self._block_stores)
 
-    def bind(self, blocks: Sequence[nn.Module]) -> StreamedComponent:
-        """Bind this store's per-block backing bytes to ``blocks``."""
-        block_list = list(blocks)
+    def resolve_blocks(self, model: nn.Module) -> list[nn.Module]:
+        """Resolve this store's layer path on ``model``."""
+        return _resolve_layer_blocks(model, self.layer_path)
+
+    def bind(
+        self,
+        model: nn.Module,
+    ) -> StreamedComponent:
+        """Bind this store's per-block backing bytes to ``model``."""
+        block_list = self.resolve_blocks(model)
         if len(block_list) != len(self._block_stores):
             raise ValueError(
                 "StreamedComponentStore.bind() block count mismatch: "
@@ -530,7 +607,7 @@ class StreamedComponentStore:
             blocks_to_swap=self.blocks_to_swap,
             prefetch_count=self.prefetch_count,
             cyclic=self.cyclic,
-            name=self.name,
+            name=self.layer_path,
         )
 
 
@@ -579,8 +656,7 @@ class StreamedComponent:
     functional).
 
     Instances are usually created by binding a
-    :class:`StreamedComponentStore` to the resolved sequence of block
-    modules.
+    :class:`StreamedComponentStore` to a compatible model.
 
     Parameters
     ----------

@@ -35,20 +35,37 @@ def _make_streamed_component(
     blocks_to_swap: int,
     prefetch_count: int = 2,
     cyclic: bool = False,
-    name: str | None = None,
-    stream_param_names: set[str] | None = None,
-    stream_buffer_names: set[str] | None = None,
+    layer_path: str = "blocks",
+    stream_trainable_weights: bool = True,
 ) -> StreamedComponent:
-    store = StreamedComponentStore.from_blocks(
-        blocks,
+    model = _make_block_list_model(blocks, layer_path)
+    store = StreamedComponentStore.from_module(
+        model,
+        layer_path=layer_path,
         blocks_to_swap=blocks_to_swap,
         prefetch_count=prefetch_count,
         cyclic=cyclic,
-        name=name,
-        stream_param_names=stream_param_names,
-        stream_buffer_names=stream_buffer_names,
+        stream_trainable_weights=stream_trainable_weights,
     )
-    return store.bind(blocks)
+    return store.bind(model)
+
+
+def _make_block_list_model(
+    blocks: Sequence[nn.Module],
+    layer_path: str,
+) -> nn.Module:
+    class BlockListModel(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            parent: nn.Module = self
+            parts = layer_path.split(".")
+            for part in parts[:-1]:
+                child = nn.Module()
+                setattr(parent, part, child)
+                parent = child
+            setattr(parent, parts[-1], nn.ModuleList(blocks))
+
+    return BlockListModel()
 
 
 def _make_block_model(num_blocks: int = 4, width: int = 8) -> nn.Module:
@@ -1751,7 +1768,7 @@ class TestStreamedNameSelection:
         streamer = _make_streamed_component(
             blocks=list(m.transformer_blocks),
             blocks_to_swap=2,
-            name="transformer_blocks",
+            layer_path="transformer_blocks",
         )
         try:
             assert streamer.param_names == {
@@ -1766,7 +1783,7 @@ class TestStreamedNameSelection:
         streamer = _make_streamed_component(
             blocks=list(m.transformer_blocks),
             blocks_to_swap=2,
-            name="transformer_blocks",
+            layer_path="transformer_blocks",
         )
         try:
             handle = streamer.register_post_copy_hook(
@@ -1786,7 +1803,7 @@ class TestStreamedNameSelection:
         streamer = _make_streamed_component(
             blocks=list(m.transformer_blocks),
             blocks_to_swap=2,
-            name="transformer_blocks",
+            layer_path="transformer_blocks",
         )
         try:
             with pytest.raises(ValueError, match="not owned by this streamer"):
@@ -1794,38 +1811,6 @@ class TestStreamedNameSelection:
                     "transformer_blocks.10.weight",
                     lambda _param: None,
                 )
-        finally:
-            streamer.deactivate()
-
-    def test_streamed_component_include_names_select_owned_entries(self) -> None:
-        class Block(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.keep = nn.Parameter(torch.randn(4, 4), requires_grad=False)
-                self.skip = nn.Parameter(torch.randn(4, 4), requires_grad=False)
-                self.register_buffer("keep_buffer", torch.randn(4))
-                self.register_buffer("skip_buffer", torch.randn(4))
-
-        blocks = [Block(), Block()]
-        skipped_params = [block.skip for block in blocks]
-        skipped_buffer_ptrs = [block.skip_buffer.data_ptr() for block in blocks]
-
-        streamer = _make_streamed_component(
-            blocks=blocks,
-            blocks_to_swap=1,
-            stream_param_names={"keep"},
-            stream_buffer_names={"keep_buffer"},
-        )
-        try:
-            assert streamer.streamed_param_names_by_block == [["keep"], ["keep"]]
-            assert streamer.streamed_buffer_names_by_block == [
-                ["keep_buffer"],
-                ["keep_buffer"],
-            ]
-            assert [block.skip for block in blocks] == skipped_params
-            assert [block.skip_buffer.data_ptr() for block in blocks] == (
-                skipped_buffer_ptrs
-            )
         finally:
             streamer.deactivate()
 
@@ -1882,53 +1867,6 @@ class TestStreamedComponentContractGuard:
         # so optimizer state attached to it would still apply.
         assert isinstance(block_0.weight, nn.Parameter)
         assert block_0.weight.requires_grad
-
-    def test_direct_empty_param_name_selection_constructs(self) -> None:
-        block_0 = nn.Linear(4, 4, bias=False)  # trainable
-        block_1 = nn.Linear(4, 4, bias=False)  # trainable
-        streamer = _make_streamed_component(
-            blocks=[block_0, block_1],
-            blocks_to_swap=1,
-            stream_param_names=set(),
-            stream_buffer_names=set(),
-        )
-        assert streamer.streamed_param_names_by_block == [[], []]
-        assert streamer.streamed_buffer_names_by_block == [[], []]
-
-    def test_direct_empty_buffer_name_selection_does_not_pin_buffer(self) -> None:
-        class BufferBlock(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.weight = nn.Parameter(torch.randn(4, 4), requires_grad=False)
-                self.register_buffer("table", torch.randn(8))
-
-        blocks = [BufferBlock(), BufferBlock()]
-        buffer_ptrs = [block.table.data_ptr() for block in blocks]
-
-        streamer = _make_streamed_component(
-            blocks=blocks,
-            blocks_to_swap=1,
-            stream_buffer_names=set(),
-        )
-
-        assert streamer.streamed_buffer_names_by_block == [[], []]
-        assert [block.table.data_ptr() for block in blocks] == buffer_ptrs
-        assert all(not block.table.is_pinned() for block in blocks)
-
-    def test_direct_include_names_reject_unknown_names_before_pinning(self) -> None:
-        block_0 = nn.Linear(4, 4, bias=False)
-        block_1 = nn.Linear(4, 4, bias=False)
-        original_params = [block_0.weight, block_1.weight]
-
-        with pytest.raises(ValueError, match="unknown block-local names"):
-            _make_streamed_component(
-                blocks=[block_0, block_1],
-                blocks_to_swap=1,
-                stream_param_names={"missing"},
-            )
-
-        assert [block_0.weight, block_1.weight] == original_params
-
 
 class TestMixedGradTieDetection:
     """Mixed-grad shared storage is rejected by the owning component."""
