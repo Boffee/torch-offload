@@ -158,13 +158,27 @@ class PinnedModuleStore:
             buffer_targets=_allocate_buffer_targets(buffers, device),
         )
 
+    def bind(self, module: nn.Module) -> PinnedModuleInstance:
+        """Validate ``module`` and bind this store's backing bytes to it."""
+        _validate_store_names(self)
+        _validate_module_matches_store(self, module)
+        instance = PinnedModuleInstance(
+            module=module,
+            params=self.params,
+            buffers=self.buffers,
+            cpu_params_by_pinned_id=_make_cpu_params(self.params),
+        )
+        instance.restore_pinned()
+        return instance
+
 
 @dataclass(slots=True)
 class PinnedModuleInstance:
-    """One concrete module bound to a shared :class:`PinnedModuleStore`."""
+    """One concrete module bound to pinned parameter and buffer backings."""
 
     module: nn.Module
-    store: PinnedModuleStore
+    params: Mapping[str, PinnedParam]
+    buffers: Mapping[str, PinnedBuffer]
     cpu_params_by_pinned_id: dict[int, nn.Parameter]
     _post_copy_hooks: dict[int, PostCopyHook] = field(
         default_factory=dict,
@@ -172,34 +186,29 @@ class PinnedModuleInstance:
         repr=False,
     )
 
-    @classmethod
-    def from_store(
-        cls,
-        store: PinnedModuleStore,
-        module: nn.Module,
-    ) -> PinnedModuleInstance:
-        """Validate ``module`` names/layouts and restore pinned CPU state."""
-        _validate_store_names(store)
-        _validate_module_matches_store(store, module)
-        instance = cls(
-            module=module,
-            store=store,
-            cpu_params_by_pinned_id=_make_cpu_params(store.params),
-        )
-        instance.restore_pinned()
-        return instance
-
     @property
     def cache_bytes(self) -> int:
-        return self.store.cache_bytes
+        return _unique_cache_bytes(self.params) + _unique_cache_bytes(self.buffers)
+
+    @property
+    def has_trainables(self) -> bool:
+        return bool(self.trainable_param_names)
+
+    @property
+    def trainable_param_names(self) -> tuple[str, ...]:
+        return tuple(
+            name
+            for name, pinned in self.params.items()
+            if pinned.requires_grad
+        )
 
     def restore_pinned(self) -> None:
         _restore_params(
             self.module,
-            self.store.params,
+            self.params,
             self.cpu_params_by_pinned_id,
         )
-        _restore_buffers(self.module, self.store.buffers)
+        _restore_buffers(self.module, self.buffers)
 
     def allocate_target(
         self,
@@ -208,11 +217,13 @@ class PinnedModuleInstance:
         param_names: Iterable[str] | None = None,
         buffer_names: Iterable[str] | None = None,
     ) -> PinnedModuleTarget:
-        """Allocate active storage for selected store entries on ``device``."""
-        return self.store.allocate_target(
-            device,
-            param_names=param_names,
-            buffer_names=buffer_names,
+        """Allocate active storage for selected bound entries on ``device``."""
+        _validate_cuda_device(device)
+        params = _select_known_names(self.params, param_names)
+        buffers = _select_known_names(self.buffers, buffer_names)
+        return PinnedModuleTarget(
+            param_targets=_allocate_param_targets(params, device),
+            buffer_targets=_allocate_buffer_targets(buffers, device),
         )
 
     def register_post_copy_hook(
@@ -231,11 +242,11 @@ class PinnedModuleInstance:
 
     def post_copy_hook_key(self, name: str) -> int:
         """Stable hook/dedup key for a managed parameter name."""
-        if name not in self.store.params:
+        if name not in self.params:
             raise ValueError(
                 f"param name {name!r} is not owned by this PinnedModuleInstance"
             )
-        return id(self.store.params[name])
+        return id(self.params[name])
 
     def load_to_target(
         self,
@@ -249,9 +260,9 @@ class PinnedModuleInstance:
         Copying and hooks complete before any module mutation, so a copy
         failure does not leave the instance partially active.
         """
-        _validate_target_names_known(self.store, target)
-        params = _items_for_names(self.store.params, target.param_targets)
-        buffers = _items_for_names(self.store.buffers, target.buffer_targets)
+        _validate_target_names_known(self.params, self.buffers, target)
+        params = _items_for_names(self.params, target.param_targets)
+        buffers = _items_for_names(self.buffers, target.buffer_targets)
 
         _copy_params_to_target(
             params,
@@ -297,10 +308,10 @@ class PinnedModuleInstance:
         This is the explicit pinned-cache mutation path for optimizer-step
         sync. Frozen params and buffers are intentionally not copied back.
         """
-        _validate_target_names_known(self.store, target)
-        _validate_target_has_trainable_params(self.store, target)
+        _validate_target_names_known(self.params, self.buffers, target)
+        _validate_target_has_trainable_params(self.params, target)
         _copy_trainable_params_from_target(
-            self.store.params,
+            self.params,
             target.param_targets,
             non_blocking=non_blocking,
         )
@@ -385,10 +396,10 @@ def _validate_module_matches_store(
 
 
 def _validate_target_has_trainable_params(
-    store: PinnedModuleStore,
+    params: Mapping[str, PinnedParam],
     target: PinnedModuleTarget,
 ) -> None:
-    trainable_params = _trainable_params(store.params)
+    trainable_params = _trainable_params(params)
     expected_names = set(trainable_params)
     actual_names = set(target.param_targets)
     missing = sorted(expected_names - actual_names)
@@ -400,11 +411,12 @@ def _validate_target_has_trainable_params(
 
 
 def _validate_target_names_known(
-    store: PinnedModuleStore,
+    params: Mapping[str, PinnedParam],
+    buffers: Mapping[str, PinnedBuffer],
     target: PinnedModuleTarget,
 ) -> None:
-    extra_params = sorted(set(target.param_targets) - set(store.params))
-    extra_buffers = sorted(set(target.buffer_targets) - set(store.buffers))
+    extra_params = sorted(set(target.param_targets) - set(params))
+    extra_buffers = sorted(set(target.buffer_targets) - set(buffers))
     if not extra_params and not extra_buffers:
         return
 

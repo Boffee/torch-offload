@@ -62,7 +62,6 @@ from torch import nn
 
 from ._devices import canonical_device
 from .pinned_module import (
-    PinnedModuleInstance,
     PinnedModuleStore,
     PinnedModuleTarget,
     PostCopyHook,
@@ -201,7 +200,7 @@ class PinnedComponent:
         # Construction is still not fully rollback-safe because of the
         # low-peak Parameter.data repointing described above.
         self._store = store
-        self._instance = PinnedModuleInstance.from_store(store, model)
+        self._instance = store.bind(model)
         self._param_names = frozenset(store.params)
         self._buffer_names = frozenset(store.buffers)
         self._has_trainables = any(

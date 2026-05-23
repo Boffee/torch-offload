@@ -95,12 +95,12 @@ class _PinnedModuleTargetPool:
 
     def __init__(
         self,
-        template_store: PinnedModuleStore,
+        template_instance: PinnedModuleInstance,
         num_targets: int,
         device: torch.device,
     ) -> None:
         self._targets = [
-            template_store.allocate_target(device)
+            template_instance.allocate_target(device)
             for _ in range(num_targets)
         ]
         self._free: list[int] = list(range(num_targets))
@@ -318,7 +318,7 @@ def _pin_block_module_instances(
     ]
 
     block_instances = [
-        PinnedModuleInstance.from_store(store, block)
+        store.bind(block)
         for store, block in zip(block_stores, blocks, strict=True)
     ]
     return block_instances
@@ -329,7 +329,7 @@ def _iter_instance_trainable_params(
 ) -> Iterator[nn.Parameter]:
     params = dict(instance.module.named_parameters(remove_duplicate=False))
     seen: set[int] = set()
-    for name, pinned in instance.store.params.items():
+    for name, pinned in instance.params.items():
         if not pinned.requires_grad:
             continue
         param = params[name]
@@ -365,7 +365,7 @@ def _build_param_name_index(
 ) -> dict[str, tuple[int, str]]:
     index: dict[str, tuple[int, str]] = {}
     for block_idx, instance in enumerate(instances):
-        for local_name in instance.store.params:
+        for local_name in instance.params:
             name = _streamed_param_name(prefix, block_idx, local_name)
             if name in index:
                 raise ValueError(
@@ -599,7 +599,7 @@ class StreamedComponent:
     def streamed_param_names_by_block(self) -> list[list[str]]:
         """Per-block streamed parameter names."""
         return [
-            list(instance.store.params)
+            list(instance.params)
             for instance in self._block_instances
         ]
 
@@ -607,7 +607,7 @@ class StreamedComponent:
     def streamed_buffer_names_by_block(self) -> list[list[str]]:
         """Per-block streamed buffer names."""
         return [
-            list(instance.store.buffers)
+            list(instance.buffers)
             for instance in self._block_instances
         ]
 
@@ -622,7 +622,7 @@ class StreamedComponent:
 
     @property
     def has_trainables(self) -> bool:
-        return any(instance.store.has_trainables for instance in self._block_instances)
+        return any(instance.has_trainables for instance in self._block_instances)
 
     def register_post_copy_hook(
         self,
@@ -663,7 +663,7 @@ class StreamedComponent:
                 f"streamed block index {block_idx} is out of range"
             )
         instance = self._block_instances[block_idx]
-        if name not in instance.store.params:
+        if name not in instance.params:
             raise ValueError(
                 f"param name {name!r} is not owned by streamed block {block_idx}"
             )
@@ -960,12 +960,12 @@ class StreamedComponent:
         loaded: list[_LoadedTrainableBlock] = []
         with torch.cuda.stream(step_stream):
             for instance in self._block_instances:
-                if not instance.store.has_trainables:
+                if not instance.has_trainables:
                     continue
                 stack.callback(instance.restore_pinned)
                 trainable_target = instance.allocate_target(
                     device,
-                    param_names=instance.store.trainable_param_names,
+                    param_names=instance.trainable_param_names,
                     buffer_names=(),
                 )
                 instance.load_to_target(trainable_target, non_blocking=True)
@@ -1038,7 +1038,7 @@ class StreamedComponent:
         # Pool template comes from block 0. The constructor's layout
         # check has already verified every other block matches.
         self._pool = _PinnedModuleTargetPool(
-            self._block_instances[0].store,
+            self._block_instances[0],
             num_gpu_targets,
             device,
         )

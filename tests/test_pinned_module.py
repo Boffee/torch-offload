@@ -329,7 +329,8 @@ class TestPinnedModuleInstance:
         )
         instance = PinnedModuleInstance(
             module=nn.Module(),
-            store=store,
+            params=store.params,
+            buffers=store.buffers,
             cpu_params_by_pinned_id={
                 id(pinned_param): pinned_param.make_cpu_param(),
             },
@@ -344,7 +345,8 @@ class TestPinnedModuleInstance:
     def test_allocate_target_rejects_non_cuda_device(self) -> None:
         instance = PinnedModuleInstance(
             module=nn.Module(),
-            store=PinnedModuleStore(params={}, buffers={}),
+            params={},
+            buffers={},
             cpu_params_by_pinned_id={},
         )
 
@@ -367,7 +369,8 @@ class TestPinnedModuleInstance:
         )
         instance = PinnedModuleInstance(
             module=module,
-            store=store,
+            params=store.params,
+            buffers=store.buffers,
             cpu_params_by_pinned_id={id(pinned): pinned.make_cpu_param()},
         )
         target = instance.allocate_target(torch.device("cuda"))
@@ -397,7 +400,8 @@ class TestPinnedModuleInstance:
         )
         instance = PinnedModuleInstance(
             module=module,
-            store=store,
+            params=store.params,
+            buffers=store.buffers,
             cpu_params_by_pinned_id={id(pinned): pinned.make_cpu_param()},
         )
         target = instance.allocate_target(torch.device("cuda"))
@@ -426,7 +430,8 @@ class TestPinnedModuleInstance:
         )
         instance = PinnedModuleInstance(
             module=module,
-            store=store,
+            params=store.params,
+            buffers=store.buffers,
             cpu_params_by_pinned_id={id(pinned): pinned.make_cpu_param()},
         )
         target = instance.allocate_target(torch.device("cuda"))
@@ -437,7 +442,7 @@ class TestPinnedModuleInstance:
         assert module.weight.data_ptr() == target.param_targets["weight"].param.data_ptr()
         assert pinned.validated == 0
 
-    def test_from_store_does_not_revalidate_trainable_param_swap(self) -> None:
+    def test_bind_does_not_revalidate_trainable_param_swap(self) -> None:
         module = nn.Module()
         module.weight = nn.Parameter(torch.zeros(2), requires_grad=True)
         pinned = _FakePinnedParam(torch.ones(2), requires_grad=True)
@@ -446,7 +451,7 @@ class TestPinnedModuleInstance:
             buffers={},
         )
 
-        PinnedModuleInstance.from_store(store, module)
+        store.bind(module)
 
         assert pinned.validated == 0
 
@@ -459,7 +464,7 @@ class TestPinnedModuleInstance:
         module = nn.Module()
         module.register_buffer("running", torch.zeros(2), persistent=False)
         module.register_buffer("running_alias", module.running, persistent=False)
-        instance = PinnedModuleInstance.from_store(store, module)
+        instance = store.bind(module)
         target_tensor = torch.empty_like(store.buffers["running"].tensor)
         buffer_target = PinnedBufferTarget(target_tensor)
         target = PinnedModuleTarget(
@@ -489,7 +494,8 @@ class TestPinnedModuleInstance:
         )
         instance = PinnedModuleInstance(
             module=module,
-            store=store,
+            params=store.params,
+            buffers=store.buffers,
             cpu_params_by_pinned_id={id(pinned): pinned.make_cpu_param()},
         )
         target = PinnedModuleTarget(
@@ -519,7 +525,8 @@ class TestPinnedModuleInstance:
         )
         instance = PinnedModuleInstance(
             module=module,
-            store=store,
+            params=store.params,
+            buffers=store.buffers,
             cpu_params_by_pinned_id={},
         )
         target = PinnedModuleTarget(
@@ -547,7 +554,8 @@ class TestPinnedModuleInstance:
         )
         instance = PinnedModuleInstance(
             module=nn.Module(),
-            store=store,
+            params=store.params,
+            buffers=store.buffers,
             cpu_params_by_pinned_id={id(pinned): pinned.make_cpu_param()},
         )
         target = instance.allocate_target(torch.device("cuda"))
@@ -569,7 +577,8 @@ class TestPinnedModuleInstance:
         )
         instance = PinnedModuleInstance(
             module=nn.Module(),
-            store=store,
+            params=store.params,
+            buffers=store.buffers,
             cpu_params_by_pinned_id={
                 id(frozen): frozen.make_cpu_param(),
                 id(trainable): trainable.make_cpu_param(),
@@ -594,7 +603,8 @@ class TestPinnedModuleInstance:
         )
         instance = PinnedModuleInstance(
             module=nn.Module(),
-            store=store,
+            params=store.params,
+            buffers=store.buffers,
             cpu_params_by_pinned_id={
                 id(frozen): frozen.make_cpu_param(),
                 id(trainable): trainable.make_cpu_param(),
@@ -619,7 +629,8 @@ class TestPinnedModuleInstance:
         )
         instance = PinnedModuleInstance(
             module=nn.Module(),
-            store=store,
+            params=store.params,
+            buffers=store.buffers,
             cpu_params_by_pinned_id={id(pinned): pinned.make_cpu_param()},
         )
 
@@ -647,7 +658,8 @@ class TestPinnedModuleInstance:
         )
         instance = PinnedModuleInstance(
             module=module,
-            store=store,
+            params=store.params,
+            buffers=store.buffers,
             cpu_params_by_pinned_id={
                 id(frozen): frozen.make_cpu_param(),
                 id(trainable): trainable.make_cpu_param(),
@@ -690,7 +702,8 @@ class TestPinnedModuleInstance:
         )
         instance = PinnedModuleInstance(
             module=module,
-            store=store,
+            params=store.params,
+            buffers=store.buffers,
             cpu_params_by_pinned_id={
                 id(frozen): frozen.make_cpu_param(),
                 id(trainable): trainable.make_cpu_param(),
@@ -722,12 +735,12 @@ class TestPinnedModuleInstance:
         prototype.register_buffer("running", torch.randn(2))
         store = PinnedModuleStore.from_module(prototype)
 
-        first = PinnedModuleInstance.from_store(store, prototype)
+        first = store.bind(prototype)
 
         second_module = nn.Module()
         second_module.weight = nn.Parameter(torch.randn(2, 2), requires_grad=False)
         second_module.register_buffer("running", torch.randn(2))
-        second = PinnedModuleInstance.from_store(store, second_module)
+        second = store.bind(second_module)
 
         pinned = store.params["weight"]
         first_cpu = first.cpu_params_by_pinned_id[id(pinned)]
@@ -747,10 +760,11 @@ class TestPinnedModuleInstance:
         module.weight = nn.Parameter(torch.randn(2, 2), requires_grad=False)
         store = PinnedModuleStore.from_module(module)
 
-        instance = PinnedModuleInstance.from_store(store, module)
+        instance = store.bind(module)
 
         assert not hasattr(instance, "parent")
         assert not hasattr(instance, "leaf")
+        assert not hasattr(instance, "store")
 
     def test_restores_tied_params_with_one_cpu_wrapper(self) -> None:
         prototype = nn.Module()
@@ -765,7 +779,7 @@ class TestPinnedModuleInstance:
         target_shared.weight.requires_grad_(False)
         target.left = target_shared
         target.right = target_shared
-        instance = PinnedModuleInstance.from_store(store, target)
+        instance = store.bind(target)
 
         pinned = store.params["left.weight"]
         cpu_param = instance.cpu_params_by_pinned_id[id(pinned)]
@@ -783,7 +797,7 @@ class TestPinnedModuleInstance:
         target.weight = nn.Parameter(torch.randn(2, 2), requires_grad=True)
         target_param = target.weight
 
-        instance = PinnedModuleInstance.from_store(store, target)
+        instance = store.bind(target)
         cpu_param = instance.cpu_params_by_pinned_id[id(store.params["weight"])]
 
         assert target.weight is target_param
@@ -797,7 +811,7 @@ class TestPinnedModuleInstance:
         target = nn.Module()
         target.register_buffer("running", torch.randn(2), persistent=False)
 
-        PinnedModuleInstance.from_store(store, target)
+        store.bind(target)
 
         assert target.running is store.buffers["running"].tensor
         assert "running" in target._non_persistent_buffers_set
@@ -808,7 +822,7 @@ class TestPinnedModuleInstance:
         module.register_buffer("table", source)
 
         store = PinnedModuleStore.from_module(module)
-        instance = PinnedModuleInstance.from_store(store, module)
+        instance = store.bind(module)
 
         assert not source.is_contiguous()
         assert store.buffers["table"].tensor.is_contiguous()
@@ -820,7 +834,7 @@ class TestPinnedModuleInstance:
         store = PinnedModuleStore.from_module(prototype)
 
         with pytest.raises(ValueError, match="missing pinned names.*weight"):
-            PinnedModuleInstance.from_store(store, nn.Module())
+            store.bind(nn.Module())
 
     def test_rejects_missing_buffer_name(self) -> None:
         prototype = nn.Module()
@@ -828,7 +842,7 @@ class TestPinnedModuleInstance:
         store = PinnedModuleStore.from_module(prototype)
 
         with pytest.raises(ValueError, match="missing pinned names.*running"):
-            PinnedModuleInstance.from_store(store, nn.Module())
+            store.bind(nn.Module())
 
     def test_rejects_requires_grad_mismatch(self) -> None:
         prototype = nn.Module()
@@ -839,7 +853,7 @@ class TestPinnedModuleInstance:
         target.weight = nn.Parameter(torch.randn(2, 2), requires_grad=True)
 
         with pytest.raises(ValueError, match="requires_grad mismatch"):
-            PinnedModuleInstance.from_store(store, target)
+            store.bind(target)
 
     def test_rejects_param_layout_mismatch(self) -> None:
         prototype = nn.Module()
@@ -850,7 +864,7 @@ class TestPinnedModuleInstance:
         target.weight = nn.Parameter(torch.randn(3, 2), requires_grad=False)
 
         with pytest.raises(ValueError, match="Param 'weight' layout mismatch"):
-            PinnedModuleInstance.from_store(store, target)
+            store.bind(target)
 
     def test_rejects_buffer_layout_mismatch(self) -> None:
         prototype = nn.Module()
@@ -861,9 +875,9 @@ class TestPinnedModuleInstance:
         target.register_buffer("running", torch.randn(3))
 
         with pytest.raises(ValueError, match="Buffer 'running' layout mismatch"):
-            PinnedModuleInstance.from_store(store, target)
+            store.bind(target)
 
-    def test_from_store_allows_param_sharing_mismatch(self) -> None:
+    def test_bind_allows_param_sharing_mismatch(self) -> None:
         prototype = nn.Module()
         shared = nn.Linear(2, 2, bias=False)
         shared.weight.requires_grad_(False)
@@ -877,11 +891,11 @@ class TestPinnedModuleInstance:
         target.left.weight.requires_grad_(False)
         target.right.weight.requires_grad_(False)
 
-        PinnedModuleInstance.from_store(store, target)
+        store.bind(target)
 
         assert target.left.weight is target.right.weight
 
-    def test_from_store_allows_untracked_param_sharing(self) -> None:
+    def test_bind_allows_untracked_param_sharing(self) -> None:
         prototype = nn.Module()
         prototype.weight = nn.Parameter(torch.randn(2, 2), requires_grad=False)
         store = PinnedModuleStore.from_module(prototype)
@@ -892,12 +906,12 @@ class TestPinnedModuleInstance:
         target.extra = nn.Parameter(shared, requires_grad=False)
         extra = target.extra
 
-        PinnedModuleInstance.from_store(store, target)
+        store.bind(target)
 
         assert target.extra is extra
         assert target.weight is not target.extra
 
-    def test_from_store_allows_buffer_sharing_mismatch(self) -> None:
+    def test_bind_allows_buffer_sharing_mismatch(self) -> None:
         prototype = nn.Module()
         shared = torch.randn(2)
         prototype.register_buffer("running", shared)
@@ -908,6 +922,6 @@ class TestPinnedModuleInstance:
         target.register_buffer("running", torch.randn(2))
         target.register_buffer("running_alias", torch.randn(2))
 
-        PinnedModuleInstance.from_store(store, target)
+        store.bind(target)
 
         assert target.running is target.running_alias
