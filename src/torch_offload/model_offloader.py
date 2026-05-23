@@ -2,10 +2,6 @@
 
 Composes block streaming, non-streamed pinning, and optional per-weight
 LoRA application into a single :class:`ModelOffloader` class.
-
-Also provides :func:`detect_streaming_region_ties`
-(construction-time validation), used internally by
-:class:`ModelOffloader` and exported for direct use / testing.
 """
 
 from __future__ import annotations
@@ -13,7 +9,6 @@ from __future__ import annotations
 import contextlib
 import logging
 from collections.abc import Callable, Iterator, Sequence
-from dataclasses import dataclass
 from typing import Literal, Protocol
 
 import torch
@@ -22,15 +17,7 @@ from torch import nn
 from ._devices import canonical_device
 from .lora import LoRA, LoRARouteHandle, LoRATransform
 from .pinned_weights import PinnedWeights
-from .protocols import ModelStrategyComponent, SlotKey
-from .slots import (
-    buffer_storage_key,
-    canonical_param_name,
-    iter_buffer_slots,
-    iter_param_slots,
-    param_storage_key,
-    walk_attr_path,
-)
+from .protocols import ModelStrategyComponent
 from .streamed_weights import StreamedWeights
 from .tensor_adapter_factory import select_adapter
 
@@ -48,7 +35,6 @@ class _RemovableHook(Protocol):
 
 __all__ = [
     "ModelOffloader",
-    "detect_streaming_region_ties",
 ]
 
 
@@ -84,7 +70,7 @@ class ModelOffloader:
 
     CUDA activation uses block streaming plus component-level device
     movement. CPU activation is pass-through over the pinned
-    host-backed module slots.
+    host-backed module state.
 
     Composes :class:`PinnedWeights` (non-streamed params and buffers)
     and one or more :class:`StreamedWeights`\\ s internally. LoRA requests
@@ -154,7 +140,7 @@ class ModelOffloader:
     Parameters
     ----------
     model:
-        The model containing the block list(s). Managed slots may start
+        The model containing the block list(s). Managed tensors may start
         on CPU or CUDA; construction clones them directly into pinned
         CPU storage before activation.
     layers_attr:
@@ -233,16 +219,13 @@ class ModelOffloader:
                     f"layers_attr[{i}] = {layer_paths[i]!r} resolved to empty list"
                 )
 
-        _validate_block_groups_disjoint(block_groups, layer_paths)
-        _validate_streamed_block_names_are_exclusive(
-            model,
-            block_groups,
-            layer_paths,
-            stream_trainables=stream_trainable_weights,
-        )
-        detect_streaming_region_ties(
-            model, block_groups, stream_trainables=stream_trainable_weights,
-        )
+        streamed_name_selections = [
+            _streamed_names_for_blocks(
+                blocks,
+                stream_trainables=stream_trainable_weights,
+            )
+            for blocks in block_groups
+        ]
 
         # By default, streamers skip trainables and PinnedWeights keeps
         # them GPU-resident while active. With stream_trainable_weights=True,
@@ -255,10 +238,7 @@ class ModelOffloader:
         streamed_param_names: set[str] = set()
         streamed_buffer_names: set[str] = set()
         for i, blocks in enumerate(block_groups):
-            stream_param_names, stream_buffer_names = _streamed_names_for_blocks(
-                blocks,
-                stream_trainables=stream_trainable_weights,
-            )
+            stream_param_names, stream_buffer_names = streamed_name_selections[i]
             streamed_param_names.update(
                 _full_block_names(layer_paths[i], len(blocks), stream_param_names)
             )
@@ -835,6 +815,19 @@ def _all_buffer_names(model: nn.Module) -> set[str]:
     }
 
 
+def walk_attr_path(root: nn.Module, dotted_path: str) -> object:
+    """Walk a dotted attribute path from ``root``."""
+    obj: object = root
+    for part in dotted_path.split("."):
+        obj = getattr(obj, part)
+    return obj
+
+
+def canonical_param_name(name: str) -> str:
+    """Normalize PEFT base-layer paths for LoRA target matching."""
+    return name.replace(".base_layer.", ".")
+
+
 def _resolve_param_parent(block: nn.Module, name: str) -> nn.Module:
     parent_path, sep, _leaf = name.rpartition(".")
     if not sep:
@@ -877,319 +870,3 @@ def _hf_block_has_checkpointing_flag(block: nn.Module) -> bool:
     for why.
     """
     return bool(getattr(block, "gradient_checkpointing", False))
-
-
-# ---------------------------------------------------------------------------
-# Composer-level invariants
-# ---------------------------------------------------------------------------
-
-
-def _validate_block_groups_disjoint(
-    block_groups: Sequence[Sequence[nn.Module]], layer_paths: Sequence[str]
-) -> None:
-    """Reject configurations where any :class:`SlotKey` is owned
-    by more than one block entry.
-
-    Each ``StreamedWeights`` instance assumes it is the sole owner of
-    every ``(parent_module, leaf, kind)`` slot inside its blocks.
-    Overlapping ownership comes in three shapes:
-
-    - **Same block module listed in two groups** (or twice in one):
-      multiple block entries would pin and slot-replace the same
-      ``nn.Module``, and per-block ``.data`` swap during streaming
-      would conflict.
-    - **Parent/child blocks across groups** (group A has a parent
-      module, group B has one of its children): different
-      ``id(parent)`` block instances, but their per-leaf
-      ``SlotKey`` values coincide on the child's slots.
-    - **Within a single group, the same nn.Module appearing twice**:
-      the streamer would create per-index pinned clones for the same
-      slots and swap ``.data`` redundantly.
-
-    This validation is the precondition for
-    :func:`detect_streaming_region_ties` and the per-block instance
-    construction inside :class:`StreamedWeights` to be unambiguous; it lives
-    at the composer because it is about how the caller composed
-    ``layers_attr`` paths, not about parameter aliasing.
-    """
-    slot_owner: dict[SlotKey, str] = {}
-    duplicates: dict[SlotKey, list[str]] = {}
-    for group_idx, blocks in enumerate(block_groups):
-        for block_idx, layer in enumerate(blocks):
-            label = f"{layer_paths[group_idx]}[{block_idx}]"
-            slots: set[SlotKey] = set()
-            for s in iter_param_slots(layer):
-                slots.add(s.key)
-            for s in iter_buffer_slots(layer):
-                slots.add(s.key)
-            for slot in slots:
-                if slot in slot_owner:
-                    duplicates.setdefault(slot, [slot_owner[slot]]).append(label)
-                else:
-                    slot_owner[slot] = label
-    if duplicates:
-        sample = next(iter(duplicates.items()))
-        raise ValueError(
-            f"Streamer block groups must own disjoint module slots, "
-            f"but {len(duplicates)} slot(s) are claimed by multiple "
-            f"block entries. Example: leaf {sample[0].leaf!r} is "
-            f"owned by {sample[1]}. Likely causes: the same block is "
-            f"listed in two `layers_attr` paths, a path resolves to a "
-            f"module that contains another resolved path, or a block "
-            f"appears twice in a single `nn.ModuleList`."
-        )
-
-
-def _validate_streamed_block_names_are_exclusive(
-    model: nn.Module,
-    block_groups: Sequence[Sequence[nn.Module]],
-    layer_paths: Sequence[str],
-    *,
-    stream_trainables: bool,
-) -> None:
-    """Reject params/buffers inside streamed blocks that have extra model names."""
-    expected_names_by_slot: dict[SlotKey, set[str]] = {}
-    for group_idx, blocks in enumerate(block_groups):
-        layer_path = layer_paths[group_idx]
-        for block_idx, block in enumerate(blocks):
-            prefix = f"{layer_path}.{block_idx}"
-            for slot in iter_param_slots(block):
-                if not stream_trainables and slot.get().requires_grad:
-                    continue
-                expected_names_by_slot.setdefault(slot.key, set()).add(
-                    f"{prefix}.{slot.name}"
-                )
-            for slot in iter_buffer_slots(block):
-                expected_names_by_slot.setdefault(slot.key, set()).add(
-                    f"{prefix}.{slot.name}"
-                )
-
-    for slot in iter_param_slots(model):
-        expected_names = expected_names_by_slot.get(slot.key)
-        if expected_names is not None and slot.name not in expected_names:
-            _raise_non_exclusive_streamed_block_name(slot.name, expected_names)
-    for slot in iter_buffer_slots(model):
-        expected_names = expected_names_by_slot.get(slot.key)
-        if expected_names is not None and slot.name not in expected_names:
-            _raise_non_exclusive_streamed_block_name(slot.name, expected_names)
-
-
-def _raise_non_exclusive_streamed_block_name(
-    name: str,
-    expected_names: set[str],
-) -> None:
-    raise ValueError(
-        "ModelOffloader requires streamed block names to be exclusive. "
-        f"Slot {name!r} is inside a configured streamed block but is also "
-        f"reachable outside its expected streamed name(s) "
-        f"{sorted(expected_names)!r}. Remove the extra module reference or "
-        "use whole-model PinnedWeights."
-    )
-
-
-# ---------------------------------------------------------------------------
-# Cross-region tied-weight detection
-# ---------------------------------------------------------------------------
-
-
-_NON_BLOCK_REGION = "non_block"
-_BLOCK_REGION_PREFIX = "block:"
-
-
-@dataclass(frozen=True, slots=True)
-class _ParamStorageMember:
-    region: str
-    name: str
-    requires_grad: bool
-
-
-@dataclass(frozen=True, slots=True)
-class _BufferStorageMember:
-    region: str
-    name: str
-
-
-def detect_streaming_region_ties(
-    model: nn.Module,
-    block_groups: Sequence[Sequence[nn.Module]],
-    *,
-    stream_trainables: bool = False,
-) -> None:
-    """Raise if tied storage is unsafe for block streaming.
-
-    Each entry in ``block_groups`` is one block list, and each block in
-    those lists is treated as a separate streamed region. Everything
-    else in ``model`` is the "non_block" region.
-
-    Unsupported configurations:
-
-    - **Frozen cross-region parameter ties** (block<->block,
-      block<->non-block): the per-region pinning regimes can't
-      coordinate to share storage.
-    - **Mixed frozen/trainable ties** anywhere — across regions OR
-      within a single region. The frozen side gets pinned and slot-
-      replaced while the trainable side is moved via storage swap on
-      activate; the two mechanisms cannot share a tied storage
-      without breaking aliasing invariants silently.
-    - **Streamed trainable ties across regions** when
-      ``stream_trainables=True``. Each streamed region owns independent
-      pinned storage and cannot coordinate optimizer-step copy-back for
-      shared trainable storage. Intra-region trainable ties are safe:
-      pinned module stores deduplicate them by storage and install a
-      single active target.
-    - **Cross-region buffer ties**. Per-block buffer clones and
-      composed non-block pinning cannot coordinate to preserve the
-      alias.
-    Non-block-internal all-frozen ties (the standard ``tie_weights()``
-    embed<->head pattern) are handled correctly by
-    :class:`PinnedWeights`'s storage-key dedup and are NOT rejected
-    here.
-    """
-    param_slot_regions = _param_slot_regions(block_groups)
-    for members in _param_storage_groups(model, param_slot_regions).values():
-        _validate_param_storage_group(
-            members,
-            stream_trainables=stream_trainables,
-        )
-
-    buffer_slot_regions = _buffer_slot_regions(block_groups)
-    for members in _buffer_storage_groups(model, buffer_slot_regions).values():
-        _validate_buffer_storage_group(members)
-
-
-def _block_region(group_idx: int, block_idx: int) -> str:
-    return f"{_BLOCK_REGION_PREFIX}{group_idx}:{block_idx}"
-
-
-def _param_slot_regions(
-    block_groups: Sequence[Sequence[nn.Module]],
-) -> dict[SlotKey, str]:
-    """Map slots inside streamed blocks to their owning block region.
-
-    Slot-level ownership distinguishes "this slot lives in block X"
-    from "this slot's Parameter is also referenced from block Y" — the
-    latter is what cross-region same-Parameter aliasing produces. A
-    Parameter-id-only map would silently collapse both slots to the
-    first block's region.
-    """
-    regions: dict[SlotKey, str] = {}
-    for group_idx, blocks in enumerate(block_groups):
-        for block_idx, layer in enumerate(blocks):
-            region = _block_region(group_idx, block_idx)
-            for slot in iter_param_slots(layer):
-                regions[slot.key] = region
-    return regions
-
-
-def _buffer_slot_regions(
-    block_groups: Sequence[Sequence[nn.Module]],
-) -> dict[SlotKey, set[str]]:
-    regions: dict[SlotKey, set[str]] = {}
-    for group_idx, blocks in enumerate(block_groups):
-        for block_idx, layer in enumerate(blocks):
-            region = _block_region(group_idx, block_idx)
-            for slot in iter_buffer_slots(layer):
-                regions.setdefault(slot.key, set()).add(region)
-    return regions
-
-
-def _param_storage_groups(
-    model: nn.Module,
-    slot_regions: dict[SlotKey, str],
-) -> dict[tuple[object, ...], list[_ParamStorageMember]]:
-    groups: dict[tuple[object, ...], list[_ParamStorageMember]] = {}
-    for slot in iter_param_slots(model):
-        param = slot.get()
-        if param.numel() == 0:
-            continue
-        region = slot_regions.get(slot.key, _NON_BLOCK_REGION)
-        groups.setdefault(param_storage_key(param), []).append(
-            _ParamStorageMember(
-                region=region,
-                name=slot.name,
-                requires_grad=param.requires_grad,
-            )
-        )
-    return groups
-
-
-def _buffer_storage_groups(
-    model: nn.Module,
-    slot_regions: dict[SlotKey, set[str]],
-) -> dict[tuple[object, ...], list[_BufferStorageMember]]:
-    groups: dict[tuple[object, ...], list[_BufferStorageMember]] = {}
-    for slot in iter_buffer_slots(model):
-        buffer = slot.get()
-        if buffer.numel() == 0:
-            continue
-        regions = slot_regions.get(slot.key, {_NON_BLOCK_REGION})
-        for region in regions:
-            groups.setdefault(buffer_storage_key(buffer), []).append(
-                _BufferStorageMember(region=region, name=slot.name)
-            )
-    return groups
-
-
-def _validate_param_storage_group(
-    members: list[_ParamStorageMember],
-    *,
-    stream_trainables: bool,
-) -> None:
-    regions = {member.region for member in members}
-    names = sorted(member.name for member in members)
-    grad_flags = {member.requires_grad for member in members}
-    if len(grad_flags) > 1:
-        raise ValueError(
-            f"Tied storage spans both trainable and frozen parameters: "
-            f"{names}. Slot-replace (frozen) and storage-swap "
-            "(trainable) mechanisms cannot share a tied storage. "
-            "Untie the parameters or freeze/unfreeze them consistently."
-        )
-    requires_grad = next(iter(grad_flags))
-    if requires_grad:
-        if stream_trainables and len(regions) > 1:
-            raise ValueError(
-                f"All-trainable tied storage spans streamed regions "
-                f"{sorted(regions)}: {names}. Shared trainable storage "
-                "across independently streamed regions creates divergent "
-                "pinned clones; per-block .data swap and optimizer-step "
-                "copy-back cannot coordinate to preserve the alias. Untie "
-                "the parameters, refactor so the alias is intra-region, or use "
-                "stream_trainable_weights=False."
-            )
-        return
-    _validate_frozen_param_storage_group(
-        regions=regions,
-        names=names,
-    )
-
-
-def _validate_frozen_param_storage_group(
-    *,
-    regions: set[str],
-    names: list[str],
-) -> None:
-    if len(regions) > 1:
-        raise ValueError(
-            f"Block streaming does not support tied parameters across "
-            f"streamed regions: storage shared by {names}. Slot-local "
-            "block streaming cannot preserve cross-region tying. Use "
-            "whole-model PinnedWeights, disable block streaming, or "
-            "untie the parameters."
-        )
-
-
-def _validate_buffer_storage_group(
-    members: list[_BufferStorageMember],
-) -> None:
-    regions = {member.region for member in members}
-    names = sorted({member.name for member in members})
-    if len(regions) > 1:
-        raise ValueError(
-            f"Block streaming does not support tied buffers across "
-            f"streamed regions: storage shared by {names}. The two "
-            "pinning regimes (per-block clone vs composed "
-            "PinnedWeights) can't coordinate to preserve the alias. "
-            "Untie the buffers or use whole-model PinnedWeights "
-            "instead."
-        )

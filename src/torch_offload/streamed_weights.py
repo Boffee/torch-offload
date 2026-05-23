@@ -24,9 +24,9 @@ This is the sharp, low-level primitive. It does NOT manage:
   by excluding the streamer's owned block-local names.
 - Out-of-block trainable parameter movement — caller handles that
   alongside non-streamed parameters, usually with :class:`PinnedWeights`.
-- Cross-region tied-weight detection — that's a composer concern
-  (see :func:`ModelOffloader` /
-  :class:`~torch_offload.model_offloader.ModelOffloader`).
+- Shared storage with tensors outside the streamed block list — caller
+  must choose a valid composition; use whole-model
+  :class:`PinnedWeights` if sharing must be preserved.
 - Activation-checkpointing enforcement — required for in-block
   trainable streaming, but checked at the composer level.
 

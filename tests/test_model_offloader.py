@@ -1,8 +1,7 @@
 """Tests for the block-streaming machinery in ``torch_offload``.
 
 Covers ``ModelOffloader`` (the public composite),
-``StreamedWeights`` (the per-block-list primitive),
-and the cross-region tied-weight detector.
+and ``StreamedWeights`` (the per-block-list primitive).
 
 CUDA-only tests gate on availability. CPU activation is pass-through
 over the host-backed pinned state.
@@ -24,8 +23,6 @@ from torch_offload import (
     PinnedWeights,
     StreamedWeights,
 )
-from torch_offload.model_offloader import detect_streaming_region_ties
-from torch_offload.slots import iter_param_slots
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -1085,103 +1082,11 @@ class TestBufferOnlyNonBlock:
 
 
 # ---------------------------------------------------------------------------
-# Cross-region tied-weight detection
+# Shared storage handled inside one component
 # ---------------------------------------------------------------------------
 
 
-class TestCrossRegionTiedDetection:
-    def test_cross_block_tied_raises(self) -> None:
-        shared = torch.randn(8, 8)
-        block_0 = nn.Linear(8, 8, bias=False)
-        block_1 = nn.Linear(8, 8, bias=False)
-        block_0.weight = nn.Parameter(shared, requires_grad=False)
-        block_1.weight = nn.Parameter(shared, requires_grad=False)
-
-        class M(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.transformer_blocks = nn.ModuleList([block_0, block_1])
-
-        m = M()
-        for p in m.parameters():
-            p.requires_grad = False
-        with pytest.raises(ValueError, match="streamed regions|tied"):
-            ModelOffloader(
-                m,
-                layers_attr="transformer_blocks", blocks_to_swap=1,
-                stream_trainable_weights=True,
-            )
-
-    def test_block_to_non_block_tied_raises(self) -> None:
-        shared = torch.randn(4, 4)
-        block_0 = nn.Linear(4, 4, bias=False)
-        block_0.weight = nn.Parameter(shared, requires_grad=False)
-        head = nn.Linear(4, 4, bias=False)
-        head.weight = nn.Parameter(shared, requires_grad=False)
-
-        class M(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.transformer_blocks = nn.ModuleList(
-                    [block_0, nn.Linear(4, 4, bias=False)]
-                )
-                self.head = head
-
-        m = M()
-        for p in m.parameters():
-            p.requires_grad = False
-        with pytest.raises(ValueError, match="streamed regions|tied"):
-            ModelOffloader(
-                m,
-                layers_attr="transformer_blocks", blocks_to_swap=1,
-                stream_trainable_weights=True,
-            )
-
-    def test_mixed_trainable_frozen_cross_region_tied_raises(self) -> None:
-        shared = torch.randn(4, 4)
-        block_0 = nn.Linear(4, 4, bias=False)
-        block_0.weight = nn.Parameter(shared, requires_grad=True)
-        head = nn.Linear(4, 4, bias=False)
-        head.weight = nn.Parameter(shared, requires_grad=False)
-
-        class M(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.transformer_blocks = nn.ModuleList(
-                    [block_0, nn.Linear(4, 4, bias=False)]
-                )
-                self.head = head
-
-        m = M()
-        for p in m.transformer_blocks[1].parameters():
-            p.requires_grad = False
-        with pytest.raises(ValueError, match="streamed regions|tied"):
-            ModelOffloader(
-                m,
-                layers_attr="transformer_blocks", blocks_to_swap=1,
-            )
-
-    def test_streamed_block_name_must_be_exclusive(self) -> None:
-        block = nn.Linear(4, 4, bias=False)
-
-        class M(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.transformer_blocks = nn.ModuleList(
-                    [block, nn.Linear(4, 4, bias=False)]
-                )
-                self.first_block = block
-
-        m = M()
-        for p in m.parameters():
-            p.requires_grad = False
-
-        with pytest.raises(ValueError, match="streamed block names to be exclusive"):
-            ModelOffloader(
-                m,
-                layers_attr="transformer_blocks", blocks_to_swap=1,
-            )
-
+class TestSharedStorageLocalBehavior:
     def test_extra_name_for_unstreamed_trainable_block_param_is_allowed(
         self,
     ) -> None:
@@ -1234,66 +1139,6 @@ class TestCrossRegionTiedDetection:
                 assert block.attn_q.weight is block.attn_k.weight
         finally:
             strategy.deactivate()
-
-    def test_cross_region_tied_buffers_raises(self) -> None:
-        shared = torch.randn(8)
-        view_block = shared.view(8)
-        view_aux = shared.view(8)
-        assert id(view_block) != id(view_aux)
-        assert view_block.data_ptr() == view_aux.data_ptr()
-
-        class BlockWithTiedBuf(nn.Module):
-            def __init__(self, buf):
-                super().__init__()
-                self.register_buffer("table", buf)
-
-        class M(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.transformer_blocks = nn.ModuleList(
-                    [BlockWithTiedBuf(view_block), nn.Linear(4, 4, bias=False)]
-                )
-                self.aux = nn.Module()
-                self.aux.register_buffer("alias", view_aux)
-
-        m = M()
-        for p in m.parameters():
-            p.requires_grad = False
-        with pytest.raises(ValueError, match="tied buffers across"):
-            ModelOffloader(
-                m,
-                layers_attr="transformer_blocks", blocks_to_swap=1,
-            )
-
-    def test_same_buffer_object_cross_region_raises(self) -> None:
-        # Bug 3 regression: the SAME Python buffer object registered
-        # at both a block path AND a non-block path. Previously this
-        # was missed (id-based classification put both in block
-        # region). Slot-ownership classification now catches it.
-        shared_buf = torch.randn(8)
-
-        class BlockWithBuf(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.register_buffer("table", shared_buf)
-
-        class M(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.transformer_blocks = nn.ModuleList(
-                    [BlockWithBuf(), nn.Linear(4, 4, bias=False)]
-                )
-                # Same Python buffer object also registered at non-block path.
-                self.register_buffer("aux", shared_buf)
-
-        m = M()
-        for p in m.parameters():
-            p.requires_grad = False
-        with pytest.raises(ValueError, match="tied buffers across"):
-            ModelOffloader(
-                m,
-                layers_attr="transformer_blocks", blocks_to_swap=1,
-            )
 
     def test_intra_block_tied_buffers_are_preserved(self) -> None:
         class TiedBufBlock(nn.Module):
@@ -1358,7 +1203,7 @@ class TestCrossRegionTiedDetection:
             strategy.deactivate()
 
     def test_non_block_internal_tied_works(self) -> None:
-        # Tied embed↔head WITHIN non-block region: PinnedWeights handles
+        # Tied embed↔head WITHIN PinnedWeights: PinnedWeights handles
         # this via storage-key dedup. Should not raise.
         embed = nn.Embedding(16, 8)
         head = nn.Linear(8, 16, bias=False)
@@ -1985,43 +1830,7 @@ class TestStreamedNameSelection:
 
 
 # ---------------------------------------------------------------------------
-# detect_streaming_region_ties (free-function, multi-group)
-# ---------------------------------------------------------------------------
-
-
-class TestDetectStreamingRegionTies:
-    def test_passes_for_clean_model(self) -> None:
-        m = _make_block_model()
-        # Should not raise.
-        detect_streaming_region_ties(m, [list(m.transformer_blocks)])
-
-    def test_multi_group_cross_group_tied_raises(self) -> None:
-        # Same Parameter object appearing in two different groups —
-        # this must be rejected (slot-local streaming can't preserve
-        # cross-group sharing).
-        shared = torch.randn(4, 4)
-        block_a = nn.Linear(4, 4, bias=False)
-        block_b = nn.Linear(4, 4, bias=False)
-        block_a.weight = nn.Parameter(shared, requires_grad=False)
-        block_b.weight = nn.Parameter(shared, requires_grad=False)
-
-        class M(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.group_a = nn.ModuleList([block_a, nn.Linear(4, 4, bias=False)])
-                self.group_b = nn.ModuleList([block_b, nn.Linear(4, 4, bias=False)])
-
-        m = M()
-        for p in m.parameters():
-            p.requires_grad = False
-        with pytest.raises(ValueError, match="tied|streamed regions"):
-            detect_streaming_region_ties(
-                m, [list(m.group_a), list(m.group_b)],
-            )
-
-
-# ---------------------------------------------------------------------------
-# Composer-driven trainable partitioning (contract guards + tie detection)
+# Composer-driven trainable partitioning
 # ---------------------------------------------------------------------------
 
 
@@ -2093,16 +1902,11 @@ class TestStreamedWeightsContractGuard:
 
 
 class TestMixedGradTieDetection:
-    """detect_streaming_region_ties must catch mixed-grad ties anywhere
-    — across regions, intra-block, or intra-non-block. Slot replacement
-    (frozen) and storage swap (trainable) cannot cohabit a tied
-    storage."""
+    """Mixed-grad shared storage is rejected by the owning component."""
 
     def test_intra_non_block_mixed_grad_tie_raises(self) -> None:
         # Two distinct Parameter objects sharing storage, both in the
-        # non-block region, with mixed grad. Slot replacement on the
-        # frozen alias would diverge from the storage-swap-managed
-        # trainable alias on activate.
+        # PinnedWeights store, with mixed grad.
         shared = torch.randn(4, 4)
         a = nn.Parameter(shared, requires_grad=True)
         b = nn.Parameter(shared, requires_grad=False)
@@ -2121,7 +1925,7 @@ class TestMixedGradTieDetection:
         m = M()
         for p in m.transformer_blocks.parameters():
             p.requires_grad = False
-        with pytest.raises(ValueError, match="trainable and frozen"):
+        with pytest.raises(ValueError, match="mixed requires_grad"):
             ModelOffloader(
                 m,
                 layers_attr="transformer_blocks", blocks_to_swap=1,
@@ -2217,43 +2021,9 @@ class TestMixedGradTieDetection:
         finally:
             strategy.deactivate()
 
-    def test_all_trainable_same_parameter_cross_region_tie_raises(self) -> None:
-        # The SAME trainable Parameter object aliased into two streamed
-        # blocks is rejected: each block builds its own pinned clone,
-        # so the per-block .data swap and the gather/scatter at step
-        # time would diverge across the two clones — silent corruption
-        # of the optimizer state. Block 1's layout matches block 0
-        # (same Parameter shape, same slot names) so the layout check
-        # passes; the tie check fires next.
-        shared = nn.Parameter(torch.randn(4, 4), requires_grad=True)
-
-        class TiedTrainableBlock(nn.Module):
-            def __init__(self):
-                super().__init__()
-                # ``a`` references the cross-region-shared Parameter.
-                self.a = shared
-
-        class M(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.transformer_blocks = nn.ModuleList(
-                    [TiedTrainableBlock(), TiedTrainableBlock()]
-                )
-
-        m = M()
-
-        with pytest.raises(
-            ValueError, match="spans streamed regions",
-        ):
-            ModelOffloader(
-                m,
-                layers_attr="transformer_blocks", blocks_to_swap=1,
-                stream_trainable_weights=True,
-            )
-
     def test_all_trainable_same_parameter_default_mode_constructs(self) -> None:
         # Default mode skips all trainables in StreamedWeights and manages
-        # them through PinnedWeights, so all-trainable cross-region ties
+        # them through PinnedWeights, so all-trainable shared storage
         # remain valid.
         shared = nn.Parameter(torch.randn(4, 4), requires_grad=True)
 
@@ -2279,7 +2049,7 @@ class TestMixedGradTieDetection:
         strategy.deactivate()
 
     def test_all_trainable_same_parameter_intra_block_only_tie(self) -> None:
-        # Pure intra-block aliasing (no cross-region): two slots inside
+        # Pure intra-block aliasing: two slots inside
         # each block share the same trainable Parameter, but block 0's
         # shared Parameter is distinct from block 1's. Streamed block
         # stores dedup by storage per block, and the .data swap reaches
@@ -2350,68 +2120,6 @@ class TestMixedGradTieDetection:
                 assert block.weight.grad.device.type == "cpu"
         finally:
             strategy.deactivate()
-
-    def test_mixed_grad_cross_region_reports_grad_cause(self) -> None:
-        # When a tie is BOTH cross-region AND mixed-grad, the user
-        # should see the mixed-grad cause (the more specific one) — the
-        # cross-region recovery advice (whole-model PinnedWeights)
-        # wouldn't fix mixed-grad anyway.
-        shared = torch.randn(4, 4)
-        block_0 = nn.Linear(4, 4, bias=False)
-        block_0.weight = nn.Parameter(shared, requires_grad=True)
-        head = nn.Linear(4, 4, bias=False)
-        head.weight = nn.Parameter(shared, requires_grad=False)
-
-        class M(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.transformer_blocks = nn.ModuleList(
-                    [block_0, nn.Linear(4, 4, bias=False)]
-                )
-                self.head = head
-
-        m = M()
-        for p in m.transformer_blocks[1].parameters():
-            p.requires_grad = False
-        with pytest.raises(
-            ValueError, match="trainable and frozen",
-        ):
-            ModelOffloader(
-                m,
-                layers_attr="transformer_blocks", blocks_to_swap=1,
-            )
-
-    def test_intra_block_mixed_grad_tie_raises(self) -> None:
-        # Two distinct Parameter objects sharing storage, both inside
-        # the same block, with mixed grad. The intra-block tie check
-        # already fires for distinct slots; this test ensures the
-        # mixed-grad message takes precedence (or at minimum, that the
-        # composer rejects).
-        shared = torch.randn(4, 4)
-
-        class TiedBlock(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.q = nn.Linear(4, 4, bias=False)
-                self.k = nn.Linear(4, 4, bias=False)
-                self.q.weight = nn.Parameter(shared, requires_grad=True)
-                self.k.weight = nn.Parameter(shared, requires_grad=False)
-
-        class M(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.transformer_blocks = nn.ModuleList(
-                    [TiedBlock(), nn.Linear(4, 4, bias=False)]
-                )
-
-        m = M()
-        for p in m.transformer_blocks[1].parameters():
-            p.requires_grad = False
-        with pytest.raises(ValueError, match="trainable and frozen"):
-            ModelOffloader(
-                m,
-                layers_attr="transformer_blocks", blocks_to_swap=1,
-            )
 
 
 class TestLoRAInBlockRouting:
@@ -2532,13 +2240,13 @@ class TestLoRAInBlockRouting:
             # PinnedWeights manages every non-streamed parameter, including
             # trainable_bias.
             assert pinned.param_names == {"frozen_head.weight", "trainable_bias"}
-            for s in iter_param_slots(m):
-                if s.name in {"frozen_head.weight", "trainable_bias"}:
-                    assert s.name in pinned.param_names
+            for name, param in m.named_parameters(remove_duplicate=False):
+                if name in {"frozen_head.weight", "trainable_bias"}:
+                    assert name in pinned.param_names
                 else:
-                    assert s.name not in pinned.param_names, (
-                        f"slot {s.name} (requires_grad={s.get().requires_grad}) "
-                        f"leaked into PinnedWeights"
+                    assert name not in pinned.param_names, (
+                        f"param {name} (requires_grad={param.requires_grad}) "
+                        "leaked into PinnedWeights"
                     )
         finally:
             strat.deactivate()
@@ -3270,93 +2978,6 @@ class TestInBlockTrainableStreamingEndToEnd:
                 assert p.is_pinned()
         finally:
             offloader.deactivate()
-
-
-# ---------------------------------------------------------------------------
-# Composer-level invariants from the .data-only redesign
-# ---------------------------------------------------------------------------
-
-
-class TestBlockGroupsDisjoint:
-    """``ModelOffloader`` rejects configurations where the same module
-    slot is owned by more than one block entry. Catches duplicate
-    blocks, parent/child overlap across groups, and the same block
-    listed twice in one group — all of which would make multiple
-    entries mutate the same slot's Parameter / .data swap."""
-
-    def test_same_block_in_two_groups_raises(self) -> None:
-        shared = nn.Linear(4, 4, bias=False)
-
-        class M(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.group_a = nn.ModuleList(
-                    [shared, nn.Linear(4, 4, bias=False)]
-                )
-                self.group_b = nn.ModuleList(
-                    [nn.Linear(4, 4, bias=False), shared]
-                )
-
-        m = M()
-        for p in m.parameters():
-            p.requires_grad = False
-        with pytest.raises(ValueError, match="disjoint module slots"):
-            ModelOffloader(
-                m,
-                layers_attr=["group_a", "group_b"],
-                blocks_to_swap=1,
-            )
-
-    def test_parent_child_overlap_raises(self) -> None:
-        # group_a has a parent block whose child is also referenced
-        # directly by group_b. Different block ids; same child slots
-        # in both regions.
-        child = nn.Linear(4, 4, bias=False)
-
-        class Parent(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.child = child
-                self.extra = nn.Linear(4, 4, bias=False)
-
-        class M(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.group_a = nn.ModuleList(
-                    [Parent(), Parent()]
-                )
-                self.group_b = nn.ModuleList(
-                    [child, nn.Linear(4, 4, bias=False)]
-                )
-
-        m = M()
-        for p in m.parameters():
-            p.requires_grad = False
-        with pytest.raises(ValueError, match="disjoint module slots"):
-            ModelOffloader(
-                m,
-                layers_attr=["group_a", "group_b"],
-                blocks_to_swap=1,
-            )
-
-    def test_same_block_twice_in_one_group_raises(self) -> None:
-        shared = nn.Linear(4, 4, bias=False)
-
-        class M(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.transformer_blocks = nn.ModuleList(
-                    [shared, shared, nn.Linear(4, 4, bias=False)]
-                )
-
-        m = M()
-        for p in m.parameters():
-            p.requires_grad = False
-        with pytest.raises(ValueError, match="disjoint module slots"):
-            ModelOffloader(
-                m,
-                layers_attr="transformer_blocks", blocks_to_swap=1,
-            )
 
 
 class TestPluggableCheckpointingDetection:

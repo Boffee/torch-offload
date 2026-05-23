@@ -530,15 +530,14 @@ This is a low-level library; we don't guard against caller misuse.
 
 ## Tied weights
 
-Both strategies handle the standard `tie_weights()` pattern (one
+`PinnedWeights` handles the standard `tie_weights()` pattern (one
 `Parameter` referenced under multiple names) plus the rarer case of
 distinct quanto wrappers around shared inner `_data` storage.
 
-`ModelOffloader` rejects (at construction) tied weights that
-span streamed regions — block↔block, block↔non-block, or mixed
-trainable/frozen across regions. Slot-local block streaming can't
-preserve cross-region tying. Use whole-model `PinnedWeights` for
-those models instead.
+`ModelOffloader` is intended for ordinary transformer block lists where
+the streamed block weights are independent. It does not prevalidate
+unusual shared-storage layouts that cross block/non-block boundaries;
+use whole-model `PinnedWeights` if that sharing must be preserved.
 
 ## Quanto support
 

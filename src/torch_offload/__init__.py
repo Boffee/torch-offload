@@ -73,11 +73,6 @@ dequantize/requantize plus ``copy_into`` merge, otherwise use routed
 LoRA when their module exposes a compatible logical Linear weight shape
 and compute dtype.
 
-Cross-region tied parameters (block <-> non-block, cross-block, or
-mixed trainable/frozen across regions) are detected at construction
-and raise — slot-local block streaming cannot preserve such ties; use
-whole-model :class:`PinnedWeights` instead.
-
 :class:`ModelCache` manages the cached backing storage of multiple
 strategies with policy-driven eviction, an active-set with refcounted
 leases, and transactional admission. Custom :class:`EvictionPolicy`
@@ -113,7 +108,7 @@ from .model_cache import (
     ModelTooLargeError,
     ResourceSpec,
 )
-from .model_offloader import ModelOffloader, detect_streaming_region_ties
+from .model_offloader import ModelOffloader
 from .mps_weights import MpsWeights
 from .pinned_weights import PinnedWeights
 from .protocols import CachedResource, ModelStrategy, ModelStrategyComponent, SlotKey
@@ -145,6 +140,5 @@ __all__ = [
     "ResourceSpec",
     "SlotKey",
     "StreamedWeights",
-    "detect_streaming_region_ties",
     "merge_lora",
 ]
