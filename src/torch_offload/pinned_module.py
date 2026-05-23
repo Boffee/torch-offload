@@ -23,7 +23,7 @@ from torch import nn
 from .module_names import group_names, resolve_parent_leaf
 from .pinned_buffer import PinnedBuffer
 from .pinned_param import PinnedParam
-from .tensor_adapter_registry import buffer_storage_key, param_storage_key
+from .tensor_adapter_registry import buffer_tensor_id, param_tensor_id
 
 PostCopyHook = Callable[[nn.Parameter], None]
 _NamedT = TypeVar("_NamedT")
@@ -310,7 +310,7 @@ def _pin_params(params: Mapping[str, nn.Parameter]) -> dict[str, PinnedParam]:
     pinned_by_name: dict[str, PinnedParam] = {}
     for names in group_names(
         params.keys(),
-        lambda name: param_storage_key(params[name]),
+        lambda name: param_tensor_id(params[name]),
     ):
         _validate_param_storage_group_requires_grad(names, params)
         pinned = PinnedParam(params[names[0]])
@@ -323,7 +323,7 @@ def _pin_buffers(buffers: Mapping[str, torch.Tensor]) -> dict[str, PinnedBuffer]
     pinned_by_name: dict[str, PinnedBuffer] = {}
     for names in group_names(
         buffers.keys(),
-        lambda name: buffer_storage_key(buffers[name]),
+        lambda name: buffer_tensor_id(buffers[name]),
     ):
         pinned = PinnedBuffer.clone(buffers[names[0]])
         for name in names:

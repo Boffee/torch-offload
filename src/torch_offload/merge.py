@@ -22,7 +22,7 @@ from torch import nn
 
 from .lora import LoRA, LoRATransform
 from .module_names import canonical_param_name
-from .tensor_adapter_registry import param_storage_key
+from .tensor_adapter_registry import param_tensor_id
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +32,7 @@ __all__ = ["merge_lora"]
 @dataclass(slots=True)
 class _MergeParamGroup:
     param: nn.Parameter
-    storage: tuple[Any, ...]
+    tensor_id: tuple[Any, ...]
 
 
 @dataclass(slots=True)
@@ -53,23 +53,23 @@ def merge_lora(
     params_by_target = _collect_params_by_target(model)
 
     merge_ops: list[_MergeOp] = []
-    param_groups_by_storage: dict[tuple[Any, ...], _MergeParamGroup] = {}
-    target_by_storage: dict[tuple[Any, ...], str] = {}
+    param_groups_by_tensor_id: dict[tuple[Any, ...], _MergeParamGroup] = {}
+    target_by_tensor_id: dict[tuple[Any, ...], str] = {}
     for lora, strength in loras:
         for target_key, (a, b) in lora.targets.items():
             param = params_by_target.get(target_key)
             if param is None:
                 continue
             group = _param_group_for_param(
-                param, param_groups_by_storage,
+                param, param_groups_by_tensor_id,
             )
-            existing_target = target_by_storage.setdefault(
-                group.storage, target_key,
+            existing_target = target_by_tensor_id.setdefault(
+                group.tensor_id, target_key,
             )
             if existing_target != target_key:
                 raise ValueError(
                     f"LoRA targets {existing_target!r} and {target_key!r} "
-                    f"resolve to the same tied parameter storage. Apply "
+                    f"resolve to the same tied parameter backing. Apply "
                     f"only one name for a tied weight in a single "
                     f"merge_lora() call; otherwise the same base weight "
                     f"would receive multiple logical updates."
@@ -99,13 +99,13 @@ def _collect_params_by_target(model: nn.Module) -> dict[str, nn.Parameter]:
 
 def _param_group_for_param(
     target_param: nn.Parameter,
-    param_groups_by_storage: dict[tuple[Any, ...], _MergeParamGroup],
+    param_groups_by_tensor_id: dict[tuple[Any, ...], _MergeParamGroup],
 ) -> _MergeParamGroup:
-    storage = param_storage_key(target_param)
-    group = param_groups_by_storage.get(storage)
+    tensor_id = param_tensor_id(target_param)
+    group = param_groups_by_tensor_id.get(tensor_id)
     if group is not None:
         return group
 
-    group = _MergeParamGroup(target_param, storage)
-    param_groups_by_storage[storage] = group
+    group = _MergeParamGroup(target_param, tensor_id)
+    param_groups_by_tensor_id[tensor_id] = group
     return group

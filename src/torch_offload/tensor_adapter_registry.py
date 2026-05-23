@@ -1,8 +1,8 @@
-"""Explicit tensor adapter selection and storage identity.
+"""Explicit tensor adapter selection and tensor identity.
 
 The adapter classes themselves live in ``tensor_adapters.py`` and the
 format-specific modules. This module is the one normal Python place that
-knows the built-in dispatch order and adapter-defined storage identity.
+knows the built-in dispatch order and adapter-defined tensor identity.
 """
 
 from __future__ import annotations
@@ -35,30 +35,30 @@ def select_adapter(t: torch.Tensor) -> TensorAdapter[Any, Any]:
     )
 
 
-def storage_key(t: torch.Tensor) -> tuple[Any, ...]:
-    """Identity key for tied-weight detection."""
-    return select_adapter(t).storage_key(t)
+def tensor_id(t: torch.Tensor) -> tuple[Any, ...]:
+    """Adapter-defined tensor identity for tied-weight detection."""
+    return select_adapter(t).tensor_id(t)
 
 
-def param_storage_key(param: nn.Parameter) -> tuple[Any, ...]:
-    """Return a storage-identity grouping key for a parameter."""
+def param_tensor_id(param: nn.Parameter) -> tuple[Any, ...]:
+    """Return an adapter-defined tensor identity for a parameter."""
     if param.numel() == 0:
         # Zero-sized tensors all share data_ptr()==0; key by object
         # identity so aliases of the same Parameter still dedupe.
         return ("__empty__", id(param))
-    return storage_key(param.data)
+    return tensor_id(param.data)
 
 
-def buffer_storage_key(buffer: torch.Tensor) -> tuple[Any, ...]:
-    """Return a storage-identity grouping key for a registered buffer."""
+def buffer_tensor_id(buffer: torch.Tensor) -> tuple[Any, ...]:
+    """Return an adapter-defined tensor identity for a registered buffer."""
     if buffer.numel() == 0:
         return ("__empty_buf__", id(buffer))
-    return storage_key(buffer)
+    return tensor_id(buffer)
 
 
 __all__ = [
-    "buffer_storage_key",
-    "param_storage_key",
+    "buffer_tensor_id",
+    "param_tensor_id",
     "select_adapter",
-    "storage_key",
+    "tensor_id",
 ]

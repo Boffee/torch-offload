@@ -178,7 +178,7 @@ class GgufAdapter:
         )
 
     @staticmethod
-    def storage_key(t: torch.Tensor) -> tuple[object, ...]:
+    def tensor_id(t: torch.Tensor) -> tuple[object, ...]:
         weight = _require_gguf_weight(t)
         raw = weight.as_subclass(torch.Tensor)
         return (

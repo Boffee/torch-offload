@@ -13,7 +13,7 @@ from torch_offload.tensor_adapters import (
     DequantRequantTensorAdapter,
     TensorCopyIntoAdapter,
 )
-from torch_offload.tensor_adapter_registry import select_adapter, storage_key
+from torch_offload.tensor_adapter_registry import select_adapter, tensor_id
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -30,10 +30,10 @@ class TestPinnedParam:
 
         assert type(first) is type(second)
 
-    def test_regular_storage_key_includes_device(self) -> None:
+    def test_regular_tensor_id_includes_device(self) -> None:
         t = torch.randn(2, 3)
 
-        assert storage_key(t)[:2] == ("regular", t.device)
+        assert tensor_id(t)[:2] == ("regular", t.device)
 
     def test_non_quanto_pin_and_load(self) -> None:
         p = nn.Parameter(torch.randn(8, 16, dtype=torch.bfloat16), requires_grad=False)
@@ -125,7 +125,7 @@ class TestPinnedBuffer:
 
 
 class TestPinnedParamQuanto:
-    def test_quanto_storage_key_includes_inner_devices(self) -> None:
+    def test_quanto_tensor_id_includes_inner_devices(self) -> None:
         quanto = pytest.importorskip("optimum.quanto")
         from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
 
@@ -136,7 +136,7 @@ class TestPinnedParamQuanto:
             quanto.qint8, 0, (rows, cols), (cols, 1), data, scale, None,
         )
 
-        key = storage_key(qt)
+        key = tensor_id(qt)
         assert key[1] == qt._data.device
         assert key[7] == qt._scale.device
 
@@ -317,7 +317,7 @@ class TestCopyToCpu:
         assert not torch.equal(pinned_param.pinned_state.data, original)
 
     @CUDA
-    def test_regular_pinned_storage_identity_preserved(self) -> None:
+    def test_regular_pinned_tensor_identity_preserved(self) -> None:
         # The pinned-host buffer stays at the same address after D2H —
         # we're overwriting in place, not allocating a new tensor.
         # Callers that hold CPU Parameter wrapper references rely on this.

@@ -9,7 +9,7 @@ from torch import nn
 from torch_offload import LoRA, ModelOffloader, merge_lora
 from torch_offload.nvfp4_adapter import Nvfp4Adapter
 from torch_offload.pinned_param import PinnedParam
-from torch_offload.tensor_adapter_registry import storage_key
+from torch_offload.tensor_adapter_registry import tensor_id
 from torch_offload.streamed_component import _param_target_layout
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -85,16 +85,16 @@ class TestNvfp4Adapter:
         assert pinned.scale.stride() == qt.scale.stride()
         assert pinned.dequantize().shape == qt.dequantize().shape
 
-    def test_storage_key_tracks_optional_scale_storage(self) -> None:
+    def test_tensor_id_tracks_optional_scale_tensor(self) -> None:
         qt = _make_nvfp4()
-        key = storage_key(qt)
+        key = tensor_id(qt)
         assert key[0] == "torchao-nvfp4"
         assert key[1][0] == qt.qdata.device
         assert key[2][0] == qt.scale.device
         assert key[3][0] == qt.per_tensor_scale.device
-        assert key == storage_key(qt)
+        assert key == tensor_id(qt)
 
-    def test_target_layout_ignores_storage_identity(self) -> None:
+    def test_target_layout_ignores_tensor_id(self) -> None:
         p1 = nn.Parameter(_make_nvfp4(), requires_grad=False)
         p2 = nn.Parameter(_make_nvfp4(), requires_grad=False)
 

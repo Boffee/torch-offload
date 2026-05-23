@@ -500,7 +500,7 @@ class TestSharedSubmoduleAlias:
     def test_aliased_buffer(self) -> None:
         # Two distinct submodules sharing the same buffer tensor. The
         # default named_buffers() walks only one path; using
-        # remove_duplicate=False plus storage-key dedup ensures both
+        # remove_duplicate=False plus tensor-id dedup ensures both
         # paths get pinned consistently.
         shared_buf = torch.randn(4)
 

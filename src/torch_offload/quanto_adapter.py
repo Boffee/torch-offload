@@ -98,7 +98,7 @@ class QuantoAdapter:
         return True
 
     @staticmethod
-    def storage_key(t: torch.Tensor) -> tuple[object, ...]:
+    def tensor_id(t: torch.Tensor) -> tuple[object, ...]:
         # Composite identity: the two underlying buffers plus the quant
         # metadata. Two distinct WeightQBytesTensors with the same
         # underlying _data/_scale storage AND matching quant params are

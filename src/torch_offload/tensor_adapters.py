@@ -83,9 +83,9 @@ class TensorAdapter(Protocol[PinnedStateT, GpuStateT]):
         ...
 
     @staticmethod
-    def storage_key(t: torch.Tensor) -> tuple:
+    def tensor_id(t: torch.Tensor) -> tuple:
         """Composite identity key for tied-weight detection. Two tensors
-        with the same key share storage and quant metadata; different
+        with the same key share backing data and quant metadata; different
         keys must not be deduped. Includes device and view layout
         (shape/stride/offset) so distinct devices or views into the
         same buffer don't collapse."""
@@ -95,8 +95,8 @@ class TensorAdapter(Protocol[PinnedStateT, GpuStateT]):
     def layout_signature(t: torch.Tensor) -> tuple:
         """Hashable tensor layout metadata for block-pool compatibility.
 
-        Unlike :meth:`storage_key`, this must not include storage
-        identity. It captures only fields that must match for one GPU
+        Unlike :meth:`tensor_id`, this must not include tensor identity.
+        It captures only fields that must match for one GPU
         pool slot to safely receive bytes from multiple block instances.
         """
         ...
@@ -338,7 +338,7 @@ class RegularAdapter:
         return type(t) is torch.Tensor or type(t) is nn.Parameter
 
     @staticmethod
-    def storage_key(t: torch.Tensor) -> tuple:
+    def tensor_id(t: torch.Tensor) -> tuple:
         return (
             "regular",
             t.device,

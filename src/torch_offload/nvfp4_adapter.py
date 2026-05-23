@@ -70,7 +70,7 @@ def _empty_like_strided(t: torch.Tensor, device: torch.device) -> torch.Tensor:
     )
 
 
-def _tensor_storage_key(t: torch.Tensor | None) -> tuple[object, ...] | None:
+def _optional_tensor_id(t: torch.Tensor | None) -> tuple[object, ...] | None:
     if t is None:
         return None
     return (
@@ -149,14 +149,14 @@ class Nvfp4Adapter:
         return True
 
     @staticmethod
-    def storage_key(t: torch.Tensor) -> tuple[object, ...]:
+    def tensor_id(t: torch.Tensor) -> tuple[object, ...]:
         qt = require_nvfp4_tensor(t)
         return (
             "torchao-nvfp4",
-            _tensor_storage_key(qt.qdata),
-            _tensor_storage_key(qt.scale),
-            _tensor_storage_key(qt.per_tensor_scale),
-            _tensor_storage_key(qt.act_per_tensor_scale),
+            _optional_tensor_id(qt.qdata),
+            _optional_tensor_id(qt.scale),
+            _optional_tensor_id(qt.per_tensor_scale),
+            _optional_tensor_id(qt.act_per_tensor_scale),
             tuple(qt.shape),
             qt.stride(),
             qt.block_size,

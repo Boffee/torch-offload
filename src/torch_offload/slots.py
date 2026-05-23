@@ -22,18 +22,18 @@ from torch import nn
 
 from .module_names import canonical_param_name, resolve_parent_leaf, walk_attr_path
 from .protocols import SlotKey
-from .tensor_adapter_registry import buffer_storage_key, param_storage_key
+from .tensor_adapter_registry import buffer_tensor_id, param_tensor_id
 
 __all__ = [
     "BufferSlot",
     "ParamSlot",
     "assert_frozen",
-    "buffer_storage_key",
+    "buffer_tensor_id",
     "canonical_param_name",
     "get_param_slot",
     "iter_buffer_slots",
     "iter_param_slots",
-    "param_storage_key",
+    "param_tensor_id",
     "set_buffer_slot",
     "set_param_data",
     "set_param_slot",

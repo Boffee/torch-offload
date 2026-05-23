@@ -73,8 +73,8 @@ class TestAdapter:
         """A GGUFWeight that got .float()'d is no longer valid packed data."""
         assert not GgufAdapter.matches(w.float())
 
-    def test_storage_key_deterministic(self, w: GGUFWeight) -> None:
-        key = GgufAdapter.storage_key(w)
+    def test_tensor_id_deterministic(self, w: GGUFWeight) -> None:
+        key = GgufAdapter.tensor_id(w)
 
         assert key[1] == w.as_subclass(torch.Tensor).device
-        assert key == GgufAdapter.storage_key(w)
+        assert key == GgufAdapter.tensor_id(w)

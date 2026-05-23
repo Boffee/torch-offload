@@ -22,7 +22,7 @@ to be lifted into its own package when a second consumer appears.
 | `pinned_param.py` | `PinnedParam` — per-parameter pinning primitive (handles quanto, GGUF, and TorchAO NVFP4 via adapters) |
 | `pinned_module.py` | `PinnedModuleStore`, `PinnedModuleInstance` — name-keyed pinned module storage plus concrete model instances |
 | `tensor_adapters.py`, `quanto_adapter.py`, `gguf_adapter.py`, `nvfp4_adapter.py`, `gguf_dequant.py` | Tensor adapter contracts/implementations and optional optimum-quanto / gguf / torchao support |
-| `tensor_adapter_registry.py` | Internal adapter dispatch and storage-identity helpers |
+| `tensor_adapter_registry.py` | Internal adapter dispatch and tensor-identity helpers |
 | `module_names.py` | Internal name traversal and mutation helpers |
 | `_quanto.py` | Internal: optimum-quanto optional-import + layout validation; consumed by `quanto_adapter.py` and `merge.py` |
 | `_torchao_nvfp4.py` | Internal: TorchAO NVFP4 optional-import + layout validation; consumed by `nvfp4_adapter.py` |

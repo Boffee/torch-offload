@@ -61,7 +61,7 @@ from .pinned_module import (
     PostCopyHookHandle,
 )
 from .pinned_param import PinnedParam
-from .tensor_adapter_registry import buffer_storage_key, param_storage_key
+from .tensor_adapter_registry import buffer_tensor_id, param_tensor_id
 
 logger = logging.getLogger(__name__)
 
@@ -141,7 +141,7 @@ def _param_target_layout(p: nn.Parameter) -> tuple[object, object]:
 
     :class:`PinnedParam` owns the tensor-adapter details needed for the
     opaque target layout because wrapper metadata is type-specific. The
-    returned value intentionally excludes storage identity so distinct
+    returned value intentionally excludes tensor identity so distinct
     block instances with the same layout can share one pool template.
     """
     return PinnedParam.target_layout_for(p)
@@ -172,7 +172,7 @@ def _check_block_layouts_match(
             )
             for names in group_names(
                 params.keys(),
-                lambda name: param_storage_key(params[name]),
+                lambda name: param_tensor_id(params[name]),
             )
         )
 
@@ -184,7 +184,7 @@ def _check_block_layouts_match(
             )
             for names in group_names(
                 buffers.keys(),
-                lambda name: buffer_storage_key(buffers[name]),
+                lambda name: buffer_tensor_id(buffers[name]),
             )
         )
 

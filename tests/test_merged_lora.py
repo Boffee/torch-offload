@@ -1007,7 +1007,7 @@ class TestPermanentMerge:
             "head.lora_B.weight": torch.randn(16, 4),
         }
 
-        with pytest.raises(ValueError, match="same tied parameter storage"):
+        with pytest.raises(ValueError, match="same tied parameter backing"):
             merge_lora(m, [(LoRA(state_dict=sd, key_transform=None), 1.0)])
 
         torch.testing.assert_close(m.embed.weight, before)

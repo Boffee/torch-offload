@@ -1204,7 +1204,7 @@ class TestSharedStorageLocalBehavior:
 
     def test_non_block_internal_tied_works(self) -> None:
         # Tied embed↔head WITHIN PinnedComponent: PinnedComponent handles
-        # this via storage-key dedup. Should not raise.
+        # this via tensor-id dedup. Should not raise.
         embed = nn.Embedding(16, 8)
         head = nn.Linear(8, 16, bias=False)
         head.weight = embed.weight  # standard tie_weights() pattern
