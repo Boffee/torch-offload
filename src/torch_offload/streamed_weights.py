@@ -379,6 +379,37 @@ def _move_instance_trainable_grads_to(
             param.grad.data = moved.data
 
 
+def _build_param_name_index(
+    instances: Sequence[PinnedModuleInstance],
+    prefix: str | None,
+) -> dict[str, tuple[int, str]]:
+    index: dict[str, tuple[int, str]] = {}
+    for block_idx, instance in enumerate(instances):
+        for local_name in instance.store.params:
+            name = _streamed_param_name(prefix, block_idx, local_name)
+            if name in index:
+                raise ValueError(
+                    f"duplicate streamed parameter name {name!r}"
+                )
+            index[name] = (block_idx, local_name)
+    return index
+
+
+def _streamed_param_name(
+    prefix: str | None,
+    block_idx: int,
+    local_name: str,
+) -> str:
+    name = f"{block_idx}.{local_name}"
+    return name if prefix is None else f"{prefix}.{name}"
+
+
+def _streamed_log_label(name: str | None, block_count: int) -> str:
+    if name is None:
+        return f"StreamedWeights({block_count} blocks)"
+    return f"StreamedWeights[{name}]"
+
+
 # ---------------------------------------------------------------------------
 # LRU tracker
 # ---------------------------------------------------------------------------
@@ -491,7 +522,10 @@ class StreamedWeights:
         on a live streamer has no effect until the next
         deactivate/activate cycle.
     name:
-        Optional human-readable label for log messages.
+        Optional model path for the streamed block list. When set,
+        :attr:`param_names` and name-based post-copy hook registration
+        use names like ``"blocks.3.weight"``. When omitted, standalone
+        streamers use ``"3.weight"``.
     stream_param_names:
         Optional set of block-local parameter names to stream from
         every block. ``None`` streams all parameters.
@@ -520,7 +554,7 @@ class StreamedWeights:
         self._blocks_to_swap = blocks_to_swap
         self._prefetch_count = prefetch_count
         self._cyclic = cyclic
-        self._name = name or f"StreamedWeights({len(self._blocks)} blocks)"
+        self._log_label = _streamed_log_label(name, len(self._blocks))
 
         if blocks_to_swap < 0:
             raise ValueError(f"blocks_to_swap ({blocks_to_swap}) must be >= 0")
@@ -547,6 +581,11 @@ class StreamedWeights:
                 None if stream_buffer_names is None else set(stream_buffer_names)
             ),
         )
+        self._param_name_to_block_param = _build_param_name_index(
+            self._block_instances,
+            name,
+        )
+        self._param_names = frozenset(self._param_name_to_block_param)
         self._move_trainable_grads_to(torch.device("cpu"))
 
         # Active resources allocated on CUDA activate().
@@ -593,6 +632,11 @@ class StreamedWeights:
         ]
 
     @property
+    def param_names(self) -> frozenset[str]:
+        """Externally addressable streamed parameter names."""
+        return self._param_names
+
+    @property
     def cache_bytes(self) -> int:
         return sum(instance.cache_bytes for instance in self._block_instances)
 
@@ -601,7 +645,9 @@ class StreamedWeights:
         return any(instance.store.has_trainables for instance in self._block_instances)
 
     def register_post_copy_hook(
-        self, block_idx: int, name: str, hook: PostCopyHook,
+        self,
+        name: str,
+        hook: PostCopyHook,
     ) -> PostCopyHookHandle:
         """Register a hook after this component copies ``name`` to GPU.
 
@@ -609,15 +655,25 @@ class StreamedWeights:
         LoRA. Mirrors PyTorch's hook registration pattern by returning a
         handle whose :meth:`remove` method unregisters the hook.
         """
-        instance, name = self._resolve_param(block_idx, name)
+        instance, name = self._resolve_param_name(name)
         return instance.register_post_copy_hook(name, hook)
 
-    def post_copy_hook_key(self, block_idx: int, name: str) -> int:
+    def post_copy_hook_key(self, name: str) -> int:
         """Stable hook/dedup key for a streamed parameter."""
-        instance, name = self._resolve_param(block_idx, name)
+        instance, name = self._resolve_param_name(name)
         return instance.post_copy_hook_key(name)
 
-    def _resolve_param(
+    def _resolve_param_name(
+        self,
+        name: str,
+    ) -> tuple[PinnedModuleInstance, str]:
+        ref = self._param_name_to_block_param.get(name)
+        if ref is None:
+            raise ValueError(f"param name {name!r} is not owned by this streamer")
+        block_idx, local_name = ref
+        return self._resolve_block_param(block_idx, local_name)
+
+    def _resolve_block_param(
         self,
         block_idx: int,
         name: str,
@@ -716,7 +772,7 @@ class StreamedWeights:
         self.reset_peak()
 
         logger.info(
-            f"{self._name} active: {self._blocks_to_swap}/{num_layers} on CPU, "
+            f"{self._log_label} active: {self._blocks_to_swap}/{num_layers} on CPU, "
             f"{num_resident} resident on GPU, prefetch={self._prefetch_count}, "
             f"gpu_pool_slots={num_gpu_slots}"
         )

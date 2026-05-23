@@ -1872,6 +1872,57 @@ class TestStreamedNameSelection:
         finally:
             streamer.deactivate()
 
+    def test_streamed_weights_exposes_addressable_param_names(self) -> None:
+        m = _make_block_model()
+        streamer = StreamedWeights(
+            blocks=list(m.transformer_blocks),
+            blocks_to_swap=2,
+            name="transformer_blocks",
+        )
+        try:
+            assert streamer.param_names == {
+                f"transformer_blocks.{i}.weight"
+                for i in range(len(m.transformer_blocks))
+            }
+        finally:
+            streamer.deactivate()
+
+    def test_streamed_weights_registers_post_copy_hook_by_param_name(self) -> None:
+        m = _make_block_model()
+        streamer = StreamedWeights(
+            blocks=list(m.transformer_blocks),
+            blocks_to_swap=2,
+            name="transformer_blocks",
+        )
+        try:
+            handle = streamer.register_post_copy_hook(
+                "transformer_blocks.1.weight",
+                lambda _param: None,
+            )
+            key = streamer.post_copy_hook_key("transformer_blocks.1.weight")
+            assert key in streamer._block_instances[1]._post_copy_hooks
+
+            handle.remove()
+            assert key not in streamer._block_instances[1]._post_copy_hooks
+        finally:
+            streamer.deactivate()
+
+    def test_streamed_weights_rejects_unknown_post_copy_hook_name(self) -> None:
+        m = _make_block_model()
+        streamer = StreamedWeights(
+            blocks=list(m.transformer_blocks),
+            blocks_to_swap=2,
+            name="transformer_blocks",
+        )
+        try:
+            with pytest.raises(ValueError, match="not owned by this streamer"):
+                streamer.register_post_copy_hook(
+                    "transformer_blocks.10.weight",
+                    lambda _param: None,
+                )
+        finally:
+            streamer.deactivate()
+
     def test_streamed_weights_include_names_select_owned_entries(self) -> None:
         class Block(nn.Module):
             def __init__(self):

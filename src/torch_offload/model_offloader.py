@@ -14,7 +14,7 @@ import contextlib
 import logging
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
-from typing import Literal, Protocol, TypeGuard
+from typing import Literal, Protocol
 
 import torch
 from torch import nn
@@ -39,8 +39,6 @@ logger = logging.getLogger(__name__)
 LoraMode = Literal["merge", "routed"]
 _LoraFactorRef = tuple[torch.Tensor, torch.Tensor, float]
 _LoraTargetMap = dict[str, list[_LoraFactorRef]]
-_StreamedHookTarget = tuple[int, str]
-_TargetParamRef = _StreamedHookTarget | str
 
 
 class _RemovableHook(Protocol):
@@ -273,7 +271,7 @@ class ModelOffloader:
                     blocks_to_swap=swap_list[i],
                     prefetch_count=pf_list[i],
                     cyclic=cyclic,
-                    name=f"StreamedWeights[{layer_paths[i]}]",
+                    name=layer_paths[i],
                     stream_param_names=stream_param_names,
                     stream_buffer_names=stream_buffer_names,
                 )
@@ -305,7 +303,7 @@ class ModelOffloader:
         self._teardown_stack: contextlib.ExitStack | None = None
 
         (
-            self._target_to_param_ref,
+            self._target_to_param_name,
             self._target_to_parent,
             self._target_to_component,
         ) = self._build_target_index(
@@ -395,7 +393,7 @@ class ModelOffloader:
         for lora, strength in loras:
             for target_key, (a, b) in lora.targets.items():
                 total_targets += 1
-                if target_key not in self._target_to_param_ref:
+                if target_key not in self._target_to_param_name:
                     continue
                 matched_targets += 1
                 per_target.setdefault(target_key, []).append(
@@ -404,7 +402,7 @@ class ModelOffloader:
 
         if matched_targets < total_targets:
             sample_lora = sorted(next(iter(loras))[0].targets)[:3]
-            sample_index = sorted(self._target_to_param_ref)[:3]
+            sample_index = sorted(self._target_to_param_name)[:3]
             logger.warning(
                 "set_loras matched %d/%d targets. "
                 "Sample LoRA keys: %s ... Sample index keys: %s ...",
@@ -439,22 +437,12 @@ class ModelOffloader:
             )
 
         for target_key, refs in targets.items():
-            param_ref = self._target_to_param_ref[target_key]
+            param_name = self._target_to_param_name[target_key]
             component = self._target_to_component[target_key]
             transform = LoRATransform(refs)
-            if isinstance(component, PinnedWeights):
-                if not isinstance(param_ref, str):
-                    raise TypeError("PinnedWeights merge target must be a name.")
-                handle = component.register_post_copy_hook(
-                    param_ref, transform.apply,
-                )
-            else:
-                if not _is_streamed_hook_target(param_ref):
-                    raise TypeError("StreamedWeights merge target must be a ref.")
-                block_idx, name = param_ref
-                handle = component.register_post_copy_hook(
-                    block_idx, name, transform.apply,
-                )
+            handle = component.register_post_copy_hook(
+                param_name, transform.apply,
+            )
             self._lora_hook_handles.append(handle)
 
     def _register_routed_lora_hooks(
@@ -753,14 +741,14 @@ class ModelOffloader:
         block_groups: list[list[nn.Module]],
         pinned_weights: PinnedWeights | None,
     ) -> tuple[
-        dict[str, _TargetParamRef],
+        dict[str, str],
         dict[str, nn.Module],
         dict[str, PinnedWeights | StreamedWeights],
     ]:
-        """Map canonical param names to their component-local param ref
+        """Map canonical param names to their exact runtime param name
         and to the exact parent module where the named param is installed.
 
-        The param-ref map drives merge-mode LoRA post-copy hooks, the
+        The param-name map drives merge-mode LoRA post-copy hooks, the
         component map identifies which component owns the copy loop, and
         the parent map drives routed-mode LoRA forward hooks.
 
@@ -773,7 +761,7 @@ class ModelOffloader:
         routed mode ambiguous because routed mode does not mutate the
         parameter bytes.
         """
-        param_refs: dict[str, _TargetParamRef] = {}
+        param_names: dict[str, str] = {}
         parent_by_key: dict[str, nn.Module] = {}
         components: dict[str, PinnedWeights | StreamedWeights] = {}
 
@@ -788,24 +776,23 @@ class ModelOffloader:
             ):
                 block = blocks[block_idx]
                 for local_name in local_names:
-                    param_ref = (block_idx, local_name)
                     parent = _resolve_param_parent(block, local_name)
                     full_name = f"{layer_path}.{block_idx}.{local_name}"
                     key = canonical_param_name(full_name)
-                    param_refs[key] = param_ref
+                    param_names[key] = full_name
                     parent_by_key[key] = parent
                     components[key] = streamer
 
         if pinned_weights is not None:
             for name in pinned_weights.param_names:
                 key = canonical_param_name(name)
-                param_refs[key] = name
+                param_names[key] = name
                 parent_by_key[key] = _resolve_param_parent(
                     pinned_weights.model, name,
                 )
                 components[key] = pinned_weights
 
-        return param_refs, parent_by_key, components
+        return param_names, parent_by_key, components
 
 
 # ---------------------------------------------------------------------------
@@ -877,15 +864,6 @@ def _all_buffer_names(model: nn.Module) -> set[str]:
         name
         for name, _buffer in model.named_buffers(remove_duplicate=False)
     }
-
-
-def _is_streamed_hook_target(value: object) -> TypeGuard[_StreamedHookTarget]:
-    return (
-        isinstance(value, tuple)
-        and len(value) == 2
-        and isinstance(value[0], int)
-        and isinstance(value[1], str)
-    )
 
 
 def _resolve_param_parent(block: nn.Module, name: str) -> nn.Module:
