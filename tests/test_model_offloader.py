@@ -10,6 +10,7 @@ over the host-backed pinned state.
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from concurrent.futures import Future
 
 import pytest
@@ -22,9 +23,32 @@ from torch_offload import (
     ModelStrategy,
     PinnedComponent,
     StreamedComponent,
+    StreamedComponentStore,
 )
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+
+
+def _make_streamed_component(
+    blocks: Sequence[nn.Module],
+    *,
+    blocks_to_swap: int,
+    prefetch_count: int = 2,
+    cyclic: bool = False,
+    name: str | None = None,
+    stream_param_names: set[str] | None = None,
+    stream_buffer_names: set[str] | None = None,
+) -> StreamedComponent:
+    store = StreamedComponentStore.from_blocks(
+        blocks,
+        blocks_to_swap=blocks_to_swap,
+        prefetch_count=prefetch_count,
+        cyclic=cyclic,
+        name=name,
+        stream_param_names=stream_param_names,
+        stream_buffer_names=stream_buffer_names,
+    )
+    return store.bind(blocks)
 
 
 def _make_block_model(num_blocks: int = 4, width: int = 8) -> nn.Module:
@@ -316,7 +340,7 @@ class TestStreamedComponentBackendActivation:
         with torch.no_grad():
             expected = m_eager(x)
 
-        streamer = StreamedComponent(
+        streamer = _make_streamed_component(
             blocks=list(m.transformer_blocks),
             blocks_to_swap=2,
         )
@@ -354,7 +378,7 @@ class TestStreamedComponentBackendActivation:
         before = {i: block.weight.detach().clone() for i, block in enumerate(blocks)}
         optimizer = torch.optim.SGD(blocks.parameters(), lr=0.1)
 
-        streamer = StreamedComponent(
+        streamer = _make_streamed_component(
             blocks=list(blocks),
             blocks_to_swap=1,
         )
@@ -394,7 +418,7 @@ class TestStreamedComponentBackendActivation:
 
     def test_direct_cpu_double_activate_raises(self) -> None:
         m = _make_block_model(num_blocks=2)
-        streamer = StreamedComponent(
+        streamer = _make_streamed_component(
             blocks=list(m.transformer_blocks),
             blocks_to_swap=1,
         )
@@ -1443,7 +1467,7 @@ class TestActivatePoolIdempotency:
     @CUDA
     def test_same_config_idempotent(self) -> None:
         m = _make_block_model()
-        streamer = StreamedComponent(
+        streamer = _make_streamed_component(
             list(m.transformer_blocks),
             blocks_to_swap=1,
         )
@@ -1455,7 +1479,7 @@ class TestActivatePoolIdempotency:
     @CUDA
     def test_mismatched_config_raises(self) -> None:
         m = _make_block_model()
-        streamer = StreamedComponent(
+        streamer = _make_streamed_component(
             list(m.transformer_blocks),
             blocks_to_swap=1,
         )
@@ -1490,7 +1514,7 @@ class TestBlockLayoutCompatibility:
         for p in m.parameters():
             p.requires_grad = False
         with pytest.raises(ValueError, match="layout differs"):
-            StreamedComponent(
+            _make_streamed_component(
                 blocks=list(m.blocks),
                 blocks_to_swap=1,
             )
@@ -1504,7 +1528,7 @@ class TestBlockLayoutCompatibility:
             for p in b.parameters():
                 p.requires_grad = False
         with pytest.raises(ValueError, match="layout differs"):
-            StreamedComponent(
+            _make_streamed_component(
                 blocks=[b0, b1],
                 blocks_to_swap=1,
             )
@@ -1523,7 +1547,7 @@ class TestBlockLayoutCompatibility:
                 self.bar = nn.Parameter(torch.randn(4, 4), requires_grad=False)
 
         with pytest.raises(ValueError, match="layout differs"):
-            StreamedComponent(
+            _make_streamed_component(
                 blocks=[A(), B()],
                 blocks_to_swap=1,
             )
@@ -1535,7 +1559,7 @@ class TestBlockLayoutCompatibility:
         block_1.weight.requires_grad_(True)
 
         with pytest.raises(ValueError, match="layout differs"):
-            StreamedComponent(
+            _make_streamed_component(
                 blocks=[block_0, block_1],
                 blocks_to_swap=1,
             )
@@ -1558,7 +1582,7 @@ class TestBlockLayoutCompatibility:
                 self.k.weight.requires_grad_(False)
 
         with pytest.raises(ValueError, match="layout differs"):
-            StreamedComponent(
+            _make_streamed_component(
                 blocks=[TiedBlock(), UntiedBlock()],
                 blocks_to_swap=1,
             )
@@ -1573,7 +1597,7 @@ class TestBlockLayoutCompatibility:
                 self.register_buffer("table", torch.randn(buffer_size))
 
         with pytest.raises(ValueError, match="buffer layout differs"):
-            StreamedComponent(
+            _make_streamed_component(
                 blocks=[Block(4), Block(8)],
                 blocks_to_swap=1,
             )
@@ -1593,7 +1617,7 @@ class TestBlockLayoutCompatibility:
         assert contiguous.stride() != non_contiguous.stride()
 
         with pytest.raises(ValueError, match="buffer layout differs"):
-            StreamedComponent(
+            _make_streamed_component(
                 blocks=[Block(contiguous), Block(non_contiguous)],
                 blocks_to_swap=1,
             )
@@ -1616,7 +1640,7 @@ class TestBlockLayoutCompatibility:
                 self.register_buffer("bar", torch.randn(4))
 
         with pytest.raises(ValueError, match="buffer layout differs"):
-            StreamedComponent(
+            _make_streamed_component(
                 blocks=[A(), B()],
                 blocks_to_swap=1,
             )
@@ -1641,7 +1665,7 @@ class TestBlockLayoutCompatibility:
         original_pinned = [b.weight.is_pinned() for b in m.blocks]
 
         with pytest.raises(ValueError, match="layout differs"):
-            StreamedComponent(
+            _make_streamed_component(
                 blocks=list(m.blocks),
                 blocks_to_swap=1,
             )
@@ -1708,7 +1732,7 @@ class TestMultiComponentCleanup:
 class TestStreamedNameSelection:
     def test_streamed_component_exposes_owned_block_local_names(self) -> None:
         m = _make_block_model()
-        streamer = StreamedComponent(
+        streamer = _make_streamed_component(
             blocks=list(m.transformer_blocks),
             blocks_to_swap=2,
         )
@@ -1724,7 +1748,7 @@ class TestStreamedNameSelection:
 
     def test_streamed_component_exposes_addressable_param_names(self) -> None:
         m = _make_block_model()
-        streamer = StreamedComponent(
+        streamer = _make_streamed_component(
             blocks=list(m.transformer_blocks),
             blocks_to_swap=2,
             name="transformer_blocks",
@@ -1739,7 +1763,7 @@ class TestStreamedNameSelection:
 
     def test_streamed_component_registers_post_copy_hook_by_param_name(self) -> None:
         m = _make_block_model()
-        streamer = StreamedComponent(
+        streamer = _make_streamed_component(
             blocks=list(m.transformer_blocks),
             blocks_to_swap=2,
             name="transformer_blocks",
@@ -1759,7 +1783,7 @@ class TestStreamedNameSelection:
 
     def test_streamed_component_rejects_unknown_post_copy_hook_name(self) -> None:
         m = _make_block_model()
-        streamer = StreamedComponent(
+        streamer = _make_streamed_component(
             blocks=list(m.transformer_blocks),
             blocks_to_swap=2,
             name="transformer_blocks",
@@ -1786,7 +1810,7 @@ class TestStreamedNameSelection:
         skipped_params = [block.skip for block in blocks]
         skipped_buffer_ptrs = [block.skip_buffer.data_ptr() for block in blocks]
 
-        streamer = StreamedComponent(
+        streamer = _make_streamed_component(
             blocks=blocks,
             blocks_to_swap=1,
             stream_param_names={"keep"},
@@ -1848,7 +1872,7 @@ class TestStreamedComponentContractGuard:
     def test_direct_unskipped_trainable_constructs(self) -> None:
         block_0 = nn.Linear(4, 4, bias=False)  # default requires_grad=True
         block_1 = nn.Linear(4, 4, bias=False)
-        streamer = StreamedComponent(
+        streamer = _make_streamed_component(
             blocks=[block_0, block_1],
             blocks_to_swap=1,
         )
@@ -1862,7 +1886,7 @@ class TestStreamedComponentContractGuard:
     def test_direct_empty_param_name_selection_constructs(self) -> None:
         block_0 = nn.Linear(4, 4, bias=False)  # trainable
         block_1 = nn.Linear(4, 4, bias=False)  # trainable
-        streamer = StreamedComponent(
+        streamer = _make_streamed_component(
             blocks=[block_0, block_1],
             blocks_to_swap=1,
             stream_param_names=set(),
@@ -1881,7 +1905,7 @@ class TestStreamedComponentContractGuard:
         blocks = [BufferBlock(), BufferBlock()]
         buffer_ptrs = [block.table.data_ptr() for block in blocks]
 
-        streamer = StreamedComponent(
+        streamer = _make_streamed_component(
             blocks=blocks,
             blocks_to_swap=1,
             stream_buffer_names=set(),
@@ -1897,7 +1921,7 @@ class TestStreamedComponentContractGuard:
         original_params = [block_0.weight, block_1.weight]
 
         with pytest.raises(ValueError, match="unknown block-local names"):
-            StreamedComponent(
+            _make_streamed_component(
                 blocks=[block_0, block_1],
                 blocks_to_swap=1,
                 stream_param_names={"missing"},

@@ -45,6 +45,7 @@ import weakref
 from collections import OrderedDict
 from collections.abc import Iterable, Iterator, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 from typing import cast
 
 import torch
@@ -278,13 +279,13 @@ def _format_names(names: Sequence[str]) -> str:
     return ", ".join(repr(name) for name in names)
 
 
-def _pin_block_module_instances(
+def _pin_block_module_stores(
     blocks: Sequence[nn.Module],
     *,
     stream_param_names: set[str] | None = None,
     stream_buffer_names: set[str] | None = None,
-) -> list[PinnedModuleInstance]:
-    """Collect, validate, and pin one :class:`PinnedModuleInstance` per block.
+) -> list[PinnedModuleStore]:
+    """Collect, validate, and pin one :class:`PinnedModuleStore` per block.
 
     Pre-pin validation failures do not pin and do not mutate module
     parameters or buffers. Once pinning starts, :class:`PinnedParam` may use its
@@ -306,7 +307,7 @@ def _pin_block_module_instances(
     # into block 0's pool target without raising and corrupt forward.
     _check_block_layouts_match(block_params, block_buffers)
 
-    block_stores = [
+    return [
         PinnedModuleStore.from_module(
             block,
             include_param_names=params,
@@ -316,12 +317,6 @@ def _pin_block_module_instances(
             blocks, block_params, block_buffers, strict=True,
         )
     ]
-
-    block_instances = [
-        store.bind(block)
-        for store, block in zip(block_stores, blocks, strict=True)
-    ]
-    return block_instances
 
 
 def _iter_instance_trainable_params(
@@ -390,6 +385,22 @@ def _streamed_log_label(name: str | None, block_count: int) -> str:
     return f"StreamedComponent[{name}]"
 
 
+def _validate_stream_config(
+    *,
+    num_blocks: int,
+    blocks_to_swap: int,
+    prefetch_count: int,
+) -> None:
+    if blocks_to_swap < 0:
+        raise ValueError(f"blocks_to_swap ({blocks_to_swap}) must be >= 0")
+    if blocks_to_swap >= num_blocks:
+        raise ValueError(
+            f"blocks_to_swap ({blocks_to_swap}) must be < num blocks ({num_blocks})"
+        )
+    if prefetch_count < 0:
+        raise ValueError(f"prefetch_count ({prefetch_count}) must be >= 0")
+
+
 # ---------------------------------------------------------------------------
 # LRU tracker
 # ---------------------------------------------------------------------------
@@ -428,6 +439,101 @@ class _BlockTracker:
         self._lru.clear()
 
 
+@dataclass(frozen=True, slots=True)
+class StreamedComponentStore:
+    """Reusable pinned backing storage for a streamed block group."""
+
+    _block_stores: tuple[PinnedModuleStore, ...]
+    blocks_to_swap: int
+    prefetch_count: int = 2
+    cyclic: bool = False
+    name: str | None = None
+
+    @classmethod
+    def from_blocks(
+        cls,
+        blocks: Sequence[nn.Module],
+        *,
+        blocks_to_swap: int,
+        prefetch_count: int = 2,
+        cyclic: bool = False,
+        name: str | None = None,
+        stream_param_names: Iterable[str] | None = None,
+        stream_buffer_names: Iterable[str] | None = None,
+    ) -> StreamedComponentStore:
+        """Pin selected state for a reusable streamed block group."""
+        block_list = list(blocks)
+        _validate_stream_config(
+            num_blocks=len(block_list),
+            blocks_to_swap=blocks_to_swap,
+            prefetch_count=prefetch_count,
+        )
+        block_stores = _pin_block_module_stores(
+            block_list,
+            stream_param_names=(
+                None if stream_param_names is None else set(stream_param_names)
+            ),
+            stream_buffer_names=(
+                None if stream_buffer_names is None else set(stream_buffer_names)
+            ),
+        )
+        return cls(
+            _block_stores=tuple(block_stores),
+            blocks_to_swap=blocks_to_swap,
+            prefetch_count=prefetch_count,
+            cyclic=cyclic,
+            name=name,
+        )
+
+    @property
+    def streamed_param_names_by_block(self) -> list[list[str]]:
+        """Per-block streamed parameter names."""
+        return [list(store.params) for store in self._block_stores]
+
+    @property
+    def streamed_buffer_names_by_block(self) -> list[list[str]]:
+        """Per-block streamed buffer names."""
+        return [list(store.buffers) for store in self._block_stores]
+
+    @property
+    def param_names(self) -> frozenset[str]:
+        """Externally addressable streamed parameter names."""
+        names = {
+            _streamed_param_name(self.name, block_idx, local_name)
+            for block_idx, store in enumerate(self._block_stores)
+            for local_name in store.params
+        }
+        return frozenset(names)
+
+    @property
+    def cache_bytes(self) -> int:
+        return sum(store.cache_bytes for store in self._block_stores)
+
+    @property
+    def has_trainables(self) -> bool:
+        return any(store.has_trainables for store in self._block_stores)
+
+    def bind(self, blocks: Sequence[nn.Module]) -> StreamedComponent:
+        """Bind this store's per-block backing bytes to ``blocks``."""
+        block_list = list(blocks)
+        if len(block_list) != len(self._block_stores):
+            raise ValueError(
+                "StreamedComponentStore.bind() block count mismatch: "
+                f"store has {len(self._block_stores)}, got {len(block_list)}."
+            )
+        instances = [
+            store.bind(block)
+            for store, block in zip(self._block_stores, block_list, strict=True)
+        ]
+        return StreamedComponent(
+            instances,
+            blocks_to_swap=self.blocks_to_swap,
+            prefetch_count=self.prefetch_count,
+            cyclic=self.cyclic,
+            name=self.name,
+        )
+
+
 # ---------------------------------------------------------------------------
 # StreamedComponent — public block-streaming primitive
 # ---------------------------------------------------------------------------
@@ -436,8 +542,8 @@ class _BlockTracker:
 class StreamedComponent:
     """Streams a single block list between pinned CPU and CUDA.
 
-    The sharp, low-level streaming primitive. Manages the block list's
-    owned params and buffers: pins them to CPU at construction time,
+    The sharp, low-level streaming primitive. Manages bound block
+    instances whose owned params and buffers are pinned to CPU and
     streams them to CUDA via forward-pre hooks on :meth:`activate`.
     CPU activation is pass-through over that pinned host-backed state:
     no pool, no hooks, no copies. Frozen params use parameter
@@ -454,9 +560,9 @@ class StreamedComponent:
     model). For top-level use, build a strategy via
     :class:`~torch_offload.model_offloader.ModelOffloader`.
 
-    Lifecycle is uniform with :class:`PinnedComponent`: ``__init__``
+    Lifecycle is uniform with :class:`PinnedComponent`: store construction
     pins (so ``cache_bytes`` is final at construction time, ready
-    for :class:`~torch_offload.model_cache.ModelCache` admission),
+    for :class:`~torch_offload.model_cache.ModelCache` admission), and
     ``activate`` brings to CUDA or marks CPU active, ``deactivate`` returns state to
     pinned CPU and removes hooks. There is no ``close()``; pinned
     memory in module state is freed when the caller drops the
@@ -472,11 +578,14 @@ class StreamedComponent:
     through previously-evicted blocks find pinned-CPU tensors (slow but
     functional).
 
+    Instances are usually created by binding a
+    :class:`StreamedComponentStore` to the resolved sequence of block
+    modules.
+
     Parameters
     ----------
-    blocks:
-        The resolved sequence of block modules. Caller is responsible
-        for path resolution. Typically an ``nn.ModuleList``.
+    block_instances:
+        The concrete bound block instances.
     blocks_to_swap:
         Number of blocks to keep offloaded on CPU at any time. Must
         be ``< len(blocks)``.
@@ -506,61 +615,28 @@ class StreamedComponent:
         :attr:`param_names` and name-based post-copy hook registration
         use names like ``"blocks.3.weight"``. When omitted, standalone
         streamers use ``"3.weight"``.
-    stream_param_names:
-        Optional set of block-local parameter names to stream from
-        every block. ``None`` streams all parameters.
-    stream_buffer_names:
-        Optional set of block-local buffer names to stream from every
-        block. ``None`` streams all registered buffers.
-        Trainable streaming requires activation checkpointing on
-        every block (the ``.data`` swap bypasses autograd's
-        version-counter check). The streamer doesn't enforce that
-        precondition itself — :class:`ModelOffloader` does.
+        Trainable streaming requires activation checkpointing on every
+        block (the ``.data`` swap bypasses autograd's version-counter
+        check). The streamer doesn't enforce that precondition itself —
+        :class:`ModelOffloader` does.
     """
 
     def __init__(
         self,
-        blocks: Sequence[nn.Module],
+        block_instances: Sequence[PinnedModuleInstance],
         *,
         blocks_to_swap: int,
         prefetch_count: int = 2,
         cyclic: bool = False,
         name: str | None = None,
-        stream_param_names: Iterable[str] | None = None,
-        stream_buffer_names: Iterable[str] | None = None,
     ) -> None:
-        self._blocks: list[nn.Module] = list(blocks)
+        self._block_instances = list(block_instances)
+        self._blocks = [instance.module for instance in self._block_instances]
         self._active_device: torch.device | None = None
         self._blocks_to_swap = blocks_to_swap
         self._prefetch_count = prefetch_count
         self._cyclic = cyclic
         self._log_label = _streamed_log_label(name, len(self._blocks))
-
-        if blocks_to_swap < 0:
-            raise ValueError(f"blocks_to_swap ({blocks_to_swap}) must be >= 0")
-        if blocks_to_swap >= len(self._blocks):
-            raise ValueError(
-                f"blocks_to_swap ({blocks_to_swap}) must be < num blocks ({len(self._blocks)})"
-            )
-        if prefetch_count < 0:
-            raise ValueError(f"prefetch_count ({prefetch_count}) must be >= 0")
-
-        # Pin in __init__ — uniform lifecycle with PinnedComponent, and
-        # ModelCache integration sees a final `cache_bytes` immediately.
-        # Block instance construction validates that every block shares
-        # the same pool-compatible layout before any model state is
-        # mutated, then clones directly from the source device into
-        # pinned CPU storage. Heterogeneous block lists split across
-        # separate `layers_attr=[...]` entries in ModelOffloader.
-        self._block_instances = _pin_block_module_instances(
-            self._blocks,
-            stream_param_names=(
-                None if stream_param_names is None else set(stream_param_names)
-            ),
-            stream_buffer_names=(
-                None if stream_buffer_names is None else set(stream_buffer_names)
-            ),
-        )
         self._param_name_to_block_param = _build_param_name_index(
             self._block_instances,
             name,
@@ -1335,4 +1411,5 @@ class StreamedComponent:
 
 __all__ = [
     "StreamedComponent",
+    "StreamedComponentStore",
 ]

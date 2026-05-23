@@ -103,7 +103,7 @@ from .model_offloader import ModelOffloader
 from .mps_weights import MpsWeights
 from .pinned_component import PinnedComponent, PinnedComponentStore
 from .protocols import CachedResource, ModelStrategy, ModelStrategyComponent
-from .streamed_component import StreamedComponent
+from .streamed_component import StreamedComponent, StreamedComponentStore
 
 __all__ = [
     "ActivationError",
@@ -131,5 +131,6 @@ __all__ = [
     "PinnedComponentStore",
     "ResourceSpec",
     "StreamedComponent",
+    "StreamedComponentStore",
     "merge_lora",
 ]

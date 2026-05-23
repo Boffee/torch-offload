@@ -16,7 +16,7 @@ to be lifted into its own package when a second consumer appears.
 | `protocols.py` | `CachedResource` (generic), `ModelStrategy` / `ModelStrategyComponent` plug-in contracts |
 | `model_offloader.py` | `ModelOffloader` — whole-model bulk pinned-CPU↔GPU or streamed block offload strategy |
 | `pinned_component.py` | `PinnedComponent`, `PinnedComponentStore` — reusable pinned backing storage plus lifecycle-only pinned component used by `ModelOffloader` |
-| `streamed_component.py` | `StreamedComponent` — sharp per-block-list streaming primitive (component) |
+| `streamed_component.py` | `StreamedComponent`, `StreamedComponentStore` — reusable streamed backing storage plus sharp per-block-list streaming component |
 | `lora.py` | `LoRA`, `LoRATransform`, `LoRARouteHandle` — pinned factor storage + merge / routed-hook application |
 | `merge.py` | `merge_lora()` — permanent in-place LoRA merge into base weights (alternative to `set_loras`) |
 | `pinned_param.py` | `PinnedParam` — per-parameter pinning primitive (handles quanto, GGUF, and TorchAO NVFP4 via adapters) |

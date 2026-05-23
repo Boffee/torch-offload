@@ -25,7 +25,7 @@ from .module_names import (
 )
 from .pinned_component import PinnedComponent, PinnedComponentStore
 from .protocols import ModelStrategyComponent
-from .streamed_component import StreamedComponent
+from .streamed_component import StreamedComponent, StreamedComponentStore
 from .tensor_adapter_registry import select_adapter
 
 logger = logging.getLogger(__name__)
@@ -833,15 +833,18 @@ def _build_streamed_components(
         streamed_buffer_names.update(
             _full_block_names(layer_paths[i], len(blocks), stream_buffer_names)
         )
+        store = StreamedComponentStore.from_blocks(
+            blocks,
+            blocks_to_swap=swap_list[i],
+            prefetch_count=pf_list[i],
+            cyclic=cyclic,
+            name=layer_paths[i],
+            stream_param_names=stream_param_names,
+            stream_buffer_names=stream_buffer_names,
+        )
         streamed_components.append(
-            StreamedComponent(
+            store.bind(
                 blocks=blocks,
-                blocks_to_swap=swap_list[i],
-                prefetch_count=pf_list[i],
-                cyclic=cyclic,
-                name=layer_paths[i],
-                stream_param_names=stream_param_names,
-                stream_buffer_names=stream_buffer_names,
             )
         )
 
