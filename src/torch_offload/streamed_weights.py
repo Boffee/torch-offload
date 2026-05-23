@@ -547,7 +547,6 @@ class StreamedWeights:
                 None if stream_buffer_names is None else set(stream_buffer_names)
             ),
         )
-        self._post_copy_hooks: dict[int, PostCopyHook] = {}
         self._move_trainable_grads_to(torch.device("cpu"))
 
         # Active resources allocated on CUDA activate().
@@ -593,16 +592,6 @@ class StreamedWeights:
             for instance in self._block_instances
         ]
 
-    def param_alias_names(self, block_idx: int, name: str) -> tuple[str, ...]:
-        """Return block-local names that share ``name``'s pinned backing."""
-        instance, name = self._resolve_param(block_idx, name)
-        pinned = instance.store.params[name]
-        return tuple(
-            candidate
-            for candidate, candidate_pinned in instance.store.params.items()
-            if candidate_pinned is pinned
-        )
-
     @property
     def cache_bytes(self) -> int:
         return sum(instance.cache_bytes for instance in self._block_instances)
@@ -620,19 +609,13 @@ class StreamedWeights:
         LoRA. Mirrors PyTorch's hook registration pattern by returning a
         handle whose :meth:`remove` method unregisters the hook.
         """
-        key = self.post_copy_hook_key(block_idx, name)
-        if key in self._post_copy_hooks:
-            raise RuntimeError(
-                "post-copy hook already registered for "
-                f"streamed param ({block_idx}, {name!r})"
-            )
-        self._post_copy_hooks[key] = hook
-        return PostCopyHookHandle(self._post_copy_hooks, key)
+        instance, name = self._resolve_param(block_idx, name)
+        return instance.register_post_copy_hook(name, hook)
 
     def post_copy_hook_key(self, block_idx: int, name: str) -> int:
         """Stable hook/dedup key for a streamed parameter."""
         instance, name = self._resolve_param(block_idx, name)
-        return id(instance.store.params[name])
+        return instance.post_copy_hook_key(name)
 
     def _resolve_param(
         self,
@@ -1050,7 +1033,7 @@ class StreamedWeights:
         target = self._pool.target(slot_id)
         instance.load_to_target(
             target,
-            post_copy_hooks=self._post_copy_hooks,
+            run_post_copy_hooks=True,
             non_blocking=non_blocking,
         )
 

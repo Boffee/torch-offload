@@ -15,7 +15,7 @@ from collections.abc import (
     Mapping,
     MutableMapping,
 )
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TypeVar
 
 import torch
@@ -167,6 +167,11 @@ class PinnedModuleInstance:
     module: nn.Module
     store: PinnedModuleStore
     cpu_params_by_pinned_id: dict[int, nn.Parameter]
+    _post_copy_hooks: dict[int, PostCopyHook] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
 
     @classmethod
     def from_store(
@@ -211,11 +216,33 @@ class PinnedModuleInstance:
             buffer_names=buffer_names,
         )
 
+    def register_post_copy_hook(
+        self, name: str, hook: PostCopyHook,
+    ) -> PostCopyHookHandle:
+        """Register a hook after this instance copies ``name`` to a target."""
+        key = self.post_copy_hook_key(name)
+        if key in self._post_copy_hooks:
+            raise RuntimeError(
+                "post-copy hook already registered for "
+                f"param name {name!r}. Duplicate or shared LoRA "
+                "targets for the same parameter backing are unsupported."
+            )
+        self._post_copy_hooks[key] = hook
+        return PostCopyHookHandle(self._post_copy_hooks, key)
+
+    def post_copy_hook_key(self, name: str) -> int:
+        """Stable hook/dedup key for a managed parameter name."""
+        if name not in self.store.params:
+            raise ValueError(
+                f"param name {name!r} is not owned by this PinnedModuleInstance"
+            )
+        return id(self.store.params[name])
+
     def load_to_target(
         self,
         target: PinnedModuleTarget,
         *,
-        post_copy_hooks: Mapping[int, PostCopyHook] | None = None,
+        run_post_copy_hooks: bool = False,
         non_blocking: bool = False,
     ) -> None:
         """Copy selected pinned bytes into ``target`` and install them.
@@ -232,11 +259,12 @@ class PinnedModuleInstance:
             target.param_targets,
             non_blocking=non_blocking,
         )
-        _run_post_copy_hooks(
-            params,
-            target.param_targets,
-            post_copy_hooks,
-        )
+        if run_post_copy_hooks:
+            _run_post_copy_hooks(
+                params,
+                target.param_targets,
+                self._post_copy_hooks,
+            )
         _copy_buffers_to_target(
             buffers,
             target.buffer_targets,
@@ -558,11 +586,8 @@ def _copy_trainable_params_from_target(
 def _run_post_copy_hooks(
     params: Mapping[str, PinnedParam],
     targets: Mapping[str, PinnedParamTarget],
-    hooks: Mapping[int, PostCopyHook] | None,
+    hooks: Mapping[int, PostCopyHook],
 ) -> None:
-    if hooks is None:
-        return
-
     seen: set[int] = set()
     for name, pinned in params.items():
         key = id(pinned)

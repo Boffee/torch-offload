@@ -377,7 +377,8 @@ class TestPinnedModuleInstance:
             hook_calls.append(param)
             param.data.add_(1)
 
-        instance.load_to_target(target, post_copy_hooks={id(pinned): hook})
+        instance.register_post_copy_hook("left.weight", hook)
+        instance.load_to_target(target, run_post_copy_hooks=True)
 
         target_param = target.param_targets["left.weight"].param
         assert pinned.copied == 1
@@ -385,6 +386,34 @@ class TestPinnedModuleInstance:
         assert module.left.weight is target_param
         assert module.right.weight is target_param
         torch.testing.assert_close(target_param, torch.full((2, 2), 2.0))
+
+    def test_load_to_target_skips_registered_hooks_by_default(self) -> None:
+        module = nn.Module()
+        module.weight = nn.Parameter(torch.zeros(2), requires_grad=False)
+        pinned = _FakePinnedParam(torch.ones(2))
+        store = PinnedModuleStore(
+            params={"weight": cast(PinnedParam, pinned)},
+            buffers={},
+        )
+        instance = PinnedModuleInstance(
+            module=module,
+            store=store,
+            cpu_params_by_pinned_id={id(pinned): pinned.make_cpu_param()},
+        )
+        target = instance.allocate_target(torch.device("cuda"))
+        hook_calls: list[nn.Parameter] = []
+
+        def hook(param: nn.Parameter) -> None:
+            hook_calls.append(param)
+            param.data.add_(1)
+
+        instance.register_post_copy_hook("weight", hook)
+        instance.load_to_target(target)
+
+        target_param = target.param_targets["weight"].param
+        assert hook_calls == []
+        assert module.weight is target_param
+        torch.testing.assert_close(target_param, torch.ones(2))
 
     def test_load_to_target_preserves_trainable_param_wrapper(self) -> None:
         module = nn.Module()

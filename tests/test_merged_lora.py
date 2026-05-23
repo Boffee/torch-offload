@@ -201,13 +201,17 @@ def _has_post_copy_hook(strategy: ModelOffloader, target_key: str) -> bool:
         return False
     if isinstance(component, PinnedWeights):
         assert isinstance(param_ref, str)
-        return component.post_copy_hook_key(param_ref) in component._post_copy_hooks
+        return (
+            component.post_copy_hook_key(param_ref)
+            in component._instance._post_copy_hooks
+        )
     if isinstance(component, StreamedWeights):
         assert isinstance(param_ref, tuple)
         block_idx, name = param_ref
+        instance = component._block_instances[block_idx]
         return (
             component.post_copy_hook_key(block_idx, name)
-            in component._post_copy_hooks
+            in instance._post_copy_hooks
         )
     return False
 
@@ -347,8 +351,10 @@ class TestSetLorasValidation:
             "head.lora_B.weight": torch.randn(16, 4),
         }
         s.set_loras([(LoRA(state_dict=sd), 1.0)], mode="merge")
-        with pytest.raises(ValueError, match="same tied parameter storage"):
+        with pytest.raises(RuntimeError, match="shared LoRA targets"):
             _activate_loras_for_test(s)
+        assert not _has_post_copy_hook(s, "embed.weight")
+        assert not _has_post_copy_hook(s, "head.weight")
 
     def test_streamed_block_shared_submodule_alias_target_matched(self) -> None:
         class Block(nn.Module):
@@ -1283,11 +1289,11 @@ class TestRoutedMode:
             s.deactivate()
 
     @pytest.mark.parametrize("target", ["embed", "head"])
-    def test_routed_tied_weight_target_raises(self, target: str) -> None:
+    def test_routed_tied_weight_target_uses_exact_parent(self, target: str) -> None:
         # Standard tied embed/head pattern: one Parameter aliased at
-        # multiple names. PinnedWeights dedupes them into one backing
-        # with multiple parent modules. Routed mode would only hook one
-        # module and silently miss the others — reject explicitly.
+        # multiple names. Routed mode is name-centric and does not
+        # mutate the shared storage, so it should hook only the exact
+        # parent module named by the LoRA target.
         model = _make_tied_non_block_model(dtype=torch.bfloat16)
 
         s = ModelOffloader(
@@ -1301,9 +1307,16 @@ class TestRoutedMode:
         }
         lora = LoRA(state_dict=sd, key_transform=None)
         s.set_loras([(lora, 1.0)], mode="routed")
-        with pytest.raises(ValueError, match="tied weights"):
-            _activate_loras_for_test(s)
-        # Merge mode handles tied weights via storage mutation.
+        targets = s._group_loras_by_target(s._loras)
+        s._register_lora_hooks(torch.device("cpu"), targets)
+        try:
+            assert len(model.embed._forward_hooks) == (1 if target == "embed" else 0)
+            assert len(model.head._forward_hooks) == (1 if target == "head" else 0)
+        finally:
+            s._clear_active_lora_hooks()
+
+        # Merge mode also matches by name; it mutates the copied backing,
+        # so the normal shared-storage effect is preserved.
         s.set_loras([(lora, 1.0)], mode="merge")
         _activate_loras_for_test(s)
 

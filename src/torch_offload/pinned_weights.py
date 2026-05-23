@@ -127,7 +127,6 @@ class PinnedWeights:
         self._active_device: torch.device | None = None
         self._active_target: PinnedModuleTarget | None = None
         self._optimizer_step_active: bool = False
-        self._post_copy_hooks: dict[int, PostCopyHook] = {}
 
         # Pin selected names without replacing module slots.
         # PinnedParam intentionally repoints plain Parameter.data at each
@@ -202,22 +201,11 @@ class PinnedWeights:
         LoRA. Mirrors PyTorch's hook registration pattern by returning a
         handle whose :meth:`remove` method unregisters the hook.
         """
-        if name not in self._store.params:
-            raise ValueError(
-                f"param name {name!r} is not owned by this PinnedWeights"
-            )
-        key = self.post_copy_hook_key(name)
-        if key in self._post_copy_hooks:
-            raise RuntimeError(
-                "post-copy hook already registered for "
-                f"param name {name!r}"
-            )
-        self._post_copy_hooks[key] = hook
-        return PostCopyHookHandle(self._post_copy_hooks, key)
+        return self._instance.register_post_copy_hook(name, hook)
 
     def post_copy_hook_key(self, name: str) -> int:
         """Stable hook/dedup key for a managed parameter name."""
-        return id(self._store.params[name])
+        return self._instance.post_copy_hook_key(name)
 
     def activate(self, device: torch.device | str | None = None) -> None:
         """Activate the wrapped model on ``device``.
@@ -256,7 +244,7 @@ class PinnedWeights:
             target = self._instance.allocate_target(active_device)
             self._instance.load_to_target(
                 target,
-                post_copy_hooks=self._post_copy_hooks,
+                run_post_copy_hooks=True,
                 non_blocking=True,
             )
             torch.cuda.synchronize(active_device)

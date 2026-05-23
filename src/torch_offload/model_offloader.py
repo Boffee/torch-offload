@@ -306,7 +306,7 @@ class ModelOffloader:
 
         (
             self._target_to_param_ref,
-            self._target_to_parents,
+            self._target_to_parent,
             self._target_to_component,
         ) = self._build_target_index(
             streamers,
@@ -358,12 +358,15 @@ class ModelOffloader:
           matched parent module. Forward becomes
           ``y = base(x) + alpha * B * A * x``. Doesn't touch the base
           weight in place. Restricted to ``nn.Linear`` parents (the math
-          assumes ``y = x @ W.T``); tied targets and non-Linear parents
-          raise. Quantized bases work when the matched module still
-          exposes the logical ``nn.Linear`` weight shape and either its
-          adapter reports a logical compute dtype or the module exposes
-          ``compute_dtype``. Packed formats whose parameter shape differs
-          from the logical matmul weight need a per-format route layer.
+          assumes ``y = x @ W.T``); non-Linear parents raise. Shared
+          weight storage is allowed because routed mode hooks the exact
+          matched parent module instead of mutating weight bytes.
+          Quantized bases work when the matched module still exposes the
+          logical ``nn.Linear`` weight shape and either its adapter
+          reports a logical compute dtype or the module exposes
+          ``compute_dtype``. Packed formats whose parameter shape
+          differs from the logical matmul weight need a per-format route
+          layer.
         Routed mode requires activations to reach the hooked layer in
         the layer's compute dtype (or under autocast). Mixed-dtype
         inputs without autocast will error in the hook's matmul.
@@ -387,29 +390,14 @@ class ModelOffloader:
         self, loras: Sequence[tuple[LoRA, float]],
     ) -> _LoraTargetMap:
         per_target: _LoraTargetMap = {}
-        per_param_ref_target: dict[int, str] = {}
         total_targets = 0
         matched_targets = 0
         for lora, strength in loras:
             for target_key, (a, b) in lora.targets.items():
                 total_targets += 1
-                param_ref = self._target_to_param_ref.get(target_key)
-                component = self._target_to_component.get(target_key)
-                if param_ref is None or component is None:
+                if target_key not in self._target_to_param_ref:
                     continue
                 matched_targets += 1
-                ref_key = _post_copy_hook_key(component, param_ref)
-                existing_target = per_param_ref_target.setdefault(
-                    ref_key, target_key,
-                )
-                if existing_target != target_key:
-                    raise ValueError(
-                        f"LoRA targets {existing_target!r} and {target_key!r} "
-                        f"resolve to the same tied parameter storage. Apply "
-                        f"only one name for a tied weight in a single "
-                        f"set_loras() call; otherwise the same base weight "
-                        f"would receive multiple logical updates."
-                    )
                 per_target.setdefault(target_key, []).append(
                     (a, b, strength)
                 )
@@ -475,19 +463,7 @@ class ModelOffloader:
         targets: _LoraTargetMap,
     ) -> None:
         for target_key, refs in targets.items():
-            parents = self._target_to_parents[target_key]
-            if len(parents) != 1:
-                raise ValueError(
-                    f"Routed LoRA mode does not support tied "
-                    f"weights; target {target_key!r} has "
-                    f"{len(parents)} parent modules (typically the "
-                    f"tied embed/head pattern). The hook would only "
-                    f"fire on one of them, silently missing the "
-                    f"others. Use mode='merge' for tied targets — "
-                    f"merge mutates the shared storage so all "
-                    f"tied slots see the LoRA contribution."
-                )
-            parent = next(iter(parents))
+            parent = self._target_to_parent[target_key]
             if not isinstance(parent, nn.Linear):
                 raise ValueError(
                     f"Routed LoRA mode requires nn.Linear targets; "
@@ -778,30 +754,27 @@ class ModelOffloader:
         pinned_weights: PinnedWeights | None,
     ) -> tuple[
         dict[str, _TargetParamRef],
-        dict[str, tuple[nn.Module, ...]],
+        dict[str, nn.Module],
         dict[str, PinnedWeights | StreamedWeights],
     ]:
         """Map canonical param names to their component-local param ref
-        and to the tuple of parent modules where the param is installed.
+        and to the exact parent module where the named param is installed.
 
         The param-ref map drives merge-mode LoRA post-copy hooks, the
-        component map identifies which component owns the copy loop,
-        and the parents map drives routed-mode LoRA forward hooks.
+        component map identifies which component owns the copy loop, and
+        the parent map drives routed-mode LoRA forward hooks.
 
         Keys are normalized to strip PEFT's ``.base_layer.`` segments
         so that LoRA state-dict keys (which use the original model
         names) match regardless of whether the model is PEFT-wrapped.
 
-        Parents are stored as a tuple to preserve tied-weight
-        information. Streamed-block targets can have multiple parents
-        when aliases inside the same block share pinned storage;
-        cross-region ties are rejected upstream by
-        :func:`detect_streaming_region_ties`. Routed mode rejects tied
-        targets, while merge mode handles tied storage uniformly because
-        it mutates the shared bytes.
+        Routed LoRA is name-centric: it hooks the parent module for the
+        exact matched name. Shared parameter storage alone does not make
+        routed mode ambiguous because routed mode does not mutate the
+        parameter bytes.
         """
         param_refs: dict[str, _TargetParamRef] = {}
-        parents: dict[str, tuple[nn.Module, ...]] = {}
+        parent_by_key: dict[str, nn.Module] = {}
         components: dict[str, PinnedWeights | StreamedWeights] = {}
 
         for streamer, layer_path, blocks in zip(
@@ -816,29 +789,23 @@ class ModelOffloader:
                 block = blocks[block_idx]
                 for local_name in local_names:
                     param_ref = (block_idx, local_name)
-                    alias_names = streamer.param_alias_names(block_idx, local_name)
-                    parent_tuple = _unique_named_param_parents(block, alias_names)
+                    parent = _resolve_param_parent(block, local_name)
                     full_name = f"{layer_path}.{block_idx}.{local_name}"
                     key = canonical_param_name(full_name)
                     param_refs[key] = param_ref
-                    parents[key] = parent_tuple
+                    parent_by_key[key] = parent
                     components[key] = streamer
 
         if pinned_weights is not None:
-            names_by_hook_key: dict[int, list[str]] = {}
             for name in pinned_weights.param_names:
-                hook_key = pinned_weights.post_copy_hook_key(name)
-                names_by_hook_key.setdefault(hook_key, []).append(name)
+                key = canonical_param_name(name)
+                param_refs[key] = name
+                parent_by_key[key] = _resolve_param_parent(
+                    pinned_weights.model, name,
+                )
+                components[key] = pinned_weights
 
-            for names in names_by_hook_key.values():
-                parent_tuple = _unique_named_param_parents(pinned_weights.model, names)
-                for name in names:
-                    key = canonical_param_name(name)
-                    param_refs[key] = name
-                    parents[key] = parent_tuple
-                    components[key] = pinned_weights
-
-        return param_refs, parents, components
+        return param_refs, parent_by_key, components
 
 
 # ---------------------------------------------------------------------------
@@ -912,20 +879,6 @@ def _all_buffer_names(model: nn.Module) -> set[str]:
     }
 
 
-def _post_copy_hook_key(
-    component: PinnedWeights | StreamedWeights,
-    param_ref: _TargetParamRef,
-) -> int:
-    if isinstance(component, PinnedWeights):
-        if not isinstance(param_ref, str):
-            raise TypeError("PinnedWeights merge target must be a name.")
-        return component.post_copy_hook_key(param_ref)
-    if not _is_streamed_hook_target(param_ref):
-        raise TypeError("StreamedWeights merge target must be a ref.")
-    block_idx, name = param_ref
-    return component.post_copy_hook_key(block_idx, name)
-
-
 def _is_streamed_hook_target(value: object) -> TypeGuard[_StreamedHookTarget]:
     return (
         isinstance(value, tuple)
@@ -933,22 +886,6 @@ def _is_streamed_hook_target(value: object) -> TypeGuard[_StreamedHookTarget]:
         and isinstance(value[0], int)
         and isinstance(value[1], str)
     )
-
-
-def _unique_named_param_parents(
-    block: nn.Module,
-    names: Sequence[str],
-) -> tuple[nn.Module, ...]:
-    seen_parent_ids: set[int] = set()
-    parents: list[nn.Module] = []
-    for name in names:
-        parent = _resolve_param_parent(block, name)
-        parent_id = id(parent)
-        if parent_id in seen_parent_ids:
-            continue
-        seen_parent_ids.add(parent_id)
-        parents.append(parent)
-    return tuple(parents)
 
 
 def _resolve_param_parent(block: nn.Module, name: str) -> nn.Module:
