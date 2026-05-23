@@ -31,7 +31,7 @@ def _make_simple_model() -> nn.Module:
 class _FakeMpsWeights(MpsWeights):
     """CPU-only test double for the MPS copy path.
 
-    It lets tests exercise slot replacement and reference lifetimes on
+    It lets tests exercise parameter replacement and reference lifetimes on
     machines without an MPS backend. The active tensors stay on CPU, but
     ``activate("mps")`` still takes the same copy-and-replace path.
     """
@@ -71,7 +71,7 @@ class TestModelStrategyConformance:
 
 
 class TestLifecycle:
-    def test_init_materializes_slots(self) -> None:
+    def test_init_materializes_named_parameters(self) -> None:
         model = _make_simple_model()
         first_param = model[0].weight
         first_ref = weakref.ref(first_param)
@@ -153,7 +153,7 @@ class TestLifecycle:
 class TestConstruction:
     def test_rejects_trainable_param(self) -> None:
         model = nn.Linear(4, 4)
-        with pytest.raises(ValueError, match="cannot manage trainable slot"):
+        with pytest.raises(ValueError, match="cannot manage trainable parameter"):
             MpsWeights(model)
 
     def test_rejects_empty_model(self) -> None:

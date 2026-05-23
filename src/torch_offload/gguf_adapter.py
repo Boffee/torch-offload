@@ -22,7 +22,7 @@ GGUF intentionally does not implement the CPU round-trip adapter
 capability because GPU storage is dequantized bf16; copying back would
 require lossy re-quantization.
 
-Selected by :mod:`tensor_adapter_factory`. Import fails silently if the
+Selected by :mod:`tensor_adapter_registry`. Import fails silently if the
 ``gguf`` package is not installed — GGUF support is optional.
 """
 

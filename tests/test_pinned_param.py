@@ -13,7 +13,7 @@ from torch_offload.tensor_adapters import (
     DequantRequantTensorAdapter,
     TensorCopyIntoAdapter,
 )
-from torch_offload.tensor_adapter_factory import select_adapter, storage_key
+from torch_offload.tensor_adapter_registry import select_adapter, storage_key
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 

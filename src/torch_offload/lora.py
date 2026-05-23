@@ -36,7 +36,7 @@ from typing import Any
 import torch
 from torch import nn
 
-from .tensor_adapter_factory import select_adapter
+from .tensor_adapter_registry import select_adapter
 from .tensor_adapters import (
     DenseAddmmTensorAdapter,
     DequantRequantCopyIntoTensorAdapter,

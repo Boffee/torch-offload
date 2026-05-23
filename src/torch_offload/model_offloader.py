@@ -16,10 +16,17 @@ from torch import nn
 
 from ._devices import canonical_device
 from .lora import LoRA, LoRARouteHandle, LoRATransform
+from .module_names import (
+    buffer_names,
+    canonical_param_name,
+    parameter_names,
+    resolve_parent_leaf,
+    walk_attr_path,
+)
 from .pinned_component import PinnedComponent
 from .protocols import ModelStrategyComponent
 from .streamed_component import StreamedComponent
-from .tensor_adapter_factory import select_adapter
+from .tensor_adapter_registry import select_adapter
 
 logger = logging.getLogger(__name__)
 
@@ -411,7 +418,7 @@ class ModelOffloader:
         targets: _LoraParamMap,
     ) -> None:
         for param_name, refs in targets.items():
-            parent = _resolve_param_parent(self._model, param_name)
+            parent, _leaf = resolve_parent_leaf(self._model, param_name)
             if not isinstance(parent, nn.Linear):
                 raise ValueError(
                     f"Routed LoRA mode requires nn.Linear targets; "
@@ -863,8 +870,8 @@ def _build_pinned_component(
     include_param_names: Iterable[str] | None,
     include_buffer_names: Iterable[str] | None,
 ) -> PinnedComponent | None:
-    pinned_param_names = _all_param_names(model) - streamed_param_names
-    pinned_buffer_names = _all_buffer_names(model) - streamed_buffer_names
+    pinned_param_names = parameter_names(model) - streamed_param_names
+    pinned_buffer_names = buffer_names(model) - streamed_buffer_names
     if include_param_names is not None:
         pinned_param_names = set(include_param_names)
     if include_buffer_names is not None:
@@ -948,46 +955,6 @@ def _full_block_names(
         for block_idx in range(block_count)
         for local_name in local_names
     }
-
-
-def _all_param_names(model: nn.Module) -> set[str]:
-    return {
-        name
-        for name, _param in model.named_parameters(remove_duplicate=False)
-    }
-
-
-def _all_buffer_names(model: nn.Module) -> set[str]:
-    return {
-        name
-        for name, _buffer in model.named_buffers(remove_duplicate=False)
-    }
-
-
-def walk_attr_path(root: nn.Module, dotted_path: str) -> object:
-    """Walk a dotted attribute path from ``root``."""
-    obj: object = root
-    for part in dotted_path.split("."):
-        obj = getattr(obj, part)
-    return obj
-
-
-def canonical_param_name(name: str) -> str:
-    """Normalize PEFT base-layer paths for LoRA target matching."""
-    return name.replace(".base_layer.", ".")
-
-
-def _resolve_param_parent(block: nn.Module, name: str) -> nn.Module:
-    parent_path, sep, _leaf = name.rpartition(".")
-    if not sep:
-        return block
-    parent = walk_attr_path(block, parent_path)
-    if not isinstance(parent, nn.Module):
-        raise TypeError(
-            f"Path {parent_path!r} resolved to {type(parent).__name__}, "
-            "expected nn.Module."
-        )
-    return parent
 
 
 def _resolve_layers_attr(module: nn.Module, dotted_path: str) -> nn.ModuleList:

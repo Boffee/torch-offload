@@ -21,12 +21,8 @@ from typing import Any
 from torch import nn
 
 from .lora import LoRA, LoRATransform
-from .slots import (
-    ParamSlot,
-    canonical_param_name,
-    iter_param_slots,
-    param_storage_key,
-)
+from .module_names import canonical_param_name
+from .tensor_adapter_registry import param_storage_key
 
 logger = logging.getLogger(__name__)
 
@@ -54,18 +50,18 @@ def merge_lora(
 
     Returns the number of parameters that were modified.
     """
-    param_slots_by_target = _collect_param_slots(model)
+    params_by_target = _collect_params_by_target(model)
 
     merge_ops: list[_MergeOp] = []
     param_groups_by_storage: dict[tuple[Any, ...], _MergeParamGroup] = {}
     target_by_storage: dict[tuple[Any, ...], str] = {}
     for lora, strength in loras:
         for target_key, (a, b) in lora.targets.items():
-            slot = param_slots_by_target.get(target_key)
-            if slot is None:
+            param = params_by_target.get(target_key)
+            if param is None:
                 continue
-            group = _param_group_for_slot(
-                slot, param_groups_by_storage,
+            group = _param_group_for_param(
+                param, param_groups_by_storage,
             )
             existing_target = target_by_storage.setdefault(
                 group.storage, target_key,
@@ -94,18 +90,17 @@ def merge_lora(
     return len(merge_ops)
 
 
-def _collect_param_slots(model: nn.Module) -> dict[str, ParamSlot]:
-    param_slots_by_target: dict[str, ParamSlot] = {}
-    for slot in iter_param_slots(model):
-        param_slots_by_target[canonical_param_name(slot.name)] = slot
-    return param_slots_by_target
+def _collect_params_by_target(model: nn.Module) -> dict[str, nn.Parameter]:
+    params_by_target: dict[str, nn.Parameter] = {}
+    for name, param in model.named_parameters(remove_duplicate=False):
+        params_by_target[canonical_param_name(name)] = param
+    return params_by_target
 
 
-def _param_group_for_slot(
-    target_slot: ParamSlot,
+def _param_group_for_param(
+    target_param: nn.Parameter,
     param_groups_by_storage: dict[tuple[Any, ...], _MergeParamGroup],
 ) -> _MergeParamGroup:
-    target_param = target_slot.get()
     storage = param_storage_key(target_param)
     group = param_groups_by_storage.get(storage)
     if group is not None:

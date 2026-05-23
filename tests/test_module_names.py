@@ -1,43 +1,46 @@
-"""Tests for shared slot helpers."""
+"""Tests for shared name and storage-identity helpers."""
 
 from __future__ import annotations
 
 import torch
 from torch import nn
 
-from torch_offload.slots import (
+from torch_offload.module_names import (
+    named_buffer_entries,
+    named_parameter_entries,
+)
+from torch_offload.tensor_adapter_registry import (
     buffer_storage_key,
-    iter_buffer_slots,
-    iter_param_slots,
     param_storage_key,
 )
 
 
-def test_iter_param_slots_returns_duplicate_module_paths() -> None:
+def test_named_parameter_entries_return_duplicate_module_paths() -> None:
     model = nn.Module()
     shared = nn.Linear(4, 4, bias=False)
     model.left = shared
     model.right = shared
 
-    slots = list(iter_param_slots(model))
+    entries = list(named_parameter_entries(model))
 
-    assert [slot.name for slot in slots] == ["left.weight", "right.weight"]
-    assert slots[0].parent is shared
-    assert slots[1].parent is shared
-    assert slots[0].leaf == "weight"
-    assert slots[1].leaf == "weight"
-    assert slots[0].key == slots[1].key
+    assert [(name, parent, leaf) for name, parent, leaf, _param in entries] == [
+        ("left.weight", shared, "weight"),
+        ("right.weight", shared, "weight"),
+    ]
 
 
-def test_iter_buffer_slots_preserves_persistence() -> None:
+def test_named_buffer_entries_preserve_persistence() -> None:
     model = nn.Module()
     model.register_buffer("persistent", torch.randn(2), persistent=True)
     model.register_buffer("temporary", torch.randn(2), persistent=False)
 
-    slots = {slot.name: slot for slot in iter_buffer_slots(model)}
+    entries = {
+        name: persistent
+        for name, _parent, _leaf, _buffer, persistent in named_buffer_entries(model)
+    }
 
-    assert slots["persistent"].persistent is True
-    assert slots["temporary"].persistent is False
+    assert entries["persistent"] is True
+    assert entries["temporary"] is False
 
 
 def test_param_storage_key_groups_distinct_params_sharing_storage() -> None:

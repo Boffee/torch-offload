@@ -15,7 +15,7 @@ across the CPU↔GPU boundary while preserving correctness:
 
 Each adapter encapsulates the mechanics for one tensor type. The rest
 of the package is type-agnostic and dispatches through
-``tensor_adapter_factory.select_adapter``. The base adapter contract is
+``tensor_adapter_registry.select_adapter``. The base adapter contract is
 intentionally small: clone/pin, move to GPU, rebuild wrappers, report
 cache bytes, and report the logical compute dtype. Adapters also
 provide a layout signature for block-pool compatibility checks. Extra
@@ -24,7 +24,7 @@ the exact capability they need instead of hard-coding tensor classes.
 
 This module is internal to :mod:`torch_offload`. It contains the base
 contracts and plain tensor adapter only; built-in adapter selection
-lives in :mod:`tensor_adapter_factory`.
+lives in :mod:`tensor_adapter_registry`.
 """
 
 from __future__ import annotations

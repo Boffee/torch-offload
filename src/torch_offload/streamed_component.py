@@ -43,7 +43,7 @@ import functools
 import logging
 import weakref
 from collections import OrderedDict
-from collections.abc import Callable, Hashable, Iterable, Iterator, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import cast
 
@@ -51,6 +51,7 @@ import torch
 from torch import nn
 
 from ._devices import canonical_device
+from .module_names import group_names
 from .pinned_buffer import PinnedBuffer
 from .pinned_module import (
     PinnedModuleInstance,
@@ -60,12 +61,11 @@ from .pinned_module import (
     PostCopyHookHandle,
 )
 from .pinned_param import PinnedParam
-from .tensor_adapter_factory import storage_key
+from .tensor_adapter_registry import buffer_storage_key, param_storage_key
 
 logger = logging.getLogger(__name__)
 
 _LoadedTrainableBlock = tuple[PinnedModuleInstance, PinnedModuleTarget]
-_KeyForName = Callable[[str], Hashable]
 
 
 def _release_cuda_cache_on_drop(is_cuda: bool) -> None:
@@ -170,9 +170,9 @@ def _check_block_layouts_match(
                 params[names[0]].requires_grad,
                 _param_target_layout(params[names[0]]),
             )
-            for names in _group_names(
+            for names in group_names(
                 params.keys(),
-                lambda name: _param_storage_key(params[name]),
+                lambda name: param_storage_key(params[name]),
             )
         )
 
@@ -182,9 +182,9 @@ def _check_block_layouts_match(
                 tuple(names),
                 _buffer_target_layout(buffers[names[0]]),
             )
-            for names in _group_names(
+            for names in group_names(
                 buffers.keys(),
-                lambda name: _buffer_storage_key(buffers[name]),
+                lambda name: buffer_storage_key(buffers[name]),
             )
         )
 
@@ -256,28 +256,6 @@ def _select_streamed_entries(
     _validate_streamed_names_known(stream_buffer_names, all_buffer_names)
 
     return params, buffers
-
-
-def _group_names(
-    names: Iterable[str],
-    key_for_name: _KeyForName,
-) -> list[tuple[str, ...]]:
-    groups_by_key: dict[Hashable, list[str]] = {}
-    for name in names:
-        groups_by_key.setdefault(key_for_name(name), []).append(name)
-    return [tuple(group) for group in groups_by_key.values()]
-
-
-def _param_storage_key(param: nn.Parameter) -> Hashable:
-    if param.numel() == 0:
-        return ("empty-param", id(param))
-    return storage_key(param.data)
-
-
-def _buffer_storage_key(buffer: torch.Tensor) -> Hashable:
-    if buffer.numel() == 0:
-        return ("empty-buffer", id(buffer))
-    return storage_key(buffer)
 
 
 def _validate_streamed_names_known(

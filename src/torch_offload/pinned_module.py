@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from collections.abc import (
     Callable,
-    Hashable,
     Iterable,
     Iterator,
     Mapping,
@@ -21,12 +20,12 @@ from typing import TypeVar
 import torch
 from torch import nn
 
+from .module_names import group_names, resolve_parent_leaf
 from .pinned_buffer import PinnedBuffer
 from .pinned_param import PinnedParam
-from .tensor_adapter_factory import storage_key
+from .tensor_adapter_registry import buffer_storage_key, param_storage_key
 
 PostCopyHook = Callable[[nn.Parameter], None]
-_KeyForName = Callable[[str], Hashable]
 _NamedT = TypeVar("_NamedT")
 
 
@@ -309,9 +308,9 @@ class PinnedModuleInstance:
 
 def _pin_params(params: Mapping[str, nn.Parameter]) -> dict[str, PinnedParam]:
     pinned_by_name: dict[str, PinnedParam] = {}
-    for names in _group_names(
+    for names in group_names(
         params.keys(),
-        lambda name: _param_storage_key(params[name]),
+        lambda name: param_storage_key(params[name]),
     ):
         _validate_param_storage_group_requires_grad(names, params)
         pinned = PinnedParam(params[names[0]])
@@ -322,9 +321,9 @@ def _pin_params(params: Mapping[str, nn.Parameter]) -> dict[str, PinnedParam]:
 
 def _pin_buffers(buffers: Mapping[str, torch.Tensor]) -> dict[str, PinnedBuffer]:
     pinned_by_name: dict[str, PinnedBuffer] = {}
-    for names in _group_names(
+    for names in group_names(
         buffers.keys(),
-        lambda name: _buffer_storage_key(buffers[name]),
+        lambda name: buffer_storage_key(buffers[name]),
     ):
         pinned = PinnedBuffer.clone(buffers[names[0]])
         for name in names:
@@ -621,7 +620,7 @@ def _set_params(
 ) -> None:
     for name, pinned in params.items():
         materialized = materialized_params[name]
-        parent, leaf = _resolve_parent_leaf(module, name)
+        parent, leaf = resolve_parent_leaf(module, name)
         if pinned.requires_grad:
             _get_param(parent, leaf).data = materialized.data
         else:
@@ -643,7 +642,7 @@ def _set_buffers(
     buffers: Mapping[str, torch.Tensor],
 ) -> None:
     for name, tensor in buffers.items():
-        parent, leaf = _resolve_parent_leaf(module, name)
+        parent, leaf = resolve_parent_leaf(module, name)
         persistent = leaf not in parent._non_persistent_buffers_set
         parent.register_buffer(leaf, tensor, persistent=persistent)
 
@@ -673,27 +672,6 @@ def _unique_name_dict(
     return values
 
 
-def _resolve_parent_leaf(root: nn.Module, name: str) -> tuple[nn.Module, str]:
-    parent_path, sep, leaf = name.rpartition(".")
-    if not sep:
-        return root, leaf
-
-    parent = _walk_attr_path(root, parent_path)
-    if not isinstance(parent, nn.Module):
-        raise TypeError(
-            f"Path {parent_path!r} resolved to {type(parent).__name__}, "
-            "expected nn.Module."
-        )
-    return parent, leaf
-
-
-def _walk_attr_path(root: nn.Module, path: str) -> object:
-    current: object = root
-    for part in path.split("."):
-        current = getattr(current, part)
-    return current
-
-
 def _get_param(parent: nn.Module, leaf: str) -> nn.Parameter:
     param = parent._parameters.get(leaf)
     if param is None:
@@ -705,28 +683,6 @@ def _set_param(parent: nn.Module, leaf: str, param: nn.Parameter) -> None:
     if leaf not in parent._parameters:
         raise RuntimeError(f"Parameter {leaf!r} is unexpectedly missing.")
     parent._parameters[leaf] = param
-
-
-def _group_names(
-    names: Iterable[str],
-    key_for_name: _KeyForName,
-) -> list[tuple[str, ...]]:
-    groups_by_key: dict[Hashable, list[str]] = {}
-    for name in names:
-        groups_by_key.setdefault(key_for_name(name), []).append(name)
-    return [tuple(group) for group in groups_by_key.values()]
-
-
-def _param_storage_key(param: nn.Parameter) -> Hashable:
-    if param.numel() == 0:
-        return ("empty-param", id(param))
-    return storage_key(param.data)
-
-
-def _buffer_storage_key(buffer: torch.Tensor) -> Hashable:
-    if buffer.numel() == 0:
-        return ("empty-buffer", id(buffer))
-    return storage_key(buffer)
 
 
 def _unique_values(

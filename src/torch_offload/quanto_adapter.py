@@ -21,7 +21,7 @@ repo depends on. If quanto refactors the wrapper class, the
 :meth:`matches` (validates the expected attributes exist on first
 match).
 
-Selected by :mod:`tensor_adapter_factory`. Importing fails silently if
+Selected by :mod:`tensor_adapter_registry`. Importing fails silently if
 optimum-quanto is not installed — quanto support is optional.
 """
 

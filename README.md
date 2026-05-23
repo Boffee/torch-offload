@@ -21,10 +21,12 @@ to be lifted into its own package when a second consumer appears.
 | `merge.py` | `merge_lora()` — permanent in-place LoRA merge into base weights (alternative to `set_loras`) |
 | `pinned_param.py` | `PinnedParam` — per-parameter pinning primitive (handles quanto, GGUF, and TorchAO NVFP4 via adapters) |
 | `pinned_module.py` | `PinnedModuleStore`, `PinnedModuleInstance` — name-keyed pinned module storage plus concrete model instances |
-| `tensor_adapters.py`, `quanto_adapter.py`, `gguf_adapter.py`, `nvfp4_adapter.py`, `gguf_dequant.py` | Tensor-type adapter registry and optional optimum-quanto / gguf / torchao support |
+| `tensor_adapters.py`, `quanto_adapter.py`, `gguf_adapter.py`, `nvfp4_adapter.py`, `gguf_dequant.py` | Tensor adapter contracts/implementations and optional optimum-quanto / gguf / torchao support |
+| `tensor_adapter_registry.py` | Internal adapter dispatch and storage-identity helpers |
+| `module_names.py` | Internal name traversal and mutation helpers |
 | `_quanto.py` | Internal: optimum-quanto optional-import + layout validation; consumed by `quanto_adapter.py` and `merge.py` |
 | `_torchao_nvfp4.py` | Internal: TorchAO NVFP4 optional-import + layout validation; consumed by `nvfp4_adapter.py` |
-| `slots.py` | Slot-resolution helpers: `iter_param_slots`, `iter_buffer_slots`, `assert_frozen`, `canonical_param_name`, dotted-path walkers |
+| `slots.py` | Legacy slot-resolution wrappers pending removal |
 | `model_cache.py` | `ModelCache` — policy-driven pool over `CachedResource` instances with active-set leases |
 
 ## Why use this

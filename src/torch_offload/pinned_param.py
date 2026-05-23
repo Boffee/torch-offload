@@ -22,9 +22,8 @@ from typing import Any
 import torch
 from torch import nn
 
-from .slots import set_param_data
-from .tensor_adapter_factory import select_adapter
-from .tensor_adapter_factory import storage_key as _storage_key
+from .tensor_adapter_registry import select_adapter
+from .tensor_adapter_registry import storage_key as _storage_key
 from .tensor_adapters import (
     CpuRoundTripTensorAdapter,
     ParameterDataSwapTensorAdapter,
@@ -34,7 +33,7 @@ from .tensor_adapters import (
 
 
 def storage_key(t: torch.Tensor) -> tuple[Any, ...]:
-    """Compatibility wrapper for :func:`tensor_adapter_factory.storage_key`."""
+    """Compatibility wrapper for :func:`tensor_adapter_registry.storage_key`."""
     return _storage_key(t)
 
 
@@ -93,7 +92,7 @@ class PinnedParam:
         # Only safe for plain tensors; subclass wrappers can lose
         # metadata or ignore .data assignment.
         if type(param.data) is torch.Tensor:
-            set_param_data(param, self.make_cpu_param().data)
+            param.data = self.make_cpu_param().data
 
     @staticmethod
     def _target_layout_from_adapter(

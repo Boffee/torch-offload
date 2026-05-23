@@ -9,17 +9,18 @@ import torch
 from torch import nn
 
 from ._devices import canonical_device
-from .slots import (
-    assert_frozen,
-    iter_buffer_slots,
-    iter_param_slots,
+from .module_names import (
+    named_buffer_entries,
+    named_parameter_entries,
+    set_named_buffer,
+    set_named_parameter,
 )
 
 __all__ = ["MpsWeights"]
 
 
 class MpsWeights:
-    """Materialize a CPU model on MPS one tensor slot at a time.
+    """Materialize a CPU model on MPS one named tensor at a time.
 
     This is intentionally just the strategy lifecycle around a simple
     constructor-time copy-and-replace loop. It does not keep a second CPU
@@ -83,26 +84,28 @@ class MpsWeights:
 
     def _validate_and_count(self) -> int:
         total = 0
-        for slot in iter_param_slots(self._model):
-            assert_frozen(slot, owner="MpsWeights")
-            param = slot.get()
-            self._require_cpu(param.data, slot.name)
+        for name, param in self._model.named_parameters(remove_duplicate=False):
+            _assert_frozen_param(name, param)
+            self._require_cpu(param.data, name)
             total += param.numel() * param.element_size()
         if self._include_buffers:
-            for slot in iter_buffer_slots(self._model):
-                buffer = slot.get()
-                self._require_cpu(buffer, slot.name)
+            for name, buffer in self._model.named_buffers(remove_duplicate=False):
+                self._require_cpu(buffer, name)
                 total += buffer.numel() * buffer.element_size()
         return total
 
     def _move_to_mps(self) -> None:
         device = torch.device("mps")
-        for slot in iter_param_slots(self._model):
-            param = slot.get()
+        for _name, parent, leaf, param in named_parameter_entries(self._model):
             if param.requires_grad:
-                raise RuntimeError("MpsWeights is frozen-only, but a managed parameter became trainable.")
+                raise RuntimeError(
+                    "MpsWeights is frozen-only, but a managed parameter "
+                    "became trainable."
+                )
             if param.device != device:
-                slot.set(
+                set_named_parameter(
+                    parent,
+                    leaf,
                     nn.Parameter(
                         self._copy_tensor(param.detach(), device),
                         requires_grad=False,
@@ -110,12 +113,16 @@ class MpsWeights:
                 )
 
         if self._include_buffers:
-            for slot in iter_buffer_slots(self._model):
-                buffer = slot.get()
+            for _name, parent, leaf, buffer, persistent in named_buffer_entries(
+                self._model,
+            ):
                 if buffer.device == device:
                     continue
-                slot.set(
+                set_named_buffer(
+                    parent,
+                    leaf,
                     self._copy_tensor(buffer.detach(), device),
+                    persistent=persistent,
                 )
 
     def _copy_tensor(self, source: torch.Tensor, device: torch.device) -> torch.Tensor:
@@ -142,3 +149,14 @@ class MpsWeights:
         mps_backend = getattr(torch.backends, "mps", None)
         if mps_backend is not None and mps_backend.is_available():
             torch.mps.synchronize()
+
+
+def _assert_frozen_param(name: str, param: nn.Parameter) -> None:
+    if not param.requires_grad:
+        return
+    raise ValueError(
+        f"MpsWeights cannot manage trainable parameter {name!r}: "
+        "replacing the Parameter object would break optimizer/grad "
+        "identity."
+    )
+

@@ -16,13 +16,13 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import Any
 
 import torch
 from torch import nn
 
+from .module_names import canonical_param_name, resolve_parent_leaf, walk_attr_path
 from .protocols import SlotKey
-from .tensor_adapter_factory import storage_key
+from .tensor_adapter_registry import buffer_storage_key, param_storage_key
 
 __all__ = [
     "BufferSlot",
@@ -41,19 +41,6 @@ __all__ = [
     "split_attr_path",
     "walk_attr_path",
 ]
-
-
-def walk_attr_path(root: nn.Module, dotted_path: str) -> object:
-    """Walk a dotted attribute path from ``root``, returning the leaf.
-
-    Equivalent to a chained ``getattr``. Used to resolve dotted paths
-    like ``"transformer.blocks"`` or ``"a.b.weight"`` to their target.
-    Raises ``AttributeError`` if any segment is missing.
-    """
-    obj: object = root
-    for part in dotted_path.split("."):
-        obj = getattr(obj, part)
-    return obj
 
 
 def split_attr_path(
@@ -76,19 +63,6 @@ def split_attr_path(
             "expected nn.Module"
         )
     return parent, leaf
-
-
-def canonical_param_name(name: str) -> str:
-    """Normalize a parameter name to its canonical (non-PEFT) form.
-
-    PEFT inserts ``.base_layer.`` into wrapped module paths
-    (e.g. ``to_q.base_layer.weight`` instead of ``to_q.weight``).
-    LoRA state dicts always use the original names, so target maps
-    built from named-parameter walks must store canonical keys for
-    matching to work.
-    """
-    return name.replace(".base_layer.", ".")
-
 
 def assert_frozen(
     slot: "ParamSlot", owner: str, *, extra: str | None = None,
@@ -221,9 +195,8 @@ def iter_param_slots(module: nn.Module) -> Iterator[ParamSlot]:
     submodule paths yields one :class:`ParamSlot` per name. To dedupe by
     Parameter identity, track ``id(row.get())`` in the consumer.
     """
-    modules_map = dict(module.named_modules(remove_duplicate=False))
     for name, _p in module.named_parameters(remove_duplicate=False):
-        parent, leaf = _resolve_parent_leaf(module, modules_map, name)
+        parent, leaf = resolve_parent_leaf(module, name)
         yield ParamSlot(
             name=name,
             parent=parent,
@@ -236,37 +209,11 @@ def iter_buffer_slots(module: nn.Module) -> Iterator[BufferSlot]:
 
     Mirrors :func:`iter_param_slots` for the buffer namespace.
     """
-    modules_map = dict(module.named_modules(remove_duplicate=False))
     for name, _b in module.named_buffers(remove_duplicate=False):
-        parent, leaf = _resolve_parent_leaf(module, modules_map, name)
+        parent, leaf = resolve_parent_leaf(module, name)
         yield BufferSlot(
             name=name,
             parent=parent,
             leaf=leaf,
             persistent=leaf not in parent._non_persistent_buffers_set,
         )
-
-
-def param_storage_key(param: nn.Parameter) -> tuple[Any, ...]:
-    """Return a storage-identity grouping key for a parameter."""
-    if param.numel() == 0:
-        # Zero-sized tensors all share data_ptr()==0; key by object
-        # identity so aliases of the same Parameter still dedupe.
-        return ("__empty__", id(param))
-    return storage_key(param.data)
-
-
-def buffer_storage_key(buffer: torch.Tensor) -> tuple[Any, ...]:
-    """Return a storage-identity grouping key for a registered buffer."""
-    if buffer.numel() == 0:
-        return ("__empty_buf__", id(buffer))
-    return storage_key(buffer)
-
-
-def _resolve_parent_leaf(
-    module: nn.Module, modules_map: dict[str, nn.Module], qual_name: str
-) -> tuple[nn.Module, str]:
-    parts = qual_name.rsplit(".", 1)
-    if len(parts) == 2:
-        return modules_map[parts[0]], parts[1]
-    return module, qual_name
