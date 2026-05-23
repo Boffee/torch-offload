@@ -52,7 +52,7 @@ class PinnedParam:
     The pinned parameter captures the source parameter's ``requires_grad`` at
     construction time and threads it through to the adapter when
     building CPU and GPU parameter wrappers. Model-bound callers can
-    either slot-replace frozen params with those wrappers or preserve
+    either replace frozen params with those wrappers or preserve
     trainable Parameter identity by ``.data``-swapping into the user's
     persistent Parameter — both are supported.
 

@@ -96,18 +96,18 @@ class ModelOffloader:
     :func:`torch.utils.checkpoint.checkpoint`, or call
     ``model.gradient_checkpointing_enable()`` on a HuggingFace model.
     Without it, ``loss.backward()`` raises ``RuntimeError: ... has
-    been modified by an inplace operation`` on the first slot reuse.
+    been modified by an inplace operation`` on the first target reuse.
 
     Why: autograd saves a reference to each ``Linear``'s weight
     tensor at forward time and records its version counter. Streaming
     is a sequence of in-place ``copy_`` writes into a fixed pool of
-    GPU slot tensors — every load bumps the slot tensor's version,
-    invalidating any previously-saved reference into that slot.
+    GPU target tensors — every load bumps the target tensor's version,
+    invalidating any previously-saved reference into that target.
     Checkpointing makes each block's internal forward run under
     ``no_grad`` (no internal tensors saved); when backward arrives,
     PyTorch re-runs the block's forward with grad enabled, building
     a fresh autograd graph whose saved references only live within
-    that one block's recompute-then-backward window. Slot reuse
+    that one block's recompute-then-backward window. Target reuse
     outside that window is then safe.
 
     For **frozen-only** streamed blocks (training touches only
@@ -125,7 +125,7 @@ class ModelOffloader:
     host-backed module state.
 
     Pass ``stream_trainable_weights=True`` to stream in-block
-    trainable parameter data through the CUDA block slot pool. In that
+    trainable parameter data through the CUDA block target pool. In that
     mode, CUDA :meth:`activate` *raises* during training if no
     ``gradient_checkpointing`` flag is detected. The failure mode
     here is **silent gradient corruption** rather than a loud
@@ -749,7 +749,7 @@ class ModelOffloader:
                 "ModelOffloader: streamed blocks have inconsistent "
                 "gradient_checkpointing flags. Backward through any "
                 "non-checkpointed streamed block will raise on the first "
-                "slot reuse — call model.gradient_checkpointing_enable() "
+                "target reuse — call model.gradient_checkpointing_enable() "
                 "to enable on every block."
             )
             self._warned_about_checkpointing = True

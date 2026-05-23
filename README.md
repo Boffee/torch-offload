@@ -13,9 +13,9 @@ to be lifted into its own package when a second consumer appears.
 
 | Module | Role |
 |---|---|
-| `protocols.py` | `CachedResource` (generic), `ModelStrategy` / `ModelStrategyComponent` plug-in contracts; `SlotKey` topology key |
+| `protocols.py` | `CachedResource` (generic), `ModelStrategy` / `ModelStrategyComponent` plug-in contracts |
 | `model_offloader.py` | `ModelOffloader` — whole-model bulk pinned-CPU↔GPU or streamed block offload strategy |
-| `pinned_component.py` | `PinnedComponent` — lifecycle-only pinned slot manager used by `ModelOffloader` |
+| `pinned_component.py` | `PinnedComponent` — lifecycle-only pinned component used by `ModelOffloader` |
 | `streamed_component.py` | `StreamedComponent` — sharp per-block-list streaming primitive (component) |
 | `lora.py` | `LoRA`, `LoRATransform`, `LoRARouteHandle` — pinned factor storage + merge / routed-hook application |
 | `merge.py` | `merge_lora()` — permanent in-place LoRA merge into base weights (alternative to `set_loras`) |
@@ -26,7 +26,6 @@ to be lifted into its own package when a second consumer appears.
 | `module_names.py` | Internal name traversal and mutation helpers |
 | `_quanto.py` | Internal: optimum-quanto optional-import + layout validation; consumed by `quanto_adapter.py` and `merge.py` |
 | `_torchao_nvfp4.py` | Internal: TorchAO NVFP4 optional-import + layout validation; consumed by `nvfp4_adapter.py` |
-| `slots.py` | Legacy slot-resolution wrappers pending removal |
 | `model_cache.py` | `ModelCache` — policy-driven pool over `CachedResource` instances with active-set leases |
 
 ## Why use this
@@ -49,7 +48,7 @@ This library gives you:
    used inactive entries when a new model needs room, and tracks active
    leases so you can't accidentally evict something you're using.
 3. **A clean plug-in contract** so you can write your own strategy
-   (disk-mmap, NVMe-paged, multi-GPU shard) and it slots in.
+   (disk-mmap, NVMe-paged, multi-GPU shard) and it fits in.
 
 ## When to use what
 
@@ -81,7 +80,7 @@ del strategy, model  # drop refs to free pinned host memory
 ```
 
 `ModelOffloader` mutates the model in place: frozen `nn.Parameter`
-slots get repointed at Parameters wrapping pinned CPU storage,
+registry entries get repointed at Parameters wrapping pinned CPU storage,
 trainable Parameter objects keep their identity and point their
 `.data` at pinned CPU storage, and buffers are replaced with pinned
 copies. After construction, only access the model through the strategy's
@@ -120,7 +119,7 @@ del offload, model  # drop refs to free pinned host memory
 
 `ModelOffloader` only streams on CUDA. Activating the strategy on
 `cpu` is a pass-through over the already-installed pinned CPU storage:
-no slot pool, no streaming hooks, no weight copies.
+no target pool, no streaming hooks, no weight copies.
 `set_loras(..., mode="merge")` is CUDA-only; use routed LoRA mode for
 CPU activation. Routed LoRA still installs forward hooks and materializes
 LoRA factors on the activation device.
@@ -128,7 +127,7 @@ LoRA factors on the activation device.
 By default, trainable parameters (e.g. LoRA adapters) are managed by
 the composed `PinnedComponent`: they move to GPU on CUDA activation and
 back to pinned CPU storage on deactivate. On CPU activation they stay in
-the host-backed module slots. Wrap CUDA optimizer updates in
+the host-backed module state. Wrap CUDA optimizer updates in
 `offload.optimizer_step()` so updated trainable bytes are copied back
 to pinned CPU storage before deactivation.
 
@@ -233,7 +232,7 @@ standard) and uses an in-place `addmm_` for fp/bf bases. Unlike
 `layers_attr` accepts a list of dotted paths for models with
 multiple kinds of blocks (e.g. Flux's `transformer_blocks` +
 `single_transformer_blocks`). Each path becomes its own streaming
-group with its own slot pool. Blocks within a group must share the
+group with its own target pool. Blocks within a group must share the
 same parameter layout (names/shapes/dtypes/quant-metadata) — split
 heterogeneous block lists into separate `layers_attr` entries:
 
@@ -262,9 +261,9 @@ has been modified by an inplace operation
 The reason is autograd's saved-tensor mechanism. A `Linear` saves a
 reference to its weight tensor at forward time and records the
 tensor's version counter. Streaming is a sequence of in-place `copy_`
-writes into a fixed pool of GPU slot tensors — every block load
-bumps the slot tensor's version, so by the time backward arrives at
-an earlier block, the slot has been overwritten and the version
+writes into a fixed pool of GPU target tensors — every block load
+bumps the target tensor's version, so by the time backward arrives at
+an earlier block, the target has been overwritten and the version
 mismatch raises.
 
 Activation checkpointing sidesteps this. With checkpointing, the
@@ -272,7 +271,7 @@ block's internal forward runs under `no_grad` — no internal tensors
 are saved for backward. When backward arrives, PyTorch re-runs the
 block's forward with grad enabled, building a fresh autograd graph
 whose saved references only live within that one block's
-recompute-then-backward window. Slot reuse outside that window is
+recompute-then-backward window. Target reuse outside that window is
 safe because no autograd graph spans across reuses.
 
 ```python
@@ -380,7 +379,7 @@ with cache.use(spec, device=device) as vae:  # registers if missing, then uses
 > not capture an externally-held one. With `factory=lambda:
 > ModelOffloader(my_kept_model)` the cache is no longer the
 > sole owner of the model — eviction drops the strategy, but
-> `my_kept_model` keeps the pinned slots alive. `used_cache_bytes`
+> `my_kept_model` keeps the pinned tensors alive. `used_cache_bytes`
 > will lie about freed memory. Always have the factory build the
 > model itself.
 
@@ -433,7 +432,7 @@ the cache lock. `choose_victims()` must return unique keys from
 `activate(device=None)`, and `deactivate()`. Device-aware package
 strategies also expose `use(device)` for direct exception-safe use.
 `ModelCache` only talks to this protocol; write a new strategy and
-it slots in:
+it fits in:
 
 ```python
 from torch import nn
@@ -474,7 +473,7 @@ requested device. `ModelOffloader`, `MpsWeights`, `PinnedComponent`, and
 streaming/DMA path where applicable; CPU activation is pass-through over
 pinned host-backed storage.
 `deactivate()` releases transient device resources (the `cache_bytes`
-worth of pinned storage stays held in module slots, ready for fast
+worth of pinned storage stays held in module state, ready for fast
 re-activation).
 
 Construction optimizes peak host memory. Pinning clones managed tensors
@@ -504,13 +503,13 @@ This is a low-level library; we don't guard against caller misuse.
 ## Compatibility
 
 - **`torch.compile` is not supported** for `ModelOffloader`-managed
-  modules. Its `PinnedComponent` swaps parameter slots
+  modules. Its `PinnedComponent` swaps parameter registry entries
   (`module._parameters[leaf] = new_param`) on activate/deactivate, and
-  `StreamedComponent` registers forward-pre hooks that mutate slots on
-  every block call. Both invalidate the tensor-identity assumptions
+  `StreamedComponent` registers forward-pre hooks that mutate registered
+  parameters on every block call. Both invalidate the tensor-identity assumptions
   `torch.compile` makes about its trace.
 - **Wrap before DDP/FSDP**, not after. Those wrappers manage parameter
-  storage themselves and conflict with the slot-swap pattern.
+  storage themselves and conflict with the registry-replacement pattern.
 - **Coarse cache concurrency.** `ModelCache` protects cache metadata,
   admission, leases, and per-key active device state with an internal
   lock. Factory/build, activation, and deactivation are serialized, but
@@ -567,7 +566,7 @@ TorchAO NVFP4 weights
 frozen inference weights when the `nvfp4` optional extra is installed.
 `PinnedParam` pins the packed FP4 `qdata`, FP8 block `scale`,
 optional per-tensor scales, and the TorchAO dispatch metadata, then
-rebuilds the `NVFP4Tensor` wrapper around GPU slot storage on activation.
+rebuilds the `NVFP4Tensor` wrapper around GPU storage on activation.
 The optional extra requires TorchAO plus PyTorch 2.8+; dynamic NVFP4
 matmul execution still depends on Blackwell-class CUDA hardware and the
 matching PyTorch CUDA stack.

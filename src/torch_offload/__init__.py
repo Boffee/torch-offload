@@ -15,7 +15,7 @@ Top-level offload strategies:
 - :class:`MpsWeights` — whole-model CPU->MPS materializer. Use for
   frozen models that should become MPS-resident without retaining a
   separate CPU cache. Construction copies one managed tensor at a time
-  and immediately replaces its module slot to keep peak host memory
+  and immediately replaces its module registry entry to keep peak host memory
   close to one model plus the current tensor.
 
 The CUDA-oriented :class:`ModelOffloader` shares the underlying
@@ -33,7 +33,7 @@ Package strategies make ``cache_bytes`` final in their constructor, so
 :class:`ModelCache` can admit them without a factory-side ``prepare()``
 dance. ``activate(device)`` then makes the resource usable on the
 requested device. For :class:`ModelOffloader`, ``deactivate()`` returns
-slots to pinned CPU. For :class:`MpsWeights`,
+managed tensors to pinned CPU. For :class:`MpsWeights`,
 construction has already materialized the model on MPS, so
 ``activate('mps')`` and ``deactivate()`` are lifecycle-only.
 
@@ -102,7 +102,7 @@ from .model_cache import (
 from .model_offloader import ModelOffloader
 from .mps_weights import MpsWeights
 from .pinned_component import PinnedComponent
-from .protocols import CachedResource, ModelStrategy, ModelStrategyComponent, SlotKey
+from .protocols import CachedResource, ModelStrategy, ModelStrategyComponent
 from .streamed_component import StreamedComponent
 
 __all__ = [
@@ -129,7 +129,6 @@ __all__ = [
     "MpsWeights",
     "PinnedComponent",
     "ResourceSpec",
-    "SlotKey",
     "StreamedComponent",
     "merge_lora",
 ]

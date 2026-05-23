@@ -46,7 +46,7 @@ class TestPinnedParam:
         assert cpu_param.data.is_pinned()
         assert cpu_param.data.shape == p.shape
         # CPU params are distinct wrappers over the same pinned host buffer,
-        # not a second clone — callers slot-replace at this and rely on
+        # not a second clone — callers replace registry entries with this and rely on
         # the storage staying alive for the pinned parameter's lifetime.
         assert cpu_param is not other_cpu_param
         assert cpu_param.data.data_ptr() == pinned_param.pinned_state.data.data_ptr()

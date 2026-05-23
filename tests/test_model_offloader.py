@@ -135,7 +135,7 @@ class TestConstructorPins:
             layers_attr="transformer_blocks", blocks_to_swap=2,
         )
         try:
-            # Block weights are pinned via swapped slots.
+            # Block weights are pinned via registry replacement.
             for block in m.transformer_blocks:
                 assert block.weight.is_pinned()
             # Non-block (embed/head) also pinned via composed PinnedComponent.
@@ -1380,7 +1380,7 @@ class TestBlockBuffersPinned:
                 self.register_buffer("table", torch.randn(2))
 
             def to(self, *args, **kwargs):
-                raise AssertionError("constructor must pin slots directly")
+                raise AssertionError("constructor must pin directly")
 
         class M(nn.Module):
             def __init__(self):
@@ -1388,7 +1388,7 @@ class TestBlockBuffersPinned:
                 self.transformer_blocks = nn.ModuleList([Block(), Block()])
 
             def to(self, *args, **kwargs):
-                raise AssertionError("constructor must pin slots directly")
+                raise AssertionError("constructor must pin directly")
 
         m = M()
         strategy = ModelOffloader(
@@ -1468,7 +1468,7 @@ class TestActivatePoolIdempotency:
 
 class TestBlockLayoutCompatibility:
     """Block 0 is the pool template; later blocks copy raw bytes into
-    its slot. ``Tensor.copy_`` silently casts dtype and silently
+    its target. ``Tensor.copy_`` silently casts dtype and silently
     broadcasts compatible shapes, so mismatches that don't trip the
     copy_ shape check would silently corrupt forward. The constructor's
     block layout check rejects them up front."""
@@ -1686,7 +1686,7 @@ class TestMultiComponentCleanup:
             with pytest.raises(RuntimeError, match="simulated pinned deactivate failure"):
                 strategy.deactivate()
 
-            # PinnedComponent restored slots before raising, and streamers
+            # PinnedComponent restored registry entries before raising, and streamers
             # were already unwound in LIFO order.
             assert m.embed.weight.is_pinned()  # type: ignore[union-attr]
             assert not strategy._streamed_components[0]._hooks
@@ -2049,11 +2049,11 @@ class TestMixedGradTieDetection:
         strategy.deactivate()
 
     def test_all_trainable_same_parameter_intra_block_only_tie(self) -> None:
-        # Pure intra-block aliasing: two slots inside
+        # Pure intra-block aliasing: two names inside
         # each block share the same trainable Parameter, but block 0's
         # shared Parameter is distinct from block 1's. Streamed block
         # stores dedup by storage per block, and the .data swap reaches
-        # the shared Parameter so every aliased slot sees the update.
+        # the shared Parameter so every aliased name sees the update.
         # The pool layout matches because both blocks dedup to a single
         # storage group of identical shape/dtype.
         shared_0 = nn.Parameter(torch.randn(4, 4), requires_grad=True)
@@ -2084,7 +2084,7 @@ class TestMixedGradTieDetection:
             stream_trainable_weights=True,
         )
 
-        # Both aliased slots in block 0 still reference the same Parameter.
+        # Both aliased names in block 0 still reference the same Parameter.
         assert m.transformer_blocks[0]._parameters["a"] is shared_0
         assert m.transformer_blocks[0]._parameters["b"] is shared_0
         del strategy
@@ -2256,18 +2256,18 @@ class TestLoRAInBlockRouting:
 # Phase 1: training through streamed blocks under activation checkpointing
 # ---------------------------------------------------------------------------
 #
-# The block streamer's slot pool reuses GPU storage across blocks via
-# in-place ``copy_``, which bumps the slot tensor's autograd version
+# The block streamer's target pool reuses GPU storage across blocks via
+# in-place ``copy_``, which bumps the target tensor's autograd version
 # counter on every load. Without checkpointing, the original forward's
-# saved-tensor references into a slot are invalidated as soon as that
-# slot is reused later in the same forward, and ``loss.backward()``
+# saved-tensor references into a target are invalidated as soon as that
+# target is reused later in the same forward, and ``loss.backward()``
 # raises ``RuntimeError: ... has been modified by an inplace
 # operation`` before producing any grad.
 #
 # Activation checkpointing fixes this by deferring autograd-graph
 # construction for each block to backward time (the recompute), at
 # which point the forward-pre hook ensures the right block is loaded
-# and the saved-tensor lifetimes don't span slot reuses.
+# and the saved-tensor lifetimes don't span target reuses.
 #
 # These tests pin Phase 1's contract: forward+backward through a
 # streamed model produces baseline-matching grads under checkpointing,
@@ -2302,7 +2302,7 @@ class TestTrainingWithCheckpointing:
         assert baseline_grads, "baseline run produced no grads — bad fixture"
 
         # blocks_to_swap=2 + prefetch_count=0 → pool size 2 < 4 blocks,
-        # so forward forces real slot reuse on blocks 2 and 3. That
+        # so forward forces real target reuse on blocks 2 and 3. That
         # reuse is what the checkpointing contract has to survive.
         offloader = ModelOffloader(
             m_streamed,
@@ -2334,8 +2334,8 @@ class TestTrainingWithCheckpointing:
 
     @CUDA
     def test_backward_without_checkpointing_raises_in_place_error(self) -> None:
-        """Without checkpointing, slot reuse during forward bumps the
-        version counter on a slot tensor whose forward-time reference
+        """Without checkpointing, target reuse during forward bumps the
+        version counter on a target tensor whose forward-time reference
         autograd needs at backward. PyTorch's saved-tensor check
         catches this and raises."""
         torch.manual_seed(42)
@@ -2912,7 +2912,7 @@ class TestInBlockTrainableStreamingEndToEnd:
         )
         try:
             with offloader.use("cuda") as gpu_model:
-                # Run forward to warm the slot pool.
+                # Run forward to warm the target pool.
                 x = torch.randn(2, 8, device="cuda")
                 _ = gpu_model(x, use_checkpoint=True)
 
@@ -3279,7 +3279,7 @@ class TestRevisedDataOnlyDesign:
     ) -> None:
         # Real-world scenario: rank-256 LoRA on a many-block model.
         # Use prefetch_count>0 AND blocks_to_swap>0 so streaming is
-        # actually exercising the prefetch slot pool with trainables.
+        # actually exercising the prefetch target pool with trainables.
         # Verify grads match a non-streamed baseline.
         torch.manual_seed(0)
         m_baseline = _make_lora_in_block_model(num_blocks=6, width=8, rank=2)

@@ -4,7 +4,7 @@ TorchAO's NVFP4 workflow stores weights as a tensor subclass with
 packed FP4 bytes (``qdata``), FP8 block scales (``scale``), optional
 global per-tensor scales, and metadata controlling the matmul dispatch.
 This adapter preserves that representation across pinned CPU storage and
-GPU slot storage.
+GPU storage.
 
 The adapter intentionally exposes inference movement only. NVFP4 model
 weights are treated as frozen: no CPU round-trip, no trainable

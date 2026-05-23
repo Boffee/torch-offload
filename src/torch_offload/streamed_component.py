@@ -4,13 +4,13 @@ A :class:`StreamedComponent` manages a single block list whose blocks
 share the same parameter layout (names, shapes, dtypes, and any
 tensor-adapter wrapper metadata): pins the params to CPU at
 construction time, streams them to GPU on demand via forward-pre
-hooks, and uses a pre-allocated GPU slot pool plus a background
+hooks, and uses a pre-allocated GPU target pool plus a background
 prefetcher to overlap DMA with compute. On CPU, the host-backed
 pinned state is used directly without streaming. Heterogeneous block lists
 (e.g. Flux's two block kinds) split into multiple
 :class:`StreamedComponent` instances composed via :class:`ModelOffloader`.
 
-In-block trainable params (LoRA adapters) flow through the same slot
+In-block trainable params (LoRA adapters) flow through the same target
 pool; pinned module instances branch on the source trainable flag to swap
 ``.data`` (preserves user Parameter identity for autograd / optimizer
 state) instead of replacing the Parameter wrapper. Gradients live on GPU
@@ -96,34 +96,36 @@ class _PinnedModuleTargetPool:
     def __init__(
         self,
         template_store: PinnedModuleStore,
-        num_slots: int,
+        num_targets: int,
         device: torch.device,
     ) -> None:
         self._targets = [
             template_store.allocate_target(device)
-            for _ in range(num_slots)
+            for _ in range(num_targets)
         ]
-        self._free: list[int] = list(range(num_slots))
-        self._events: list[torch.cuda.Event | None] = [None] * num_slots
+        self._free: list[int] = list(range(num_targets))
+        self._events: list[torch.cuda.Event | None] = [None] * num_targets
 
     def acquire(self) -> int:
         return self._free.pop()
 
-    def release(self, slot_id: int) -> None:
-        self._free.append(slot_id)
+    def release(self, target_idx: int) -> None:
+        self._free.append(target_idx)
 
-    def target(self, slot_id: int) -> PinnedModuleTarget:
-        return self._targets[slot_id]
+    def target(self, target_idx: int) -> PinnedModuleTarget:
+        return self._targets[target_idx]
 
-    def set_compute_event(self, slot_id: int, event: torch.cuda.Event) -> None:
-        self._events[slot_id] = event
+    def set_compute_event(self, target_idx: int, event: torch.cuda.Event) -> None:
+        self._events[target_idx] = event
 
-    def wait_if_needed(self, slot_id: int, stream: torch.cuda.Stream | None) -> None:
-        ev = self._events[slot_id]
+    def wait_if_needed(
+        self, target_idx: int, stream: torch.cuda.Stream | None
+    ) -> None:
+        ev = self._events[target_idx]
         if ev is not None:
             if stream is not None and not ev.query():
                 stream.wait_event(ev)
-            self._events[slot_id] = None
+            self._events[target_idx] = None
 
 
 # ---------------------------------------------------------------------------
@@ -467,7 +469,7 @@ class StreamedComponent:
     is non-fatal: the orphaned hooks remain installed on the model
     but no-op; resident blocks stay on GPU until the model itself is
     dropped. Forward calls through still-resident blocks work; calls
-    through previously-evicted blocks find pinned-CPU slots (slow but
+    through previously-evicted blocks find pinned-CPU tensors (slow but
     functional).
 
     Parameters
@@ -568,7 +570,7 @@ class StreamedComponent:
 
         # Active resources allocated on CUDA activate().
         self._pool: _PinnedModuleTargetPool | None = None
-        self._block_to_slot: dict[int, int] = {}
+        self._block_to_target: dict[int, int] = {}
         self._pool_config: tuple[int, torch.device] | None = None
         self._tracker: _BlockTracker | None = None
         self._hooks: list[torch.utils.hooks.RemovableHandle] = []
@@ -687,7 +689,7 @@ class StreamedComponent:
     def activate(self, device: torch.device | str | None = None) -> None:
         """Activate the block list on ``device``.
 
-        CUDA activation uses the streaming path: GPU slot pool, CUDA
+        CUDA activation uses the streaming path: GPU target pool, CUDA
         stream/events, prefetch executor, and forward hooks. CPU
         activation is pass-through over the pinned host-backed state.
         The composite's :meth:`activate` returns the model — this
@@ -705,7 +707,7 @@ class StreamedComponent:
         # Hard-guard against the documented "don't activate twice"
         # case. Without this, a double-activate would double-install
         # forward-pre hooks (silent grad doubling) and stack a second
-        # slot pool on top of an active one.
+        # target pool on top of an active one.
         if self._active_device is not None:
             raise RuntimeError(
                 "StreamedComponent.activate() called while already "
@@ -729,7 +731,7 @@ class StreamedComponent:
     def _activate_cuda_resolved(self, active_device: torch.device) -> None:
         num_layers = len(self._blocks)
         num_resident = num_layers - self._blocks_to_swap
-        num_gpu_slots = num_resident + self._prefetch_count
+        num_gpu_targets = num_resident + self._prefetch_count
 
         self._active_device = active_device
         self._tracker = _BlockTracker()
@@ -739,7 +741,7 @@ class StreamedComponent:
         self._prefetch_events = {i: torch.cuda.Event() for i in range(num_layers)}
         self._last_idx = -1
 
-        self._activate_pool(num_gpu_slots, active_device)
+        self._activate_pool(num_gpu_targets, active_device)
         self._move_trainable_grads_to(active_device)
 
         for block_idx in range(min(num_resident, num_layers)):
@@ -752,7 +754,7 @@ class StreamedComponent:
         logger.info(
             f"{self._log_label} active: {self._blocks_to_swap}/{num_layers} on CPU, "
             f"{num_resident} resident on GPU, prefetch={self._prefetch_count}, "
-            f"gpu_pool_slots={num_gpu_slots}"
+            f"gpu_pool_targets={num_gpu_targets}"
         )
 
     def deactivate(self) -> None:
@@ -789,7 +791,7 @@ class StreamedComponent:
         On CUDA activation, this brings trainable ``.data`` to GPU
         around the optimizer-step boundary. On CPU activation, it is a
         guarded no-op because trainable ``.data`` is already resident in
-        the pinned host-backed module slots.
+        the pinned host-backed module state.
 
         On CUDA, gradients live on GPU throughout backward via
         PyTorch's native ``AccumulateGrad`` — we don't D2H them inside
@@ -803,7 +805,7 @@ class StreamedComponent:
         Enter:
           1. Quiesce streaming via :meth:`_drain_and_evict_all`
              (drain pending prefetch, sync prefetch stream, evict
-             every allocated slot). Raises if a prefetch errored —
+             every allocated target). Raises if a prefetch errored —
              eviction still ran first so the streamer is in a
              consistent baseline.
           2. On the streamer's private ``self._stream``, H2D each
@@ -854,7 +856,7 @@ class StreamedComponent:
                 optimizer.step()
             optimizer.zero_grad()  # can be inside or outside
 
-        On CUDA, the slot pool's pre-warmed state is lost (next forward
+        On CUDA, the target pool's pre-warmed state is lost (next forward
         re-loads from pinned), but that cost is dominated by the
         forward + backward of the next iteration.
         """
@@ -1005,7 +1007,7 @@ class StreamedComponent:
         During backward, PyTorch's native ``AccumulateGrad`` writes
         grads on the param's data device, which is GPU at that point
         because the ``.data`` swap in :meth:`PinnedModuleInstance.load_to_target`
-        repointed ``.data`` at slot storage. Eviction restores ``.data``
+        repointed ``.data`` at target storage. Eviction restores ``.data``
         to pinned CPU, but ``.grad`` keeps living wherever AccumulateGrad
         placed it.
         """
@@ -1016,19 +1018,19 @@ class StreamedComponent:
     # Pool and block movement
     # ------------------------------------------------------------------
 
-    def _activate_pool(self, num_gpu_slots: int, device: torch.device) -> None:
+    def _activate_pool(self, num_gpu_targets: int, device: torch.device) -> None:
         if self._pool_config is not None:
             existing = self._pool_config
-            if existing != (num_gpu_slots, device):
+            if existing != (num_gpu_targets, device):
                 raise ValueError(
                     f"StreamedComponent pool already activated with "
-                    f"{existing}; cannot re-activate with ({num_gpu_slots}, "
+                    f"{existing}; cannot re-activate with ({num_gpu_targets}, "
                     f"{device}). Call _deactivate_pool() first."
                 )
             return
-        if num_gpu_slots <= 0:
+        if num_gpu_targets <= 0:
             raise ValueError(
-                f"num_gpu_slots must be > 0, got {num_gpu_slots}. "
+                f"num_gpu_targets must be > 0, got {num_gpu_targets}. "
                 "num_resident is always >= 1 by construction; this only "
                 "fires when prefetch_count is negative."
             )
@@ -1037,14 +1039,14 @@ class StreamedComponent:
         # check has already verified every other block matches.
         self._pool = _PinnedModuleTargetPool(
             self._block_instances[0].store,
-            num_gpu_slots,
+            num_gpu_targets,
             device,
         )
-        self._pool_config = (num_gpu_slots, device)
+        self._pool_config = (num_gpu_targets, device)
 
     def _deactivate_pool(self) -> None:
         self._pool = None
-        self._block_to_slot.clear()
+        self._block_to_target.clear()
         self._pool_config = None
 
     def _load_block(
@@ -1058,13 +1060,13 @@ class StreamedComponent:
 
         instance = self._block_instances[block_idx]
 
-        slot_id = self._block_to_slot.get(block_idx)
-        if slot_id is None:
-            slot_id = self._pool.acquire()
-            self._block_to_slot[block_idx] = slot_id
+        target_idx = self._block_to_target.get(block_idx)
+        if target_idx is None:
+            target_idx = self._pool.acquire()
+            self._block_to_target[block_idx] = target_idx
 
-        self._pool.wait_if_needed(slot_id, stream)
-        target = self._pool.target(slot_id)
+        self._pool.wait_if_needed(target_idx, stream)
+        target = self._pool.target(target_idx)
         instance.load_to_target(
             target,
             run_post_copy_hooks=True,
@@ -1075,34 +1077,34 @@ class StreamedComponent:
         self._block_instances[block_idx].restore_pinned()
         if self._pool is None:
             return
-        slot_id = self._block_to_slot.pop(block_idx, None)
-        if slot_id is not None:
-            self._pool.release(slot_id)
+        target_idx = self._block_to_target.pop(block_idx, None)
+        if target_idx is not None:
+            self._pool.release(target_idx)
 
     def _evict_allocated_blocks(self) -> None:
-        """Evict every block that currently holds a pool slot.
+        """Evict every block that currently holds a pool target.
 
-        ``_block_to_slot`` is the source of truth for slot allocation:
+        ``_block_to_target`` is the source of truth for target allocation:
         a block is recorded there as soon as :meth:`_load_block`
-        (foreground or prefetch) acquires its slot, and removed only
+        (foreground or prefetch) acquires its target, and removed only
         by :meth:`_release_block`. Iterating it catches both
         currently-resident blocks and pending-prefetch blocks whose H2D
         may still be in flight, so teardown and optimizer_step don't
         need to reconcile tracker and pending-future state.
 
         Caller is responsible for stream/event synchronization before
-        the eviction so in-flight DMA into the slot bytes has settled.
+        the eviction so in-flight DMA into the target bytes has settled.
         """
-        for block_idx in list(self._block_to_slot.keys()):
+        for block_idx in list(self._block_to_target.keys()):
             self._release_block(block_idx)
 
     def _mark_compute_done(
         self, block_idx: int, event: torch.cuda.Event,
     ) -> None:
         assert self._pool is not None, "_activate_pool not called"
-        slot_id = self._block_to_slot.get(block_idx)
-        if slot_id is not None:
-            self._pool.set_compute_event(slot_id, event)
+        target_idx = self._block_to_target.get(block_idx)
+        if target_idx is not None:
+            self._pool.set_compute_event(target_idx, event)
 
     # ------------------------------------------------------------------
     # Drain and teardown
@@ -1114,7 +1116,7 @@ class StreamedComponent:
         Drains pending prefetch futures (waits for completion),
         synchronizes the prefetch stream so any in-flight H2D has
         settled device-side, then evicts every block currently holding
-        a pool slot via the streamer's ``_block_to_slot`` source of
+        a pool target via the streamer's ``_block_to_target`` source of
         truth, and clears tracker + pending bookkeeping.
 
         Idempotent — safe to call when no resources are active and
@@ -1122,14 +1124,14 @@ class StreamedComponent:
         exception encountered (or ``None``) so the caller can choose
         to surface it. We don't raise here so eviction still runs
         after a failed prefetch; without this, a transient prefetch
-        error would leak the GPU slot it had partially populated.
+        error would leak the GPU target it had partially populated.
 
         Used by both :meth:`_teardown_active_resources` (full
         deactivate) and :meth:`optimizer_step` (mid-cycle quiesce
         before optimizer step). Centralizing it removes the bug
         class where the two paths' bookkeeping diverged — optimizer_step
         used to walk ``_tracker._on_gpu`` and miss pending prefetch
-        slots, leaking them across step boundaries.
+        targets, leaking them across step boundaries.
         """
         first_prefetch_exc: BaseException | None = None
         for future in list(self._pending.values()):
@@ -1310,7 +1312,7 @@ class StreamedComponent:
             if streamer is None:
                 # Strategy was dropped without deactivate. Hook is
                 # orphaned — no-op. Forward through this block uses
-                # whatever the slot currently holds: GPU param if it
+                # whatever the registry currently holds: GPU param if it
                 # was resident at drop-time, instance cpu_param if it
                 # had been evicted. Both are functional (CPU forward
                 # is slower but works on pinned tensors).

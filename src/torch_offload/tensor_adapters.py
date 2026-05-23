@@ -4,14 +4,14 @@ Different tensor subclasses need different machinery to move bytes
 across the CPU↔GPU boundary while preserving correctness:
 
 - Plain ``torch.Tensor`` (bf16/fp16/fp32): single contiguous pinned
-  buffer; consumers either slot-replace via ``module._parameters[leaf]
-  = ...`` with a fresh :class:`nn.Parameter` wrapping it, or ``.data``-
-  swap to preserve identity for trainable params.
+  buffer; consumers either replace ``module._parameters[leaf]`` with a
+  fresh :class:`nn.Parameter` wrapping it, or ``.data``-swap to preserve
+  identity for trainable params.
 - Quanto ``WeightQBytesTensor``: two pinned tensors (``_data`` + ``_scale``)
   plus quant metadata; the wrapper must be reconstructed on each move.
   ``.data``-swap doesn't work for quanto — its quant state is part of
   the Parameter's wrapped object, not its bytes — so quanto stays
-  frozen-only via slot replacement.
+  frozen-only via registry replacement.
 
 Each adapter encapsulates the mechanics for one tensor type. The rest
 of the package is type-agnostic and dispatches through
@@ -97,7 +97,7 @@ class TensorAdapter(Protocol[PinnedStateT, GpuStateT]):
 
         Unlike :meth:`tensor_id`, this must not include tensor identity.
         It captures only fields that must match for one GPU
-        pool slot to safely receive bytes from multiple block instances.
+        pool target to safely receive bytes from multiple block instances.
         """
         ...
 
@@ -112,11 +112,11 @@ class TensorAdapter(Protocol[PinnedStateT, GpuStateT]):
         state: PinnedStateT, *, requires_grad: bool = False
     ) -> nn.Parameter:
         """Build a stable :class:`nn.Parameter` wrapping the host state.
-        Used as the deactivated-state slot value
+        Used as the deactivated-state registry value
         (``module._parameters[leaf] = cpu_param``).
 
         ``requires_grad`` defaults to ``False`` to match frozen
-        slot-replacement callers; pass ``True`` when building a wrapper
+        registry-replacement callers; pass ``True`` when building a wrapper
         for trainable storage.
         """
         ...
@@ -316,10 +316,10 @@ class RegularAdapter:
     """Adapter for plain ``torch.Tensor`` (no subclass machinery).
 
     Builds fresh :class:`nn.Parameter` objects wrapping the pinned-CPU
-    and GPU storages. Frozen model-bound callers slot-replace via
+    and GPU storages. Frozen model-bound callers replace the module registry via
     ``module._parameters[leaf] = ...`` with a pinned CPU wrapper or
     active GPU wrapper; trainable callers preserve Parameter identity
-    by skipping slot replacement and ``.data``-swapping into their own
+    by skipping registry replacement and ``.data``-swapping into their own
     persistent Parameter. Both paths are supported by the shape of this
     adapter (plain tensors round-trip through ``.data =`` cleanly).
 

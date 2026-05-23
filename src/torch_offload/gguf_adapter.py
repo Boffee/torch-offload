@@ -16,7 +16,7 @@ Memory layout::
          ↓  on-device dequant
     GPU output:  bf16 weight tensor  (full precision for matmul)
 
-The staging + output buffers are pre-allocated once per pool slot and
+The staging + output buffers are pre-allocated once per pool target and
 reused across block loads, matching the existing pooled streaming path.
 GGUF intentionally does not implement the CPU round-trip adapter
 capability because GPU storage is dequantized bf16; copying back would

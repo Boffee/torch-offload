@@ -742,15 +742,13 @@ class TestPinnedModuleInstance:
         assert prototype.running is store.buffers["running"].tensor
         assert second_module.running is store.buffers["running"].tensor
 
-    def test_does_not_store_slots_or_parent_leaf_state(self) -> None:
+    def test_does_not_store_parent_leaf_state(self) -> None:
         module = nn.Module()
         module.weight = nn.Parameter(torch.randn(2, 2), requires_grad=False)
         store = PinnedModuleStore.from_module(module)
 
         instance = PinnedModuleInstance.from_store(store, module)
 
-        assert not hasattr(instance, "param_slots")
-        assert not hasattr(instance, "buffer_slots")
         assert not hasattr(instance, "parent")
         assert not hasattr(instance, "leaf")
 

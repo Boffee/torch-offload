@@ -30,7 +30,7 @@ and :class:`~torch_offload.StreamedComponent`.
 
 Lifecycle
 ---------
-``__init__`` sets up backing state (pinning, slot metadata, etc.) so
+``__init__`` sets up backing state (pinning, name metadata, etc.) so
 ``cache_bytes`` is final immediately and a top-level resource is ready
 for :class:`~torch_offload.model_cache.ModelCache` admission →
 ``activate(device=...)`` (make resource usable, on the caller-selected
@@ -56,31 +56,10 @@ own; ownership of the user's model is the user's concern.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Literal, Protocol, TypeVar, runtime_checkable
+from typing import Protocol, TypeVar, runtime_checkable
 
 import torch
 from torch import nn
-
-
-@dataclass(frozen=True, slots=True)
-class SlotKey:
-    """Hashable identity for a parameter or buffer slot.
-
-    Used as a skip filter when one strategy manages a subset of a
-    model's slots and a second strategy needs to ignore them. Unlike
-    ``id(param)`` / ``id(buffer)``, this key survives
-    ``module._parameters[leaf] = new_param`` swaps: the parent module
-    and leaf name are stable even when the object at that slot changes.
-
-    ``parent_id`` is ``id()`` of the parent module, which is stable for
-    the module's lifetime and unique per submodule (Python guarantee
-    while a reference is held).
-    """
-
-    parent_id: int
-    leaf: str
-    kind: Literal["param", "buffer"]
 
 
 @runtime_checkable
@@ -112,7 +91,7 @@ class ModelStrategyComponent(Protocol):
     def activate(self, device: torch.device | str | None = None) -> None:
         """Make this piece's contribution ready for compute.
 
-        Implementations may move weights to GPU, allocate a slot pool,
+        Implementations may move weights to GPU, allocate a target pool,
         register forward hooks, install an mmap, or do nothing for
         always-resident pieces. Not necessarily re-entrant — call
         :meth:`deactivate` before activating again. ``device`` lets a

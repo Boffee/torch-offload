@@ -1,8 +1,9 @@
 """Pinned-CPU component for selected model parameters and buffers.
 
-Holds selected slots in pinned CPU memory and bulk-copies them to the
-activation device. This is the component used by :class:`ModelOffloader`
-for both non-streamed slots and whole-model pinning. It satisfies
+Holds selected parameters and buffers in pinned CPU memory and
+bulk-copies them to the activation device. This is the component used
+by :class:`ModelOffloader` for both non-streamed names and whole-model
+pinning. It satisfies
 :class:`~torch_offload.protocols.ModelStrategyComponent`, not the
 top-level model strategy protocol.
 
@@ -13,11 +14,11 @@ DDP/FSDP wrap-before requirement, single-thread contract) live in the
 Class-specific caveats
 ----------------------
 - The constructor *mutates* the wrapped ``model`` — frozen parameter
-  slots (``module._parameters[leaf]``) are replaced with Parameters
+  registry entries (``module._parameters[leaf]``) are replaced with Parameters
   wrapping pinned CPU storage, trainable parameter ``.data`` points at
   pinned CPU storage while preserving the user's Parameter objects, and
   registered buffers are replaced with pinned copies.
-- Slot replacement (rather than ``param.data`` swap) is required for
+- Registry replacement (rather than ``param.data`` swap) is required for
   correctness with quanto ``WeightQBytesTensor``: assigning
   ``param.data = new_quanto_tensor`` is a no-op for the inner ``_data``
   / ``_scale`` storages, so the model would silently keep referencing
@@ -30,7 +31,7 @@ Class-specific caveats
   :meth:`optimizer_step`. Without that boundary, deactivation restores
   older pinned CPU bytes and discards active GPU updates.
 - **Caller owns lifecycle correctness.** Calling :meth:`activate`
-  twice without an intervening :meth:`deactivate` raises before slot
+  twice without an intervening :meth:`deactivate` raises before registry
   movement or GPU allocation. Construction optimizes peak host memory
   by letting :class:`PinnedParam` repoint plain ``Parameter.data``
   at pinned clones as each pinned parameter is created; if construction or
@@ -40,9 +41,9 @@ Class-specific caveats
 - There is no ``close()``. Pinned memory is freed when the caller
   drops the component AND model references; Python's refcount-based
   GC reclaims the pinned tensors immediately. The component releases
-  what it owns (its internal slot tracking); the user's model is the
+  what it owns (its internal name tracking); the user's model is the
   user's concern.
-- Tied weights *are* deduplicated. Two parameter slots whose values
+- Tied weights *are* deduplicated. Two parameter names whose values
   share underlying storage — whether the standard ``tie_weights()``
   pattern (one ``Parameter`` under multiple names) or the rarer case
   of distinct quanto wrappers around shared inner ``_data`` — share a
@@ -69,16 +70,17 @@ from .pinned_module import (
 
 
 class PinnedComponent:
-    """Pinned-CPU slot component with bulk device transfer.
+    """Pinned-CPU component with bulk device transfer.
 
     On construction, every managed parameter is backed by pinned CPU
     storage (handling quanto decomposition and tied-weight dedup).
     :meth:`activate` allocates GPU tensors for each unique pinned
     parameter and installs that active storage into the managed model
-    slots. Frozen parameters use slot replacement; trainable parameters
-    preserve the user's Parameter objects and swap only ``.data`` so
-    optimizer state remains valid. :meth:`deactivate` restores pinned
-    CPU storage so GPU storage is released by refcount.
+    registry entries. Frozen parameters use registry replacement;
+    trainable parameters preserve the user's Parameter objects and swap
+    only ``.data`` so optimizer state remains valid.
+    :meth:`deactivate` restores pinned CPU storage so GPU storage is
+    released by refcount.
 
     If trainable params are active on CUDA, run ``optimizer.step()``
     inside :meth:`optimizer_step` so updated GPU bytes are copied back
@@ -94,7 +96,7 @@ class PinnedComponent:
     Parameters
     ----------
     model:
-        The model to cache. Managed slots may start on CPU or CUDA;
+        The model to cache. Managed tensors may start on CPU or CUDA;
         construction clones them directly into pinned CPU storage.
     include_param_names:
         Optional PyTorch parameter names to cache. ``None`` caches all
@@ -116,7 +118,7 @@ class PinnedComponent:
         self._active_target: PinnedModuleTarget | None = None
         self._optimizer_step_active: bool = False
 
-        # Pin selected names without replacing module slots.
+        # Pin selected names without replacing module registry entries.
         # PinnedParam intentionally repoints plain Parameter.data at each
         # pinned clone during this phase to keep construction peak memory
         # low. If a later pin fails, the caller must drop the partially
@@ -141,7 +143,7 @@ class PinnedComponent:
             )
 
         # Bind this concrete model instance to the store. This applies the
-        # module slot/register_buffer mutations after all pinning succeeded.
+        # module registry/register_buffer mutations after all pinning succeeded.
         # Construction is still not fully rollback-safe because of the
         # low-peak Parameter.data repointing described above.
         self._instance = PinnedModuleInstance.from_store(self._store, model)
@@ -186,23 +188,24 @@ class PinnedComponent:
         return self._instance.post_copy_hook_key(name)
 
     def activate(self, device: torch.device | str | None = None) -> None:
-        """Activate the managed slots on ``device``.
+        """Activate the managed tensors on ``device``.
 
         CUDA activation bulk-DMAs pinned weights to GPU: per-tensor
         ``.to()`` (non-blocking), then a single ``cuda.synchronize`` to
-        make the writes visible. Tied parameter slots all receive the
-        same GPU Parameter. CPU activation repoints slots back to the
-        pinned CPU Parameters and performs no device copy.
+        make the writes visible. Tied parameter names all receive the
+        same GPU Parameter. CPU activation repoints registry entries
+        back to the pinned CPU Parameters and performs no device copy.
 
         Calling activate() twice without an intervening deactivate()
-        raises before any slot movement or GPU allocation.
+        raises before any registry movement or GPU allocation.
 
         **Activation failure semantics:** if CUDA activation fails
         midway, the component is left in an undefined partial state —
-        some slots may be GPU, some pinned-CPU. Retrying activation on
+        some tensors may be GPU, some pinned-CPU. Retrying activation on
         that component is unsupported; the caller's only supported
-        cleanup path is :meth:`deactivate` (which forces all slots back
-        to pinned-CPU) followed by dropping the component reference.
+        cleanup path is :meth:`deactivate` (which forces managed
+        tensors back to pinned-CPU) followed by dropping the component
+        reference.
         """
         assert self._model is not None
         if self._active_device is not None:
@@ -216,7 +219,7 @@ class PinnedComponent:
             self._instance.restore_pinned()
         elif active_device.type == "cuda":
             # One active-device Parameter per unique pinned parameter.
-            # Tied slots all receive the same Parameter object so the
+            # Tied names all receive the same Parameter object so the
             # tying invariant survives on device.
             target = self._instance.allocate_target(active_device)
             self._instance.load_to_target(
@@ -234,7 +237,7 @@ class PinnedComponent:
         self._active_device = active_device
 
     def deactivate(self) -> None:
-        """Repoint slots back at pinned-CPU Parameters. Idempotent —
+        """Repoint registry entries back at pinned-CPU Parameters. Idempotent —
         safe to call before activate or multiple times. After
         deactivate, drop the component reference to release pinned
         memory (and the model reference too if you don't need it

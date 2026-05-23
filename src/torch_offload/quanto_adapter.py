@@ -9,7 +9,7 @@ Parameter's wrapped object, not its bytes. So this adapter:
 - Decomposes ``WeightQBytesTensor`` into ``_data`` and ``_scale``,
   pins each separately.
 - Reconstructs a fresh ``WeightQBytesTensor`` (and thus a fresh
-  :class:`nn.Parameter`) on each activate via slot replacement.
+  :class:`nn.Parameter`) on each activate via registry replacement.
   PyTorch optimizers keyed by the user's pre-wrap Parameter id are
   orphaned across cycles — quanto-quantized weights are inference-only.
 
@@ -84,7 +84,7 @@ class QuantoAdapter:
 
     Decompose-on-pin, reconstruct-on-move. Each activate creates a
     fresh ``WeightQBytesTensor`` and a fresh :class:`nn.Parameter`,
-    installed via slot replacement. This breaks PyTorch optimizer
+    installed via registry replacement. This breaks PyTorch optimizer
     references — quanto-quantized weights are inference-only.
     """
 

@@ -279,7 +279,7 @@ class TestLifecycle:
 class TestCleanup:
     def test_drop_strategy_and_model_frees_pinned(self) -> None:
         # The "drop refs to free pinned" contract. Strategies don't have
-        # a destructive close(); pinned tensors live in module slots
+        # a destructive close(); pinned tensors live in module state
         # and are freed when the caller drops the model reference (and
         # the strategy reference, which is the only other holder).
         import gc
@@ -287,12 +287,12 @@ class TestCleanup:
 
         m = _make_simple_model()
         pw = ModelOffloader(m)
-        slot_param_ref = weakref.ref(m[0]._parameters["weight"])
+        module_param_ref = weakref.ref(m[0]._parameters["weight"])
         pw.deactivate()
-        assert slot_param_ref() is not None  # still alive via model slot
+        assert module_param_ref() is not None  # still alive via model state
         del m, pw
         gc.collect()
-        assert slot_param_ref() is None  # GC freed it
+        assert module_param_ref() is None  # GC freed it
 
 
 # ---------------------------------------------------------------------------
@@ -334,7 +334,7 @@ class TestConstruction:
                 self.weight = nn.Parameter(torch.randn(4), requires_grad=False)
 
             def to(self, *args, **kwargs):
-                raise AssertionError("constructor must pin slots directly")
+                raise AssertionError("constructor must pin directly")
 
         m = Guarded()
         pw = ModelOffloader(m)
@@ -384,7 +384,7 @@ class TestTiedWeightDedup:
             # Exactly one unique pinned parameter for the tied weight.
             assert _unique_pinned_param_count(pw) == 1
             assert pw.param_names == {"embed.weight", "head.weight"}
-            # After construction, both slots reference the same Parameter
+            # After construction, both names reference the same Parameter
             # object, preserving tying at the strongest level.
             assert m.embed._parameters["weight"] is m.head._parameters["weight"]
             pinned = pw._store.params["embed.weight"]
@@ -399,7 +399,7 @@ class TestTiedWeightDedup:
         try:
             assert _unique_pinned_param_count(pw) == 1
             assert pw.param_names == {"a", "b"}
-            # Both module slots now reference the same Parameter object.
+            # Both module entries now reference the same Parameter object.
             assert m._parameters["a"] is m._parameters["b"]
         finally:
             pw.deactivate()
@@ -447,8 +447,8 @@ class TestTiedWeightDedup:
         pw = ModelOffloader(m)
         try:
             with pw.use("cuda"):
-                # Slot identity comparison; the local `a` / `b` refs are
-                # the now-orphaned originals (replaced in module slots).
+                # Registry identity comparison; the local `a` / `b` refs are
+                # the now-orphaned originals (replaced in module registries).
                 assert m._parameters["a"].is_cuda
                 assert m._parameters["b"].is_cuda
                 assert m._parameters["a"].data.data_ptr() == m._parameters["b"].data.data_ptr()
@@ -520,7 +520,7 @@ class TestSharedSubmoduleAlias:
             assert pw.buffer_names == {"a.buf", "b.buf"}
             pinned_buffer = pw._store.buffers["a.buf"]
             assert pinned_buffer.tensor.is_pinned()
-            # Both module slots reference the SAME pinned tensor.
+            # Both module entries reference the SAME pinned tensor.
             assert m.a.buf is pinned_buffer.tensor
             assert m.b.buf is pinned_buffer.tensor
         finally:
@@ -613,11 +613,11 @@ class TestZeroSizedParams:
         m.a = nn.Parameter(torch.empty(0), requires_grad=False)
         m.b = nn.Parameter(torch.empty(0), requires_grad=False)
         # Need at least one non-empty frozen param so the constructor doesn't
-        # reject the model. The empties should each be their own slot.
+        # reject the model. The empties should each be their own entry.
         m.c = nn.Parameter(torch.randn(4), requires_grad=False)
         pw = ModelOffloader(m)
         try:
-            # 3 slots: a, b, c — empties did not collapse.
+            # 3 entries: a, b, c — empties did not collapse.
             assert _unique_pinned_param_count(pw) == 3
         finally:
             pw.deactivate()
