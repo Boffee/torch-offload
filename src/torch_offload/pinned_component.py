@@ -55,6 +55,7 @@ from __future__ import annotations
 
 import contextlib
 from collections.abc import Iterable, Iterator
+from dataclasses import dataclass
 
 import torch
 from torch import nn
@@ -67,6 +68,50 @@ from .pinned_module import (
     PostCopyHook,
     PostCopyHookHandle,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class PinnedComponentStore:
+    """Reusable pinned backing storage for :class:`PinnedComponent`.
+
+    Public component-level wrapper over the internal name-keyed module
+    store. Build once from a prototype module, then bind it to concrete
+    compatible modules with :meth:`PinnedComponent.from_store`.
+    """
+
+    _module_store: PinnedModuleStore
+
+    @classmethod
+    def from_module(
+        cls,
+        model: nn.Module,
+        *,
+        include_param_names: Iterable[str] | None = None,
+        include_buffer_names: Iterable[str] | None = None,
+    ) -> PinnedComponentStore:
+        """Pin selected model state into a reusable component store."""
+        return cls(
+            PinnedModuleStore.from_module(
+                model,
+                include_param_names=include_param_names,
+                include_buffer_names=include_buffer_names,
+            )
+        )
+
+    @property
+    def param_names(self) -> frozenset[str]:
+        """Pinned parameter names in this store."""
+        return frozenset(self._module_store.params)
+
+    @property
+    def buffer_names(self) -> frozenset[str]:
+        """Pinned buffer names in this store."""
+        return frozenset(self._module_store.buffers)
+
+    @property
+    def cache_bytes(self) -> int:
+        """Total pinned host bytes held by this store."""
+        return self._module_store.cache_bytes
 
 
 class PinnedComponent:
@@ -90,8 +135,9 @@ class PinnedComponent:
     Buffer-only modules (only registered buffers, no params)
     are valid — common for sibling tables like RoPE/positional
     embeddings managed via :class:`ModelOffloader`'s non-block
-    composition. Construction raises only if there is *nothing* to
-    manage — neither selected params nor selected registered buffers.
+    composition. Empty selections are valid no-op components; the
+    top-level :class:`ModelOffloader` still rejects configurations
+    with no components to manage.
 
     Parameters
     ----------
@@ -113,44 +159,53 @@ class PinnedComponent:
         include_param_names: Iterable[str] | None = None,
         include_buffer_names: Iterable[str] | None = None,
     ) -> None:
-        self._model: nn.Module | None = model
-        self._active_device: torch.device | None = None
-        self._active_target: PinnedModuleTarget | None = None
-        self._optimizer_step_active: bool = False
-
         # Pin selected names without replacing module registry entries.
         # PinnedParam intentionally repoints plain Parameter.data at each
         # pinned clone during this phase to keep construction peak memory
         # low. If a later pin fails, the caller must drop the partially
         # constructed model/strategy and rebuild from a fresh model instance.
-        self._store = PinnedModuleStore.from_module(
+        store = PinnedComponentStore.from_module(
             model,
             include_param_names=include_param_names,
             include_buffer_names=include_buffer_names,
         )
+        self._init_from_store(store._module_store, model)
 
-        # Reject if there is nothing at all to manage — neither selected
-        # params nor selected registered buffers.
-        # Buffer-only modules (e.g., a pure RoPE/positional table sibling)
-        # are valid: PinnedComponent still gives them pinned-CPU storage and
-        # the activate/deactivate round-trip, which is exactly what
-        # ModelOffloader non-block composition needs.
-        if not self._store.params and not self._store.buffers:
-            raise ValueError(
-                "PinnedComponent requires at least one parameter or, "
-                "at least one registered buffer to cache. The selected "
-                "model names contain neither — leave the model unwrapped."
-            )
+    @classmethod
+    def from_store(
+        cls,
+        store: PinnedComponentStore,
+        model: nn.Module,
+    ) -> PinnedComponent:
+        """Bind an existing pinned component store to ``model``.
+
+        The store owns the pinned bytes, while the returned component
+        owns lifecycle state for this concrete module binding.
+        """
+        component = cls.__new__(cls)
+        component._init_from_store(store._module_store, model)
+        return component
+
+    def _init_from_store(
+        self,
+        store: PinnedModuleStore,
+        model: nn.Module,
+    ) -> None:
+        self._model: nn.Module | None = model
+        self._active_device: torch.device | None = None
+        self._active_target: PinnedModuleTarget | None = None
+        self._optimizer_step_active: bool = False
 
         # Bind this concrete model instance to the store. This applies the
         # module registry/register_buffer mutations after all pinning succeeded.
         # Construction is still not fully rollback-safe because of the
         # low-peak Parameter.data repointing described above.
-        self._instance = PinnedModuleInstance.from_store(self._store, model)
-        self._param_names = frozenset(self._store.params)
-        self._buffer_names = frozenset(self._store.buffers)
+        self._store = store
+        self._instance = PinnedModuleInstance.from_store(store, model)
+        self._param_names = frozenset(store.params)
+        self._buffer_names = frozenset(store.buffers)
         self._has_trainables = any(
-            pinned.requires_grad for pinned in self._store.params.values()
+            pinned.requires_grad for pinned in store.params.values()
         )
 
     # ------------------------------------------------------------------
@@ -308,4 +363,5 @@ class PinnedComponent:
 
 __all__ = [
     "PinnedComponent",
+    "PinnedComponentStore",
 ]

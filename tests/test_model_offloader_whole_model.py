@@ -8,7 +8,12 @@ import pytest
 import torch
 from torch import nn
 
-from torch_offload import ModelStrategy, PinnedComponent, ModelOffloader
+from torch_offload import (
+    ModelOffloader,
+    ModelStrategy,
+    PinnedComponent,
+    PinnedComponentStore,
+)
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 _OFFLOADER_LOGGER = "torch_offload.model_offloader"
@@ -59,6 +64,75 @@ class TestModelStrategyConformance:
             assert pw.cache_bytes > 0
         finally:
             pw.deactivate()
+
+
+class TestPinnedComponentFromStore:
+    def test_from_store_allows_empty_noop_component(self) -> None:
+        module = nn.Module()
+        module.weight = nn.Parameter(torch.randn(2, 2), requires_grad=False)
+        module.register_buffer("running", torch.randn(2))
+
+        store = PinnedComponentStore.from_module(
+            module,
+            include_param_names=set(),
+            include_buffer_names=set(),
+        )
+
+        assert store.cache_bytes == 0
+        assert store.param_names == frozenset()
+        assert store.buffer_names == frozenset()
+
+        component = PinnedComponent.from_store(store, module)
+        try:
+            assert component.cache_bytes == 0
+            assert component.param_names == frozenset()
+            assert component.buffer_names == frozenset()
+            component.activate("cpu")
+        finally:
+            component.deactivate()
+
+    def test_binds_existing_store_to_multiple_components(self) -> None:
+        prototype = nn.Module()
+        prototype.weight = nn.Parameter(torch.randn(2, 2), requires_grad=False)
+        prototype.register_buffer("running", torch.randn(2))
+        store = PinnedComponentStore.from_module(prototype)
+
+        first = PinnedComponent.from_store(store, prototype)
+        second_model = nn.Module()
+        second_model.weight = nn.Parameter(torch.randn(2, 2), requires_grad=False)
+        second_model.register_buffer("running", torch.randn(2))
+        second = PinnedComponent.from_store(store, second_model)
+
+        try:
+            assert first.cache_bytes == store.cache_bytes
+            assert second.cache_bytes == store.cache_bytes
+            assert store.param_names == frozenset({"weight"})
+            assert first.param_names == store.param_names
+            assert second.param_names == store.param_names
+            assert store.buffer_names == frozenset({"running"})
+            assert first.buffer_names == store.buffer_names
+            assert second.buffer_names == store.buffer_names
+
+            assert prototype.weight.data_ptr() == second_model.weight.data_ptr()
+            assert prototype.weight is not second_model.weight
+            assert prototype.running is second_model.running
+
+            first.activate("cpu")
+            second.activate("cpu")
+        finally:
+            first.deactivate()
+            second.deactivate()
+
+    def test_from_store_propagates_module_mismatch_errors(self) -> None:
+        prototype = nn.Module()
+        prototype.weight = nn.Parameter(torch.randn(2, 2), requires_grad=False)
+        store = PinnedComponentStore.from_module(prototype)
+
+        target = nn.Module()
+        target.weight = nn.Parameter(torch.randn(3, 2), requires_grad=False)
+
+        with pytest.raises(ValueError, match="Param 'weight' layout mismatch"):
+            PinnedComponent.from_store(store, target)
 
 
 # ---------------------------------------------------------------------------

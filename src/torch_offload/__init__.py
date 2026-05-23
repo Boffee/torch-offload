@@ -101,7 +101,7 @@ from .model_cache import (
 )
 from .model_offloader import ModelOffloader
 from .mps_weights import MpsWeights
-from .pinned_component import PinnedComponent
+from .pinned_component import PinnedComponent, PinnedComponentStore
 from .protocols import CachedResource, ModelStrategy, ModelStrategyComponent
 from .streamed_component import StreamedComponent
 
@@ -128,6 +128,7 @@ __all__ = [
     "ModelTooLargeError",
     "MpsWeights",
     "PinnedComponent",
+    "PinnedComponentStore",
     "ResourceSpec",
     "StreamedComponent",
     "merge_lora",

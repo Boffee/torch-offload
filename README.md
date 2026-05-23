@@ -15,12 +15,12 @@ to be lifted into its own package when a second consumer appears.
 |---|---|
 | `protocols.py` | `CachedResource` (generic), `ModelStrategy` / `ModelStrategyComponent` plug-in contracts |
 | `model_offloader.py` | `ModelOffloader` — whole-model bulk pinned-CPU↔GPU or streamed block offload strategy |
-| `pinned_component.py` | `PinnedComponent` — lifecycle-only pinned component used by `ModelOffloader` |
+| `pinned_component.py` | `PinnedComponent`, `PinnedComponentStore` — reusable pinned backing storage plus lifecycle-only pinned component used by `ModelOffloader` |
 | `streamed_component.py` | `StreamedComponent` — sharp per-block-list streaming primitive (component) |
 | `lora.py` | `LoRA`, `LoRATransform`, `LoRARouteHandle` — pinned factor storage + merge / routed-hook application |
 | `merge.py` | `merge_lora()` — permanent in-place LoRA merge into base weights (alternative to `set_loras`) |
 | `pinned_param.py` | `PinnedParam` — per-parameter pinning primitive (handles quanto, GGUF, and TorchAO NVFP4 via adapters) |
-| `pinned_module.py` | `PinnedModuleStore`, `PinnedModuleInstance` — name-keyed pinned module storage plus concrete model instances |
+| `pinned_module.py` | Internal name-keyed pinned module storage plus concrete module bindings |
 | `tensor_adapters.py`, `quanto_adapter.py`, `gguf_adapter.py`, `nvfp4_adapter.py`, `gguf_dequant.py` | Tensor adapter contracts/implementations and optional optimum-quanto / gguf / torchao support |
 | `tensor_adapter_registry.py` | Internal adapter dispatch and tensor-identity helpers |
 | `module_names.py` | Internal name traversal and mutation helpers |
