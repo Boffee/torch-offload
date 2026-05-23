@@ -9,6 +9,7 @@ from __future__ import annotations
 import contextlib
 import logging
 from collections.abc import Callable, Iterable, Iterator, Sequence
+from dataclasses import dataclass
 from typing import Literal, Protocol
 
 import torch
@@ -37,6 +38,98 @@ _LoraParamMap = dict[str, list[_LoraFactorRef]]
 class _RemovableHook(Protocol):
     def remove(self) -> None:
         ...
+
+
+@dataclass(frozen=True, slots=True)
+class _ModelOffloaderBinding:
+    pinned_component: PinnedComponent | None
+    streamed_components: list[StreamedComponent]
+    block_groups: list[list[nn.Module]]
+    components: list[ModelStrategyComponent]
+    lora_param_names: frozenset[str]
+
+
+@dataclass(frozen=True, slots=True)
+class _ModelOffloaderStore:
+    pinned_component_store: PinnedComponentStore | None
+    streamed_component_stores: tuple[StreamedComponentStore, ...]
+    stream_trainable_weights: bool
+
+    @classmethod
+    def from_module(
+        cls,
+        model: nn.Module,
+        *,
+        layer_paths: Sequence[str],
+        blocks_to_swap: int | Sequence[int] | None,
+        prefetch_count: int | Sequence[int],
+        cyclic: bool,
+        stream_trainable_weights: bool,
+        include_param_names: Iterable[str] | None,
+        include_buffer_names: Iterable[str] | None,
+    ) -> _ModelOffloaderStore:
+        (
+            streamed_component_stores,
+            streamed_param_names,
+            streamed_buffer_names,
+        ) = _build_streamed_component_stores(
+            model,
+            layer_paths=layer_paths,
+            blocks_to_swap=blocks_to_swap,
+            prefetch_count=prefetch_count,
+            cyclic=cyclic,
+            stream_trainable_weights=stream_trainable_weights,
+        )
+        pinned_component_store = _build_pinned_component_store(
+            model,
+            streamed_param_names=streamed_param_names,
+            streamed_buffer_names=streamed_buffer_names,
+            include_param_names=include_param_names,
+            include_buffer_names=include_buffer_names,
+        )
+        return cls(
+            pinned_component_store=pinned_component_store,
+            streamed_component_stores=streamed_component_stores,
+            stream_trainable_weights=stream_trainable_weights,
+        )
+
+    @property
+    def cache_bytes(self) -> int:
+        pinned_bytes = (
+            0
+            if self.pinned_component_store is None
+            else self.pinned_component_store.cache_bytes
+        )
+        streamed_bytes = sum(
+            store.cache_bytes for store in self.streamed_component_stores
+        )
+        return pinned_bytes + streamed_bytes
+
+    def bind(self, model: nn.Module) -> _ModelOffloaderBinding:
+        streamed_components: list[StreamedComponent] = []
+        block_groups: list[list[nn.Module]] = []
+        for store in self.streamed_component_stores:
+            block_groups.append(store.resolve_blocks(model))
+            streamed_components.append(store.bind(model))
+
+        pinned_component = (
+            None
+            if self.pinned_component_store is None
+            else self.pinned_component_store.bind(model)
+        )
+        components = _compose_components(pinned_component, streamed_components)
+        lora_param_names: set[str] = set()
+        if pinned_component is not None:
+            lora_param_names.update(pinned_component.param_names)
+        for streamed_component in streamed_components:
+            lora_param_names.update(streamed_component.param_names)
+        return _ModelOffloaderBinding(
+            pinned_component=pinned_component,
+            streamed_components=streamed_components,
+            block_groups=block_groups,
+            components=components,
+            lora_param_names=frozenset(lora_param_names),
+        )
 
 
 __all__ = [
@@ -228,46 +321,32 @@ class ModelOffloader:
             include_param_names=include_param_names,
             include_buffer_names=include_buffer_names,
         )
-        (
-            block_groups,
-            streamed_components,
-            streamed_param_names,
-            streamed_buffer_names,
-        ) = _build_streamed_components(
+        store = _ModelOffloaderStore.from_module(
             model,
             layer_paths=layer_paths,
             blocks_to_swap=blocks_to_swap,
             prefetch_count=prefetch_count,
             cyclic=cyclic,
             stream_trainable_weights=stream_trainable_weights,
-        )
-        pinned_component = _build_pinned_component(
-            model,
-            streamed_param_names=streamed_param_names,
-            streamed_buffer_names=streamed_buffer_names,
             include_param_names=include_param_names,
             include_buffer_names=include_buffer_names,
         )
-        components = _compose_components(pinned_component, streamed_components)
+        binding = store.bind(model)
 
         self._model = model
+        self._store = store
         self._active_device: torch.device | None = None
-        self._components = components
-        self._pinned_component = pinned_component
-        self._streamed_components = streamed_components
-        if pinned_component is not None:
-            self._instance = pinned_component._instance
+        self._components = binding.components
+        self._pinned_component = binding.pinned_component
+        self._streamed_components = binding.streamed_components
+        if binding.pinned_component is not None:
+            self._instance = binding.pinned_component._instance
         self._teardown_stack: contextlib.ExitStack | None = None
-        lora_param_names: set[str] = set()
-        if pinned_component is not None:
-            lora_param_names.update(pinned_component.param_names)
-        for streamed_component in streamed_components:
-            lora_param_names.update(streamed_component.param_names)
-        self._lora_param_names = frozenset(lora_param_names)
+        self._lora_param_names = binding.lora_param_names
         self._lora_hook_handles: list[_RemovableHook] = []
-        self._block_groups: list[list[nn.Module]] = block_groups
+        self._block_groups: list[list[nn.Module]] = binding.block_groups
         self._warned_about_checkpointing: bool = False
-        self._stream_trainable_weights: bool = stream_trainable_weights
+        self._stream_trainable_weights: bool = store.stream_trainable_weights
         self._skip_checkpointing_check: bool = skip_checkpointing_check
         self._is_block_checkpointed: Callable[[nn.Module], bool] = (
             is_block_checkpointed
@@ -801,7 +880,7 @@ def _validate_constructor_mode(
         )
 
 
-def _build_streamed_components(
+def _build_streamed_component_stores(
     model: nn.Module,
     *,
     layer_paths: Sequence[str],
@@ -809,15 +888,14 @@ def _build_streamed_components(
     prefetch_count: int | Sequence[int],
     cyclic: bool,
     stream_trainable_weights: bool,
-) -> tuple[list[list[nn.Module]], list[StreamedComponent], set[str], set[str]]:
+) -> tuple[tuple[StreamedComponentStore, ...], set[str], set[str]]:
     if not layer_paths:
-        return [], [], set(), set()
+        return (), set(), set()
 
     assert blocks_to_swap is not None
     swap_list = _broadcast(blocks_to_swap, len(layer_paths), "blocks_to_swap")
     pf_list = _broadcast(prefetch_count, len(layer_paths), "prefetch_count")
-    streamed_components: list[StreamedComponent] = []
-    block_groups: list[list[nn.Module]] = []
+    streamed_component_stores: list[StreamedComponentStore] = []
     streamed_param_names: set[str] = set()
     streamed_buffer_names: set[str] = set()
 
@@ -830,23 +908,21 @@ def _build_streamed_components(
             cyclic=cyclic,
             stream_trainable_weights=stream_trainable_weights,
         )
-        blocks = store.resolve_blocks(model)
-        block_groups.append(blocks)
         streamed_param_names.update(store.param_names)
         streamed_buffer_names.update(store.buffer_names)
-        streamed_components.append(store.bind(model))
+        streamed_component_stores.append(store)
 
-    return block_groups, streamed_components, streamed_param_names, streamed_buffer_names
+    return tuple(streamed_component_stores), streamed_param_names, streamed_buffer_names
 
 
-def _build_pinned_component(
+def _build_pinned_component_store(
     model: nn.Module,
     *,
     streamed_param_names: set[str],
     streamed_buffer_names: set[str],
     include_param_names: Iterable[str] | None,
     include_buffer_names: Iterable[str] | None,
-) -> PinnedComponent | None:
+) -> PinnedComponentStore | None:
     pinned_param_names = parameter_names(model) - streamed_param_names
     pinned_buffer_names = buffer_names(model) - streamed_buffer_names
     if include_param_names is not None:
@@ -855,12 +931,11 @@ def _build_pinned_component(
         pinned_buffer_names = set(include_buffer_names)
     if not pinned_param_names and not pinned_buffer_names:
         return None
-    store = PinnedComponentStore.from_module(
+    return PinnedComponentStore.from_module(
         model,
         include_param_names=pinned_param_names,
         include_buffer_names=pinned_buffer_names,
     )
-    return store.bind(model)
 
 
 def _compose_components(

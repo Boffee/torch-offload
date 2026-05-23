@@ -1778,6 +1778,35 @@ class TestStreamedNameSelection:
         finally:
             streamer.deactivate()
 
+    def test_streamed_component_store_binds_compatible_model(self) -> None:
+        torch.manual_seed(0)
+        prototype = _make_block_model()
+        target = _make_block_model()
+        target_embed = target.embed.weight.detach().clone()
+
+        store = StreamedComponentStore.from_module(
+            prototype,
+            layer_path="transformer_blocks",
+            blocks_to_swap=2,
+        )
+        streamer = store.bind(target)
+        try:
+            assert streamer.param_names == {
+                f"transformer_blocks.{i}.weight"
+                for i in range(len(target.transformer_blocks))
+            }
+            for prototype_block, target_block in zip(
+                prototype.transformer_blocks,
+                target.transformer_blocks,
+                strict=True,
+            ):
+                assert target_block.weight.is_pinned()
+                torch.testing.assert_close(target_block.weight, prototype_block.weight)
+            torch.testing.assert_close(target.embed.weight, target_embed)
+            assert not target.embed.weight.is_pinned()
+        finally:
+            streamer.deactivate()
+
     def test_streamed_component_registers_post_copy_hook_by_param_name(self) -> None:
         m = _make_block_model()
         streamer = _make_streamed_component(
