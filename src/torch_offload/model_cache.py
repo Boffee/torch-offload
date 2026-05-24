@@ -467,7 +467,6 @@ class ModelCache:
         model: ResourceSpec[T],
         *,
         device: torch.device | str | None = None,
-        configure: Callable[[ResourceBinding[T]], None] | None = None,
     ) -> contextlib.AbstractContextManager[T]: ...
     @overload
     def use(
@@ -475,7 +474,6 @@ class ModelCache:
         model: str,
         *,
         device: torch.device | str | None = None,
-        configure: Callable[[ResourceBinding[Any]], None] | None = None,
     ) -> contextlib.AbstractContextManager[Any]: ...
 
     @contextlib.contextmanager
@@ -484,14 +482,13 @@ class ModelCache:
         model: str | ResourceSpec,
         *,
         device: torch.device | str | None = None,
-        configure: Callable[[ResourceBinding[Any]], None] | None = None,
     ) -> Iterator[Any]:
-        """Acquire an active lease on a cached resource.
+        """Acquire an active binding on a cached resource.
 
         Accepts either a registered key (string) or a :class:`ResourceSpec`
         (auto-registers if its key isn't already known). Yields the
         resource binding's :attr:`~ResourceBinding.value` for use; on context
-        exit, releases the lease.
+        exit, releases the binding.
 
         ``device`` optionally selects the activation device for this
         acquire. It is normalized and passed to the binding's
@@ -501,11 +498,6 @@ class ModelCache:
         concurrent same-key bindings. Different keys and supported
         multiple bindings for the same key may be active on the same
         device at the same time; caller code owns GPU memory planning.
-
-        ``configure`` is an optional hook called with the fresh binding
-        after bind and before :meth:`activate`. Use it for per-acquire
-        configuration that requires the deactivated state (e.g.,
-        :meth:`ModelOffloader.set_loras`).
         """
         spec = model if isinstance(model, ResourceSpec) else None
         key = spec.key if spec is not None else model
@@ -521,13 +513,9 @@ class ModelCache:
                 self.register(spec)
                 entry = self._entries[key]
 
-            binding, value = self._acquire(
-                entry,
-                device=device,
-                configure=configure,
-            )
+            binding = self._acquire(entry, device=device)
         try:
-            yield value
+            yield binding.value
         finally:
             with self._lock:
                 self._release(entry, binding)
@@ -570,7 +558,7 @@ class ModelCache:
             )
 
     # ------------------------------------------------------------------
-    # Lease lifecycle
+    # Binding lifecycle
     # ------------------------------------------------------------------
 
     def _acquire(
@@ -578,20 +566,16 @@ class ModelCache:
         entry: _Entry,
         *,
         device: torch.device | str | None = None,
-        configure: Callable[[ResourceBinding[Any]], None] | None = None,
-    ) -> tuple[ResourceBinding[Any], object]:
-        """Build the store if needed, bind, read value, activate, and
-        publish the active binding."""
+    ) -> ResourceBinding[Any]:
+        """Build the store if needed, bind, activate, and publish the
+        active binding."""
         active_device = self._normalize_device(device)
         self._ensure_store(entry)
         binding = self._create_binding(entry)
-        value = binding.value
-        if configure is not None:
-            configure(binding)
         binding.activate(active_device)
         entry.bindings.append(binding)
         self._eviction.mark_active(entry.spec.key)
-        return binding, value
+        return binding
 
     @staticmethod
     def _normalize_device(device: torch.device | str | None) -> torch.device | None:
@@ -614,7 +598,7 @@ class ModelCache:
         return entry.spec.bind(store)
 
     def _release(self, entry: _Entry, binding: ResourceBinding[Any]) -> None:
-        """End a lease. On the final release, deactivate and mark the
+        """End a binding use. On the final release, deactivate and mark the
         entry inactive for eviction policy state. A raising deactivate
         leaves the binding unrecoverable: discard it and propagate so
         the caller sees the binding's failure."""

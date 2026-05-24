@@ -648,7 +648,7 @@ class TestActiveSet:
 
 
 # ---------------------------------------------------------------------------
-# Device activation + thread-safe cache leases
+# Device activation + thread-safe cache bindings
 # ---------------------------------------------------------------------------
 
 
@@ -1016,7 +1016,7 @@ class TestCacheBytesValidation:
         assert _is_cached(cache, "bad")
         assert cache.info("bad").active_count == 0
 
-    def test_value_failure_before_activate_keeps_store_inactive(self) -> None:
+    def test_value_failure_after_activate_releases_binding(self) -> None:
         class ValueErrorBinding(FakeBinding):
             @property
             def value(self) -> nn.Module:
@@ -1038,7 +1038,7 @@ class TestCacheBytesValidation:
                 pass
         assert _is_cached(cache, "bad")
         assert cache.info("bad").active_count == 0
-        assert FakeBinding.instances[0].events == []
+        assert FakeBinding.instances[0].events == ["activate", "deactivate"]
 
 
 # ---------------------------------------------------------------------------
@@ -1192,125 +1192,6 @@ class TestHostEmptyCache:
             pass
         # Should not propagate the callback failure.
         cache.evict("a")
-
-
-# ---------------------------------------------------------------------------
-# configure hook
-# ---------------------------------------------------------------------------
-
-
-class TestConfigure:
-    def test_runs_after_build_before_activate(self) -> None:
-        # Hook fires while the binding is still deactivated. Capture the
-        # state observed by the hook.
-        observed: list[str] = []
-
-        def configure(binding):
-            observed.append(f"configure(active={binding._active})")
-
-        cache = ModelCache(200)
-        with cache.use(_spec("a", 100), configure=configure):
-            pass
-        s = FakeBinding.instances[0]
-        assert observed == ["configure(active=False)"]
-        assert s.events == ["activate", "deactivate"]
-
-    def test_runs_on_cache_hit_too(self) -> None:
-        # First use builds + activates; second use hits the cache. The hook
-        # must run on both paths (anything keyed off activation state needs
-        # per-acquire reconfiguration).
-        calls = {"n": 0}
-
-        def configure(strategy):
-            calls["n"] += 1
-
-        cache = ModelCache(200)
-        cache.register(_spec("a", 100))
-        with cache.use("a", configure=configure):
-            pass
-        with cache.use("a", configure=configure):
-            pass
-        assert calls["n"] == 2
-
-    def test_failure_discards_binding_only(self) -> None:
-        # A raising hook never publishes the binding; the store remains cached.
-        def configure(binding):
-            raise RuntimeError("config boom")
-
-        cache = ModelCache(200)
-        cache.register(_spec("a", 100))
-        with pytest.raises(RuntimeError, match="config boom"):
-            with cache.use("a", configure=configure):
-                pass
-        assert _is_cached(cache, "a")
-        assert cache.used_cache_bytes == 100
-        assert _is_registered(cache, "a")
-        # Binding must NOT have been activated (hook ran before activate
-        # and raised, so activate never fired).
-        s = FakeBinding.instances[0]
-        assert "activate" not in s.events
-        assert cache.info("a").active_count == 0
-
-    def test_nested_same_key_runs_configure_for_each_binding(self) -> None:
-        calls = {"n": 0}
-
-        def configure(binding):
-            calls["n"] += 1
-
-        cache = ModelCache(200)
-        cache.register(_spec("a", 100))
-        with cache.use("a", configure=configure):
-            with cache.use("a", configure=configure):
-                pass
-        assert calls["n"] == 2
-
-    def test_same_key_reentry_from_inside_hook_works(self) -> None:
-        cache = ModelCache(200)
-        cache.register(_spec("a", 100))
-
-        def reenter_same(binding):
-            with cache.use("a"):
-                pass
-
-        with cache.use("a", configure=reenter_same):
-            pass
-        assert _is_cached(cache, "a")
-        assert cache.used_cache_bytes == 100
-        assert len(FakeBinding.instances) == 2
-
-    def test_different_key_reentry_from_inside_hook_works(self) -> None:
-        # Re-entering the cache for a DIFFERENT key during the hook is
-        # legitimate: different entries don't share active state.
-        cache = ModelCache(300)
-        cache.register(_spec("a", 100))
-        cache.register(_spec("b", 100))
-
-        captured: list[str] = []
-
-        def use_other(binding):
-            with cache.use("b") as m:
-                captured.append(type(m).__name__)
-
-        with cache.use("a", configure=use_other) as m_a:
-            assert m_a is not None
-        # Both keys remain cached and inactive after the outer lease exits.
-        assert _is_cached(cache, "a")
-        assert _is_cached(cache, "b")
-        assert captured == ["Identity"]
-
-    def test_configure_failure_clears_binding_so_retry_works(self) -> None:
-        cache = ModelCache(200)
-        cache.register(_spec("a", 100))
-
-        def boom(binding):
-            raise RuntimeError("first attempt fails")
-
-        with pytest.raises(RuntimeError, match="first attempt fails"):
-            with cache.use("a", configure=boom):
-                pass
-
-        with cache.use("a") as m:
-            assert m is not None
 
 
 # ---------------------------------------------------------------------------
