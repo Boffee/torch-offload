@@ -325,8 +325,9 @@ class ModelOffloader:
 
     def set_loras(
         self,
-        loras: Sequence[tuple[LoRA, float]],
+        loras: Sequence[LoRA],
         *,
+        strengths: Sequence[float] | None = None,
         mode: LoraMode = "merge",
     ) -> None:
         """Record LoRAs for the next activation cycle.
@@ -368,7 +369,8 @@ class ModelOffloader:
         the layer's compute dtype (or under autocast). Mixed-dtype
         inputs without autocast will error in the hook's matmul.
 
-        Pass an empty sequence to clear all LoRAs (base-only forward).
+        ``strengths`` defaults to ``1.0`` for each LoRA. Pass an empty
+        LoRA sequence to clear all LoRAs (base-only forward).
         """
         if self._teardown_stack is not None:
             raise RuntimeError(
@@ -379,9 +381,22 @@ class ModelOffloader:
             raise ValueError(
                 f"set_loras mode must be 'merge' or 'routed', got {mode!r}"
             )
-        configured_loras = list(loras)
-        self._loras = configured_loras
-        self._lora_mode = mode if configured_loras else "merge"
+        lora_list = list(loras)
+        if strengths is None:
+            strength_list = [1.0] * len(lora_list)
+        else:
+            if len(strengths) != len(lora_list):
+                raise ValueError(
+                    "strengths must have the same length as loras"
+                )
+            strength_list = [float(strength) for strength in strengths]
+        for lora in lora_list:
+            if not isinstance(lora, LoRA):
+                raise TypeError(
+                    "ModelOffloader.set_loras() expects LoRA instances"
+                )
+        self._loras = list(zip(lora_list, strength_list, strict=True))
+        self._lora_mode = mode if lora_list else "merge"
 
     def _group_lora_factors_by_param_name(
         self, loras: Sequence[tuple[LoRA, float]],

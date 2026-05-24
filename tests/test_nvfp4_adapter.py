@@ -288,7 +288,7 @@ class TestNvfp4Adapter:
                 "blocks.0.lora_B.weight": torch.randn(128, 4),
             }
         )
-        offloader.set_loras([(lora, 0.25)], mode="routed")
+        offloader.set_loras([lora], strengths=[0.25], mode="routed")
 
         try:
             x = torch.randn(128, 128, dtype=torch.bfloat16, device="cuda")

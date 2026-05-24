@@ -11,7 +11,6 @@ CUDA-only tests gate on availability.
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from typing import cast
 
 import pytest
 import torch
@@ -24,13 +23,14 @@ from torch_offload import (
     ModelCache,
     ModelOffloader,
     ModelOffloaderStore,
+    ModelSpec,
     PinnedComponent,
-    ResourceSpec,
+    LoRASpec,
     StreamedComponent,
     merge_lora,
 )
 from torch_offload.lora import KeyTransformT
-from torch_offload.model_offloader import _routed_factor_dtype
+from torch_offload.model_offloader import LoraMode, _routed_factor_dtype
 from torch_offload.module_names import canonical_param_name
 from torch_offload.protocols import ResourceBinding, ResourceStore
 
@@ -163,6 +163,19 @@ def _make_lora(
     if key_transform is ...:  # type: ignore[comparison-overlap]
         return LoRA(state_dict=sd)
     return LoRA(state_dict=sd, key_transform=key_transform)
+
+
+def _set_loras(
+    strategy: ModelOffloader,
+    loras: Sequence[tuple[LoRA, float]],
+    *,
+    mode: LoraMode = "merge",
+) -> None:
+    strategy.set_loras(
+        [lora for lora, _strength in loras],
+        strengths=[strength for _lora, strength in loras],
+        mode=mode,
+    )
 
 
 def _expected_merged_weight(
@@ -331,6 +344,33 @@ class TestLoRAConstruction:
 
 
 class TestSetLorasValidation:
+    def test_set_loras_defaults_strength_to_one(self) -> None:
+        m = _make_bf16_model()
+        s = _make_strategy(m)
+        lora = _make_lora(4, 16)
+        s.set_loras([lora])
+        assert s._loras == [(lora, 1.0)]
+
+    def test_set_loras_accepts_strengths(self) -> None:
+        m = _make_bf16_model()
+        s = _make_strategy(m)
+        lora = _make_lora(4, 16)
+        s.set_loras([lora], strengths=[0.25], mode="routed")
+        assert s._loras == [(lora, 0.25)]
+        assert s._lora_mode == "routed"
+
+    def test_set_loras_rejects_strength_length_mismatch(self) -> None:
+        m = _make_bf16_model()
+        s = _make_strategy(m)
+        with pytest.raises(ValueError, match="same length"):
+            s.set_loras([_make_lora(4, 16)], strengths=[])
+
+    def test_set_loras_rejects_tuple_pairs(self) -> None:
+        m = _make_bf16_model()
+        s = _make_strategy(m)
+        with pytest.raises(TypeError, match="LoRA instances"):
+            s.set_loras([(_make_lora(4, 16), 1.0)])  # type: ignore[list-item]
+
     def test_target_shape_mismatch_is_deferred_until_apply(self) -> None:
         m = _make_bf16_model()
         s = _make_strategy(m)
@@ -338,7 +378,7 @@ class TestSetLorasValidation:
             "transformer_blocks.0.attn.lora_A.weight": torch.randn(4, 16),
             "transformer_blocks.0.attn.lora_B.weight": torch.randn(8, 4),
         }
-        s.set_loras([(LoRA(state_dict=sd), 1.0)])
+        _set_loras(s, [(LoRA(state_dict=sd), 1.0)])
         _activate_loras_for_test(s)
         assert _has_post_copy_hook(s, "transformer_blocks.0.attn.weight")
 
@@ -347,7 +387,7 @@ class TestSetLorasValidation:
         for p in m.parameters():
             p.requires_grad = False
         s = _make_strategy(m)
-        s.set_loras([(_make_lora(4, 16), 1.0)])
+        _set_loras(s, [(_make_lora(4, 16), 1.0)])
         assert not _has_post_copy_hook(s, "transformer_blocks.0.attn.weight")
         _activate_loras_for_test(s)
         assert _has_post_copy_hook(s, "transformer_blocks.0.attn.weight")
@@ -359,7 +399,7 @@ class TestSetLorasValidation:
             "embed.lora_A.weight": torch.randn(4, 16),
             "embed.lora_B.weight": torch.randn(16, 4),
         }
-        s.set_loras([(LoRA(state_dict=sd), 1.0)])
+        _set_loras(s, [(LoRA(state_dict=sd), 1.0)])
         _activate_loras_for_test(s)
         assert _has_post_copy_hook(s, "embed.weight")
 
@@ -370,7 +410,7 @@ class TestSetLorasValidation:
             "head.lora_A.weight": torch.randn(4, 16),
             "head.lora_B.weight": torch.randn(16, 4),
         }
-        s.set_loras([(LoRA(state_dict=sd), 1.0)], mode="merge")
+        _set_loras(s, [(LoRA(state_dict=sd), 1.0)], mode="merge")
         _activate_loras_for_test(s)
         assert _has_post_copy_hook(s, "head.weight")
         assert _has_post_copy_hook(s, "embed.weight")
@@ -384,7 +424,7 @@ class TestSetLorasValidation:
             "head.lora_A.weight": torch.randn(4, 16),
             "head.lora_B.weight": torch.randn(16, 4),
         }
-        s.set_loras([(LoRA(state_dict=sd), 1.0)], mode="merge")
+        _set_loras(s, [(LoRA(state_dict=sd), 1.0)], mode="merge")
         with pytest.raises(RuntimeError, match="shared LoRA targets"):
             _activate_loras_for_test(s)
         assert not _has_post_copy_hook(s, "embed.weight")
@@ -412,7 +452,7 @@ class TestSetLorasValidation:
             "transformer_blocks.0.b.lora_A.weight": torch.randn(4, 16),
             "transformer_blocks.0.b.lora_B.weight": torch.randn(16, 4),
         }
-        s.set_loras([(LoRA(state_dict=sd), 1.0)], mode="merge")
+        _set_loras(s, [(LoRA(state_dict=sd), 1.0)], mode="merge")
         _activate_loras_for_test(s)
         assert _has_post_copy_hook(s, "transformer_blocks.0.b.weight")
         assert _has_post_copy_hook(s, "transformer_blocks.0.a.weight")
@@ -421,7 +461,7 @@ class TestSetLorasValidation:
         m = _make_bf16_model()
         s = _make_strategy(m)
         lora = _make_lora(4, 16, prefix="diffusion_model.")
-        s.set_loras([(lora, 1.0)])
+        _set_loras(s, [(lora, 1.0)])
         _activate_loras_for_test(s)
         assert _has_post_copy_hook(s, "transformer_blocks.0.attn.weight")
 
@@ -429,7 +469,7 @@ class TestSetLorasValidation:
         m = _make_bf16_model()
         s = _make_strategy(m)
         lora = _make_lora(4, 16, key_transform=None)
-        s.set_loras([(lora, 1.0)])
+        _set_loras(s, [(lora, 1.0)])
         _activate_loras_for_test(s)
         assert _has_post_copy_hook(s, "transformer_blocks.0.attn.weight")
 
@@ -437,7 +477,7 @@ class TestSetLorasValidation:
         m = _make_bf16_model()
         s = _make_strategy(m)
         lora = _make_lora(4, 16, prefix="diffusion_model.", key_transform=None)
-        s.set_loras([(lora, 1.0)])
+        _set_loras(s, [(lora, 1.0)])
         with pytest.raises(ValueError, match="LoRA target .* is not managed"):
             _activate_loras_for_test(s)
         assert not _has_post_copy_hook(s, "transformer_blocks.0.attn.weight")
@@ -449,7 +489,7 @@ class TestSetLorasValidation:
             "transformer_blocks.0.attn.base_layer.lora_A.weight": torch.randn(4, 16),
             "transformer_blocks.0.attn.base_layer.lora_B.weight": torch.randn(16, 4),
         }
-        s.set_loras([(LoRA(state_dict=sd, key_transform=None), 1.0)])
+        _set_loras(s, [(LoRA(state_dict=sd, key_transform=None), 1.0)])
 
         with pytest.raises(ValueError, match="LoRA target .* is not managed"):
             _activate_loras_for_test(s)
@@ -461,7 +501,7 @@ class TestSetLorasValidation:
     def test_merge_mode_activation_rejects_cpu(self) -> None:
         m = _make_bf16_model()
         s = _make_strategy(m)
-        s.set_loras([(_make_lora(4, 16), 1.0)], mode="merge")
+        _set_loras(s, [(_make_lora(4, 16), 1.0)], mode="merge")
         with pytest.raises(ValueError, match="merge mode requires CUDA"):
             s.activate("cpu")
 
@@ -469,18 +509,18 @@ class TestSetLorasValidation:
     def test_set_loras_raises_while_active(self) -> None:
         m = _make_bf16_model()
         s = _make_strategy(m)
-        s.set_loras([(_make_lora(4, 16), 1.0)])
+        _set_loras(s, [(_make_lora(4, 16), 1.0)])
         s.activate("cuda")
         try:
             with pytest.raises(RuntimeError, match="inactive"):
-                s.set_loras([])
+                _set_loras(s, [])
         finally:
             s.deactivate()
 
     def test_clear_loras_clears_previous_merge_hooks(self) -> None:
         m = _make_bf16_model()
         s = _make_strategy(m)
-        s.set_loras([(_make_lora(4, 16, rank=4), 1.0)])
+        _set_loras(s, [(_make_lora(4, 16, rank=4), 1.0)])
         _activate_loras_for_test(s)
         assert _has_post_copy_hook(s, "transformer_blocks.0.attn.weight")
         s._clear_loras()
@@ -504,12 +544,12 @@ class TestSetLorasValidation:
             "embed.lora_A.weight": torch.randn(4, 16),
             "embed.lora_B.weight": torch.randn(16, 4),
         }
-        s.set_loras([(LoRA(state_dict=sd), 1.0)], mode="merge")
+        _set_loras(s, [(LoRA(state_dict=sd), 1.0)], mode="merge")
         assert _activate_loras_for_test(s) == 1
         assert _has_post_copy_hook(s, "embed.weight")
 
         # routed mode must still accept it.
-        s.set_loras([(LoRA(state_dict=sd), 1.0)], mode="routed")
+        _set_loras(s, [(LoRA(state_dict=sd), 1.0)], mode="routed")
         route_count = _activate_loras_for_test(s)
         assert route_count == 1
 
@@ -524,7 +564,7 @@ class TestSetLorasValidation:
             "embed.lora_A.weight": torch.randn(4, 16),
             "embed.lora_B.weight": torch.randn(16, 4),
         }
-        s.set_loras([(LoRA(state_dict=sd), 1.0)], mode="merge")
+        _set_loras(s, [(LoRA(state_dict=sd), 1.0)], mode="merge")
         _activate_loras_for_test(s)
         assert _has_post_copy_hook(s, "embed.weight")
 
@@ -539,7 +579,7 @@ class TestSetLorasValidation:
         m = _make_bf16_model()
         s = _make_strategy(m)
         for mode in ("merge", "routed"):
-            s.set_loras([(_make_lora(4, 16), 1.0)], mode=mode)
+            _set_loras(s, [(_make_lora(4, 16), 1.0)], mode=mode)
             assert not _has_post_copy_hook(s, "transformer_blocks.0.attn.weight")
             assert len(s._loras) == 1
             assert s._lora_mode == mode
@@ -550,7 +590,7 @@ class TestSetLorasValidation:
             p.requires_grad = False
         loras = [(_make_lora(2, 16, seed=9), 0.75)]
         s = _make_strategy(m)
-        s.set_loras(loras, mode="routed")
+        _set_loras(s, loras, mode="routed")
 
         x = torch.randn(2, 16)
         s.activate("cpu")
@@ -575,7 +615,7 @@ class TestLifecycle:
     def test_activate_runs_components(self) -> None:
         m = _make_bf16_model()
         s = _make_strategy(m)
-        s.set_loras([(_make_lora(4, 16), 1.0)])
+        _set_loras(s, [(_make_lora(4, 16), 1.0)])
         try:
             s.activate("cuda")
             assert m.embed.weight.is_cuda
@@ -587,7 +627,7 @@ class TestLifecycle:
     def test_deactivate_returns_to_pinned(self) -> None:
         m = _make_bf16_model()
         s = _make_strategy(m)
-        s.set_loras([(_make_lora(4, 16), 1.0)])
+        _set_loras(s, [(_make_lora(4, 16), 1.0)])
         s.activate("cuda")
         s.deactivate()
         assert m.embed.weight.is_pinned()
@@ -597,10 +637,10 @@ class TestLifecycle:
     def test_reactivation_with_different_loras(self) -> None:
         m = _make_bf16_model()
         s = _make_strategy(m)
-        s.set_loras([(_make_lora(4, 16, seed=1), 1.0)])
+        _set_loras(s, [(_make_lora(4, 16, seed=1), 1.0)])
         s.activate("cuda")
         s.deactivate()
-        s.set_loras([(_make_lora(4, 16, seed=2), 1.0)])
+        _set_loras(s, [(_make_lora(4, 16, seed=2), 1.0)])
         s.activate("cuda")
         s.deactivate()
         assert m.embed.weight.is_pinned()
@@ -620,11 +660,11 @@ class TestLifecycle:
             16, 4, generator=g, dtype=torch.float32,
         )
         s = _make_strategy(m)
-        s.set_loras([(LoRA(state_dict=sd), 1.0)], mode="merge")
+        _set_loras(s, [(LoRA(state_dict=sd), 1.0)], mode="merge")
         s.activate("cuda")
         s.deactivate()
 
-        s.set_loras([])
+        _set_loras(s, [])
         s.activate("cuda")
         try:
             torch.cuda.synchronize()
@@ -681,7 +721,7 @@ class TestMergeCorrectness:
             (_make_lora(num_blocks=4, dim=16, seed=20), 0.25),
         ]
         s = _make_strategy(m)
-        s.set_loras(loras)
+        _set_loras(s, loras)
         s.activate("cuda")
         try:
             x = torch.randn(2, 16, dtype=torch.bfloat16, device="cuda")
@@ -717,7 +757,7 @@ class TestMergeCorrectness:
 
         lora = _make_lora(4, 16, seed=42, prefix="diffusion_model.")
         s = _make_strategy(m)
-        s.set_loras([(lora, 0.7)])
+        _set_loras(s, [(lora, 0.7)])
         s.activate("cuda")
         try:
             x = torch.randn(2, 16, dtype=torch.bfloat16, device="cuda")
@@ -750,7 +790,7 @@ class TestMergeCorrectness:
         }
         lora = LoRA(state_dict=sd)
         s = _make_strategy(m)
-        s.set_loras([(lora, 0.5)])
+        _set_loras(s, [(lora, 0.5)])
         s.activate("cuda")
         try:
             a, b = lora.targets["embed.weight"]
@@ -802,7 +842,7 @@ class TestMergeCorrectness:
 
         lora = _make_lora(num_blocks=4, dim=16, seed=42)
         s = _make_strategy(m)
-        s.set_loras([(lora, 0.7)])
+        _set_loras(s, [(lora, 0.7)])
         s.activate("cuda")
         try:
             x = torch.randn(2, 16, dtype=torch.bfloat16, device="cuda")
@@ -924,7 +964,7 @@ class TestLoRATransform:
         ).round().clamp(-128, 127).to(torch.int8)
 
         s = _make_strategy(m, blocks_to_swap=0)
-        s.set_loras([(lora, 0.5)], mode="merge")
+        _set_loras(s, [(lora, 0.5)], mode="merge")
         s.activate("cuda")
         try:
             merged_qt = m.embed.weight.data
@@ -969,7 +1009,7 @@ class TestLoRATransform:
         ).round().clamp(-128, 127).to(torch.int8)
 
         s = _make_strategy(m, blocks_to_swap=1)
-        s.set_loras([(lora, 0.5)], mode="merge")
+        _set_loras(s, [(lora, 0.5)], mode="merge")
         s.activate("cuda")
         try:
             streamer = s._streamed_components[0]
@@ -1133,7 +1173,7 @@ class TestRoutedMode:
         ]
 
         s = _make_strategy(m)
-        s.set_loras(loras, mode="routed")
+        _set_loras(s, loras, mode="routed")
         s.activate("cuda")
         try:
             x = torch.randn(2, 16, dtype=torch.bfloat16, device="cuda")
@@ -1162,7 +1202,7 @@ class TestRoutedMode:
         # subsequent base-only forward sees the unaugmented model.
         m = _make_bf16_model(num_blocks=3, dim=16)
         s = _make_strategy(m)
-        s.set_loras([(_make_lora(3, 16, seed=7), 1.0)], mode="routed")
+        _set_loras(s, [(_make_lora(3, 16, seed=7), 1.0)], mode="routed")
         s.activate("cuda")
         x = torch.randn(2, 16, dtype=torch.bfloat16, device="cuda")
         with_lora = m(x).detach().clone()
@@ -1171,7 +1211,7 @@ class TestRoutedMode:
 
         # Re-activate without LoRAs; output should differ from with_lora
         # (the hooks should be gone).
-        s.set_loras([], mode="routed")
+        _set_loras(s, [], mode="routed")
         s.activate("cuda")
         try:
             base_only = m(x)
@@ -1196,7 +1236,7 @@ class TestRoutedMode:
         loras = [(lora_r4, 0.6), (lora_r8, 0.3)]
 
         s = _make_strategy(m)
-        s.set_loras(loras, mode="routed")
+        _set_loras(s, loras, mode="routed")
         s.activate("cuda")
         try:
             x = torch.randn(2, 16, dtype=torch.bfloat16, device="cuda")
@@ -1259,11 +1299,11 @@ class TestRoutedMode:
         )
         # Build a LoRA targeting attn.weight (LinearLike, not nn.Linear).
         lora = _make_lora(num_blocks=2, dim=16, seed=3)
-        s.set_loras([(lora, 1.0)], mode="routed")
+        _set_loras(s, [(lora, 1.0)], mode="routed")
         with pytest.raises(ValueError, match=r"Routed LoRA mode requires nn\.Linear"):
             _activate_loras_for_test(s)
         # Merge mode should still work — it doesn't care about parent type.
-        s.set_loras([(lora, 1.0)], mode="merge")
+        _set_loras(s, [(lora, 1.0)], mode="merge")
         _activate_loras_for_test(s)
 
     def test_routed_partial_failure_leaves_no_hooks(self) -> None:
@@ -1316,7 +1356,7 @@ class TestRoutedMode:
             layers_attr="transformer_blocks", blocks_to_swap=1,
         )
         lora = _make_lora(num_blocks=2, dim=16, seed=99)
-        s.set_loras([(lora, 1.0)], mode="routed")
+        _set_loras(s, [(lora, 1.0)], mode="routed")
         with pytest.raises(ValueError, match=r"Routed LoRA mode requires nn\.Linear"):
             _activate_loras_for_test(s)
 
@@ -1328,7 +1368,7 @@ class TestRoutedMode:
         loras = [(_make_lora(num_blocks=2, dim=16, seed=33), 0.7)]
 
         s = _make_strategy(m)
-        s.set_loras(loras, mode="routed")
+        _set_loras(s, loras, mode="routed")
         s.activate("cuda")
         try:
             x = torch.randn(2, 16, dtype=torch.bfloat16, device="cuda")
@@ -1357,7 +1397,7 @@ class TestRoutedMode:
             f"{target}.lora_B.weight": torch.randn(16, 4),
         }
         lora = LoRA(state_dict=sd, key_transform=None)
-        s.set_loras([(lora, 1.0)], mode="routed")
+        _set_loras(s, [(lora, 1.0)], mode="routed")
         targets = s._group_lora_factors_by_param_name(s._loras)
         s._register_lora_hooks(torch.device("cpu"), targets)
         try:
@@ -1368,7 +1408,7 @@ class TestRoutedMode:
 
         # Merge mode also matches by name; it mutates the copied backing,
         # so the normal shared-storage effect is preserved.
-        s.set_loras([(lora, 1.0)], mode="merge")
+        _set_loras(s, [(lora, 1.0)], mode="merge")
         _activate_loras_for_test(s)
 
     @CUDA
@@ -1410,7 +1450,7 @@ class TestRoutedMode:
             m,
             layers_attr="transformer_blocks", blocks_to_swap=1,
         )
-        s.set_loras(loras, mode="routed")
+        _set_loras(s, loras, mode="routed")
         s.activate("cuda")
         try:
             x = torch.randn(2, 16, dtype=torch.bfloat16, device="cuda")
@@ -1489,7 +1529,7 @@ class TestDeactivateCleanupInvariants:
     ) -> None:
         m = _make_bf16_model()
         s = _make_strategy(m)
-        s.set_loras([(_make_lora(4, 16), 1.0)])
+        _set_loras(s, [(_make_lora(4, 16), 1.0)])
 
         def streamer_boom() -> None:
             raise RuntimeError("streamer cleanup failed")
@@ -1527,11 +1567,10 @@ class TestLoRAResource:
     def test_lora_through_model_cache(self) -> None:
         sd = _make_lora_sd(num_blocks=2, dim=8, rank=2)
         cache = ModelCache(10**9)
-        spec = ResourceSpec(
+        spec = LoRASpec(
             key="lora:test",
             estimated_cache_bytes=1000,
-            store_factory=lambda: LoRA(sd),
-            bind=lambda store: cast(LoRA, store).bind(),
+            factory=lambda: sd,
         )
         with cache.use(spec) as lora:
             assert isinstance(lora, LoRA)
@@ -1539,3 +1578,106 @@ class TestLoRAResource:
             assert len(lora.targets) == 2
         with cache.use("lora:test") as lora2:
             assert lora2 is lora
+
+    def test_model_cache_use_applies_lora_specs_and_holds_lora_bindings(
+        self,
+    ) -> None:
+        sd = _make_lora_sd(num_blocks=2, dim=8, rank=2, seed=17)
+        expected_lora = LoRA(sd)
+        factory_calls = {"lora": 0}
+
+        def lora_factory() -> dict[str, torch.Tensor]:
+            factory_calls["lora"] += 1
+            return sd
+
+        cache = ModelCache(10**9)
+        lora_spec = LoRASpec(
+            key="lora:style",
+            estimated_cache_bytes=1000,
+            factory=lora_factory,
+        )
+        model_spec = ModelSpec(
+            key="model",
+            estimated_cache_bytes=10**6,
+            factory=lambda: _make_bf16_model(num_blocks=2, dim=8).to(
+                torch.float32
+            ),
+        )
+
+        x = torch.randn(2, 8)
+        with cache.use(
+            model_spec,
+            device="cpu",
+            loras=[lora_spec],
+            lora_strengths=[0.5],
+            lora_mode="routed",
+        ) as model:
+            assert cache.info("lora:style").active_count == 1
+            assert cache.info("model").active_count == 1
+            actual = model(x)
+            expected = _expected_routed_output(
+                model, x, [(expected_lora, 0.5)]
+            )
+            assert torch.allclose(actual, expected, rtol=1e-5, atol=1e-5)
+
+        assert cache.info("lora:style").active_count == 0
+        assert cache.info("model").active_count == 0
+        assert factory_calls["lora"] == 1
+
+        with cache.use(
+            "model",
+            device="cpu",
+            loras=["lora:style"],
+            lora_mode="routed",
+        ):
+            assert cache.info("lora:style").active_count == 1
+        assert factory_calls["lora"] == 1
+
+    def test_model_cache_lora_strength_length_mismatch(self) -> None:
+        cache = ModelCache(10**9)
+        lora_spec = LoRASpec(
+            key="lora:style",
+            estimated_cache_bytes=1000,
+            factory=lambda: _make_lora_sd(num_blocks=2, dim=8, rank=2),
+        )
+        model_spec = ModelSpec(
+            key="model",
+            estimated_cache_bytes=10**6,
+            factory=lambda: _make_bf16_model(num_blocks=2, dim=8).to(
+                torch.float32
+            ),
+        )
+
+        with pytest.raises(ValueError, match="same length"):
+            with cache.use(
+                model_spec,
+                device="cpu",
+                loras=[lora_spec],
+                lora_strengths=[],
+                lora_mode="routed",
+            ):
+                pass
+
+    def test_model_cache_loras_require_model_offloader_binding(self) -> None:
+        cache = ModelCache(10**9)
+        lora_spec = LoRASpec(
+            key="lora:style",
+            estimated_cache_bytes=1000,
+            factory=lambda: _make_lora_sd(num_blocks=2, dim=8, rank=2),
+        )
+        non_model_spec = LoRASpec(
+            key="not-a-model",
+            estimated_cache_bytes=1000,
+            factory=lambda: _make_lora_sd(num_blocks=2, dim=8, rank=2),
+        )
+
+        with pytest.raises(TypeError, match="ModelOffloader"):
+            with cache.use(
+                non_model_spec,
+                loras=[lora_spec],
+                lora_mode="routed",
+            ):
+                pass
+
+        assert cache.info("lora:style").active_count == 0
+        assert cache.info("not-a-model").active_count == 0

@@ -190,10 +190,9 @@ offload = store.bind(model)
 device = torch.device("cuda")
 
 # Request LoRAs for the next activation (must be called while deactivated)
-offload.set_loras([
-    (LoRA(state_dict=load_file("lora_a.safetensors")), 0.8),
-    (LoRA(state_dict=load_file("lora_b.safetensors")), 0.5),
-])
+lora_a = LoRA(state_dict=load_file("lora_a.safetensors"))
+lora_b = LoRA(state_dict=load_file("lora_b.safetensors"))
+offload.set_loras([lora_a, lora_b], strengths=[0.8, 0.5])
 
 with offload.use(device) as gpu_model:
     output = gpu_model(input_tensor)
@@ -388,6 +387,29 @@ spec = ModelSpec(key="vae", estimated_cache_bytes=500*1024**2,
                  factory=build_vae)
 with cache.use(spec, device=device) as vae:  # registers if missing, then uses
     decoded = vae.decode(latent)
+```
+
+LoRA adapters can be cached as resources and applied to a model use
+before activation:
+
+```python
+from torch_offload import LoRASpec
+from safetensors.torch import load_file
+
+lora = LoRASpec(
+    key="style-lora",
+    estimated_cache_bytes=512 * 1024**2,
+    factory=lambda: load_file("style.safetensors"),
+)
+
+with cache.use(
+    "diffusion_model",
+    device=device,
+    loras=[lora],
+    lora_strengths=[0.8],
+    lora_mode="routed",
+) as t:
+    latent = t(...)
 ```
 
 > **Anti-pattern:** the factory should build a fresh model each call,

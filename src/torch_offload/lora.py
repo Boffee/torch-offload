@@ -77,7 +77,7 @@ class LoRA:
     :class:`LoRATransform` during the merge-mode post-copy hook.
 
     Strength is extrinsic — specify it when passing the adapter to
-    :meth:`ModelOffloader.set_loras` as a ``(LoRA, strength)`` tuple.
+    :meth:`ModelOffloader.set_loras` via the ``strengths`` argument.
 
     ``key_transform`` is applied to state-dict keys before pairing.
     Defaults to stripping the ``diffusion_model.`` prefix common in

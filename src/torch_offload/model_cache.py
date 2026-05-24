@@ -53,13 +53,14 @@ import threading
 from collections import OrderedDict
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Generic, Protocol, TypeVar, cast, overload
+from typing import Any, Generic, Protocol, TypeAlias, TypeVar, cast, overload
 
 import torch
 from torch import nn
 
 from ._devices import canonical_device
-from .model_offloader import ModelOffloaderStore
+from .lora import KeyTransformT, LoRA, default_key_transform
+from .model_offloader import LoraMode, ModelOffloader, ModelOffloaderStore
 from .protocols import ResourceBinding, ResourceStore
 
 logger = logging.getLogger(__name__)
@@ -161,6 +162,36 @@ class ModelSpec(ResourceSpec[nn.Module]):
             bind=bind,
             label=label,
         )
+
+
+class LoRASpec(ResourceSpec[LoRA]):
+    """LoRA-specific cache spec built from a state-dict factory."""
+
+    def __init__(
+        self,
+        *,
+        key: str,
+        estimated_cache_bytes: int,
+        factory: Callable[[], dict[str, torch.Tensor]],
+        key_transform: KeyTransformT = default_key_transform,
+        label: str | None = None,
+    ) -> None:
+        def store_factory() -> ResourceStore:
+            return LoRA(factory(), key_transform=key_transform)
+
+        def bind(store: ResourceStore) -> ResourceBinding[LoRA]:
+            return cast(LoRA, store).bind()
+
+        super().__init__(
+            key=key,
+            estimated_cache_bytes=estimated_cache_bytes,
+            store_factory=store_factory,
+            bind=bind,
+            label=label,
+        )
+
+
+LoRARef: TypeAlias = str | LoRASpec
 
 
 @dataclass(frozen=True, slots=True)
@@ -467,6 +498,9 @@ class ModelCache:
         model: ResourceSpec[T],
         *,
         device: torch.device | str | None = None,
+        loras: Sequence[LoRARef] | None = None,
+        lora_strengths: Sequence[float] | None = None,
+        lora_mode: LoraMode = "merge",
     ) -> contextlib.AbstractContextManager[T]: ...
     @overload
     def use(
@@ -474,6 +508,9 @@ class ModelCache:
         model: str,
         *,
         device: torch.device | str | None = None,
+        loras: Sequence[LoRARef] | None = None,
+        lora_strengths: Sequence[float] | None = None,
+        lora_mode: LoraMode = "merge",
     ) -> contextlib.AbstractContextManager[Any]: ...
 
     @contextlib.contextmanager
@@ -482,6 +519,9 @@ class ModelCache:
         model: str | ResourceSpec,
         *,
         device: torch.device | str | None = None,
+        loras: Sequence[LoRARef] | None = None,
+        lora_strengths: Sequence[float] | None = None,
+        lora_mode: LoraMode = "merge",
     ) -> Iterator[Any]:
         """Acquire an active binding on a cached resource.
 
@@ -498,15 +538,36 @@ class ModelCache:
         concurrent same-key bindings. Different keys and supported
         multiple bindings for the same key may be active on the same
         device at the same time; caller code owns GPU memory planning.
+
+        ``loras`` optionally selects cached LoRA resources to apply to
+        a :class:`ModelOffloader` binding before activation.
+        ``lora_strengths`` defaults to ``1.0`` per LoRA.
         """
+        lora_entries: list[_Entry] = []
+        lora_bindings: list[ResourceBinding[Any]] = []
         with self._lock:
+            for lora in self._lora_refs(loras):
+                lora_entry, lora_binding = self._prepare_binding(lora)
+                lora_entries.append(lora_entry)
+                lora_bindings.append(lora_binding)
             entry, binding = self._prepare_binding(model)
+            self._set_loras(
+                binding,
+                lora_bindings,
+                strengths=lora_strengths,
+                mode=lora_mode,
+            )
             self._activate_binding(entry, binding, device=device)
+            for lora_entry, lora_binding in zip(
+                lora_entries, lora_bindings, strict=True,
+            ):
+                self._activate_binding(lora_entry, lora_binding)
         try:
             yield binding.value
         finally:
             with self._lock:
                 self._release(entry, binding)
+                self._release_bindings(lora_entries, lora_bindings)
 
     def evict(self, key: str) -> None:
         """Manually evict one inactive cached entry. Raises
@@ -585,6 +646,36 @@ class ModelCache:
         self._ensure_store(entry)
         return entry, self._create_binding(entry)
 
+    @staticmethod
+    def _lora_refs(loras: Sequence[LoRARef] | None) -> Sequence[LoRARef]:
+        if loras is None:
+            return ()
+        if isinstance(loras, str):
+            raise TypeError(
+                "loras must be a sequence of LoRA keys/specs, not a string"
+        )
+        return loras
+
+    @staticmethod
+    def _set_loras(
+        model_binding: ResourceBinding[Any],
+        lora_bindings: Sequence[ResourceBinding[Any]],
+        *,
+        strengths: Sequence[float] | None,
+        mode: LoraMode,
+    ) -> None:
+        if not lora_bindings:
+            return
+        if not isinstance(model_binding, ModelOffloader):
+            raise TypeError(
+                "LoRAs can only be applied to ModelOffloader bindings"
+            )
+        model_binding.set_loras(
+            [binding.value for binding in lora_bindings],
+            strengths=strengths,
+            mode=mode,
+        )
+
     def _create_binding(self, entry: _Entry) -> ResourceBinding[Any]:
         """Create an unpublished binding from the cached store."""
         store = entry.store
@@ -609,6 +700,14 @@ class ModelCache:
         binding.activate(active_device)
         entry.bindings.append(binding)
         self._eviction.mark_active(entry.spec.key)
+
+    def _release_bindings(
+        self,
+        entries: Sequence[_Entry],
+        bindings: Sequence[ResourceBinding[Any]],
+    ) -> None:
+        for entry, binding in reversed(list(zip(entries, bindings, strict=True))):
+            self._release(entry, binding)
 
     def _release(self, entry: _Entry, binding: ResourceBinding[Any]) -> None:
         """End a binding use. On the final release, deactivate and mark the
