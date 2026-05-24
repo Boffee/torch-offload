@@ -499,22 +499,8 @@ class ModelCache:
         multiple bindings for the same key may be active on the same
         device at the same time; caller code owns GPU memory planning.
         """
-        spec = model if isinstance(model, ResourceSpec) else None
-        key = spec.key if spec is not None else model
-        assert isinstance(key, str)
-
         with self._lock:
-            entry = self._entries.get(key)
-            if entry is None:
-                if spec is None:
-                    raise ModelNotRegisteredError(
-                        f"{key!r} is not registered; pass a ResourceSpec to use() or call register() first"
-                    )
-                self.register(spec)
-                entry = self._entries[key]
-
-            self._ensure_store(entry)
-            binding = self._create_binding(entry)
+            entry, binding = self._prepare_binding(model)
             self._activate_binding(entry, binding, device=device)
         try:
             yield binding.value
@@ -567,10 +553,37 @@ class ModelCache:
     def _normalize_device(device: torch.device | str | None) -> torch.device | None:
         return canonical_device(device) if device is not None else None
 
+    def _get_entry(self, resource: str | ResourceSpec) -> _Entry:
+        """Resolve a resource key/spec to its cache entry, auto-registering
+        specs that are not known yet."""
+        spec = resource if isinstance(resource, ResourceSpec) else None
+        key = spec.key if spec is not None else resource
+        assert isinstance(key, str)
+
+        entry = self._entries.get(key)
+        if entry is not None:
+            return entry
+        if spec is None:
+            raise ModelNotRegisteredError(
+                f"{key!r} is not registered; pass a ResourceSpec to use() or call register() first"
+            )
+        self.register(spec)
+        return self._entries[key]
+
     def _ensure_store(self, entry: _Entry) -> None:
         """Build and cache the store if this is a cache miss."""
         if entry.store is None:
             self._build_into_entry(entry)
+
+    def _prepare_binding(
+        self,
+        resource: str | ResourceSpec,
+    ) -> tuple[_Entry, ResourceBinding[Any]]:
+        """Resolve a resource, ensure its store exists, and create an
+        unpublished binding."""
+        entry = self._get_entry(resource)
+        self._ensure_store(entry)
+        return entry, self._create_binding(entry)
 
     def _create_binding(self, entry: _Entry) -> ResourceBinding[Any]:
         """Create an unpublished binding from the cached store."""
