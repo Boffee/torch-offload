@@ -513,7 +513,9 @@ class ModelCache:
                 self.register(spec)
                 entry = self._entries[key]
 
-            binding = self._acquire(entry, device=device)
+            self._ensure_store(entry)
+            binding = self._create_binding(entry)
+            self._activate_binding(entry, binding, device=device)
         try:
             yield binding.value
         finally:
@@ -561,22 +563,6 @@ class ModelCache:
     # Binding lifecycle
     # ------------------------------------------------------------------
 
-    def _acquire(
-        self,
-        entry: _Entry,
-        *,
-        device: torch.device | str | None = None,
-    ) -> ResourceBinding[Any]:
-        """Build the store if needed, bind, activate, and publish the
-        active binding."""
-        active_device = self._normalize_device(device)
-        self._ensure_store(entry)
-        binding = self._create_binding(entry)
-        binding.activate(active_device)
-        entry.bindings.append(binding)
-        self._eviction.mark_active(entry.spec.key)
-        return binding
-
     @staticmethod
     def _normalize_device(device: torch.device | str | None) -> torch.device | None:
         return canonical_device(device) if device is not None else None
@@ -596,6 +582,20 @@ class ModelCache:
                 f"resource {entry.spec.key!r}"
             )
         return entry.spec.bind(store)
+
+    def _activate_binding(
+        self,
+        entry: _Entry,
+        binding: ResourceBinding[Any],
+        *,
+        device: torch.device | str | None = None,
+    ) -> None:
+        """Activate and publish a binding after all inactive binding
+        configuration has been applied."""
+        active_device = self._normalize_device(device)
+        binding.activate(active_device)
+        entry.bindings.append(binding)
+        self._eviction.mark_active(entry.spec.key)
 
     def _release(self, entry: _Entry, binding: ResourceBinding[Any]) -> None:
         """End a binding use. On the final release, deactivate and mark the
