@@ -1,6 +1,6 @@
 """Tests for ``torch_offload.model_cache.ModelCache``.
 
-Uses a fake :class:`ModelStrategy` (``FakeStrategy``) to exercise the
+Uses a fake :class:`ModelStrategy` (``FakeBinding``) to exercise the
 cache without needing actual GPU memory or pinning. The fake records
 every lifecycle call so tests can assert ordering and counts.
 """
@@ -10,60 +10,82 @@ from __future__ import annotations
 import queue
 import threading
 from collections.abc import Callable
+from typing import cast
 
 import pytest
 import torch
 from torch import nn
 
 from torch_offload import (
-    ActivationError,
     DuplicateModelKeyError,
     EvictionContext,
     EvictionPolicy,
     EvictionPolicyError,
     ModelCache,
-    ModelCacheError,
     ModelInUseError,
     ModelNotRegisteredError,
-    ModelSpec,
     ModelTooLargeError,
+    ResourceSpec,
 )
-from torch_offload.protocols import ModelStrategy
+from torch_offload.protocols import ModelStrategy, ResourceStore
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
 # ---------------------------------------------------------------------------
-# Fake strategy
+# Fake store/binding
 # ---------------------------------------------------------------------------
 
 
-class FakeStrategy:
-    """In-memory fake satisfying the :class:`ModelStrategy` protocol.
+class FakeStore:
+    """In-memory fake satisfying the :class:`ResourceStore` protocol."""
 
-    Records every lifecycle call. Optionally raises on activate via
-    an injected exception for failure-mode tests.
-    """
-
-    instances: list["FakeStrategy"] = []  # populated by FakeStrategy() constructor
+    instances: list["FakeStore"] = []
 
     def __init__(
         self,
         cache_bytes: int,
         *,
         activate_raises: BaseException | None = None,
+        bind_raises: BaseException | None = None,
     ) -> None:
         self._cache_bytes = cache_bytes
+        self._activate_raises = activate_raises
+        self._bind_raises = bind_raises
+        FakeStore.instances.append(self)
+
+    @property
+    def cache_bytes(self) -> int:
+        return self._cache_bytes
+
+    def bind(self) -> "FakeBinding":
+        if self._bind_raises is not None:
+            raise self._bind_raises
+        return FakeBinding(self, activate_raises=self._activate_raises)
+
+
+class FakeBinding:
+    """In-memory fake satisfying the :class:`ModelStrategy` protocol.
+
+    Records every lifecycle call. Optionally raises on activate via
+    an injected exception for failure-mode tests.
+    """
+
+    instances: list["FakeBinding"] = []
+
+    def __init__(
+        self,
+        store: FakeStore,
+        *,
+        activate_raises: BaseException | None = None,
+    ) -> None:
+        self.store = store
         self._activate_raises = activate_raises
         self._active = False
         self.events: list[str] = []
         self.activate_devices: list[torch.device | None] = []
         self.module = nn.Identity()
-        FakeStrategy.instances.append(self)
-
-    @property
-    def cache_bytes(self) -> int:
-        return self._cache_bytes
+        FakeBinding.instances.append(self)
 
     @property
     def model(self) -> nn.Module:
@@ -79,7 +101,7 @@ class FakeStrategy:
         if self._activate_raises is not None:
             raise self._activate_raises
         if self._active:
-            raise RuntimeError("FakeStrategy already active")
+            raise RuntimeError("FakeBinding already active")
         self._active = True
 
     def deactivate(self) -> None:
@@ -98,18 +120,32 @@ def _make_factory(
     bytes_: int,
     *,
     activate_raises: BaseException | None = None,
+    bind_raises: BaseException | None = None,
     factory_raises: BaseException | None = None,
-) -> Callable[[], FakeStrategy]:
-    def factory() -> FakeStrategy:
+) -> Callable[[], FakeStore]:
+    def factory() -> FakeStore:
         if factory_raises is not None:
             raise factory_raises
-        return FakeStrategy(bytes_, activate_raises=activate_raises)
+        return FakeStore(
+            bytes_,
+            activate_raises=activate_raises,
+            bind_raises=bind_raises,
+        )
 
     return factory
 
 
-def _spec(key: str, bytes_: int, **kwargs) -> ModelSpec:
-    return ModelSpec(key=key, estimated_cache_bytes=bytes_, factory=_make_factory(bytes_, **kwargs))
+def _bind_fake_store(store: ResourceStore) -> ModelStrategy:
+    return cast(FakeStore, store).bind()
+
+
+def _spec(key: str, bytes_: int, **kwargs) -> ResourceSpec[nn.Module]:
+    return ResourceSpec(
+        key=key,
+        estimated_cache_bytes=bytes_,
+        store_factory=_make_factory(bytes_, **kwargs),
+        bind=_bind_fake_store,
+    )
 
 
 def _is_registered(cache: ModelCache, key: str) -> bool:
@@ -215,9 +251,11 @@ class UnderSelectingEvictionPolicy(MRUEvictionPolicy):
 
 @pytest.fixture(autouse=True)
 def _clear_instances():
-    FakeStrategy.instances.clear()
+    FakeStore.instances.clear()
+    FakeBinding.instances.clear()
     yield
-    FakeStrategy.instances.clear()
+    FakeStore.instances.clear()
+    FakeBinding.instances.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -250,7 +288,8 @@ class TestHitMiss:
         cache.register(_spec("a", 100))
         with cache.use("a"):
             pass
-        assert len(FakeStrategy.instances) == 1
+        assert len(FakeStore.instances) == 1
+        assert len(FakeBinding.instances) == 1
         assert cache.info("a").cached
         assert cache.used_cache_bytes == 100
         assert cache.available_cache_bytes == 900
@@ -260,11 +299,13 @@ class TestHitMiss:
         cache.register(_spec("a", 100))
         with cache.use("a"):
             pass
-        strategy = FakeStrategy.instances[0]
+        first = FakeBinding.instances[0]
         with cache.use("a"):
             pass
-        assert len(FakeStrategy.instances) == 1
-        assert strategy.events == ["activate", "deactivate", "activate", "deactivate"]
+        assert len(FakeStore.instances) == 1
+        assert len(FakeBinding.instances) == 2
+        assert first.events == ["activate", "deactivate"]
+        assert FakeBinding.instances[1].events == ["activate", "deactivate"]
 
     def test_use_with_spec_auto_registers(self) -> None:
         cache = ModelCache(1000)
@@ -529,24 +570,52 @@ class TestEviction:
 
 
 # ---------------------------------------------------------------------------
-# Active-set refcount semantics
+# Active binding semantics
 # ---------------------------------------------------------------------------
 
 
 class TestActiveSet:
-    def test_nested_same_key_refcounts(self) -> None:
-        # Re-entrant acquire on the same key bumps refcount but does
-        # NOT call the strategy's activate again.
+    def test_nested_same_key_creates_independent_bindings(self) -> None:
         cache = ModelCache(200)
         cache.register(_spec("a", 100))
         with cache.use("a") as m1:
             with cache.use("a") as m2:
-                # Same module yielded both times.
-                assert m1 is m2
-        s = FakeStrategy.instances[0]
-        # activate called once, deactivate once.
-        assert s.events.count("activate") == 1
-        assert s.events.count("deactivate") == 1
+                assert m1 is not m2
+                assert cache.info("a").active_count == 2
+        assert len(FakeStore.instances) == 1
+        assert len(FakeBinding.instances) == 2
+        assert all(
+            binding.events == ["activate", "deactivate"]
+            for binding in FakeBinding.instances
+        )
+
+    def test_release_removes_exact_binding_when_equal(self) -> None:
+        class EqualBinding(FakeBinding):
+            def __eq__(self, other: object) -> bool:
+                return isinstance(other, EqualBinding)
+
+            __hash__ = object.__hash__
+
+        class EqualBindingStore(FakeStore):
+            def bind(self) -> EqualBinding:
+                return EqualBinding(self)
+
+        cache = ModelCache(200)
+        cache.register(
+            ResourceSpec(
+                key="a",
+                estimated_cache_bytes=100,
+                store_factory=lambda: EqualBindingStore(100),
+                bind=_bind_fake_store,
+            )
+        )
+        with cache.use("a"):
+            with cache.use("a"):
+                pass
+            assert cache.info("a").active_count == 1
+            assert FakeBinding.instances[0].events == ["activate"]
+            assert FakeBinding.instances[1].events == ["activate", "deactivate"]
+        assert FakeBinding.instances[0].events == ["activate", "deactivate"]
 
     def test_concurrent_different_keys(self) -> None:
         # Encoder + decoder co-resident — both active simultaneously,
@@ -593,8 +662,8 @@ class TestDeviceActivationAndConcurrency:
             with cache.use("b", device="cuda:1"):
                 assert _active_refcounts(cache, "a", "b") == {"a": 1, "b": 1}
 
-        assert FakeStrategy.instances[0].activate_devices == [torch.device("cuda:0")]
-        assert FakeStrategy.instances[1].activate_devices == [torch.device("cuda:1")]
+        assert FakeBinding.instances[0].activate_devices == [torch.device("cuda:0")]
+        assert FakeBinding.instances[1].activate_devices == [torch.device("cuda:1")]
 
     def test_different_keys_can_share_same_cuda_device(self) -> None:
         cache = ModelCache(300)
@@ -605,8 +674,8 @@ class TestDeviceActivationAndConcurrency:
             with cache.use("b", device="cuda:0"):
                 assert _active_refcounts(cache, "a", "b") == {"a": 1, "b": 1}
 
-        assert FakeStrategy.instances[0].activate_devices == [torch.device("cuda:0")]
-        assert FakeStrategy.instances[1].activate_devices == [torch.device("cuda:0")]
+        assert FakeBinding.instances[0].activate_devices == [torch.device("cuda:0")]
+        assert FakeBinding.instances[1].activate_devices == [torch.device("cuda:0")]
 
     def test_different_key_can_reactivate_on_same_cuda_device_after_release(self) -> None:
         cache = ModelCache(300)
@@ -618,22 +687,22 @@ class TestDeviceActivationAndConcurrency:
         with cache.use("b", device="cuda:0"):
             pass
 
-        assert FakeStrategy.instances[0].activate_devices == [torch.device("cuda:0")]
-        assert FakeStrategy.instances[1].activate_devices == [torch.device("cuda:0")]
+        assert FakeBinding.instances[0].activate_devices == [torch.device("cuda:0")]
+        assert FakeBinding.instances[1].activate_devices == [torch.device("cuda:0")]
 
     def test_activation_failure_does_not_block_same_device_for_other_key(self) -> None:
         cache = ModelCache(300)
         cache.register(_spec("a", 100, activate_raises=RuntimeError("gpu boom")))
         cache.register(_spec("b", 100))
 
-        with pytest.raises(ActivationError):
+        with pytest.raises(RuntimeError, match="gpu boom"):
             with cache.use("a", device="cuda:0"):
                 pass
 
         with cache.use("b", device="cuda:0"):
             pass
 
-        assert FakeStrategy.instances[1].activate_devices == [torch.device("cuda:0")]
+        assert FakeBinding.instances[1].activate_devices == [torch.device("cuda:0")]
 
     def test_different_keys_on_same_cuda_device_can_overlap_across_threads(self) -> None:
         cache = ModelCache(300)
@@ -688,10 +757,10 @@ class TestDeviceSelection:
         with cache.use("a", device="cpu") as m:
             assert isinstance(m, nn.Module)
 
-        s = FakeStrategy.instances[0]
+        s = FakeBinding.instances[0]
         assert s.activate_devices == [torch.device("cpu")]
 
-    def test_reentrant_same_device_allowed(self) -> None:
+    def test_nested_same_device_creates_two_bindings(self) -> None:
         cache = ModelCache(200)
         cache.register(_spec("a", 100))
 
@@ -699,11 +768,12 @@ class TestDeviceSelection:
             with cache.use("a", device=torch.device("cpu")):
                 pass
 
-        s = FakeStrategy.instances[0]
-        assert s.events.count("activate") == 1
-        assert s.events.count("deactivate") == 1
+        assert [binding.activate_devices for binding in FakeBinding.instances] == [
+            [torch.device("cpu")],
+            [torch.device("cpu")],
+        ]
 
-    def test_reentrant_indexed_cpu_matches_cpu(self) -> None:
+    def test_nested_indexed_cpu_normalizes_device(self) -> None:
         cache = ModelCache(200)
         cache.register(_spec("a", 100))
 
@@ -711,10 +781,12 @@ class TestDeviceSelection:
             with cache.use("a", device="cpu:0"):
                 pass
 
-        s = FakeStrategy.instances[0]
-        assert s.activate_devices == [torch.device("cpu")]
+        assert [binding.activate_devices for binding in FakeBinding.instances] == [
+            [torch.device("cpu")],
+            [torch.device("cpu")],
+        ]
 
-    def test_reentrant_omitted_device_inherits_active_lease(self) -> None:
+    def test_nested_omitted_device_gets_independent_binding(self) -> None:
         cache = ModelCache(200)
         cache.register(_spec("a", 100))
 
@@ -722,30 +794,36 @@ class TestDeviceSelection:
             with cache.use("a"):
                 pass
 
-        s = FakeStrategy.instances[0]
-        assert s.events.count("activate") == 1
+        assert [binding.activate_devices for binding in FakeBinding.instances] == [
+            [torch.device("cpu")],
+            [None],
+        ]
 
-    def test_reentrant_different_device_rejected(self) -> None:
+    def test_nested_different_device_allowed_with_independent_binding(self) -> None:
         cache = ModelCache(200)
         cache.register(_spec("a", 100))
 
         with cache.use("a", device="cpu"):
-            with pytest.raises(ModelCacheError, match="already active"):
-                with cache.use("a", device="meta"):
-                    pass
+            with cache.use("a", device="meta"):
+                pass
 
-        s = FakeStrategy.instances[0]
-        assert s.events.count("activate") == 1
-        assert s.events.count("deactivate") == 1
+        assert [binding.activate_devices for binding in FakeBinding.instances] == [
+            [torch.device("cpu")],
+            [torch.device("meta")],
+        ]
 
-    def test_reentrant_device_after_unspecified_activation_rejected(self) -> None:
+    def test_nested_device_after_unspecified_activation_allowed(self) -> None:
         cache = ModelCache(200)
         cache.register(_spec("a", 100))
 
         with cache.use("a"):
-            with pytest.raises(ModelCacheError, match="without a device"):
-                with cache.use("a", device="cpu"):
-                    pass
+            with cache.use("a", device="cpu"):
+                pass
+
+        assert [binding.activate_devices for binding in FakeBinding.instances] == [
+            [None],
+            [torch.device("cpu")],
+        ]
 
     def test_inactive_entry_can_reactivate_on_different_device(self) -> None:
         cache = ModelCache(200)
@@ -756,8 +834,10 @@ class TestDeviceSelection:
         with cache.use("a", device="meta"):
             pass
 
-        s = FakeStrategy.instances[0]
-        assert s.activate_devices == [torch.device("cpu"), torch.device("meta")]
+        assert [binding.activate_devices for binding in FakeBinding.instances] == [
+            [torch.device("cpu")],
+            [torch.device("meta")],
+        ]
 
     @CUDA
     def test_reentrant_bare_cuda_matches_current_indexed_cuda(self) -> None:
@@ -769,8 +849,10 @@ class TestDeviceSelection:
             with cache.use("a", device=expected):
                 pass
 
-        s = FakeStrategy.instances[0]
-        assert s.activate_devices == [expected]
+        assert [binding.activate_devices for binding in FakeBinding.instances] == [
+            [expected],
+            [expected],
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -781,57 +863,51 @@ class TestDeviceSelection:
 class TestFailureModes:
     def test_factory_failure_leaves_cache_unchanged(self) -> None:
         cache = ModelCache(200)
-        spec = ModelSpec(
+        spec = ResourceSpec(
             key="bad",
             estimated_cache_bytes=100,
-            factory=_make_factory(100, factory_raises=RuntimeError("boom")),
+            store_factory=_make_factory(100, factory_raises=RuntimeError("boom")),
+            bind=_bind_fake_store,
         )
         with pytest.raises(RuntimeError, match="boom"):
             with cache.use(spec):
                 pass
         assert cache.used_cache_bytes == 0
-        # Registration persisted (but no built strategy).
+        # Registration persisted (but no built store).
         assert _is_registered(cache, "bad")
         assert not _is_cached(cache, "bad")
 
-    def test_activation_failure_on_fresh_build_drops_entry(self) -> None:
-        # Activation failure on a freshly-built strategy: discard it
-        # entirely so a retry rebuilds (the failed activation may have
-        # left the strategy in an unknown state).
+    def test_activation_failure_on_fresh_build_keeps_store(self) -> None:
+        # Activation failure discards only the failed binding. The
+        # backing store remains cached for a retry.
         cache = ModelCache(200)
-        spec = ModelSpec(
+        spec = ResourceSpec(
             key="bad",
             estimated_cache_bytes=100,
-            factory=_make_factory(100, activate_raises=RuntimeError("gpu boom")),
+            store_factory=_make_factory(100, activate_raises=RuntimeError("gpu boom")),
+            bind=_bind_fake_store,
         )
-        with pytest.raises(ActivationError):
+        with pytest.raises(RuntimeError, match="gpu boom"):
             with cache.use(spec):
                 pass
-        assert cache.used_cache_bytes == 0
+        assert cache.used_cache_bytes == 100
         assert _is_registered(cache, "bad")
-        assert not _is_cached(cache, "bad")
-        # Strategy was constructed and then released.
+        assert _is_cached(cache, "bad")
+        assert cache.info("bad").active_count == 0
 
-    def test_activation_failure_on_cached_entry_discards_it(self) -> None:
-        # Activation failure on a previously-cached entry is handled
-        # the same as on a freshly-built one. Strategies like
-        # block-streaming can fail mid-way through activate after
-        # partially installing hooks/pool; caching them as
-        # "ready to retry" lies about their state.
+    def test_activation_failure_on_cached_entry_keeps_store(self) -> None:
         cache = ModelCache(200)
         cache.register(_spec("a", 100))
         with cache.use("a"):
             pass
-        s = FakeStrategy.instances[0]
-        s._activate_raises = RuntimeError("transient gpu")
-        with pytest.raises(ActivationError):
+        store = FakeStore.instances[0]
+        store._activate_raises = RuntimeError("transient gpu")
+        with pytest.raises(RuntimeError, match="transient gpu"):
             with cache.use("a"):
                 pass
-        # Entry was discarded — released and removed from cache state.
-        assert not _is_cached(cache, "a")
-        assert cache.used_cache_bytes == 0
-        # The failed strategy reference was dropped.
-        # Registration persisted for retry — but next acquire rebuilds.
+        assert _is_cached(cache, "a")
+        assert cache.used_cache_bytes == 100
+        assert cache.info("a").active_count == 0
         assert _is_registered(cache, "a")
 
     def test_factory_failure_after_pre_eviction_keeps_evictions(self) -> None:
@@ -848,10 +924,11 @@ class TestFailureModes:
         assert cache.used_cache_bytes == 100
         # Adding a 100-byte "bad" forces eviction of "warm" before
         # the factory runs. Factory then raises.
-        bad_spec = ModelSpec(
+        bad_spec = ResourceSpec(
             key="bad",
             estimated_cache_bytes=100,
-            factory=_make_factory(100, factory_raises=RuntimeError("build boom")),
+            store_factory=_make_factory(100, factory_raises=RuntimeError("build boom")),
+            bind=_bind_fake_store,
         )
         with pytest.raises(RuntimeError, match="build boom"):
             with cache.use(bad_spec):
@@ -871,31 +948,37 @@ class TestFailureModes:
 
 
 class TestDeactivateFailure:
-    def test_deactivate_failure_discards_entry(self) -> None:
-        # A strategy whose deactivate() raises is unrecoverable:
-        # the entry is removed from the cache and
-        # the original deactivate exception propagates.
-        class FailingDeactivateStrategy(FakeStrategy):
+    def test_deactivate_failure_discards_binding_only(self) -> None:
+        # A binding whose deactivate() raises is unrecoverable, but the
+        # backing store remains cached.
+        class FailingDeactivateBinding(FakeBinding):
             def deactivate(self) -> None:
                 self.events.append("deactivate")
                 raise RuntimeError("deactivate boom")
 
-        def factory() -> FailingDeactivateStrategy:
-            s = FailingDeactivateStrategy(100)
-            FakeStrategy.instances.append(s)
-            return s
+        class FailingDeactivateStore(FakeStore):
+            def bind(self) -> FailingDeactivateBinding:
+                return FailingDeactivateBinding(self)
+
+        def factory() -> FailingDeactivateStore:
+            return FailingDeactivateStore(100)
 
         cache = ModelCache(200)
-        cache.register(ModelSpec(key="a", estimated_cache_bytes=100, factory=factory))
+        cache.register(
+            ResourceSpec(
+                key="a",
+                estimated_cache_bytes=100,
+                store_factory=factory,
+                bind=_bind_fake_store,
+            )
+        )
         with pytest.raises(RuntimeError, match="deactivate boom"):
             with cache.use("a"):
                 pass
-        # Entry removed from cache, bytes reclaimed in accounting,
-        # registration preserved for retry.
-        assert not _is_cached(cache, "a")
-        assert cache.used_cache_bytes == 0
+        assert _is_cached(cache, "a")
+        assert cache.used_cache_bytes == 100
         assert _is_registered(cache, "a")
-        # The failed strategy reference was dropped.
+        assert cache.info("a").active_count == 0
 
 
 # ---------------------------------------------------------------------------
@@ -906,37 +989,56 @@ class TestDeactivateFailure:
 class TestCacheBytesValidation:
     def test_negative_actual_rejected(self) -> None:
         def factory():
-            return FakeStrategy(-1)
+            return FakeStore(-1)
 
         cache = ModelCache(200)
-        spec = ModelSpec(key="bad", estimated_cache_bytes=10, factory=factory)
+        spec = ResourceSpec(
+            key="bad",
+            estimated_cache_bytes=10,
+            store_factory=factory,
+            bind=_bind_fake_store,
+        )
         with pytest.raises(Exception, match="cache_bytes"):
             with cache.use(spec):
                 pass
         assert cache.used_cache_bytes == 0
         assert _is_registered(cache, "bad")
         assert not _is_cached(cache, "bad")
-        # Strategy was constructed and then released.
+        # Store was constructed and then released.
 
-    def test_negative_post_activate_rejected(self) -> None:
-        # A strategy that reports a sane cache_bytes pre-activate but
-        # mutates to negative during activate must be rejected — silently
-        # admitting it would corrupt _used_bytes accounting.
-        class PostActivateNegative(FakeStrategy):
-            def activate(self) -> None:
-                super().activate()
-                self._cache_bytes = -1
-
-        def factory():
-            return PostActivateNegative(100)
-
+    def test_bind_failure_keeps_store(self) -> None:
         cache = ModelCache(200)
-        spec = ModelSpec(key="bad", estimated_cache_bytes=100, factory=factory)
-        with pytest.raises(Exception, match="cache_bytes"):
+        spec = _spec("bad", 100, bind_raises=RuntimeError("bind boom"))
+        with pytest.raises(RuntimeError, match="bind boom"):
             with cache.use(spec):
                 pass
-        assert cache.used_cache_bytes == 0
-        assert not _is_cached(cache, "bad")
+        assert cache.used_cache_bytes == 100
+        assert _is_cached(cache, "bad")
+        assert cache.info("bad").active_count == 0
+
+    def test_value_failure_before_activate_keeps_store_inactive(self) -> None:
+        class ValueErrorBinding(FakeBinding):
+            @property
+            def value(self) -> nn.Module:
+                raise RuntimeError("value boom")
+
+        class ValueErrorStore(FakeStore):
+            def bind(self) -> ValueErrorBinding:
+                return ValueErrorBinding(self)
+
+        cache = ModelCache(200)
+        spec = ResourceSpec(
+            key="bad",
+            estimated_cache_bytes=100,
+            store_factory=lambda: ValueErrorStore(100),
+            bind=_bind_fake_store,
+        )
+        with pytest.raises(RuntimeError, match="value boom"):
+            with cache.use(spec):
+                pass
+        assert _is_cached(cache, "bad")
+        assert cache.info("bad").active_count == 0
+        assert FakeBinding.instances[0].events == []
 
 
 # ---------------------------------------------------------------------------
@@ -950,9 +1052,16 @@ class TestActualVsEstimate:
         cache = ModelCache(200)
 
         def factory():
-            return FakeStrategy(50)  # smaller than estimate
+            return FakeStore(50)  # smaller than estimate
 
-        cache.register(ModelSpec(key="a", estimated_cache_bytes=100, factory=factory))
+        cache.register(
+            ResourceSpec(
+                key="a",
+                estimated_cache_bytes=100,
+                store_factory=factory,
+                bind=_bind_fake_store,
+            )
+        )
         with cache.use("a"):
             pass
         # Bytes accounting reflects actual.
@@ -965,10 +1074,15 @@ class TestActualVsEstimate:
             pass
 
         def big_factory():
-            return FakeStrategy(250)  # actual is 250 vs estimated 150
+            return FakeStore(250)  # actual is 250 vs estimated 150
 
         cache.register(
-            ModelSpec(key="big", estimated_cache_bytes=150, factory=big_factory),
+            ResourceSpec(
+                key="big",
+                estimated_cache_bytes=150,
+                store_factory=big_factory,
+                bind=_bind_fake_store,
+            ),
         )
         with cache.use("big"):
             pass
@@ -976,45 +1090,22 @@ class TestActualVsEstimate:
         assert cache.used_cache_bytes == 250
         assert not _is_cached(cache, "filler")
 
-    def test_cache_bytes_reconciled_after_activate(self) -> None:
-        # A strategy that reports 0 bytes pre-activate but pins memory
-        # during activate (simulating block-streaming with auto_setup=False
-        # whose factory forgot to call prepare()) must have its
-        # cache_bytes reconciled by the cache after activate so
-        # _used_bytes reflects reality.
-        class LateBindStrategy(FakeStrategy):
-            def __init__(self, *args, late_bytes: int = 100, **kw):
-                super().__init__(0, **kw)  # report 0 pre-activate
-                self._late_bytes = late_bytes
-
-            def activate(self):
-                super().activate()
-                # Simulate pinning during activate.
-                self._cache_bytes = self._late_bytes
-
-        def factory():
-            return LateBindStrategy(late_bytes=100)
-
-        cache = ModelCache(200)
-        spec = ModelSpec(key="late", estimated_cache_bytes=10, factory=factory)
-        with cache.use(spec):
-            # Inside the context, cache_bytes should reflect the
-            # post-activate reality (100), not the pre-activate 0.
-            info = cache.info("late")
-            assert info.cache_bytes == 100
-            assert cache.used_cache_bytes == 100
-
     def test_actual_overflow_rejects_and_releases(self) -> None:
         cache = ModelCache(100)
 
         def oversized():
-            return FakeStrategy(200)  # estimate 50, actual 200
+            return FakeStore(200)  # estimate 50, actual 200
 
-        spec = ModelSpec(key="bad", estimated_cache_bytes=50, factory=oversized)
+        spec = ResourceSpec(
+            key="bad",
+            estimated_cache_bytes=50,
+            store_factory=oversized,
+            bind=_bind_fake_store,
+        )
         with pytest.raises(ModelTooLargeError):
             with cache.use(spec):
                 pass
-        # The constructed strategy reference was dropped.
+        # The constructed store reference was dropped.
         assert cache.used_cache_bytes == 0
 
 
@@ -1056,7 +1147,13 @@ class TestObservability:
     def test_label_is_passed_through(self) -> None:
         cache = ModelCache(200)
         cache.register(
-            ModelSpec(key="a", estimated_cache_bytes=100, factory=_make_factory(100), label="text encoder"),
+            ResourceSpec(
+                key="a",
+                estimated_cache_bytes=100,
+                store_factory=_make_factory(100),
+                bind=_bind_fake_store,
+                label="text encoder",
+            ),
         )
         assert cache.info("a").label == "text encoder"
 
@@ -1098,25 +1195,24 @@ class TestHostEmptyCache:
 
 
 # ---------------------------------------------------------------------------
-# pre_activate hook
+# configure hook
 # ---------------------------------------------------------------------------
 
 
-class TestPreActivate:
+class TestConfigure:
     def test_runs_after_build_before_activate(self) -> None:
-        # Hook fires while the strategy is still deactivated. Capture the
-        # event ordering by appending into the strategy's events list.
+        # Hook fires while the binding is still deactivated. Capture the
+        # state observed by the hook.
         observed: list[str] = []
 
-        def configure(strategy):
-            observed.append(f"pre_activate(active={strategy._active})")
+        def configure(binding):
+            observed.append(f"configure(active={binding._active})")
 
         cache = ModelCache(200)
-        with cache.use(_spec("a", 100), pre_activate=configure):
+        with cache.use(_spec("a", 100), configure=configure):
             pass
-        s = FakeStrategy.instances[0]
-        assert observed == ["pre_activate(active=False)"]
-        # pre_activate ran before activate, activate ran before deactivate.
+        s = FakeBinding.instances[0]
+        assert observed == ["configure(active=False)"]
         assert s.events == ["activate", "deactivate"]
 
     def test_runs_on_cache_hit_too(self) -> None:
@@ -1130,66 +1226,57 @@ class TestPreActivate:
 
         cache = ModelCache(200)
         cache.register(_spec("a", 100))
-        with cache.use("a", pre_activate=configure):
+        with cache.use("a", configure=configure):
             pass
-        with cache.use("a", pre_activate=configure):
+        with cache.use("a", configure=configure):
             pass
         assert calls["n"] == 2
 
-    def test_failure_discards_entry(self) -> None:
-        # A raising hook leaves the strategy in an unknown state — discard
-        # the entry, wrap in ActivationError, registration persists for retry.
-        def configure(strategy):
+    def test_failure_discards_binding_only(self) -> None:
+        # A raising hook never publishes the binding; the store remains cached.
+        def configure(binding):
             raise RuntimeError("config boom")
 
         cache = ModelCache(200)
         cache.register(_spec("a", 100))
-        with pytest.raises(ActivationError, match="pre_activate"):
-            with cache.use("a", pre_activate=configure):
+        with pytest.raises(RuntimeError, match="config boom"):
+            with cache.use("a", configure=configure):
                 pass
-        assert not _is_cached(cache, "a")
-        assert cache.used_cache_bytes == 0
+        assert _is_cached(cache, "a")
+        assert cache.used_cache_bytes == 100
         assert _is_registered(cache, "a")
-        # Strategy must NOT have been activated (hook ran before activate
+        # Binding must NOT have been activated (hook ran before activate
         # and raised, so activate never fired).
-        s = FakeStrategy.instances[0]
+        s = FakeBinding.instances[0]
         assert "activate" not in s.events
+        assert cache.info("a").active_count == 0
 
-    def test_skipped_on_reentrant_use(self) -> None:
-        # Re-entrant lease shares the active strategy; the hook would
-        # either fail (strategy active, can't reconfigure) or silently
-        # violate invariants. Skip it.
+    def test_nested_same_key_runs_configure_for_each_binding(self) -> None:
         calls = {"n": 0}
 
-        def configure(strategy):
+        def configure(binding):
             calls["n"] += 1
 
         cache = ModelCache(200)
         cache.register(_spec("a", 100))
-        with cache.use("a", pre_activate=configure):
-            with cache.use("a", pre_activate=configure):
+        with cache.use("a", configure=configure):
+            with cache.use("a", configure=configure):
                 pass
-        assert calls["n"] == 1
+        assert calls["n"] == 2
 
-    def test_same_key_reentry_from_inside_hook_raises(self) -> None:
-        # A hook that re-enters cache.use() for the SAME key would
-        # otherwise corrupt eviction-policy inactive state: active_count
-        # is still 0 during the hook, so the inner acquire treats it as
-        # a fresh lease and runs a full activate/deactivate cycle,
-        # leaving the key marked inactive when the outer continues.
+    def test_same_key_reentry_from_inside_hook_works(self) -> None:
         cache = ModelCache(200)
         cache.register(_spec("a", 100))
 
-        def reenter_same(strategy):
+        def reenter_same(binding):
             with cache.use("a"):
                 pass
 
-        with pytest.raises(ModelCacheError, match="pre_activate"):
-            with cache.use("a", pre_activate=reenter_same):
-                pass
-        # Failure discards the entry just like any pre_activate failure.
-        assert not _is_cached(cache, "a")
-        assert cache.used_cache_bytes == 0
+        with cache.use("a", configure=reenter_same):
+            pass
+        assert _is_cached(cache, "a")
+        assert cache.used_cache_bytes == 100
+        assert len(FakeBinding.instances) == 2
 
     def test_different_key_reentry_from_inside_hook_works(self) -> None:
         # Re-entering the cache for a DIFFERENT key during the hook is
@@ -1200,32 +1287,28 @@ class TestPreActivate:
 
         captured: list[str] = []
 
-        def use_other(strategy):
+        def use_other(binding):
             with cache.use("b") as m:
                 captured.append(type(m).__name__)
 
-        with cache.use("a", pre_activate=use_other) as m_a:
+        with cache.use("a", configure=use_other) as m_a:
             assert m_a is not None
         # Both keys remain cached and inactive after the outer lease exits.
         assert _is_cached(cache, "a")
         assert _is_cached(cache, "b")
         assert captured == ["Identity"]
 
-    def test_configuring_flag_clears_on_failure_so_retry_works(self) -> None:
-        # If the hook raises, the entry is discarded but the registration
-        # persists. A subsequent use() with a non-failing hook must succeed
-        # — the configuring flag must be reset on the failure path.
+    def test_configure_failure_clears_binding_so_retry_works(self) -> None:
         cache = ModelCache(200)
         cache.register(_spec("a", 100))
 
-        def boom(strategy):
+        def boom(binding):
             raise RuntimeError("first attempt fails")
 
-        with pytest.raises(ActivationError):
-            with cache.use("a", pre_activate=boom):
+        with pytest.raises(RuntimeError, match="first attempt fails"):
+            with cache.use("a", configure=boom):
                 pass
 
-        # Retry without the failing hook — must work.
         with cache.use("a") as m:
             assert m is not None
 
@@ -1237,5 +1320,7 @@ class TestPreActivate:
 
 class TestStrategyConformance:
     def test_fake_satisfies_protocol(self) -> None:
-        s = FakeStrategy(100)
+        store = FakeStore(100)
+        s = FakeBinding(store)
+        assert isinstance(store, ResourceStore)
         assert isinstance(s, ModelStrategy)

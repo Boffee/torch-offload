@@ -10,7 +10,8 @@ CUDA-only tests gate on availability.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Sequence
+from typing import cast
 
 import pytest
 import torch
@@ -31,7 +32,7 @@ from torch_offload import (
 from torch_offload.lora import KeyTransformT
 from torch_offload.model_offloader import _routed_factor_dtype
 from torch_offload.module_names import canonical_param_name
-from torch_offload.protocols import CachedResource
+from torch_offload.protocols import ResourceBinding, ResourceStore
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -51,8 +52,6 @@ def _make_model_offloader(
     stream_trainable_weights: bool = False,
     skip_checkpointing_check: bool = False,
     is_block_checkpointed: Callable[[nn.Module], bool] | None = None,
-    include_param_names: Iterable[str] | None = None,
-    include_buffer_names: Iterable[str] | None = None,
 ) -> ModelOffloader:
     store = ModelOffloaderStore.from_module(
         model,
@@ -61,8 +60,6 @@ def _make_model_offloader(
         prefetch_count=prefetch_count,
         cyclic=cyclic,
         stream_trainable_weights=stream_trainable_weights,
-        include_param_names=include_param_names,
-        include_buffer_names=include_buffer_names,
     )
     return store.bind(
         model,
@@ -536,7 +533,7 @@ class TestSetLorasValidation:
         for p in m.parameters():
             p.requires_grad = False
         s = _make_strategy(m)
-        assert s.cache_bytes > 0
+        assert "embed.weight" in s.param_names
 
     def test_modes_defer_until_activation(self) -> None:
         m = _make_bf16_model()
@@ -1514,25 +1511,17 @@ class TestCacheBytes:
         lora = _make_lora(num_blocks=4, dim=16, rank=4)
         assert lora.cache_bytes > 0
 
-    def test_strategy_cache_bytes_stable_across_set_loras(self) -> None:
-        m = _make_bf16_model()
-        s = _make_strategy(m)
-        baseline = s.cache_bytes
-        s.set_loras([(_make_lora(4, 16), 1.0)])
-        assert s.cache_bytes == baseline
-        s.set_loras([])
-        assert s.cache_bytes == baseline
-
 
 # ---------------------------------------------------------------------------
-# LoRA as CachedResource (ModelCache integration)
+# LoRA as ResourceStore/ResourceBinding (ModelCache integration)
 # ---------------------------------------------------------------------------
 
 
-class TestLoRACachedResource:
-    def test_lora_satisfies_cached_resource(self) -> None:
+class TestLoRAResource:
+    def test_lora_satisfies_store_and_binding_protocols(self) -> None:
         lora = _make_lora(num_blocks=2, dim=8, rank=2)
-        assert isinstance(lora, CachedResource)
+        assert isinstance(lora, ResourceStore)
+        assert isinstance(lora, ResourceBinding)
         assert not isinstance(lora, nn.Module)
 
     def test_lora_through_model_cache(self) -> None:
@@ -1541,7 +1530,8 @@ class TestLoRACachedResource:
         spec = ResourceSpec(
             key="lora:test",
             estimated_cache_bytes=1000,
-            factory=lambda: LoRA(sd),
+            store_factory=lambda: LoRA(sd),
+            bind=lambda store: cast(LoRA, store).bind(),
         )
         with cache.use(spec) as lora:
             assert isinstance(lora, LoRA)

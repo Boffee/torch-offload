@@ -10,7 +10,7 @@ over the host-backed pinned state.
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Sequence
 from concurrent.futures import Future
 
 import pytest
@@ -40,8 +40,6 @@ def _make_model_offloader(
     stream_trainable_weights: bool = False,
     skip_checkpointing_check: bool = False,
     is_block_checkpointed: Callable[[nn.Module], bool] | None = None,
-    include_param_names: Iterable[str] | None = None,
-    include_buffer_names: Iterable[str] | None = None,
 ) -> ModelOffloader:
     store = ModelOffloaderStore.from_module(
         model,
@@ -50,8 +48,6 @@ def _make_model_offloader(
         prefetch_count=prefetch_count,
         cyclic=cyclic,
         stream_trainable_weights=stream_trainable_weights,
-        include_param_names=include_param_names,
-        include_buffer_names=include_buffer_names,
     )
     return store.bind(
         model,
@@ -189,7 +185,6 @@ class TestModelStrategyConformance:
         try:
             assert callable(strategy.activate)
             assert callable(strategy.deactivate)
-            assert isinstance(strategy.cache_bytes, int)
         finally:
             strategy.deactivate()
 
@@ -202,10 +197,11 @@ class TestModelStrategyConformance:
 class TestConstructorPins:
     def test_constructor_pins_blocks(self) -> None:
         m = _make_block_model()
-        strategy = _make_model_offloader(
+        store = ModelOffloaderStore.from_module(
             m,
             layers_attr="transformer_blocks", blocks_to_swap=2,
         )
+        strategy = store.bind(m)
         try:
             # Block weights are pinned via registry replacement.
             for block in m.transformer_blocks:
@@ -213,7 +209,7 @@ class TestConstructorPins:
             # Non-block (embed/head) also pinned via composed PinnedComponent.
             assert m.embed.weight.is_pinned()
             assert m.head.weight.is_pinned()
-            assert strategy.cache_bytes > 0
+            assert store.cache_bytes > 0
         finally:
             strategy.deactivate()
 
@@ -334,10 +330,8 @@ class TestLifecycle:
             m, layers_attr="transformer_blocks", blocks_to_swap=2,
         )
         try:
-            cache_bytes = strategy.cache_bytes
             strategy.activate("cuda")
             strategy.deactivate()
-            assert strategy.cache_bytes == cache_bytes
             strategy.activate("cuda")
             strategy.deactivate()
         finally:
@@ -911,30 +905,33 @@ class TestValidation:
 
 
 class TestModelCacheIntegration:
-    @CUDA
-    def test_factory_returns_strategy_with_final_cache_bytes(self) -> None:
+    def test_model_spec_reuses_store_and_rebinds_skeletons(self) -> None:
         from torch_offload import ModelCache, ModelSpec
 
-        device = torch.device("cuda")
+        device = torch.device("cpu")
         factory_calls = 0
 
         def factory():
             nonlocal factory_calls
             factory_calls += 1
-            m = _make_block_model(num_blocks=4, width=8)
-            return _make_model_offloader(
-                m, layers_attr="transformer_blocks", blocks_to_swap=2,
-            )
+            return _make_block_model(num_blocks=4, width=8)
 
         cache = ModelCache(max_cache_bytes=10_000_000)
-        spec = ModelSpec(key="xformer", estimated_cache_bytes=1024, factory=factory)
+        spec = ModelSpec(
+            key="xformer",
+            estimated_cache_bytes=1024,
+            factory=factory,
+            layers_attr="transformer_blocks",
+            blocks_to_swap=2,
+        )
 
         with cache.use(spec, device=device) as model:
             assert isinstance(model, nn.Module)
-            x = torch.randn(2, 8, device=device)
+            assert all(not param.is_meta for param in model.parameters())
+            assert all(not buffer.is_meta for buffer in model.buffers())
+            x = torch.randn(2, 8)
             with torch.no_grad():
                 _ = model(x)
-            torch.cuda.synchronize()
 
         info = cache.info("xformer")
         assert info.cached
@@ -942,11 +939,59 @@ class TestModelCacheIntegration:
         assert info.cache_bytes > 0
         assert info.active_count == 0
 
-        # Second use is a cache hit — no rebuild.
-        with cache.use("xformer", device=device):
-            pass
-        assert factory_calls == 1
+        first_model = model
 
+        # Second use is a store cache hit but creates a fresh binding/model.
+        with cache.use("xformer", device=device) as second_model:
+            assert second_model is not first_model
+        assert factory_calls == 3
+
+        cache.clear()
+
+    def test_model_spec_trainable_reuses_primary_model(self) -> None:
+        from torch_offload import ModelCache, ModelSpec
+
+        device = torch.device("cpu")
+        factory_calls = 0
+
+        def factory():
+            nonlocal factory_calls
+            factory_calls += 1
+            return nn.Linear(8, 8, bias=False)
+
+        cache = ModelCache(max_cache_bytes=10_000_000)
+        spec = ModelSpec(
+            key="trainable",
+            estimated_cache_bytes=1024,
+            factory=factory,
+        )
+
+        with cache.use(spec, device=device) as first_model:
+            first_param_ids = [id(param) for param in first_model.parameters()]
+
+        with cache.use("trainable", device=device) as second_model:
+            assert second_model is first_model
+            assert [id(param) for param in second_model.parameters()] == first_param_ids
+
+        assert factory_calls == 1
+        cache.clear()
+
+    def test_model_spec_trainable_rejects_nested_binding(self) -> None:
+        from torch_offload import ModelCache, ModelInUseError, ModelSpec
+
+        cache = ModelCache(max_cache_bytes=10_000_000)
+        spec = ModelSpec(
+            key="trainable",
+            estimated_cache_bytes=1024,
+            factory=lambda: nn.Linear(8, 8, bias=False),
+        )
+
+        with cache.use(spec, device="cpu"):
+            with pytest.raises(ModelInUseError, match="trainable"):
+                with cache.use("trainable", device="cpu"):
+                    pass
+
+        assert cache.info("trainable").active_count == 0
         cache.clear()
 
 
@@ -1098,7 +1143,7 @@ class TestConstructedStateIsInactive:
 
     def test_block_only_model_has_no_non_block_pinned(self) -> None:
         # Edge case: model whose only top-level child IS the block list.
-        # No non-block PinnedComponent in components; cache_bytes from blocks only.
+        # No non-block PinnedComponent in components; store bytes come from blocks only.
         class BlockOnly(nn.Module):
             def __init__(self):
                 super().__init__()
@@ -1109,14 +1154,15 @@ class TestConstructedStateIsInactive:
         m = BlockOnly()
         for p in m.parameters():
             p.requires_grad = False
-        strategy = _make_model_offloader(
+        store = ModelOffloaderStore.from_module(
             m,
             layers_attr="transformer_blocks", blocks_to_swap=2,
         )
+        strategy = store.bind(m)
         try:
             # No PinnedComponent component, just StreamedComponent.
             assert strategy._pinned_component is None
-            assert strategy.cache_bytes > 0  # block bytes only
+            assert store.cache_bytes > 0  # block bytes only
         finally:
             strategy.deactivate()
 
@@ -1857,7 +1903,6 @@ class TestStreamedNameSelection:
         try:
             assert isinstance(strategy, ModelOffloader)
             assert strategy.model is target
-            assert strategy.cache_bytes == store.cache_bytes
             assert strategy.param_names == frozenset(
                 name
                 for name, _param in target.named_parameters(

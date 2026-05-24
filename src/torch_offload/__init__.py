@@ -27,14 +27,14 @@ weights, and TorchAO NVFP4 packed weights).
 
 :class:`ModelOffloader` and :class:`MpsWeights` implement the
 :class:`ModelStrategy` Protocol —
-the plug-in contract for storage strategies that :class:`ModelCache`
-consumes.
+the plug-in contract for per-use bindings that :class:`ModelCache`
+activates.
 
-Package strategies make ``cache_bytes`` final before use: for
+Package stores make ``cache_bytes`` final before use: for
 :class:`ModelOffloader`, store construction pins reusable backing storage
-and ``bind(model)`` creates the bound strategy; for direct strategies
+and ``bind(model)`` creates the bound strategy; for self-binding stores
 like :class:`MpsWeights`, construction owns that work. ``activate(device)``
-then makes the resource usable on the requested device. For
+then makes the binding usable on the requested device. For
 :class:`ModelOffloader`, ``deactivate()`` returns managed tensors to
 pinned CPU. For :class:`MpsWeights`,
 construction has already materialized the model on MPS, so
@@ -68,9 +68,11 @@ dequantize/requantize plus ``copy_into`` merge, otherwise use routed
 LoRA when their module exposes a compatible logical Linear weight shape
 and compute dtype.
 
-:class:`ModelCache` manages the cached backing storage of multiple
-strategies with policy-driven eviction, an active-set with refcounted
-leases, and transactional admission. Custom :class:`EvictionPolicy`
+:class:`ModelCache` manages cached backing stores with policy-driven
+eviction, creates per-use bindings, and owns transactional admission.
+Trainable model specs reuse their primary model across sequential
+leases and reject concurrent same-key bindings. Custom
+:class:`EvictionPolicy`
 implementations can replace the default LRU behavior. See its docstring
 for design notes.
 
@@ -88,7 +90,6 @@ from .gguf_adapter import GGUFWeight
 from .lora import LoRA, LoRATransform
 from .merge import merge_lora
 from .model_cache import (
-    ActivationError,
     DuplicateModelKeyError,
     EvictionCandidate,
     EvictionContext,
@@ -106,12 +107,15 @@ from .model_cache import (
 from .model_offloader import ModelOffloader, ModelOffloaderStore
 from .mps_weights import MpsWeights
 from .pinned_component import PinnedComponent, PinnedComponentStore
-from .protocols import CachedResource, ModelStrategy, ModelStrategyComponent
+from .protocols import (
+    ModelStrategy,
+    ModelStrategyComponent,
+    ResourceBinding,
+    ResourceStore,
+)
 from .streamed_component import StreamedComponent, StreamedComponentStore
 
 __all__ = [
-    "ActivationError",
-    "CachedResource",
     "DuplicateModelKeyError",
     "EvictionCandidate",
     "EvictionContext",
@@ -134,7 +138,9 @@ __all__ = [
     "MpsWeights",
     "PinnedComponent",
     "PinnedComponentStore",
+    "ResourceBinding",
     "ResourceSpec",
+    "ResourceStore",
     "StreamedComponent",
     "StreamedComponentStore",
     "merge_lora",

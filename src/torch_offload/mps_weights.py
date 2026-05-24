@@ -57,6 +57,9 @@ class MpsWeights:
     def value(self) -> nn.Module:
         return self._model
 
+    def bind(self) -> MpsWeights:
+        return self
+
     def activate(self, device: torch.device | str | None = None) -> None:
         if device is None:
             raise ValueError(
@@ -159,4 +162,3 @@ def _assert_frozen_param(name: str, param: nn.Parameter) -> None:
         "replacing the Parameter object would break optimizer/grad "
         "identity."
     )
-

@@ -746,7 +746,6 @@ class TestPinnedModuleInstance:
         first_cpu = first.cpu_params_by_pinned_id[id(pinned)]
         second_cpu = second.cpu_params_by_pinned_id[id(pinned)]
 
-        assert first.cache_bytes == store.cache_bytes
         assert first_cpu is not second_cpu
         assert first_cpu.data_ptr() == pinned.make_cpu_param().data_ptr()
         assert second_cpu.data_ptr() == pinned.make_cpu_param().data_ptr()

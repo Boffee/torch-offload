@@ -8,8 +8,8 @@ from __future__ import annotations
 
 import contextlib
 import logging
-from collections.abc import Callable, Iterable, Iterator, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Iterator, Sequence
+from dataclasses import dataclass, field
 from typing import Literal, Protocol
 
 import torch
@@ -44,10 +44,11 @@ class _RemovableHook(Protocol):
 class ModelOffloaderStore:
     """Reusable pinned backing storage for :class:`ModelOffloader`.
 
-    Build once from a prototype model, then bind to compatible model
-    instances with :meth:`bind`.
+    Build once from a primary model, then bind to that model or to
+    compatible model instances with :meth:`bind`.
     """
 
+    model: nn.Module = field(repr=False, compare=False)
     pinned_component_store: PinnedComponentStore | None
     streamed_component_stores: tuple[StreamedComponentStore, ...]
     stream_trainable_weights: bool
@@ -62,15 +63,11 @@ class ModelOffloaderStore:
         prefetch_count: int | Sequence[int] = 2,
         cyclic: bool = False,
         stream_trainable_weights: bool = False,
-        include_param_names: Iterable[str] | None = None,
-        include_buffer_names: Iterable[str] | None = None,
     ) -> ModelOffloaderStore:
         layer_paths = _normalize_layer_paths(layers_attr)
         _validate_store_config(
             layer_paths=layer_paths,
             blocks_to_swap=blocks_to_swap,
-            include_param_names=include_param_names,
-            include_buffer_names=include_buffer_names,
         )
         (
             streamed_component_stores,
@@ -88,10 +85,9 @@ class ModelOffloaderStore:
             model,
             streamed_param_names=streamed_param_names,
             streamed_buffer_names=streamed_buffer_names,
-            include_param_names=include_param_names,
-            include_buffer_names=include_buffer_names,
         )
         return cls(
+            model=model,
             pinned_component_store=pinned_component_store,
             streamed_component_stores=streamed_component_stores,
             stream_trainable_weights=stream_trainable_weights,
@@ -108,6 +104,16 @@ class ModelOffloaderStore:
             store.cache_bytes for store in self.streamed_component_stores
         )
         return pinned_bytes + streamed_bytes
+
+    @property
+    def has_trainables(self) -> bool:
+        pinned_has_trainables = (
+            self.pinned_component_store is not None
+            and self.pinned_component_store.has_trainables
+        )
+        return pinned_has_trainables or any(
+            store.has_trainables for store in self.streamed_component_stores
+        )
 
     def bind(
         self,
@@ -528,10 +534,6 @@ class ModelOffloader:
             names.update(streamed_component.buffer_names)
         return frozenset(names)
 
-    @property
-    def cache_bytes(self) -> int:
-        return sum(component.cache_bytes for component in self._iter_components())
-
     def _resolve_device(self, device: torch.device | str | None) -> torch.device:
         if device is not None:
             return canonical_device(device)
@@ -816,8 +818,6 @@ def _validate_store_config(
     *,
     layer_paths: Sequence[str],
     blocks_to_swap: int | Sequence[int] | None,
-    include_param_names: Iterable[str] | None,
-    include_buffer_names: Iterable[str] | None,
 ) -> None:
     if layer_paths and blocks_to_swap is None:
         raise TypeError(
@@ -826,13 +826,6 @@ def _validate_store_config(
         )
     if not layer_paths and blocks_to_swap is not None:
         raise ValueError("blocks_to_swap requires layers_attr")
-    if layer_paths and (
-        include_param_names is not None or include_buffer_names is not None
-    ):
-        raise ValueError(
-            "include_param_names/include_buffer_names are only valid "
-            "when layers_attr is omitted."
-        )
 
 
 def _build_streamed_component_stores(
@@ -875,15 +868,9 @@ def _build_pinned_component_store(
     *,
     streamed_param_names: set[str],
     streamed_buffer_names: set[str],
-    include_param_names: Iterable[str] | None,
-    include_buffer_names: Iterable[str] | None,
 ) -> PinnedComponentStore | None:
     pinned_param_names = parameter_names(model) - streamed_param_names
     pinned_buffer_names = buffer_names(model) - streamed_buffer_names
-    if include_param_names is not None:
-        pinned_param_names = set(include_param_names)
-    if include_buffer_names is not None:
-        pinned_buffer_names = set(include_buffer_names)
     if not pinned_param_names and not pinned_buffer_names:
         return None
     return PinnedComponentStore.from_module(

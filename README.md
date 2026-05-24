@@ -13,7 +13,7 @@ to be lifted into its own package when a second consumer appears.
 
 | Module | Role |
 |---|---|
-| `protocols.py` | `CachedResource` (generic), `ModelStrategy` / `ModelStrategyComponent` plug-in contracts |
+| `protocols.py` | `ResourceStore`, `ResourceBinding`, `ModelStrategy` / `ModelStrategyComponent` plug-in contracts |
 | `model_offloader.py` | `ModelOffloader` — whole-model bulk pinned-CPU↔GPU or streamed block offload strategy |
 | `pinned_component.py` | `PinnedComponent`, `PinnedComponentStore` — reusable pinned backing storage plus lifecycle-only pinned component used by `ModelOffloader` |
 | `streamed_component.py` | `StreamedComponent`, `StreamedComponentStore` — reusable streamed backing storage plus sharp per-block-list streaming component |
@@ -26,7 +26,7 @@ to be lifted into its own package when a second consumer appears.
 | `module_names.py` | Internal name traversal and mutation helpers |
 | `_quanto.py` | Internal: optimum-quanto optional-import + layout validation; consumed by `quanto_adapter.py` and `merge.py` |
 | `_torchao_nvfp4.py` | Internal: TorchAO NVFP4 optional-import + layout validation; consumed by `nvfp4_adapter.py` |
-| `model_cache.py` | `ModelCache` — policy-driven pool over `CachedResource` instances with active-set leases |
+| `model_cache.py` | `ModelCache` — policy-driven pool over cached stores with per-use bindings |
 
 ## Why use this
 
@@ -47,8 +47,8 @@ This library gives you:
 2. **A cache** that holds multiple pinned models, evicts least-recently-
    used inactive entries when a new model needs room, and tracks active
    leases so you can't accidentally evict something you're using.
-3. **A clean plug-in contract** so you can write your own strategy
-   (disk-mmap, NVMe-paged, multi-GPU shard) and it fits in.
+3. **A clean plug-in contract** so you can write your own store/binding
+   resource (disk-mmap, NVMe-paged, multi-GPU shard) and it fits in.
 
 ## When to use what
 
@@ -56,7 +56,7 @@ This library gives you:
 |---|---|
 | Model fits on GPU when active; want fast eviction between calls | **`ModelOffloaderStore.from_module(model).bind(model)`** — bulk DMA, ~200 ms for 12 GB at PCIe Gen5 x16 |
 | Model too big for a CUDA GPU even when active | **`ModelOffloaderStore.from_module(model, layers_attr=..., blocks_to_swap=...).bind(model)`** — streams transformer blocks via forward hooks |
-| Multiple models swap in/out across a script | Wrap each in a strategy, hand to **`ModelCache`** |
+| Multiple models swap in/out across a script | Register model factories with **`ModelCache`** via **`ModelSpec`** |
 
 ## Quick start: whole-model offload
 
@@ -343,28 +343,30 @@ CPU storage, and leaves gradients on GPU.
 For multiple independent models swapping in and out of GPU.
 
 ```python
-from torch_offload import ModelCache, ModelSpec, ModelOffloaderStore
-
-
-def make_offloader(model):
-    return ModelOffloaderStore.from_module(model).bind(model)
+from torch_offload import ModelCache, ModelSpec
 
 cache = ModelCache(max_cache_bytes=80 * 1024**3)
 device = "cuda:0"
 
-# Register specs (lazy — factory only runs on first acquire / cache miss)
+# Register specs. The factory builds real weights once to create the
+# cached store. Frozen models use allocation-light meta skeletons for
+# bindings; trainable models reuse the primary factory-created model.
 cache.register(ModelSpec(
     key="text_encoder",
     estimated_cache_bytes=12 * 1024**3,
-    factory=lambda: make_offloader(build_text_encoder()),
+    factory=build_text_encoder,
 ))
 cache.register(ModelSpec(
     key="diffusion_model",
     estimated_cache_bytes=24 * 1024**3,
-    factory=lambda: make_offloader(build_diffusion_model()),
+    factory=build_diffusion_model,
+    layers_attr="transformer_blocks",
+    blocks_to_swap=24,
 ))
 
-# First use builds via factory; subsequent uses hit the cache.
+# First use builds the store; subsequent uses reuse it. Frozen models
+# get fresh bindings; trainable models reuse the primary model so
+# optimizer parameter identity stays stable.
 with cache.use("text_encoder", device=device) as enc:
     embeddings = enc.encode(prompt)
 
@@ -374,34 +376,30 @@ with cache.use("diffusion_model", device=device) as t:
 # When budget pressure forces eviction, the eviction policy chooses
 # from inactive cached entries. The default policy is LRU.
 # Active entries (currently inside `cache.use(...)`) are never evicted.
-# Re-entrant use of the same key must use the same device; simultaneous
-# activation of one cached strategy on multiple devices is rejected.
-# Different keys may be active on the same device at the same time;
-# caller code owns VRAM planning.
+# Nested use of the same frozen key creates a second binding from the
+# same cached store. Trainable same-key nesting is rejected. Caller code
+# owns VRAM planning.
 ```
 
 You can also auto-register at acquire time:
 
 ```python
 spec = ModelSpec(key="vae", estimated_cache_bytes=500*1024**2,
-                 factory=lambda: make_offloader(build_vae()))
+                 factory=build_vae)
 with cache.use(spec, device=device) as vae:  # registers if missing, then uses
     decoded = vae.decode(latent)
 ```
 
 > **Anti-pattern:** the factory should build a fresh model each call,
 > not capture an externally-held one. With `factory=lambda:
-> make_offloader(my_kept_model)` the cache is no longer the
-> sole owner of the model — eviction drops the strategy, but
-> `my_kept_model` keeps the pinned tensors alive. `used_cache_bytes`
-> will lie about freed memory. Always have the factory build the
-> model itself.
+> my_kept_model` the cache is no longer the sole owner of the model.
+> Always have the factory build the model itself.
 
 `ModelCache` accepts custom `EvictionPolicy` implementations. The
 default is `LRUEvictionPolicy` for inactive host-cache eviction. The
 cache builds the eviction candidate set and byte context, then asks the
 eviction policy to choose victims; `ModelCache` still owns validation,
-accounting, activation, rollback, and release. Policies are called under
+accounting, binding, activation, rollback, and release. Policies are called under
 the cache lock. `choose_victims()` must return unique keys from
 `context.candidates` and enough bytes to satisfy
 `context.bytes_to_free`; otherwise `ModelCache` raises
@@ -411,10 +409,10 @@ the cache lock. `choose_victims()` must return unique keys from
 
 ```
                        ┌──────────────────┐
-                       │   ModelCache     │  policy eviction, leases,
+                       │   ModelCache     │  policy eviction, bindings,
                        │                  │  transactional admission
                        └────────┬─────────┘
-                                │ uses (via ModelStrategy protocol)
+                                │ stores + per-use bindings
                                 ▼
             ┌───────────────────┴────────────────────┐
             │                                        │
@@ -441,29 +439,44 @@ the cache lock. `choose_victims()` must return unique keys from
                       └──────────────────┘
 ```
 
-`ModelStrategy` is the protocol every top-level strategy implements:
-`cache_bytes`, `model` (the wrapped module, stable across cycles),
-`activate(device=None)`, and `deactivate()`. Device-aware package
-strategies also expose `use(device)` for direct exception-safe use.
-`ModelCache` only talks to this protocol; write a new strategy and
-it fits in:
+`ResourceStore` is the cache admission contract: it reports
+`cache_bytes` for reusable backing storage. `ResourceBinding` is the
+per-use lifecycle contract: `value`, `activate(device=None)`, and
+`deactivate()`. `ModelStrategy` specializes `ResourceBinding` for
+`nn.Module` values and adds `model`.
+
+`ModelCache` caches stores and creates bindings for `use()` calls.
+Stores that manage trainable parameters may reject concurrent same-key
+bindings. A custom resource fits by passing a store factory and binding
+function to `ResourceSpec`:
 
 ```python
 from torch import nn
 
 class MyStrategy:
     @property
-    def cache_bytes(self) -> int: ...
-    @property
     def model(self) -> nn.Module: ...
+    @property
+    def value(self) -> nn.Module: ...
     def activate(self, device=None) -> None: ...
     def deactivate(self) -> None: ...
+
+class MyStore:
+    @property
+    def cache_bytes(self) -> int: ...
+    def bind(self) -> MyStrategy: ...
+
+spec = ResourceSpec(
+    key="my-resource",
+    estimated_cache_bytes=...,
+    store_factory=MyStore,
+    bind=lambda store: store.bind(),
+)
 ```
 
-A narrower `ModelStrategyComponent` Protocol (just `cache_bytes` +
-`activate` + `deactivate`, no `model`) describes pieces composable
-inside a top-level strategy — `StreamedComponent` and `PinnedComponent`
-both satisfy it.
+A narrower `ModelStrategyComponent` Protocol (just `activate` +
+`deactivate`, no `model`) describes pieces composable inside a top-level
+strategy — `StreamedComponent` and `PinnedComponent` both satisfy it.
 
 `TensorAdapter` is the per-parameter extension point. Its base contract
 only covers inference movement: clone/pin, H2D copy, GPU wrapper rebuild,
@@ -472,23 +485,23 @@ behaviors are explicit capabilities: CPU round-trip for optimizer-step
 sync, `Parameter.data` swap for trainable streaming, and dense in-place
 `addmm_` for activation LoRA merge.
 
-## Strategy lifecycle
+## Store and Binding Lifecycle
 
-Uniform across all strategies — pinning happens in `__init__` so
-`cache_bytes` is final at admission time:
+Stores own cache accounting. Pinning happens during store construction
+so `cache_bytes` is final at admission time; bindings are created for
+individual uses:
 
 ```
-constructed → activate ↔ deactivate → drop refs
+store constructed -> bind -> activate <-> deactivate -> drop binding refs
 ```
 
-`activate(device=...)` makes the model usable for compute on the
+Binding `activate(device=...)` makes the model usable for compute on the
 requested device. `ModelOffloader`, `MpsWeights`, `PinnedComponent`, and
 `StreamedComponent` require an explicit device. CUDA activation uses the
 streaming/DMA path where applicable; CPU activation is pass-through over
 pinned host-backed storage.
-`deactivate()` releases transient device resources (the `cache_bytes`
-worth of pinned storage stays held in module state, ready for fast
-re-activation).
+`deactivate()` releases transient device resources. Store-owned pinned
+storage remains cached until the store is evicted or otherwise released.
 
 Construction optimizes peak host memory. Pinning clones managed tensors
 into pinned CPU storage. For plain `torch.Tensor` parameters, the source
@@ -500,18 +513,19 @@ CUDA-origin models. It is a clone-to-pinned plus storage swap, not true
 in-place pinning. Tensor subclasses such as quanto, GGUF, and NVFP4 do
 not use this `.data` swap when it would lose wrapper state.
 
-**There is no `close()`.** To release pinned host memory, drop the
-strategy reference (and the model reference if you don't need it
-anymore). Python's refcount-based GC frees pinned tensors
-immediately. Strategies release what they own; ownership of the
-user's model is the user's concern.
+**There is no `close()`.** To release pinned host memory, release the
+store reference. With `ModelCache`, that means evicting or clearing the
+entry. Python's refcount-based GC frees pinned tensors immediately once
+the store and any escaped binding/model references that still point at
+store-backed tensors are gone.
 
 **Failure semantics.** If construction raises after pinning has started,
 the model may already be partially repointed to pinned storage. Treat the
-partially constructed strategy/model as unrecoverable: drop those
-references and rebuild from a fresh model instance. If `activate()`
-raises midway, the strategy may contain partial device state; don't retry
-`activate()` on that strategy. Drop the strategy reference and rebuild.
+partially constructed store/model as unrecoverable: drop those references
+and rebuild from a fresh model instance. If binding `activate()` raises
+midway, the binding may contain partial device state; don't retry
+`activate()` on that binding. Drop the binding reference and bind again
+from the store when the store itself is still valid.
 This is a low-level library; we don't guard against caller misuse.
 
 ## Compatibility
@@ -525,11 +539,11 @@ This is a low-level library; we don't guard against caller misuse.
 - **Wrap before DDP/FSDP**, not after. Those wrappers manage parameter
   storage themselves and conflict with the registry-replacement pattern.
 - **Coarse cache concurrency.** `ModelCache` protects cache metadata,
-  admission, leases, and per-key active device state with an internal
-  lock. Factory/build, activation, and deactivation are serialized, but
-  the lock is released while caller code runs inside `cache.use(...)`.
+  admission, binding, activation, and deactivation with an internal lock.
+  The lock is released while caller code runs inside `cache.use(...)`.
   The cache does not make a yielded model object safe for concurrent
-  same-key execution.
+  same-key execution; trainable model specs reject concurrent same-key
+  bindings.
 - **Buffer mutations during CUDA activation are discarded** on
   `deactivate()`. CPU activation is pass-through over host-backed
   buffers, so CPU buffer mutations behave like ordinary module
@@ -605,7 +619,6 @@ than silent corruption.
 |---|---|
 | `ModelTooLargeError` | Cache miss can't fit even after evicting all inactive entries. Exposes `required`, `used`, and `limit`. |
 | `EvictionPolicyError` | Custom eviction policy returned duplicate/non-candidate victims or too few bytes |
-| `ActivationError` | Strategy's `activate()` raised — the cache discards the entry; next acquire rebuilds |
 | `ModelInUseError` | `evict()` / `clear()` / `unregister()` called while entry is active |
 | `DuplicateModelKeyError` | `register()` called for an existing key without `replace=True` |
 | `ModelNotRegisteredError` | `use(str)` called for an unknown key |
@@ -614,6 +627,5 @@ than silent corruption.
 
 Use `cache.used_cache_bytes` and `cache.available_cache_bytes` for
 current cache accounting. `available_cache_bytes` is signed; negative
-means a strategy reported growth after admission and the cache is
-currently over budget. Use `cache.info(key)` for per-key state when
-needed.
+means a store reported growth after admission and the cache is currently
+over budget. Use `cache.info(key)` for per-key state when needed.

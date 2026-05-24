@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Sequence
 from typing import Any, cast
 
 import pytest
@@ -32,8 +32,6 @@ def _make_model_offloader(
     stream_trainable_weights: bool = False,
     skip_checkpointing_check: bool = False,
     is_block_checkpointed: Callable[[nn.Module], bool] | None = None,
-    include_param_names: Iterable[str] | None = None,
-    include_buffer_names: Iterable[str] | None = None,
 ) -> ModelOffloader:
     store = ModelOffloaderStore.from_module(
         model,
@@ -42,8 +40,6 @@ def _make_model_offloader(
         prefetch_count=prefetch_count,
         cyclic=cyclic,
         stream_trainable_weights=stream_trainable_weights,
-        include_param_names=include_param_names,
-        include_buffer_names=include_buffer_names,
     )
     return store.bind(
         model,
@@ -102,8 +98,6 @@ class TestModelStrategyConformance:
         try:
             assert callable(pw.activate)
             assert callable(pw.deactivate)
-            assert isinstance(pw.cache_bytes, int)
-            assert pw.cache_bytes > 0
         finally:
             pw.deactivate()
 
@@ -126,7 +120,6 @@ class TestPinnedComponentStoreBind:
 
         component = store.bind(module)
         try:
-            assert component.cache_bytes == 0
             assert component.param_names == frozenset()
             assert component.buffer_names == frozenset()
             component.activate("cpu")
@@ -146,8 +139,6 @@ class TestPinnedComponentStoreBind:
         second = store.bind(second_model)
 
         try:
-            assert first.cache_bytes == store.cache_bytes
-            assert second.cache_bytes == store.cache_bytes
             assert store.param_names == frozenset({"weight"})
             assert first.param_names == store.param_names
             assert second.param_names == store.param_names
@@ -436,9 +427,10 @@ class TestConstruction:
                 self.register_buffer("table", torch.randn(8, 4))
 
         m = BufferOnly()
-        pw = _make_model_offloader(m)
+        store = ModelOffloaderStore.from_module(m)
+        pw = store.bind(m)
         try:
-            assert pw.cache_bytes == 8 * 4 * 4  # float32
+            assert store.cache_bytes == 8 * 4 * 4  # float32
             assert m.table.is_pinned()
         finally:
             pw.deactivate()
@@ -535,11 +527,12 @@ class TestTiedWeightDedup:
 
     def test_cache_bytes_counts_tied_once(self) -> None:
         m, _, _ = self._make_tied_model()
-        pw = _make_model_offloader(m)
+        store = ModelOffloaderStore.from_module(m)
+        pw = store.bind(m)
         try:
             # 32 * 16 * 4 (float32 default) = 2048 bytes for one pinned param.
             # If the dedup were broken this would double.
-            assert pw.cache_bytes == 32 * 16 * 4
+            assert store.cache_bytes == 32 * 16 * 4
         finally:
             pw.deactivate()
 
@@ -705,25 +698,6 @@ class TestMixedTrainableFrozenTied:
         with pytest.raises(ValueError, match="mixed requires_grad"):
             _make_model_offloader(m)
 
-    def test_include_names_can_select_one_storage_alias(self) -> None:
-        shared = torch.randn(8, dtype=torch.bfloat16)
-        m = nn.Module()
-        m.keep = nn.Parameter(shared, requires_grad=False)
-        m.skip = nn.Parameter(shared, requires_grad=False)
-        skipped = m.skip
-
-        pw = _make_model_offloader(m, include_param_names={"keep"})
-        try:
-            assert set(pw._instance.params) == {"keep"}
-            assert (
-                m.keep.data_ptr()
-                == pw._instance.params["keep"].make_cpu_param().data_ptr()
-            )
-            assert m.skip is skipped
-        finally:
-            pw.deactivate()
-
-
 class TestZeroSizedParams:
     def test_zero_sized_params_do_not_collapse(self) -> None:
         # Empty tensors all share data_ptr()==0; they must not dedupe
@@ -815,21 +789,15 @@ class TestQuanto:
 
 class TestCacheBytes:
     def test_cache_bytes_positive(self) -> None:
-        pw = _make_model_offloader(_make_simple_model())
-        try:
-            assert pw.cache_bytes > 0
-        finally:
-            pw.deactivate()
+        store = ModelOffloaderStore.from_module(_make_simple_model())
+        assert store.cache_bytes > 0
 
-    def test_cache_bytes_includes_buffers_when_requested(self) -> None:
-        m = nn.Sequential(nn.Linear(4, 4, bias=False), nn.LayerNorm(4))
-        for p in m.parameters():
-            p.requires_grad = False
-        pw_with = _make_model_offloader(m)
-        with_bytes = pw_with.cache_bytes
+    def test_cache_bytes_includes_buffers(self) -> None:
+        m = nn.Module()
+        m.weight = nn.Parameter(torch.randn(4, 4), requires_grad=False)
+        m.register_buffer("running", torch.randn(8))
 
-        m2 = nn.Sequential(nn.Linear(4, 4, bias=False), nn.LayerNorm(4))
-        for p in m2.parameters():
-            p.requires_grad = False
-        pw_without = _make_model_offloader(m2, include_buffer_names=set())
-        assert pw_without.cache_bytes <= with_bytes
+        store = ModelOffloaderStore.from_module(m)
+
+        expected = (4 * 4 * 4) + (8 * 4)
+        assert store.cache_bytes == expected

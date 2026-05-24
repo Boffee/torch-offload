@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Sequence
 
 import pytest
 import torch
@@ -27,8 +27,6 @@ def _make_model_offloader(
     stream_trainable_weights: bool = False,
     skip_checkpointing_check: bool = False,
     is_block_checkpointed: Callable[[nn.Module], bool] | None = None,
-    include_param_names: Iterable[str] | None = None,
-    include_buffer_names: Iterable[str] | None = None,
 ) -> ModelOffloader:
     store = ModelOffloaderStore.from_module(
         model,
@@ -37,8 +35,6 @@ def _make_model_offloader(
         prefetch_count=prefetch_count,
         cyclic=cyclic,
         stream_trainable_weights=stream_trainable_weights,
-        include_param_names=include_param_names,
-        include_buffer_names=include_buffer_names,
     )
     return store.bind(
         model,

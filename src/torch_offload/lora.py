@@ -68,12 +68,13 @@ class LoRA:
     Factors are paired, validated, and pinned to host memory at
     construction.  The raw ``state_dict`` is not retained.
 
-    Implements :class:`~torch_offload.protocols.CachedResource` so it
+    Implements both the :class:`~torch_offload.protocols.ResourceStore`
+    and :class:`~torch_offload.protocols.ResourceBinding` shapes so it
     can be registered in :class:`~torch_offload.ModelCache` for budget
-    tracking and policy-driven eviction.  ``activate``/``deactivate``
-    are no-ops — factors stay on pinned CPU and are copied to GPU
-    per-parameter by :class:`LoRATransform` during the merge-mode
-    post-copy hook.
+    tracking and policy-driven eviction. ``bind()`` returns ``self``;
+    ``activate``/``deactivate`` are no-ops because factors stay on
+    pinned CPU and are copied to GPU per-parameter by
+    :class:`LoRATransform` during the merge-mode post-copy hook.
 
     Strength is extrinsic — specify it when passing the adapter to
     :meth:`ModelOffloader.set_loras` as a ``(LoRA, strength)`` tuple.
@@ -101,6 +102,9 @@ class LoRA:
 
     @property
     def value(self) -> LoRA:
+        return self
+
+    def bind(self) -> LoRA:
         return self
 
     def activate(self, device: torch.device | str | None = None) -> None:

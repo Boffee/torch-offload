@@ -113,6 +113,11 @@ class PinnedComponentStore:
         """Total pinned host bytes held by this store."""
         return self._module_store.cache_bytes
 
+    @property
+    def has_trainables(self) -> bool:
+        """Whether any pinned parameter is trainable."""
+        return self._module_store.has_trainables
+
     def bind(self, model: nn.Module) -> PinnedComponent:
         """Bind this store's pinned backing bytes to ``model``."""
         return PinnedComponent(self._module_store.bind(model))
@@ -159,7 +164,6 @@ class PinnedComponent:
         self._instance = instance
         self._param_names = frozenset(instance.params)
         self._buffer_names = frozenset(instance.buffers)
-        self._cache_bytes = instance.cache_bytes
         self._has_trainables = instance.has_trainables
         self._active_device: torch.device | None = None
         self._active_target: PinnedModuleTarget | None = None
@@ -178,11 +182,6 @@ class PinnedComponent:
     def buffer_names(self) -> frozenset[str]:
         """Pinned buffer names managed by this instance."""
         return self._buffer_names
-
-    @property
-    def cache_bytes(self) -> int:
-        """Total pinned host bytes held. Tied weights counted once."""
-        return self._cache_bytes
 
     def register_post_copy_hook(
         self, name: str, hook: PostCopyHook,

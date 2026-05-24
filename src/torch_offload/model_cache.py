@@ -1,27 +1,29 @@
-"""Policy-driven resource cache over :class:`CachedResource` plug-ins.
+"""Policy-driven resource cache over store/binding plug-ins.
 
 Manages cached pinned-CPU (or other resource-owned) backing storage for
 multiple independent resources (models, LoRA adapters, etc.). When a new
-resource needs more cache than is free, inactive entries are evicted
+store needs more cache than is free, inactive entries are evicted
 according to the configured :class:`EvictionPolicy` until room is
 available. Active entries (currently inside a ``use()`` context) are
 never evicted.
 
 Design highlights
 -----------------
-- **Resource-agnostic.** The cache only talks to the
-  :class:`CachedResource` protocol — lifecycle methods plus
-  ``cache_bytes`` accounting. Pluggable: today :class:`ModelOffloader`,
-  :class:`MpsWeights`, and :class:`LoRA`; future resources
-  (disk-mmap, NVMe-paged, multi-GPU shard) just satisfy the protocol.
-- **Active-set with refcount.** Multiple keys can be active
-  simultaneously (e.g. text encoder and embedding processor in the
-  same call), and the same key can be acquired re-entrantly (refcount
-  bump, the underlying strategy is not re-activated).
+- **Resource-agnostic.** The cache only talks to
+  :class:`ResourceStore` for cached backing bytes and
+  :class:`ResourceBinding` for per-use activation. Pluggable: today
+  :class:`ModelOffloader`, :class:`MpsWeights`, and :class:`LoRA`;
+  future resources (disk-mmap, NVMe-paged, multi-GPU shard) just satisfy
+  the protocol pair.
+- **Active bindings.** Multiple keys can be active simultaneously
+  (e.g. text encoder and embedding processor in the same call), and the
+  same key can be acquired multiple times when the store supports
+  multiple active bindings. Trainable stores reject concurrent same-key
+  bindings so optimizer parameter identity stays unambiguous.
 - **Transactional admission, with one caveat.** Activation failures
-  discard the failed entry and propagate :class:`ActivationError`.
+  do not publish the failed binding and propagate the original exception.
   Eviction is just a reference drop (no failure path) — pinned memory
-  is freed when GC runs on the dropped strategy. **Factory failure**
+  is freed when GC runs on the dropped store. **Store factory failure**
   preserves the registration but leaves any pre-eviction *committed*
   — the cache evicts inactive entries to give the factory a
   predictable host-memory budget for pinning, and those evictions
@@ -49,14 +51,16 @@ import contextlib
 import logging
 import threading
 from collections import OrderedDict
-from collections.abc import Callable, Iterator
-from dataclasses import dataclass
+from collections.abc import Callable, Iterator, Sequence
+from dataclasses import dataclass, field
 from typing import Any, Generic, Protocol, TypeVar, cast, overload
 
 import torch
+from torch import nn
 
 from ._devices import canonical_device
-from .protocols import CachedResource
+from .model_offloader import ModelOffloaderStore
+from .protocols import ResourceBinding, ResourceStore
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +84,7 @@ class ResourceSpec(Generic[T]):
     same key but a different factory silently returns the cached entry.
 
     ``estimated_cache_bytes`` is used to evict before building. The
-    cache reconciles against the actual ``resource.cache_bytes`` after
+    cache reconciles against the actual ``store.cache_bytes`` after
     construction; if the actual exceeds the estimate enough to overflow
     the budget, the cache evicts more or rejects the admission.
 
@@ -88,19 +92,75 @@ class ResourceSpec(Generic[T]):
     caller-managed logging; defaults to ``None`` if omitted.
 
     .. note::
-       The ``factory`` should build a *fresh* resource that the cache
-       solely owns. Eviction releases backing storage only when
-       the resource becomes unreachable — Python's refcount-based GC
-       handles this when the cache is the sole owner.
+       The ``store_factory`` should build a *fresh* store that the cache
+       solely owns. Eviction releases backing storage only when the store
+       becomes unreachable — Python's refcount-based GC handles this
+       when the cache is the sole owner.
     """
 
     key: str
     estimated_cache_bytes: int
-    factory: Callable[[], CachedResource[T]]
+    store_factory: Callable[[], ResourceStore]
+    bind: Callable[[ResourceStore], ResourceBinding[T]]
     label: str | None = None
 
 
-ModelSpec: type[ResourceSpec] = ResourceSpec
+class ModelSpec(ResourceSpec[nn.Module]):
+    """Model-specific cache spec built from one user model factory.
+
+    The factory runs normally once to construct the cached
+    :class:`ModelOffloaderStore`. Frozen models bind allocation-light
+    skeletons created under ``torch.device("meta")``. Trainable models
+    bind the original factory-created model so optimizer parameter
+    identity stays stable across sequential ``use()`` calls.
+    """
+
+    def __init__(  # noqa: PLR0913
+        self,
+        *,
+        key: str,
+        estimated_cache_bytes: int,
+        factory: Callable[[], nn.Module],
+        label: str | None = None,
+        layers_attr: str | Sequence[str] | None = None,
+        blocks_to_swap: int | Sequence[int] | None = None,
+        prefetch_count: int | Sequence[int] = 2,
+        cyclic: bool = False,
+        stream_trainable_weights: bool = False,
+        skip_checkpointing_check: bool = False,
+        is_block_checkpointed: Callable[[nn.Module], bool] | None = None,
+    ) -> None:
+        def store_factory() -> ResourceStore:
+            model = factory()
+            return ModelOffloaderStore.from_module(
+                model,
+                layers_attr=layers_attr,
+                blocks_to_swap=blocks_to_swap,
+                prefetch_count=prefetch_count,
+                cyclic=cyclic,
+                stream_trainable_weights=stream_trainable_weights,
+            )
+
+        def bind(store: ResourceStore) -> ResourceBinding[nn.Module]:
+            offloader_store = cast(ModelOffloaderStore, store)
+            if offloader_store.has_trainables:
+                model = offloader_store.model
+            else:
+                with torch.device("meta"):
+                    model = factory()
+            return offloader_store.bind(
+                model,
+                skip_checkpointing_check=skip_checkpointing_check,
+                is_block_checkpointed=is_block_checkpointed,
+            )
+
+        super().__init__(
+            key=key,
+            estimated_cache_bytes=estimated_cache_bytes,
+            store_factory=store_factory,
+            bind=bind,
+            label=label,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -219,19 +279,6 @@ class EvictionPolicyError(ModelCacheError):
     """An :class:`EvictionPolicy` returned invalid or insufficient victims."""
 
 
-class ActivationError(ModelCacheError):
-    """A strategy's ``activate()`` (or the ``pre_activate`` hook
-    passed to :meth:`ModelCache.use`) raised. The cache discards the
-    entry (drops the strategy reference, removes it from cache state)
-    regardless of whether the entry was freshly built or previously
-    cached — strategies with multi-step ``activate()`` (e.g.
-    :class:`ModelOffloader`) can fail mid-way after partially
-    installing hooks/pool/composed PinnedComponent, and caching such an
-    entry as "ready to retry" lies about its state. The next acquire
-    rebuilds via the registered factory. The original exception is
-    chained via ``__cause__``."""
-
-
 # ---------------------------------------------------------------------------
 # Default policy implementations
 # ---------------------------------------------------------------------------
@@ -278,18 +325,13 @@ class LRUEvictionPolicy:
 @dataclass
 class _Entry:
     spec: ResourceSpec
-    strategy: CachedResource | None = None
+    store: ResourceStore | None = None
     cache_bytes: int = 0  # actual, post-build
-    active_count: int = 0
-    # Normalized device for the current active lease. ``None`` means the
-    # caller did not request one.
-    active_device: torch.device | None = None
-    # True while `pre_activate` is running. Guards against same-key
-    # re-entry from inside the hook, which would otherwise activate
-    # the strategy while we're still in the deactivated-config phase
-    # and corrupt eviction-policy inactive state (active entry ending
-    # up as an eviction candidate).
-    configuring: bool = False
+    bindings: list[ResourceBinding[Any]] = field(default_factory=list)
+
+
+def _store_has_trainables(store: ResourceStore) -> bool:
+    return bool(getattr(store, "has_trainables", False))
 
 
 # ---------------------------------------------------------------------------
@@ -298,19 +340,17 @@ class _Entry:
 
 
 class ModelCache:
-    """Policy-driven pool over :class:`CachedResource` instances.
+    """Policy-driven pool over :class:`ResourceStore` instances.
 
     Parameters
     ----------
     max_cache_bytes:
-        Total budget for cached strategy backing storage (typically
+        Total budget for cached resource backing storage (typically
         pinned host memory). Must be ≥ 0.
     empty_host_cache:
         Optional callback invoked after any path that releases a
-        cache-held strategy reference — eviction, admission rejection
-        (negative or oversized post-build ``cache_bytes``), activation
-        failure on freshly-built or previously-cached entries,
-        post-activate contract violations, and deactivate failures.
+        cache-held store reference — eviction and admission rejection
+        (negative or oversized post-build ``cache_bytes``).
         Flushes PyTorch's ``CachingHostAllocator`` so freed pinned
         pages return to the OS. If ``None`` and CUDA is available,
         defaults to ``torch._C._host_emptyCache`` when present. Pass
@@ -365,7 +405,7 @@ class ModelCache:
     def available_cache_bytes(self) -> int:
         """Current signed cache-budget headroom.
 
-        Negative means a cached strategy grew after admission and the
+        Negative means a cached store grew after admission and the
         cache is currently over budget.
         """
         with self._lock:
@@ -376,7 +416,7 @@ class ModelCache:
         return self._max_cache_bytes - self._used_bytes
 
     def register(self, spec: ResourceSpec, *, replace: bool = False) -> None:
-        """Register a lazy model factory without building it.
+        """Register a lazy store factory without building it.
 
         Idempotent only with ``replace=True``: re-registering an
         existing key without ``replace`` raises
@@ -391,27 +431,33 @@ class ModelCache:
             if existing is not None:
                 if not replace:
                     raise DuplicateModelKeyError(f"{spec.key!r} is already registered")
-                if existing.active_count > 0:
+                if existing.bindings:
                     raise ModelInUseError(
-                        f"cannot replace active registration {spec.key!r} (refcount={existing.active_count})"
+                        f"cannot replace active registration {spec.key!r} "
+                        f"(bindings={len(existing.bindings)})"
                     )
-                if existing.strategy is not None:
+                if existing.store is not None:
                     self._evict_inactive(spec.key)
             self._entries[spec.key] = _Entry(spec=spec)
 
     def unregister(self, key: str, *, evict: bool = True) -> None:
-        """Drop a registration. If a built strategy exists and
+        """Drop a registration. If a built store exists and
         ``evict=True`` (default), evict it; otherwise raise
         :class:`ModelInUseError` if it's cached or active."""
         with self._lock:
             entry = self._entries.get(key)
             if entry is None:
                 return
-            if entry.active_count > 0:
-                raise ModelInUseError(f"cannot unregister active model {key!r} (refcount={entry.active_count})")
-            if entry.strategy is not None:
+            if entry.bindings:
+                raise ModelInUseError(
+                    f"cannot unregister active model {key!r} "
+                    f"(bindings={len(entry.bindings)})"
+                )
+            if entry.store is not None:
                 if not evict:
-                    raise ModelInUseError(f"{key!r} has a built strategy; pass evict=True to release it")
+                    raise ModelInUseError(
+                        f"{key!r} has a built store; pass evict=True to release it"
+                    )
                 self._evict_inactive(key)
             del self._entries[key]
 
@@ -421,7 +467,7 @@ class ModelCache:
         model: ResourceSpec[T],
         *,
         device: torch.device | str | None = None,
-        pre_activate: Callable[[CachedResource[T]], None] | None = None,
+        configure: Callable[[ResourceBinding[T]], None] | None = None,
     ) -> contextlib.AbstractContextManager[T]: ...
     @overload
     def use(
@@ -429,7 +475,7 @@ class ModelCache:
         model: str,
         *,
         device: torch.device | str | None = None,
-        pre_activate: Callable[[CachedResource[Any]], None] | None = None,
+        configure: Callable[[ResourceBinding[Any]], None] | None = None,
     ) -> contextlib.AbstractContextManager[Any]: ...
 
     @contextlib.contextmanager
@@ -438,36 +484,28 @@ class ModelCache:
         model: str | ResourceSpec,
         *,
         device: torch.device | str | None = None,
-        pre_activate: Callable[[CachedResource[Any]], None] | None = None,
+        configure: Callable[[ResourceBinding[Any]], None] | None = None,
     ) -> Iterator[Any]:
         """Acquire an active lease on a cached resource.
 
         Accepts either a registered key (string) or a :class:`ResourceSpec`
         (auto-registers if its key isn't already known). Yields the
-        resource's :attr:`~CachedResource.value` for use; on context
+        resource binding's :attr:`~ResourceBinding.value` for use; on context
         exit, releases the lease.
 
         ``device`` optionally selects the activation device for this
-        acquire. It is normalized and passed to the strategy's
-        :meth:`~CachedResource.activate` on the first lease. Re-entrant
-        same-key acquires may omit ``device`` or must pass the same
-        device; simultaneous activation of one cached entry on multiple
-        devices is rejected. Different keys may be active on the same
+        acquire. It is normalized and passed to the binding's
+        :meth:`~ResourceBinding.activate` for that binding. Same-key
+        nested acquires create independent bindings when the store
+        supports them; stores with trainable parameters may reject
+        concurrent same-key bindings. Different keys and supported
+        multiple bindings for the same key may be active on the same
         device at the same time; caller code owns GPU memory planning.
 
-        Re-entrant for the same key: nested ``use()`` calls bump a
-        per-key refcount and share the already-active value (the
-        underlying resource is *not* activated again).
-
-        ``pre_activate`` is an optional hook called with the strategy
-        on the first lease — after build (or cache hit) and *while the
-        strategy is still deactivated*, before :meth:`activate`. Use
-        for per-acquire configuration that requires the deactivated
-        state (e.g., :meth:`ModelOffloader.set_loras`). The hook does
-        NOT run on re-entrant nested acquires (the strategy is already
-        active). A raising hook leaves the strategy state unknown: the
-        entry is discarded and the exception is wrapped in
-        :class:`ActivationError`.
+        ``configure`` is an optional hook called with the fresh binding
+        after bind and before :meth:`activate`. Use it for per-acquire
+        configuration that requires the deactivated state (e.g.,
+        :meth:`ModelOffloader.set_loras`).
         """
         spec = model if isinstance(model, ResourceSpec) else None
         key = spec.key if spec is not None else model
@@ -483,25 +521,25 @@ class ModelCache:
                 self.register(spec)
                 entry = self._entries[key]
 
-            value = self._acquire(
+            binding, value = self._acquire(
                 entry,
                 device=device,
-                pre_activate=pre_activate,
+                configure=configure,
             )
         try:
             yield value
         finally:
             with self._lock:
-                self._release(entry)
+                self._release(entry, binding)
 
     def evict(self, key: str) -> None:
         """Manually evict one inactive cached entry. Raises
         :class:`ModelInUseError` if active, no-op if not cached."""
         with self._lock:
             entry = self._entries.get(key)
-            if entry is None or entry.strategy is None:
+            if entry is None or entry.store is None:
                 return
-            if entry.active_count > 0:
+            if entry.bindings:
                 raise ModelInUseError(f"cannot evict active model {key!r}")
             self._evict_inactive(key)
 
@@ -509,7 +547,7 @@ class ModelCache:
         """Evict all inactive entries. Registrations are preserved.
         Raises :class:`ModelInUseError` if any entry is active."""
         with self._lock:
-            active = [k for k, e in self._entries.items() if e.active_count > 0]
+            active = [k for k, e in self._entries.items() if e.bindings]
             if active:
                 raise ModelInUseError(f"cannot clear while models are active: {active}")
             for key in (candidate.key for candidate in self._eviction_candidates()):
@@ -526,9 +564,9 @@ class ModelCache:
                 key=entry.spec.key,
                 label=entry.spec.label,
                 estimated_cache_bytes=entry.spec.estimated_cache_bytes,
-                cache_bytes=entry.cache_bytes if entry.strategy is not None else None,
-                cached=entry.strategy is not None,
-                active_count=entry.active_count,
+                cache_bytes=entry.cache_bytes if entry.store is not None else None,
+                cached=entry.store is not None,
+                active_count=len(entry.bindings),
             )
 
     # ------------------------------------------------------------------
@@ -540,146 +578,67 @@ class ModelCache:
         entry: _Entry,
         *,
         device: torch.device | str | None = None,
-        pre_activate: Callable[[CachedResource[Any]], None] | None = None,
-    ) -> object:
-        """Build (if needed), run ``pre_activate``, activate, and
-        return the resource value.
-
-        Re-entrant: if the entry is already active, bump the refcount
-        and share the value without re-activating or re-running
-        ``pre_activate``. Same-key re-entry from inside ``pre_activate``
-        itself is rejected with :class:`ModelCacheError` to preserve
-        eviction-policy inactive-state invariants. On pre_activate /
-        activate / post-activate-reconcile failure, the entry is discarded
-        and an exception
-        propagates (pre_activate / activate failures are wrapped in
-        :class:`ActivationError`)."""
-        key = entry.spec.key
-
-        # Same-key re-entry from inside the hook would acquire while
-        # active_count is still 0, run a full activate/deactivate cycle
-        # on the inner lease, mark the key inactive, then continue the
-        # outer activate path — yielding an active entry that's also
-        # tracked as evictable by the policy. The hook already has the
-        # strategy as its argument; legitimate re-entry is for *different*
-        # keys.
-        if entry.configuring:
-            raise ModelCacheError(
-                f"cannot acquire {key!r} from inside its own pre_activate "
-                "hook; the strategy is already available as the hook argument"
-            )
-
-        if entry.active_count > 0:
-            return self._acquire_reentrant(entry, device)
-
+        configure: Callable[[ResourceBinding[Any]], None] | None = None,
+    ) -> tuple[ResourceBinding[Any], object]:
+        """Build the store if needed, bind, read value, activate, and
+        publish the active binding."""
         active_device = self._normalize_device(device)
-        strategy = self._prepare_strategy_for_activation(entry, pre_activate)
-        value = self._activate_strategy(entry, strategy, active_device)
-
-        entry.active_count = 1
-        entry.active_device = active_device
-        return value
-
-    def _acquire_reentrant(self, entry: _Entry, device: torch.device | str | None) -> object:
-        """Bump a same-key active lease without reactivating the strategy."""
-        key = entry.spec.key
-        requested_device = self._normalize_device(device)
-        if requested_device is not None and entry.active_device is None:
-            raise ModelCacheError(
-                f"cannot acquire active {key!r} with device {requested_device}: "
-                "the existing lease was activated without a device"
-            )
-        if requested_device is not None and entry.active_device is not None and requested_device != entry.active_device:
-            raise ModelCacheError(
-                f"cannot acquire active {key!r} on {requested_device}: already active on {entry.active_device}"
-            )
-        strategy = entry.strategy
-        assert strategy is not None
-        value = strategy.value
-        entry.active_count += 1
-        return value
+        self._ensure_store(entry)
+        binding = self._create_binding(entry)
+        value = binding.value
+        if configure is not None:
+            configure(binding)
+        binding.activate(active_device)
+        entry.bindings.append(binding)
+        self._eviction.mark_active(entry.spec.key)
+        return binding, value
 
     @staticmethod
     def _normalize_device(device: torch.device | str | None) -> torch.device | None:
         return canonical_device(device) if device is not None else None
 
-    def _prepare_strategy_for_activation(
-        self,
-        entry: _Entry,
-        pre_activate: Callable[[CachedResource[Any]], None] | None,
-    ) -> CachedResource[Any]:
-        """Build or mark-active an inactive strategy, then run pre-activation config."""
-        key = entry.spec.key
-        if entry.strategy is None:
+    def _ensure_store(self, entry: _Entry) -> None:
+        """Build and cache the store if this is a cache miss."""
+        if entry.store is None:
             self._build_into_entry(entry)
-        else:
-            self._eviction.mark_active(key)
 
-        strategy = entry.strategy
-        assert strategy is not None
-        if pre_activate is not None:
-            self._run_pre_activate(entry, strategy, pre_activate)
-        return strategy
+    def _create_binding(self, entry: _Entry) -> ResourceBinding[Any]:
+        """Create an unpublished binding from the cached store."""
+        store = entry.store
+        assert store is not None
+        if entry.bindings and _store_has_trainables(store):
+            raise ModelInUseError(
+                f"cannot create multiple active bindings for trainable "
+                f"resource {entry.spec.key!r}"
+            )
+        return entry.spec.bind(store)
 
-    def _run_pre_activate(
-        self,
-        entry: _Entry,
-        strategy: CachedResource[Any],
-        pre_activate: Callable[[CachedResource[Any]], None],
-    ) -> None:
-        entry.configuring = True
-        try:
-            pre_activate(strategy)
-        except BaseException as exc:
-            entry.configuring = False
-            self._release_strategy(entry)
-            raise ActivationError(f"pre_activate() failed for {entry.spec.key!r}") from exc
-        entry.configuring = False
-
-    def _activate_strategy(
-        self,
-        entry: _Entry,
-        strategy: CachedResource[Any],
-        device: torch.device | None,
-    ) -> object:
-        """Activate an inactive strategy and reconcile its budget accounting."""
-        value = strategy.value
-        try:
-            if device is None:
-                strategy.activate()
-            else:
-                strategy.activate(device)
-        except BaseException as exc:
-            entry.configuring = False
-            self._release_strategy(entry)
-            raise ActivationError(f"activate() failed for {entry.spec.key!r}") from exc
-
-        try:
-            self._reconcile_bytes(entry, strategy.cache_bytes, phase="activate")
-        except BaseException:
-            with contextlib.suppress(BaseException):
-                strategy.deactivate()
-            self._release_strategy(entry)
-            raise
-        return value
-
-    def _release(self, entry: _Entry) -> None:
+    def _release(self, entry: _Entry, binding: ResourceBinding[Any]) -> None:
         """End a lease. On the final release, deactivate and mark the
         entry inactive for eviction policy state. A raising deactivate
-        leaves the entry unrecoverable: discard and propagate so the
-        caller sees the strategy's failure."""
-        entry.active_count -= 1
-        if entry.active_count > 0:
-            return
-        strategy = entry.strategy
-        assert strategy is not None
+        leaves the binding unrecoverable: discard it and propagate so
+        the caller sees the binding's failure."""
         try:
-            strategy.deactivate()
+            binding.deactivate()
         except BaseException:
-            self._release_strategy(entry)
+            self._discard_binding(entry, binding)
             raise
-        entry.active_device = None
-        self._eviction.mark_inactive(entry.spec.key)
+        self._discard_binding(entry, binding)
+
+    def _discard_binding(
+        self,
+        entry: _Entry,
+        binding: ResourceBinding[Any],
+    ) -> None:
+        for index, active_binding in enumerate(entry.bindings):
+            if active_binding is binding:
+                del entry.bindings[index]
+                break
+        self._mark_inactive_if_idle(entry)
+
+    def _mark_inactive_if_idle(self, entry: _Entry) -> None:
+        if entry.store is not None and not entry.bindings:
+            self._eviction.mark_inactive(entry.spec.key)
 
     # ------------------------------------------------------------------
     # Build & accounting
@@ -692,53 +651,49 @@ class ModelCache:
         a negative ``cache_bytes`` is rejected and an over-estimate
         triggers further eviction (which can fail with
         :class:`ModelTooLargeError`). All post-factory failure paths
-        drop the local strategy ref BEFORE the host-cache flush so
+        drop the local store ref BEFORE the host-cache flush so
         refcount-GC frees pinned tensors in time for the flush to
         actually reclaim them.
         """
         estimate = entry.spec.estimated_cache_bytes
         self._evict_to_fit(estimate)
-        strategy: CachedResource[Any] | None = entry.spec.factory()
+        store: ResourceStore | None = entry.spec.store_factory()
 
         try:
-            actual = strategy.cache_bytes
+            actual = store.cache_bytes
             if actual < 0:
                 raise ModelCacheError(
-                    f"strategy.cache_bytes for {entry.spec.key!r} returned {actual} (must be >= 0)",
+                    f"store.cache_bytes for {entry.spec.key!r} returned {actual} (must be >= 0)",
                 )
             if actual > estimate:
                 self._evict_to_fit(actual)
         except BaseException:
-            strategy = None
+            store = None
             self._after_release()
             raise
 
-        assert strategy is not None
-        entry.strategy = strategy
+        assert store is not None
+        entry.store = store
         # Initial commit: cache_bytes is currently 0; reconcile against
         # actual to record the bytes and update peak. Build-path
         # eviction already made room, so the over-budget warning path
         # is unreachable from here.
         self._reconcile_bytes(entry, actual, phase="build")
-        # Freshly-built entries are about to be activated; do NOT mark
-        # them inactive yet. That happens on first deactivate.
+        self._eviction.mark_inactive(entry.spec.key)
 
     def _reconcile_bytes(self, entry: _Entry, observed: int, *, phase: str) -> None:
         """Apply ``observed`` to entry and global byte accounting.
 
-        Used on the build path (initial commit, 0 → actual) and on the
-        activate path (drift from a strategy that defers pinning).
+        Used on the build path (initial commit, 0 -> actual).
         Raises :class:`ModelCacheError` if ``observed < 0`` so a
-        misbehaving strategy can't corrupt ``_used_bytes`` (the build
+        misbehaving store can't corrupt ``_used_bytes`` (the build
         path also pre-validates before attaching to keep refcount-GC
         timing correct on the cleanup path). Logs a warning if the
-        update pushes total usage over budget — only reachable from
-        the activate path; build-path pre-eviction makes the budget
-        already satisfied at this call.
+        update pushes total usage over budget.
         """
         if observed < 0:
             raise ModelCacheError(
-                f"strategy.cache_bytes for {entry.spec.key!r} returned {observed} (must be >= 0) after {phase}"
+                f"store.cache_bytes for {entry.spec.key!r} returned {observed} (must be >= 0) after {phase}"
             )
         if observed == entry.cache_bytes:
             return
@@ -748,9 +703,8 @@ class ModelCache:
         if self._used_bytes > self._max_cache_bytes:
             logger.warning(
                 "ModelCache over budget after %s: %r grew to %d bytes; total %d/%d. "
-                "The strategy reported a smaller cache_bytes earlier than at this "
-                "point — usually a custom strategy that defers pinning. Pin in "
-                "__init__ so cache_bytes is final at admission.",
+                "The store reported a smaller cache_bytes earlier than at this "
+                "point -- stores should make cache_bytes final at admission.",
                 phase,
                 entry.spec.key,
                 observed,
@@ -765,7 +719,7 @@ class ModelCache:
     def _eviction_candidates(self) -> tuple[EvictionCandidate, ...]:
         candidates: list[EvictionCandidate] = []
         for key, entry in self._entries.items():
-            if entry.strategy is None or entry.active_count > 0:
+            if entry.store is None or entry.bindings:
                 continue
             candidates.append(
                 EvictionCandidate(
@@ -821,26 +775,24 @@ class ModelCache:
         """Release a cached, inactive entry as an eviction. Asserts the
         precondition (built + inactive)."""
         entry = self._entries[key]
-        assert entry.strategy is not None
-        assert entry.active_count == 0
-        self._release_strategy(entry)
+        assert entry.store is not None
+        assert not entry.bindings
+        self._release_store(entry)
 
-    def _release_strategy(self, entry: _Entry) -> None:
-        """Drop the strategy reference and update accounting.
+    def _release_store(self, entry: _Entry) -> None:
+        """Drop the store reference and update accounting.
 
-        Used on three paths: policy eviction, activation or contract
-        failure, and deactivate failure. Dropping ``entry.strategy``
-        triggers refcount-GC of pinned tensors when the cache was the
-        sole owner; the host-cache flush runs after so freed pages
-        return to the OS.
+        Used for policy eviction and store admission rejection. Dropping
+        ``entry.store`` triggers refcount-GC of pinned tensors when the
+        cache was the sole owner; the host-cache flush runs after so
+        freed pages return to the OS.
         """
         bytes_freed = entry.cache_bytes
-        # Drop strategy ref BEFORE the host-cache flush so refcount-GC
+        # Drop store ref BEFORE the host-cache flush so refcount-GC
         # frees pinned tensors in time for empty_host_cache to reclaim
         # them.
-        entry.strategy = None
+        entry.store = None
         entry.cache_bytes = 0
-        entry.active_device = None
         self._eviction.discard(entry.spec.key)
         self._used_bytes -= bytes_freed
         self._after_release()

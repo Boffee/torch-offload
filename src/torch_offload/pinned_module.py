@@ -187,10 +187,6 @@ class PinnedModuleInstance:
     )
 
     @property
-    def cache_bytes(self) -> int:
-        return _unique_cache_bytes(self.params) + _unique_cache_bytes(self.buffers)
-
-    @property
     def has_trainables(self) -> bool:
         return bool(self.trainable_param_names)
 

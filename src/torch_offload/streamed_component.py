@@ -800,10 +800,6 @@ class StreamedComponent:
         return self._buffer_names
 
     @property
-    def cache_bytes(self) -> int:
-        return sum(instance.cache_bytes for instance in self._block_instances)
-
-    @property
     def has_trainables(self) -> bool:
         return any(instance.has_trainables for instance in self._block_instances)
 
