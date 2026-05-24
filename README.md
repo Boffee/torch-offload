@@ -54,21 +54,22 @@ This library gives you:
 
 | Situation | Use |
 |---|---|
-| Model fits on GPU when active; want fast eviction between calls | **`ModelOffloader(model)`** — bulk DMA, ~200 ms for 12 GB at PCIe Gen5 x16 |
-| Model too big for a CUDA GPU even when active | **`ModelOffloader(model, layers_attr=..., blocks_to_swap=...)`** — streams transformer blocks via forward hooks |
+| Model fits on GPU when active; want fast eviction between calls | **`ModelOffloaderStore.from_module(model).bind(model)`** — bulk DMA, ~200 ms for 12 GB at PCIe Gen5 x16 |
+| Model too big for a CUDA GPU even when active | **`ModelOffloaderStore.from_module(model, layers_attr=..., blocks_to_swap=...).bind(model)`** — streams transformer blocks via forward hooks |
 | Multiple models swap in/out across a script | Wrap each in a strategy, hand to **`ModelCache`** |
 
 ## Quick start: whole-model offload
 
 ```python
 import torch
-from torch_offload import ModelOffloader
+from torch_offload import ModelOffloaderStore
 
 model = build_my_model()  # any nn.Module
-strategy = ModelOffloader(model)
+store = ModelOffloaderStore.from_module(model)
+strategy = store.bind(model)
 device = torch.device("cuda")
 
-# Construction pays the pinning cost (clone + pin_memory).
+# Store construction pays the pinning cost (clone + pin_memory).
 # Each use is bulk-DMA only.
 with strategy.use(device) as gpu_model:
     output = gpu_model(input_tensor)
@@ -100,15 +101,16 @@ and a CUDA-stream-based async prefetcher.
 
 ```python
 import torch
-from torch_offload import ModelOffloader
+from torch_offload import ModelOffloaderStore
 
-# Constructor pins everything; cache_bytes is final immediately.
-offload = ModelOffloader(
+# Store construction pins everything; cache_bytes is final immediately.
+store = ModelOffloaderStore.from_module(
     model,
     layers_attr="transformer_blocks",  # path to the nn.ModuleList
     blocks_to_swap=24,                 # offload N blocks; rest GPU-resident
     prefetch_count=2,
 )
+offload = store.bind(model)
 device = torch.device("cuda")
 
 with offload.use(device) as gpu_model:
@@ -135,12 +137,13 @@ To reduce trainable-weight residency during training, opt into
 streaming in-block trainable weights:
 
 ```python
-offload = ModelOffloader(
+store = ModelOffloaderStore.from_module(
     model,
     layers_attr="transformer_blocks",
     blocks_to_swap=24,
     stream_trainable_weights=True,
 )
+offload = store.bind(model)
 ```
 
 During CUDA activation in this mode, only the trainable parameter
@@ -152,33 +155,38 @@ Gradients are not streamed; PyTorch owns `param.grad` normally.
 
 `ModelOffloader` supports optional per-weight LoRA merging via
 `set_loras()`. LoRA requests are applied during activation; merge mode
-installs activation-scoped post-copy hooks for matched targets. Each
-hook runs immediately after the owning component copies the base weight
-from pinned CPU storage to GPU, so both block-streamed and non-block
-weights use the same merge path. Merge compatibility is adapter-owned:
-plain dense tensors opt into in-place `addmm_`; structured quantized
-wrappers can opt into dequantize/requantize plus `copy_into` updates.
-Use routed mode for formats that do not expose either merge capability
-but still provide a compatible logical Linear weight shape and compute
-dtype. `PinnedParam` remains a storage primitive; LoRA merge mode asks
-the selected adapter for the required update capability.
+installs activation-scoped post-copy hooks for canonical managed
+parameter targets. Unknown targets raise during activation. PEFT
+`.base_layer.` model parameter paths are canonicalized for lookup, so
+LoRA target keys should use the logical form like
+`blocks.0.attn.weight`. Each hook runs immediately after the owning
+component copies the base weight from pinned CPU storage to GPU, so both
+block-streamed and non-block weights use the same merge path. Merge
+compatibility is adapter-owned: plain dense tensors opt into in-place
+`addmm_`; structured quantized wrappers can opt into
+dequantize/requantize plus `copy_into` updates. Use routed mode for
+formats that do not expose either merge capability but still provide a
+compatible logical Linear weight shape and compute dtype. `PinnedParam`
+remains a storage primitive; LoRA merge mode asks the selected adapter
+for the required update capability.
 
 `set_loras()` records the replacement request while the offload is
-inactive. Target matching is resolved during activation; target
+inactive. Target lookup is resolved during activation; target
 compatibility can be preflighted with `LoRATransform.validate_target()`
 or validated when the merge hook applies.
 
 ```python
 import torch
-from torch_offload import ModelOffloader, LoRA
+from torch_offload import ModelOffloaderStore, LoRA
 from safetensors.torch import load_file
 
-offload = ModelOffloader(
+store = ModelOffloaderStore.from_module(
     model,
     layers_attr="transformer_blocks",
     blocks_to_swap=24,
     # Default: stream_trainable_weights=False
 )
+offload = store.bind(model)
 device = torch.device("cuda")
 
 # Request LoRAs for the next activation (must be called while deactivated)
@@ -237,12 +245,13 @@ same parameter layout (names/shapes/dtypes/quant-metadata) — split
 heterogeneous block lists into separate `layers_attr` entries:
 
 ```python
-offload = ModelOffloader(
+store = ModelOffloaderStore.from_module(
     model,
     layers_attr=["transformer_blocks", "single_transformer_blocks"],
     blocks_to_swap=[8, 24],   # per-group; or pass a single int for both
     prefetch_count=[2, 4],
 )
+offload = store.bind(model)
 ```
 
 ### Training streamed blocks
@@ -276,13 +285,14 @@ safe because no autograd graph spans across reuses.
 
 ```python
 import torch
-from torch_offload import ModelOffloader
+from torch_offload import ModelOffloaderStore
 
-offload = ModelOffloader(
+store = ModelOffloaderStore.from_module(
     model,
     layers_attr="transformer_blocks",
     blocks_to_swap=24,
 )
+offload = store.bind(model)
 device = torch.device("cuda")
 
 model.gradient_checkpointing_enable()  # required for training
@@ -333,7 +343,11 @@ CPU storage, and leaves gradients on GPU.
 For multiple independent models swapping in and out of GPU.
 
 ```python
-from torch_offload import ModelCache, ModelSpec, ModelOffloader
+from torch_offload import ModelCache, ModelSpec, ModelOffloaderStore
+
+
+def make_offloader(model):
+    return ModelOffloaderStore.from_module(model).bind(model)
 
 cache = ModelCache(max_cache_bytes=80 * 1024**3)
 device = "cuda:0"
@@ -342,12 +356,12 @@ device = "cuda:0"
 cache.register(ModelSpec(
     key="text_encoder",
     estimated_cache_bytes=12 * 1024**3,
-    factory=lambda: ModelOffloader(build_text_encoder()),
+    factory=lambda: make_offloader(build_text_encoder()),
 ))
 cache.register(ModelSpec(
     key="diffusion_model",
     estimated_cache_bytes=24 * 1024**3,
-    factory=lambda: ModelOffloader(build_diffusion_model()),
+    factory=lambda: make_offloader(build_diffusion_model()),
 ))
 
 # First use builds via factory; subsequent uses hit the cache.
@@ -370,14 +384,14 @@ You can also auto-register at acquire time:
 
 ```python
 spec = ModelSpec(key="vae", estimated_cache_bytes=500*1024**2,
-                 factory=lambda: ModelOffloader(build_vae()))
+                 factory=lambda: make_offloader(build_vae()))
 with cache.use(spec, device=device) as vae:  # registers if missing, then uses
     decoded = vae.decode(latent)
 ```
 
 > **Anti-pattern:** the factory should build a fresh model each call,
 > not capture an externally-held one. With `factory=lambda:
-> ModelOffloader(my_kept_model)` the cache is no longer the
+> make_offloader(my_kept_model)` the cache is no longer the
 > sole owner of the model — eviction drops the strategy, but
 > `my_kept_model` keeps the pinned tensors alive. `used_cache_bytes`
 > will lie about freed memory. Always have the factory build the

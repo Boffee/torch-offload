@@ -30,12 +30,14 @@ and :class:`~torch_offload.StreamedComponent`.
 
 Lifecycle
 ---------
-``__init__`` sets up backing state (pinning, name metadata, etc.) so
-``cache_bytes`` is final immediately and a top-level resource is ready
-for :class:`~torch_offload.model_cache.ModelCache` admission →
-``activate(device=...)`` (make resource usable, on the caller-selected
-device when the resource is device-aware) → ``deactivate()``
-(release transient compute resources, keep ``cache_bytes`` resident).
+Backing state is set up before cache admission so ``cache_bytes`` is
+final immediately. Direct resources do that in ``__init__``; store-backed
+resources such as :class:`~torch_offload.ModelOffloader` do it in store
+construction, then bind the store to create a top-level resource.
+The resource lifecycle is then ``activate(device=...)`` (make resource
+usable, on the caller-selected device when the resource is device-aware)
+→ ``deactivate()`` (release transient compute resources, keep
+``cache_bytes`` resident).
 Package strategies optimize construction peak memory: plain
 ``torch.Tensor`` parameters may be repointed to pinned storage while
 pinning is still in progress. If construction raises after pinning has

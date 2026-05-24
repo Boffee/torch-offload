@@ -371,6 +371,22 @@ def _build_param_name_index(
     return index
 
 
+def _build_buffer_name_index(
+    instances: Sequence[PinnedModuleInstance],
+    prefix: str | None,
+) -> dict[str, tuple[int, str]]:
+    index: dict[str, tuple[int, str]] = {}
+    for block_idx, instance in enumerate(instances):
+        for local_name in instance.buffers:
+            name = _streamed_param_name(prefix, block_idx, local_name)
+            if name in index:
+                raise ValueError(
+                    f"duplicate streamed buffer name {name!r}"
+                )
+            index[name] = (block_idx, local_name)
+    return index
+
+
 def _streamed_param_name(
     prefix: str | None,
     block_idx: int,
@@ -717,7 +733,12 @@ class StreamedComponent:
             self._block_instances,
             name,
         )
+        self._buffer_name_to_block_buffer = _build_buffer_name_index(
+            self._block_instances,
+            name,
+        )
         self._param_names = frozenset(self._param_name_to_block_param)
+        self._buffer_names = frozenset(self._buffer_name_to_block_buffer)
         self._move_trainable_grads_to(torch.device("cpu"))
 
         # Active resources allocated on CUDA activate().
@@ -748,6 +769,11 @@ class StreamedComponent:
         )
 
     @property
+    def blocks(self) -> tuple[nn.Module, ...]:
+        """Bound block modules managed by this component."""
+        return tuple(self._blocks)
+
+    @property
     def streamed_param_names_by_block(self) -> list[list[str]]:
         """Per-block streamed parameter names."""
         return [
@@ -767,6 +793,11 @@ class StreamedComponent:
     def param_names(self) -> frozenset[str]:
         """Externally addressable streamed parameter names."""
         return self._param_names
+
+    @property
+    def buffer_names(self) -> frozenset[str]:
+        """Externally addressable streamed buffer names."""
+        return self._buffer_names
 
     @property
     def cache_bytes(self) -> int:
@@ -805,6 +836,16 @@ class StreamedComponent:
         block_idx, local_name = ref
         return self._resolve_block_param(block_idx, local_name)
 
+    def _resolve_buffer_name(
+        self,
+        name: str,
+    ) -> tuple[PinnedModuleInstance, str]:
+        ref = self._buffer_name_to_block_buffer.get(name)
+        if ref is None:
+            raise ValueError(f"buffer name {name!r} is not owned by this streamer")
+        block_idx, local_name = ref
+        return self._resolve_block_buffer(block_idx, local_name)
+
     def _resolve_block_param(
         self,
         block_idx: int,
@@ -818,6 +859,22 @@ class StreamedComponent:
         if name not in instance.params:
             raise ValueError(
                 f"param name {name!r} is not owned by streamed block {block_idx}"
+            )
+        return instance, name
+
+    def _resolve_block_buffer(
+        self,
+        block_idx: int,
+        name: str,
+    ) -> tuple[PinnedModuleInstance, str]:
+        if block_idx < 0 or block_idx >= len(self._block_instances):
+            raise ValueError(
+                f"streamed block index {block_idx} is out of range"
+            )
+        instance = self._block_instances[block_idx]
+        if name not in instance.buffers:
+            raise ValueError(
+                f"buffer name {name!r} is not owned by streamed block {block_idx}"
             )
         return instance, name
 

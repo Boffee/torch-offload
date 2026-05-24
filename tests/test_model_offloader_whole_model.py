@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable, Iterable, Sequence
 from typing import Any, cast
 
 import pytest
@@ -11,6 +12,7 @@ from torch import nn
 
 from torch_offload import (
     ModelOffloader,
+    ModelOffloaderStore,
     ModelStrategy,
     PinnedComponent,
     PinnedComponentStore,
@@ -18,6 +20,36 @@ from torch_offload import (
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 _OFFLOADER_LOGGER = "torch_offload.model_offloader"
+
+
+def _make_model_offloader(
+    model: nn.Module,
+    *,
+    layers_attr: str | Sequence[str] | None = None,
+    blocks_to_swap: int | Sequence[int] | None = None,
+    prefetch_count: int | Sequence[int] = 2,
+    cyclic: bool = False,
+    stream_trainable_weights: bool = False,
+    skip_checkpointing_check: bool = False,
+    is_block_checkpointed: Callable[[nn.Module], bool] | None = None,
+    include_param_names: Iterable[str] | None = None,
+    include_buffer_names: Iterable[str] | None = None,
+) -> ModelOffloader:
+    store = ModelOffloaderStore.from_module(
+        model,
+        layers_attr=layers_attr,
+        blocks_to_swap=blocks_to_swap,
+        prefetch_count=prefetch_count,
+        cyclic=cyclic,
+        stream_trainable_weights=stream_trainable_weights,
+        include_param_names=include_param_names,
+        include_buffer_names=include_buffer_names,
+    )
+    return store.bind(
+        model,
+        skip_checkpointing_check=skip_checkpointing_check,
+        is_block_checkpointed=is_block_checkpointed,
+    )
 
 
 def _make_simple_model() -> nn.Module:
@@ -43,7 +75,7 @@ def _unique_pinned_buffer_count(pw: ModelOffloader) -> int:
 
 class TestModelStrategyConformance:
     def test_isinstance_runtime_check(self) -> None:
-        pw = ModelOffloader(_make_simple_model())
+        pw = _make_model_offloader(_make_simple_model())
         try:
             assert isinstance(pw, ModelStrategy)
         finally:
@@ -61,8 +93,12 @@ class TestModelStrategyConformance:
         with pytest.raises(TypeError, match="PinnedComponentStore.from_module"):
             PinnedComponent(cast(Any, _make_simple_model()))
 
+    def test_offloader_constructor_requires_bound_components(self) -> None:
+        with pytest.raises(TypeError, match="pinned_component"):
+            cast(Any, ModelOffloader)(_make_simple_model())
+
     def test_has_lifecycle_methods(self) -> None:
-        pw = ModelOffloader(_make_simple_model())
+        pw = _make_model_offloader(_make_simple_model())
         try:
             assert callable(pw.activate)
             assert callable(pw.deactivate)
@@ -152,7 +188,7 @@ class TestTrainableParams:
         param = m.weight
         opt = torch.optim.SGD(m.parameters(), lr=0.1)
 
-        pw = ModelOffloader(m)
+        pw = _make_model_offloader(m)
         try:
             assert m.weight is param
             assert m.weight.requires_grad
@@ -178,7 +214,7 @@ class TestTrainableParams:
         m = nn.Linear(4, 2, bias=False)
         assert m.training
 
-        pw = ModelOffloader(m)
+        pw = _make_model_offloader(m)
         try:
             with caplog.at_level(logging.WARNING, logger=_OFFLOADER_LOGGER):
                 pw._warn_if_training_without_checkpointing()
@@ -190,7 +226,7 @@ class TestTrainableParams:
             pw.deactivate()
 
     def test_optimizer_step_rejects_reentrant_entry(self) -> None:
-        pw = ModelOffloader(nn.Linear(4, 2, bias=False))
+        pw = _make_model_offloader(nn.Linear(4, 2, bias=False))
         try:
             with pytest.raises(RuntimeError, match="reentrant"):
                 with pw.optimizer_step():
@@ -200,7 +236,7 @@ class TestTrainableParams:
             pw.deactivate()
 
     def test_cpu_active_optimizer_step_rejects_reentrant_entry(self) -> None:
-        pw = ModelOffloader(nn.Linear(4, 2, bias=False))
+        pw = _make_model_offloader(nn.Linear(4, 2, bias=False))
         try:
             with pw.use("cpu"):
                 with pytest.raises(RuntimeError, match="reentrant"):
@@ -215,7 +251,7 @@ class TestTrainableParams:
         m = nn.Linear(4, 2, bias=False)
         param = m.weight
 
-        pw = ModelOffloader(m)
+        pw = _make_model_offloader(m)
         try:
             with pw.use("cuda"):
                 assert m.weight is param
@@ -232,7 +268,7 @@ class TestTrainableParams:
         param = m.weight
         opt = torch.optim.SGD(m.parameters(), lr=0.25)
 
-        pw = ModelOffloader(m)
+        pw = _make_model_offloader(m)
         try:
             with pw.use("cuda"):
                 loss = m(torch.ones(1, 4, device="cuda")).sum()
@@ -254,7 +290,7 @@ class TestTrainableParams:
     @CUDA
     def test_cuda_optimizer_step_copies_back_on_body_exception(self) -> None:
         m = nn.Linear(4, 1, bias=False)
-        pw = ModelOffloader(m)
+        pw = _make_model_offloader(m)
         try:
             with pw.use("cuda"):
                 with pytest.raises(RuntimeError, match="boom"):
@@ -277,7 +313,7 @@ class TestLifecycle:
     @CUDA
     def test_activate_returns_model_on_gpu(self) -> None:
         m = _make_simple_model()
-        pw = ModelOffloader(m)
+        pw = _make_model_offloader(m)
         try:
             pw.activate("cuda")
             assert pw.model is m
@@ -292,7 +328,7 @@ class TestLifecycle:
 
     def test_context_manager_protocol(self) -> None:
         m = _make_simple_model()
-        pw = ModelOffloader(m)
+        pw = _make_model_offloader(m)
         try:
             pinned_params = list(m.parameters())
             with pw.use("cpu") as model:
@@ -306,7 +342,7 @@ class TestLifecycle:
             pw.deactivate()
 
     def test_deactivate_when_not_active_is_noop(self) -> None:
-        pw = ModelOffloader(_make_simple_model())
+        pw = _make_model_offloader(_make_simple_model())
         try:
             pw.deactivate()
             pw.deactivate()
@@ -314,7 +350,7 @@ class TestLifecycle:
             pw.deactivate()
 
     def test_double_activate_raises(self) -> None:
-        pw = ModelOffloader(_make_simple_model())
+        pw = _make_model_offloader(_make_simple_model())
         try:
             pw.activate("cpu")
             with pytest.raises(RuntimeError, match=r"already.*active"):
@@ -323,7 +359,7 @@ class TestLifecycle:
             pw.deactivate()
 
     def test_repeated_activate_deactivate_cycle(self) -> None:
-        pw = ModelOffloader(_make_simple_model())
+        pw = _make_model_offloader(_make_simple_model())
         try:
             for _ in range(3):
                 with pw.use("cpu"):
@@ -333,7 +369,7 @@ class TestLifecycle:
 
     def test_activate_accepts_device_without_constructor_default(self) -> None:
         m = _make_simple_model()
-        pw = ModelOffloader(m)
+        pw = _make_model_offloader(m)
         try:
             pw.activate(device="cpu")
             for p in m.parameters():
@@ -343,7 +379,7 @@ class TestLifecycle:
             pw.deactivate()
 
     def test_activate_without_any_device_raises(self) -> None:
-        pw = ModelOffloader(_make_simple_model())
+        pw = _make_model_offloader(_make_simple_model())
         try:
             with pytest.raises(ValueError, match="requires a device"):
                 pw.activate()
@@ -366,7 +402,7 @@ class TestCleanup:
         import weakref
 
         m = _make_simple_model()
-        pw = ModelOffloader(m)
+        pw = _make_model_offloader(m)
         module_param_ref = weakref.ref(m[0]._parameters["weight"])
         pw.deactivate()
         assert module_param_ref() is not None  # still alive via model state
@@ -387,7 +423,7 @@ class TestConstruction:
             pass
         m = Empty()
         with pytest.raises(ValueError, match="at least one parameter"):
-            ModelOffloader(m)
+            _make_model_offloader(m)
 
     def test_accepts_buffer_only_module(self) -> None:
         # A module with only registered buffers (no frozen params) is a
@@ -400,7 +436,7 @@ class TestConstruction:
                 self.register_buffer("table", torch.randn(8, 4))
 
         m = BufferOnly()
-        pw = ModelOffloader(m)
+        pw = _make_model_offloader(m)
         try:
             assert pw.cache_bytes == 8 * 4 * 4  # float32
             assert m.table.is_pinned()
@@ -417,7 +453,7 @@ class TestConstruction:
                 raise AssertionError("constructor must pin directly")
 
         m = Guarded()
-        pw = ModelOffloader(m)
+        pw = _make_model_offloader(m)
         try:
             assert m.weight.is_pinned()
         finally:
@@ -459,7 +495,7 @@ class TestTiedWeightDedup:
 
     def test_same_parameter_under_two_names_dedupes(self) -> None:
         m, embed, head = self._make_tied_model()
-        pw = ModelOffloader(m)
+        pw = _make_model_offloader(m)
         try:
             # Exactly one unique pinned parameter for the tied weight.
             assert _unique_pinned_param_count(pw) == 1
@@ -475,7 +511,7 @@ class TestTiedWeightDedup:
 
     def test_distinct_params_sharing_storage_dedupe(self) -> None:
         m, _, _ = self._make_distinct_param_tied_model()
-        pw = ModelOffloader(m)
+        pw = _make_model_offloader(m)
         try:
             assert _unique_pinned_param_count(pw) == 1
             assert pw.param_names == {"a", "b"}
@@ -490,7 +526,7 @@ class TestTiedWeightDedup:
         m.a = p
         m.b = p
 
-        pw = ModelOffloader(m)
+        pw = _make_model_offloader(m)
         try:
             assert _unique_pinned_param_count(pw) == 1
             assert m._parameters["a"] is m._parameters["b"]
@@ -499,7 +535,7 @@ class TestTiedWeightDedup:
 
     def test_cache_bytes_counts_tied_once(self) -> None:
         m, _, _ = self._make_tied_model()
-        pw = ModelOffloader(m)
+        pw = _make_model_offloader(m)
         try:
             # 32 * 16 * 4 (float32 default) = 2048 bytes for one pinned param.
             # If the dedup were broken this would double.
@@ -510,7 +546,7 @@ class TestTiedWeightDedup:
     @CUDA
     def test_tied_params_share_gpu_storage_on_activate(self) -> None:
         m, embed, head = self._make_tied_model()
-        pw = ModelOffloader(m)
+        pw = _make_model_offloader(m)
         try:
             with pw.use("cuda"):
                 assert embed.weight.is_cuda
@@ -524,7 +560,7 @@ class TestTiedWeightDedup:
     @CUDA
     def test_distinct_tied_params_share_gpu_storage_on_activate(self) -> None:
         m, a, b = self._make_distinct_param_tied_model()
-        pw = ModelOffloader(m)
+        pw = _make_model_offloader(m)
         try:
             with pw.use("cuda"):
                 # Registry identity comparison; the local `a` / `b` refs are
@@ -543,7 +579,7 @@ class TestTiedWeightDedup:
         m.a = nn.Parameter(shared, requires_grad=False)
         m.b = nn.Parameter(shared, requires_grad=False)
 
-        pw = ModelOffloader(m)
+        pw = _make_model_offloader(m)
         try:
             assert _unique_pinned_param_count(pw) == 1
             assert m._parameters["a"] is m._parameters["b"]
@@ -569,7 +605,7 @@ class TestSharedSubmoduleAlias:
         m = nn.Module()
         m.a = shared
         m.b = shared
-        pw = ModelOffloader(m)
+        pw = _make_model_offloader(m)
         try:
             assert _unique_pinned_param_count(pw) == 1
             assert pw.param_names == {"a.weight", "b.weight"}
@@ -593,7 +629,7 @@ class TestSharedSubmoduleAlias:
         m = nn.Module()
         m.a = Inner(shared_buf)
         m.b = Inner(shared_buf)
-        pw = ModelOffloader(m)
+        pw = _make_model_offloader(m)
         try:
             # One pinned buffer backing covers both alias paths.
             assert _unique_pinned_buffer_count(pw) == 1
@@ -618,7 +654,7 @@ class TestSharedSubmoduleAlias:
         m = nn.Module()
         m.a = Inner(shared_buf)
         m.b = Inner(shared_buf)
-        pw = ModelOffloader(m)
+        pw = _make_model_offloader(m)
         try:
             assert _unique_pinned_buffer_count(pw) == 1
             pinned_buffer = pw._instance.buffers["a.buf"]
@@ -644,7 +680,7 @@ class TestSharedSubmoduleAlias:
         m.a = Inner(shared_buf)
         m.b = Inner(shared_buf)
 
-        pw = ModelOffloader(m)
+        pw = _make_model_offloader(m)
         try:
             assert _unique_pinned_buffer_count(pw) == 1
             pinned_buffer = pw._instance.buffers["a.buf"]
@@ -667,7 +703,7 @@ class TestMixedTrainableFrozenTied:
         m.a = a
         m.b = b
         with pytest.raises(ValueError, match="mixed requires_grad"):
-            ModelOffloader(m)
+            _make_model_offloader(m)
 
     def test_include_names_can_select_one_storage_alias(self) -> None:
         shared = torch.randn(8, dtype=torch.bfloat16)
@@ -676,7 +712,7 @@ class TestMixedTrainableFrozenTied:
         m.skip = nn.Parameter(shared, requires_grad=False)
         skipped = m.skip
 
-        pw = ModelOffloader(m, include_param_names={"keep"})
+        pw = _make_model_offloader(m, include_param_names={"keep"})
         try:
             assert set(pw._instance.params) == {"keep"}
             assert (
@@ -698,7 +734,7 @@ class TestZeroSizedParams:
         # Need at least one non-empty frozen param so the constructor doesn't
         # reject the model. The empties should each be their own entry.
         m.c = nn.Parameter(torch.randn(4), requires_grad=False)
-        pw = ModelOffloader(m)
+        pw = _make_model_offloader(m)
         try:
             # 3 entries: a, b, c — empties did not collapse.
             assert _unique_pinned_param_count(pw) == 3
@@ -737,7 +773,7 @@ class TestQuanto:
         # Verify the model now references pinned _data storage.
         m = self._make_quanto_model()
         original_data_ptr = m.weight._data.data_ptr()
-        pw = ModelOffloader(m)
+        pw = _make_model_offloader(m)
         try:
             # Inner _data must now point at pinned storage, not the original.
             assert m.weight._data.data_ptr() != original_data_ptr
@@ -749,7 +785,7 @@ class TestQuanto:
     @CUDA
     def test_quanto_activate_moves_inner_to_cuda(self) -> None:
         m = self._make_quanto_model()
-        pw = ModelOffloader(m)
+        pw = _make_model_offloader(m)
         try:
             with pw.use("cuda"):
                 assert m.weight._data.is_cuda
@@ -765,7 +801,7 @@ class TestQuanto:
         # parameter still references its pinned-CPU storage. Pinned
         # memory is freed when the caller drops the model reference.
         m = self._make_quanto_model()
-        pw = ModelOffloader(m)
+        pw = _make_model_offloader(m)
         pw.deactivate()
         # Quanto wrapper still on CPU after deactivate.
         assert m.weight._data.is_pinned()
@@ -779,7 +815,7 @@ class TestQuanto:
 
 class TestCacheBytes:
     def test_cache_bytes_positive(self) -> None:
-        pw = ModelOffloader(_make_simple_model())
+        pw = _make_model_offloader(_make_simple_model())
         try:
             assert pw.cache_bytes > 0
         finally:
@@ -789,11 +825,11 @@ class TestCacheBytes:
         m = nn.Sequential(nn.Linear(4, 4, bias=False), nn.LayerNorm(4))
         for p in m.parameters():
             p.requires_grad = False
-        pw_with = ModelOffloader(m)
+        pw_with = _make_model_offloader(m)
         with_bytes = pw_with.cache_bytes
 
         m2 = nn.Sequential(nn.Linear(4, 4, bias=False), nn.LayerNorm(4))
         for p in m2.parameters():
             p.requires_grad = False
-        pw_without = ModelOffloader(m2, include_buffer_names=set())
+        pw_without = _make_model_offloader(m2, include_buffer_names=set())
         assert pw_without.cache_bytes <= with_bytes

@@ -41,16 +41,13 @@ class _RemovableHook(Protocol):
 
 
 @dataclass(frozen=True, slots=True)
-class _ModelOffloaderBinding:
-    pinned_component: PinnedComponent | None
-    streamed_components: list[StreamedComponent]
-    block_groups: list[list[nn.Module]]
-    components: list[ModelStrategyComponent]
-    lora_param_names: frozenset[str]
+class ModelOffloaderStore:
+    """Reusable pinned backing storage for :class:`ModelOffloader`.
 
+    Build once from a prototype model, then bind to compatible model
+    instances with :meth:`bind`.
+    """
 
-@dataclass(frozen=True, slots=True)
-class _ModelOffloaderStore:
     pinned_component_store: PinnedComponentStore | None
     streamed_component_stores: tuple[StreamedComponentStore, ...]
     stream_trainable_weights: bool
@@ -60,14 +57,21 @@ class _ModelOffloaderStore:
         cls,
         model: nn.Module,
         *,
-        layer_paths: Sequence[str],
-        blocks_to_swap: int | Sequence[int] | None,
-        prefetch_count: int | Sequence[int],
-        cyclic: bool,
-        stream_trainable_weights: bool,
-        include_param_names: Iterable[str] | None,
-        include_buffer_names: Iterable[str] | None,
-    ) -> _ModelOffloaderStore:
+        layers_attr: str | Sequence[str] | None = None,
+        blocks_to_swap: int | Sequence[int] | None = None,
+        prefetch_count: int | Sequence[int] = 2,
+        cyclic: bool = False,
+        stream_trainable_weights: bool = False,
+        include_param_names: Iterable[str] | None = None,
+        include_buffer_names: Iterable[str] | None = None,
+    ) -> ModelOffloaderStore:
+        layer_paths = _normalize_layer_paths(layers_attr)
+        _validate_store_config(
+            layer_paths=layer_paths,
+            blocks_to_swap=blocks_to_swap,
+            include_param_names=include_param_names,
+            include_buffer_names=include_buffer_names,
+        )
         (
             streamed_component_stores,
             streamed_param_names,
@@ -105,35 +109,36 @@ class _ModelOffloaderStore:
         )
         return pinned_bytes + streamed_bytes
 
-    def bind(self, model: nn.Module) -> _ModelOffloaderBinding:
-        streamed_components: list[StreamedComponent] = []
-        block_groups: list[list[nn.Module]] = []
-        for store in self.streamed_component_stores:
-            block_groups.append(store.resolve_blocks(model))
-            streamed_components.append(store.bind(model))
-
+    def bind(
+        self,
+        model: nn.Module,
+        *,
+        skip_checkpointing_check: bool = False,
+        is_block_checkpointed: Callable[[nn.Module], bool] | None = None,
+    ) -> ModelOffloader:
+        """Bind this store's backing bytes to ``model``."""
+        streamed_components = [
+            store.bind(model)
+            for store in self.streamed_component_stores
+        ]
         pinned_component = (
             None
             if self.pinned_component_store is None
             else self.pinned_component_store.bind(model)
         )
-        components = _compose_components(pinned_component, streamed_components)
-        lora_param_names: set[str] = set()
-        if pinned_component is not None:
-            lora_param_names.update(pinned_component.param_names)
-        for streamed_component in streamed_components:
-            lora_param_names.update(streamed_component.param_names)
-        return _ModelOffloaderBinding(
+        return ModelOffloader(
+            model,
             pinned_component=pinned_component,
             streamed_components=streamed_components,
-            block_groups=block_groups,
-            components=components,
-            lora_param_names=frozenset(lora_param_names),
+            stream_trainable_weights=self.stream_trainable_weights,
+            skip_checkpointing_check=skip_checkpointing_check,
+            is_block_checkpointed=is_block_checkpointed,
         )
 
 
 __all__ = [
     "ModelOffloader",
+    "ModelOffloaderStore",
 ]
 
 
@@ -166,6 +171,11 @@ def _routed_factor_dtype(module: nn.Module) -> torch.dtype:
 class ModelOffloader:
     """Move a whole model or streamed block groups between pinned CPU and
     CUDA, with optional LoRA merge and trainable-parameter support.
+
+    Instances are normally created by binding a
+    :class:`ModelOffloaderStore` to a compatible model. The constructor
+    accepts already-bound components for low-level composition; it does
+    not build stores or pin model state itself.
 
     When ``layers_attr`` is omitted, CUDA activation bulk-copies every
     managed parameter and buffer to CUDA. When ``layers_attr`` is set,
@@ -216,15 +226,16 @@ class ModelOffloader:
     back to the pinned CPU cache. CPU activation leaves them in the
     host-backed module state.
 
-    Pass ``stream_trainable_weights=True`` to stream in-block
-    trainable parameter data through the CUDA block target pool. In that
-    mode, CUDA :meth:`activate` *raises* during training if no
-    ``gradient_checkpointing`` flag is detected. The failure mode
-    here is **silent gradient corruption** rather than a loud
-    error — the ``.data`` swap path used for trainable streaming
-    bypasses autograd's version-counter check, so we hard-guard
-    the precondition. Pass ``skip_checkpointing_check=True`` to suppress
-    the check if you wrap blocks manually via
+    Configure ``stream_trainable_weights=True`` on
+    :meth:`ModelOffloaderStore.from_module` to stream in-block trainable
+    parameter data through the CUDA block target pool. In that mode,
+    CUDA :meth:`activate` *raises* during training if no
+    ``gradient_checkpointing`` flag is detected. The failure mode here
+    is **silent gradient corruption** rather than a loud error — the
+    ``.data`` swap path used for trainable streaming bypasses autograd's
+    version-counter check, so we hard-guard the precondition. Pass
+    ``skip_checkpointing_check=True`` to :meth:`ModelOffloaderStore.bind`
+    to suppress the check if you wrap blocks manually via
     ``torch.utils.checkpoint.checkpoint`` at call sites (the
     wrapping is invisible from the module tree, so detection has
     false negatives). Callers passing this flag take responsibility
@@ -241,35 +252,14 @@ class ModelOffloader:
     Parameters
     ----------
     model:
-        The model containing the block list(s). Managed tensors may start
-        on CPU or CUDA; construction clones them directly into pinned
-        CPU storage before activation.
-    layers_attr:
-        Optional dotted attribute path(s) to ``nn.ModuleList`` block
-        list(s). When omitted, :class:`ModelOffloader` performs whole-model
-        bulk pinning with no streamed block components. For PEFT-wrapped
-        models, include the PEFT prefix (e.g.
-        ``"base_model.model.transformer_blocks"``).
-    blocks_to_swap:
-        Per-group count of blocks to keep on CPU. Required when
-        ``layers_attr`` is set. Single int (broadcast to all groups) or
-        one int per group.
-    prefetch_count:
-        Per-group prefetch depth. Same broadcasting as *blocks_to_swap*.
-    cyclic:
-        Default ``False``. Forwarded to every :class:`StreamedComponent`.
-        Set ``True`` for inference loops that iterate the model
-        repeatedly (diffusion denoising, multi-step decoders); the
-        prefetcher then treats end-of-iteration as wraparound and
-        keeps streaming the next iteration's leading blocks. Leave
-        ``False`` for single-shot inference or training.
+        The concrete model bound to the supplied components.
+    pinned_component:
+        Optional bound component for non-streamed parameter and buffer
+        state.
+    streamed_components:
+        Bound streamed block-list components.
     stream_trainable_weights:
-        Default ``False`` skips trainable params in block streaming and
-        manages them with :class:`PinnedComponent`. ``True`` streams
-        in-block trainable parameter data with the block residency
-        manager. In both modes, wrap optimizer updates in
-        :meth:`optimizer_step` so trainable CUDA updates are copied back
-        to pinned CPU storage.
+        Whether the streamed components include trainable parameter data.
     skip_checkpointing_check:
         Default ``False``. Suppresses the activate-time checkpointing
         guard/warning entirely. Pass ``True`` only if you wrap each
@@ -290,63 +280,29 @@ class ModelOffloader:
         the predicate sees the block module and should return
         ``True`` iff that block runs under activation checkpointing.
         Ignored when ``skip_checkpointing_check=True``.
-    include_param_names:
-        Optional PyTorch parameter names to manage in whole-model mode.
-        ``None`` manages all parameters. Only valid when ``layers_attr``
-        is omitted.
-    include_buffer_names:
-        Optional PyTorch buffer names to manage in whole-model mode.
-        ``None`` manages all registered buffers. Only valid when
-        ``layers_attr`` is omitted.
     """
 
     def __init__(
         self,
         model: nn.Module,
         *,
-        layers_attr: str | Sequence[str] | None = None,
-        blocks_to_swap: int | Sequence[int] | None = None,
-        prefetch_count: int | Sequence[int] = 2,
-        cyclic: bool = False,
-        stream_trainable_weights: bool = False,
-        skip_checkpointing_check: bool = False,
-        is_block_checkpointed: Callable[[nn.Module], bool] | None = None,
-        include_param_names: Iterable[str] | None = None,
-        include_buffer_names: Iterable[str] | None = None,
+        pinned_component: PinnedComponent | None,
+        streamed_components: Sequence[StreamedComponent] = (),
+        stream_trainable_weights: bool,
+        skip_checkpointing_check: bool,
+        is_block_checkpointed: Callable[[nn.Module], bool] | None,
     ) -> None:
-        layer_paths = _normalize_layer_paths(layers_attr)
-        _validate_constructor_mode(
-            layer_paths=layer_paths,
-            blocks_to_swap=blocks_to_swap,
-            include_param_names=include_param_names,
-            include_buffer_names=include_buffer_names,
-        )
-        store = _ModelOffloaderStore.from_module(
-            model,
-            layer_paths=layer_paths,
-            blocks_to_swap=blocks_to_swap,
-            prefetch_count=prefetch_count,
-            cyclic=cyclic,
-            stream_trainable_weights=stream_trainable_weights,
-            include_param_names=include_param_names,
-            include_buffer_names=include_buffer_names,
-        )
-        binding = store.bind(model)
-
         self._model = model
-        self._store = store
         self._active_device: torch.device | None = None
-        self._components = binding.components
-        self._pinned_component = binding.pinned_component
-        self._streamed_components = binding.streamed_components
-        if binding.pinned_component is not None:
-            self._instance = binding.pinned_component._instance
+        self._pinned_component = pinned_component
+        self._streamed_components = list(streamed_components)
+        _validate_components(pinned_component, self._streamed_components)
+        if pinned_component is not None:
+            self._instance = pinned_component._instance
         self._teardown_stack: contextlib.ExitStack | None = None
-        self._lora_param_names = binding.lora_param_names
         self._lora_hook_handles: list[_RemovableHook] = []
-        self._block_groups: list[list[nn.Module]] = binding.block_groups
         self._warned_about_checkpointing: bool = False
-        self._stream_trainable_weights: bool = store.stream_trainable_weights
+        self._stream_trainable_weights: bool = stream_trainable_weights
         self._skip_checkpointing_check: bool = skip_checkpointing_check
         self._is_block_checkpointed: Callable[[nn.Module], bool] = (
             is_block_checkpointed
@@ -376,15 +332,21 @@ class ModelOffloader:
 
         ``mode``:
 
+        LoRA target keys must be canonical managed parameter names.
+        Unknown targets raise during activation. PEFT ``.base_layer.``
+        model parameter paths are canonicalized for lookup, so a LoRA
+        target like ``"blocks.0.attn.weight"`` can match a managed model
+        parameter named ``"blocks.0.attn.base_layer.weight"``.
+
         - ``"merge"`` (default): on CUDA activation, installs a
-          post-copy hook per matched target. The hook applies
+          post-copy hook per target. The hook applies
           :class:`LoRATransform` immediately after the base weight is
           copied to GPU, so it rides along with the streaming cycle.
           Requires CUDA activation and a base-weight adapter that
           supports dense in-place ``addmm_`` or dequantize/requantize
           plus ``copy_into`` merge.
         - ``"routed"``: on activation, registers a forward hook on each
-          matched parent module. Forward becomes
+          target's parent module. Forward becomes
           ``y = base(x) + alpha * B * A * x``. Doesn't touch the base
           weight in place. Restricted to ``nn.Linear`` parents (the math
           assumes ``y = x @ W.T``); non-Linear parents raise. Shared
@@ -419,45 +381,27 @@ class ModelOffloader:
         self, loras: Sequence[tuple[LoRA, float]],
     ) -> _LoraParamMap:
         per_param: _LoraParamMap = {}
-        total_targets = 0
-        matched_targets = 0
+        param_names = self.param_names
+        canonical_param_names = {
+            canonical_param_name(param_name): param_name
+            for param_name in param_names
+        }
         for lora, strength in loras:
             for target_key, (a, b) in lora.targets.items():
-                total_targets += 1
-                param_name = self._resolve_lora_param_name(target_key)
+                param_name = canonical_param_names.get(target_key)
                 if param_name is None:
-                    continue
-                matched_targets += 1
+                    sample_index = sorted(canonical_param_names)[:3]
+                    raise ValueError(
+                        f"LoRA target {target_key!r} is not managed by "
+                        "this ModelOffloader. LoRA target keys must use "
+                        "canonical model parameter names. Sample managed "
+                        f"keys: {sample_index} ..."
+                    )
                 per_param.setdefault(param_name, []).append(
                     (a, b, strength)
                 )
 
-        if matched_targets < total_targets:
-            sample_lora = sorted(next(iter(loras))[0].targets)[:3]
-            sample_index = sorted(self._lora_param_names)[:3]
-            logger.warning(
-                "set_loras matched %d/%d targets. "
-                "Sample LoRA keys: %s ... Sample index keys: %s ...",
-                matched_targets, total_targets, sample_lora, sample_index,
-            )
-        else:
-            logger.debug("set_loras matched %d/%d targets", matched_targets, total_targets)
-
         return per_param
-
-    def _resolve_lora_param_name(self, target_key: str) -> str | None:
-        if target_key in self._lora_param_names:
-            return target_key
-
-        canonical_key = canonical_param_name(target_key)
-        matches = [
-            name
-            for name in self._lora_param_names
-            if canonical_param_name(name) == canonical_key
-        ]
-        if len(matches) == 1:
-            return matches[0]
-        return None
 
     def _register_lora_hooks(
         self, active_device: torch.device, targets: _LoraParamMap,
@@ -566,21 +510,27 @@ class ModelOffloader:
 
     @property
     def param_names(self) -> frozenset[str]:
-        """Pinned parameter names managed by the non-streamed component."""
-        if self._pinned_component is None:
-            return frozenset()
-        return self._pinned_component.param_names
+        """Parameter names managed by this offloader."""
+        names: set[str] = set()
+        if self._pinned_component is not None:
+            names.update(self._pinned_component.param_names)
+        for streamed_component in self._streamed_components:
+            names.update(streamed_component.param_names)
+        return frozenset(names)
 
     @property
     def buffer_names(self) -> frozenset[str]:
-        """Pinned buffer names managed by the non-streamed component."""
-        if self._pinned_component is None:
-            return frozenset()
-        return self._pinned_component.buffer_names
+        """Buffer names managed by this offloader."""
+        names: set[str] = set()
+        if self._pinned_component is not None:
+            names.update(self._pinned_component.buffer_names)
+        for streamed_component in self._streamed_components:
+            names.update(streamed_component.buffer_names)
+        return frozenset(names)
 
     @property
     def cache_bytes(self) -> int:
-        return sum(c.cache_bytes for c in self._components)
+        return sum(component.cache_bytes for component in self._iter_components())
 
     def _resolve_device(self, device: torch.device | str | None) -> torch.device:
         if device is not None:
@@ -618,7 +568,7 @@ class ModelOffloader:
                 if targets is not None:
                     self._register_lora_hooks(active_device, targets)
 
-                for component in self._components:
+                for component in self._iter_components():
                     stack.callback(component.deactivate)
                     component.activate(active_device)
 
@@ -694,6 +644,11 @@ class ModelOffloader:
 
     # ----------------------------------------------------------- Internals
 
+    def _iter_components(self) -> Iterator[ModelStrategyComponent]:
+        if self._pinned_component is not None:
+            yield self._pinned_component
+        yield from self._streamed_components
+
     @property
     def _has_streamed_blocks(self) -> bool:
         return any(
@@ -703,14 +658,10 @@ class ModelOffloader:
 
     def _iter_streamed_block_groups(
         self,
-    ) -> Iterator[tuple[StreamedComponent, list[nn.Module]]]:
-        for streamed_component, blocks in zip(
-            self._streamed_components,
-            self._block_groups,
-            strict=True,
-        ):
+    ) -> Iterator[tuple[StreamedComponent, tuple[nn.Module, ...]]]:
+        for streamed_component in self._streamed_components:
             if _component_streams_tensor_state(streamed_component):
-                yield streamed_component, blocks
+                yield streamed_component, streamed_component.blocks
 
     def _enforce_checkpointing_for_trainable_streaming(self) -> None:
         """Hard-guard: refuse to activate if a streamed_component manages
@@ -775,7 +726,8 @@ class ModelOffloader:
                         "checkpointing — so this is a hard error, "
                         "not a warning.\n\n"
                         "Fix: call model.gradient_checkpointing_enable() "
-                        "before constructing the ModelOffloader (HF models, "
+                        "before binding or activating the ModelOffloader "
+                        "(HF models, "
                         "default detection); pass an "
                         "is_block_checkpointed predicate matching your "
                         "framework's conventions; or, if you wrap each "
@@ -847,7 +799,7 @@ class ModelOffloader:
             self._warned_about_checkpointing = True
 
 # ---------------------------------------------------------------------------
-# Module-private helpers (used only by ModelOffloader constructor)
+# Module-private helpers
 # ---------------------------------------------------------------------------
 
 
@@ -860,7 +812,7 @@ def _normalize_layer_paths(layers_attr: str | Sequence[str] | None) -> list[str]
     return layer_paths
 
 
-def _validate_constructor_mode(
+def _validate_store_config(
     *,
     layer_paths: Sequence[str],
     blocks_to_swap: int | Sequence[int] | None,
@@ -868,7 +820,10 @@ def _validate_constructor_mode(
     include_buffer_names: Iterable[str] | None,
 ) -> None:
     if layer_paths and blocks_to_swap is None:
-        raise TypeError("ModelOffloader requires blocks_to_swap when layers_attr is set")
+        raise TypeError(
+            "ModelOffloaderStore.from_module requires blocks_to_swap "
+            "when layers_attr is set"
+        )
     if not layer_paths and blocks_to_swap is not None:
         raise ValueError("blocks_to_swap requires layers_attr")
     if layer_paths and (
@@ -938,20 +893,15 @@ def _build_pinned_component_store(
     )
 
 
-def _compose_components(
+def _validate_components(
     pinned_component: PinnedComponent | None,
     streamed_components: Sequence[StreamedComponent],
-) -> list[ModelStrategyComponent]:
-    components: list[ModelStrategyComponent] = []
-    if pinned_component is not None:
-        components.append(pinned_component)
-    components.extend(streamed_components)
-    if not components:
+) -> None:
+    if pinned_component is None and not streamed_components:
         raise ValueError(
             "ModelOffloader requires at least one parameter, registered "
             "buffer, or streamed block to manage."
         )
-    return components
 
 
 def _component_streams_tensor_state(component: StreamedComponent) -> bool:

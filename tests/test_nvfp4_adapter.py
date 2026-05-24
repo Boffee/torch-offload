@@ -2,17 +2,49 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterable, Sequence
+
 import pytest
 import torch
 from torch import nn
 
-from torch_offload import LoRA, ModelOffloader, merge_lora
+from torch_offload import LoRA, ModelOffloader, ModelOffloaderStore, merge_lora
 from torch_offload.nvfp4_adapter import Nvfp4Adapter
 from torch_offload.pinned_param import PinnedParam
 from torch_offload.tensor_adapter_registry import tensor_id
 from torch_offload.streamed_component import _param_target_layout
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+
+
+def _make_model_offloader(
+    model: nn.Module,
+    *,
+    layers_attr: str | Sequence[str] | None = None,
+    blocks_to_swap: int | Sequence[int] | None = None,
+    prefetch_count: int | Sequence[int] = 2,
+    cyclic: bool = False,
+    stream_trainable_weights: bool = False,
+    skip_checkpointing_check: bool = False,
+    is_block_checkpointed: Callable[[nn.Module], bool] | None = None,
+    include_param_names: Iterable[str] | None = None,
+    include_buffer_names: Iterable[str] | None = None,
+) -> ModelOffloader:
+    store = ModelOffloaderStore.from_module(
+        model,
+        layers_attr=layers_attr,
+        blocks_to_swap=blocks_to_swap,
+        prefetch_count=prefetch_count,
+        cyclic=cyclic,
+        stream_trainable_weights=stream_trainable_weights,
+        include_param_names=include_param_names,
+        include_buffer_names=include_buffer_names,
+    )
+    return store.bind(
+        model,
+        skip_checkpointing_check=skip_checkpointing_check,
+        is_block_checkpointed=is_block_checkpointed,
+    )
 
 
 def _nvfp4_modules():
@@ -196,7 +228,7 @@ class TestNvfp4Adapter:
             ),
             requires_grad=False,
         )
-        strategy = ModelOffloader(layer)
+        strategy = _make_model_offloader(layer)
 
         try:
             x = torch.randn(128, 64, dtype=torch.bfloat16, device="cuda")
@@ -248,7 +280,7 @@ class TestNvfp4Adapter:
                 ),
                 requires_grad=False,
             )
-        offloader = ModelOffloader(
+        offloader = _make_model_offloader(
             model,
             layers_attr="blocks",
             blocks_to_swap=1,

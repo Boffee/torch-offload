@@ -10,6 +10,8 @@ CUDA-only tests gate on availability.
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterable, Sequence
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -20,6 +22,7 @@ from torch_offload import (
     LoRATransform,
     ModelCache,
     ModelOffloader,
+    ModelOffloaderStore,
     PinnedComponent,
     ResourceSpec,
     StreamedComponent,
@@ -27,6 +30,7 @@ from torch_offload import (
 )
 from torch_offload.lora import KeyTransformT
 from torch_offload.model_offloader import _routed_factor_dtype
+from torch_offload.module_names import canonical_param_name
 from torch_offload.protocols import CachedResource
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -35,6 +39,36 @@ CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _make_model_offloader(
+    model: nn.Module,
+    *,
+    layers_attr: str | Sequence[str] | None = None,
+    blocks_to_swap: int | Sequence[int] | None = None,
+    prefetch_count: int | Sequence[int] = 2,
+    cyclic: bool = False,
+    stream_trainable_weights: bool = False,
+    skip_checkpointing_check: bool = False,
+    is_block_checkpointed: Callable[[nn.Module], bool] | None = None,
+    include_param_names: Iterable[str] | None = None,
+    include_buffer_names: Iterable[str] | None = None,
+) -> ModelOffloader:
+    store = ModelOffloaderStore.from_module(
+        model,
+        layers_attr=layers_attr,
+        blocks_to_swap=blocks_to_swap,
+        prefetch_count=prefetch_count,
+        cyclic=cyclic,
+        stream_trainable_weights=stream_trainable_weights,
+        include_param_names=include_param_names,
+        include_buffer_names=include_buffer_names,
+    )
+    return store.bind(
+        model,
+        skip_checkpointing_check=skip_checkpointing_check,
+        is_block_checkpointed=is_block_checkpointed,
+    )
 
 
 def _make_bf16_model(num_blocks: int = 4, dim: int = 16) -> nn.Module:
@@ -186,7 +220,7 @@ def _make_strategy(
     model: nn.Module, blocks_to_swap: int = 1,
 ) -> ModelOffloader:
     """Shorthand for constructing the strategy with sensible defaults."""
-    return ModelOffloader(
+    return _make_model_offloader(
         model,
         layers_attr="transformer_blocks",
         blocks_to_swap=blocks_to_swap,
@@ -195,7 +229,11 @@ def _make_strategy(
 
 def _has_post_copy_hook(strategy: ModelOffloader, target_key: str) -> bool:
     """Check whether a merge hook is installed for the given target."""
-    param_name = strategy._resolve_lora_param_name(target_key)
+    canonical_param_names = {
+        canonical_param_name(name): name
+        for name in strategy.param_names
+    }
+    param_name = canonical_param_names.get(target_key)
     if param_name is None:
         return False
     component = strategy._component_for_param_name(param_name)
@@ -398,13 +436,30 @@ class TestSetLorasValidation:
         _activate_loras_for_test(s)
         assert _has_post_copy_hook(s, "transformer_blocks.0.attn.weight")
 
-    def test_key_transform_none_skips_prefixed_keys(self) -> None:
+    def test_key_transform_none_rejects_prefixed_keys(self) -> None:
         m = _make_bf16_model()
         s = _make_strategy(m)
         lora = _make_lora(4, 16, prefix="diffusion_model.", key_transform=None)
         s.set_loras([(lora, 1.0)])
-        _activate_loras_for_test(s)
+        with pytest.raises(ValueError, match="LoRA target .* is not managed"):
+            _activate_loras_for_test(s)
         assert not _has_post_copy_hook(s, "transformer_blocks.0.attn.weight")
+
+    def test_target_keys_are_not_canonicalized(self) -> None:
+        m = _make_bf16_model()
+        s = _make_strategy(m)
+        sd = {
+            "transformer_blocks.0.attn.base_layer.lora_A.weight": torch.randn(4, 16),
+            "transformer_blocks.0.attn.base_layer.lora_B.weight": torch.randn(16, 4),
+        }
+        s.set_loras([(LoRA(state_dict=sd, key_transform=None), 1.0)])
+
+        with pytest.raises(ValueError, match="LoRA target .* is not managed"):
+            _activate_loras_for_test(s)
+        assert not _has_post_copy_hook(s, "transformer_blocks.0.attn.weight")
+        assert not _has_post_copy_hook(
+            s, "transformer_blocks.0.attn.base_layer.weight",
+        )
 
     def test_merge_mode_activation_rejects_cpu(self) -> None:
         m = _make_bf16_model()
@@ -1201,7 +1256,7 @@ class TestRoutedMode:
         for p in model.parameters():
             p.requires_grad = False
 
-        s = ModelOffloader(
+        s = _make_model_offloader(
             model,
             layers_attr="transformer_blocks", blocks_to_swap=1,
         )
@@ -1259,7 +1314,7 @@ class TestRoutedMode:
         for p in model.parameters():
             p.requires_grad = False
 
-        s = ModelOffloader(
+        s = _make_model_offloader(
             model,
             layers_attr="transformer_blocks", blocks_to_swap=1,
         )
@@ -1295,7 +1350,7 @@ class TestRoutedMode:
         # parent module named by the LoRA target.
         model = _make_tied_non_block_model(dtype=torch.bfloat16)
 
-        s = ModelOffloader(
+        s = _make_model_offloader(
             model,
             layers_attr="transformer_blocks", blocks_to_swap=1,
         )
@@ -1354,7 +1409,7 @@ class TestRoutedMode:
             p.requires_grad = False
 
         loras = [(_make_lora(num_blocks=2, dim=16, seed=55), 0.5)]
-        s = ModelOffloader(
+        s = _make_model_offloader(
             m,
             layers_attr="transformer_blocks", blocks_to_swap=1,
         )

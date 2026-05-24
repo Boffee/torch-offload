@@ -3,8 +3,9 @@
 Top-level offload strategies:
 
 - :class:`ModelOffloader` — whole-model pinned-CPU bulk cache when
-  constructed as ``ModelOffloader(model)``, or per-block streaming when
-  constructed with ``layers_attr`` and ``blocks_to_swap``. Streaming mode
+  created by ``ModelOffloaderStore.from_module(model).bind(model)``, or
+  per-block streaming when the store is constructed with ``layers_attr``
+  and ``blocks_to_swap``. Streaming mode
   supports optional LoRA merge, trainable-parameter support, CUDA
   prefetch on a secondary stream, and activation checkpointing through
   autograd backward. By default, trainable params are managed by
@@ -29,11 +30,13 @@ weights, and TorchAO NVFP4 packed weights).
 the plug-in contract for storage strategies that :class:`ModelCache`
 consumes.
 
-Package strategies make ``cache_bytes`` final in their constructor, so
-:class:`ModelCache` can admit them without a factory-side ``prepare()``
-dance. ``activate(device)`` then makes the resource usable on the
-requested device. For :class:`ModelOffloader`, ``deactivate()`` returns
-managed tensors to pinned CPU. For :class:`MpsWeights`,
+Package strategies make ``cache_bytes`` final before use: for
+:class:`ModelOffloader`, store construction pins reusable backing storage
+and ``bind(model)`` creates the bound strategy; for direct strategies
+like :class:`MpsWeights`, construction owns that work. ``activate(device)``
+then makes the resource usable on the requested device. For
+:class:`ModelOffloader`, ``deactivate()`` returns managed tensors to
+pinned CPU. For :class:`MpsWeights`,
 construction has already materialized the model on MPS, so
 ``activate('mps')`` and ``deactivate()`` are lifecycle-only.
 
@@ -54,11 +57,12 @@ drop those references and rebuild from a fresh model instance.
      streaming is configured.
 
 Optional LoRA merging is requested via :meth:`ModelOffloader.set_loras`
-and resolved on activation by installing post-copy hooks for the matched
-targets. The hooks run immediately after the owning component copies a
-base weight from pinned CPU storage to GPU, so block-streamed and
-non-block weights use the same merge path. Merge eligibility is owned by
-the selected tensor adapter: plain dense tensors opt into in-place
+and resolved on activation by installing post-copy hooks for canonical
+managed parameter targets. Unknown targets raise during activation. The
+hooks run immediately after the owning component copies a base weight
+from pinned CPU storage to GPU, so block-streamed and non-block weights
+use the same merge path. Merge eligibility is owned by the selected
+tensor adapter: plain dense tensors opt into in-place
 ``addmm_``; structured quantized wrappers can opt into
 dequantize/requantize plus ``copy_into`` merge, otherwise use routed
 LoRA when their module exposes a compatible logical Linear weight shape
@@ -99,7 +103,7 @@ from .model_cache import (
     ModelTooLargeError,
     ResourceSpec,
 )
-from .model_offloader import ModelOffloader
+from .model_offloader import ModelOffloader, ModelOffloaderStore
 from .mps_weights import MpsWeights
 from .pinned_component import PinnedComponent, PinnedComponentStore
 from .protocols import CachedResource, ModelStrategy, ModelStrategyComponent
@@ -122,6 +126,7 @@ __all__ = [
     "ModelInUseError",
     "ModelNotRegisteredError",
     "ModelOffloader",
+    "ModelOffloaderStore",
     "ModelSpec",
     "ModelStrategy",
     "ModelStrategyComponent",
