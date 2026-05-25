@@ -22,7 +22,7 @@ __all__ = ["MpsWeights"]
 class MpsWeights:
     """Materialize a CPU model on MPS one named tensor at a time.
 
-    This is intentionally just the strategy lifecycle around a simple
+    This is intentionally just the binding lifecycle around a simple
     constructor-time copy-and-replace loop. It does not keep a second CPU
     cache and does not try to preserve more advanced invariants such as
     tied parameter aliases. ``activate()`` and ``deactivate()`` are
@@ -64,7 +64,7 @@ class MpsWeights:
         if device is None:
             raise ValueError(
                 "MpsWeights.activate() requires device='mps'; pass "
-                "activate('mps') or use this strategy through "
+                "activate('mps') or use this binding through "
                 "ModelCache.use(..., device='mps')"
             )
         active_device = canonical_device(device)

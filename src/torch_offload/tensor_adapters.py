@@ -428,5 +428,5 @@ class RegularAdapter:
 
 
 def adapter_name(adapter: TensorAdapter[Any, Any]) -> str:
-    """Human-readable name for an adapter strategy instance."""
+    """Human-readable name for an adapter instance."""
     return type(adapter).__name__

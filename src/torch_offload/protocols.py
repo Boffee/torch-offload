@@ -1,9 +1,9 @@
-"""Public protocols for cached resources and model strategies.
+"""Public protocols for cached resources and model bindings.
 
 Four Protocols form the contract:
 
 - :class:`ModelStrategyComponent` -- pure lifecycle. A piece composable
-  inside a top-level strategy (see :class:`ModelOffloader`).
+  inside a top-level model binding (see :class:`ModelOffloader`).
   Just ``activate(device=...)`` + ``deactivate()``. Components do not
   expose a value because their parent composite owns it.
 
@@ -18,7 +18,7 @@ Four Protocols form the contract:
 
 - :class:`ModelStrategy` -- model-specific specialization of
   :class:`ResourceBinding[nn.Module]`. Adds a ``model`` convenience
-  property for code that works specifically with model strategies.
+  property for code that works specifically with model bindings.
 
 Top-level :class:`ResourceBinding` implementations in this package:
 :class:`~torch_offload.ModelOffloader` (whole-model bulk DMA or streamed
@@ -42,7 +42,7 @@ usable, on the caller-selected device when device-aware) ->
 ``deactivate()`` (release transient compute resources while store
 ``cache_bytes`` remains resident).
 
-Package strategies optimize construction peak memory: plain
+Package model resources optimize construction peak memory: plain
 ``torch.Tensor`` parameters may be repointed to pinned storage while
 pinning is still in progress. If construction raises after pinning has
 started, recovery of the partially constructed model/resource is
@@ -50,7 +50,7 @@ unsupported; drop those references and rebuild from a fresh model
 instance.
 
 ``activate()/deactivate()`` may be repeated as many times as you
-want. Device-aware package strategies provide ``use(device)`` for
+want. Device-aware package bindings provide ``use(device)`` for
 direct exception-safe use, while :class:`ModelCache` passes the
 acquire-time device into ``activate``.
 
@@ -72,7 +72,7 @@ from torch import nn
 @runtime_checkable
 class ModelStrategyComponent(Protocol):
     """Lifecycle-only contract for a piece composable inside a
-    top-level strategy.
+    top-level model binding.
 
     Components do not expose a model -- their parent composite owns
     that. They just contribute to the lifecycle: activate, deactivate.
@@ -144,7 +144,7 @@ class ModelStrategy(ResourceBinding[nn.Module], Protocol):
     """Model-specific cache binding.
 
     Adds a ``model`` convenience property (equivalent to :attr:`value`)
-    for code that works specifically with model strategies.
+    for code that works specifically with model bindings.
     """
 
     @property

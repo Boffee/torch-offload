@@ -724,10 +724,10 @@ class ModelCache:
     def _discard_binding(
         self,
         entry: _Entry,
-        binding: ResourceBinding[Any],
+        target_binding: ResourceBinding[Any],
     ) -> None:
-        for index, active_binding in enumerate(entry.bindings):
-            if active_binding is binding:
+        for index, binding in enumerate(entry.bindings):
+            if binding is target_binding:
                 del entry.bindings[index]
                 break
         self._mark_inactive_if_idle(entry)

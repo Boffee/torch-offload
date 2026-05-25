@@ -1,19 +1,26 @@
-"""GPU memory management utilities — model-agnostic, torch-only.
+"""GPU memory management utilities -- model-agnostic, torch-only.
 
-Top-level offload strategies:
+High-level API:
 
-- :class:`ModelOffloader` — whole-model pinned-CPU bulk cache when
+- :class:`ModelCache` with :class:`ModelSpec` caches model stores and
+  creates per-use :class:`ModelOffloader` bindings. Use
+  :class:`LoRASpec` with ``ModelCache.use(..., loras=[...])`` to cache
+  LoRA resources and apply them during model activation.
+
+Lower-level resource bindings:
+
+- :class:`ModelOffloader` -- whole-model pinned-CPU bulk cache when
   created by ``ModelOffloaderStore.from_module(model).bind(model)``, or
   per-block streaming when the store is constructed with ``layers_attr``
-  and ``blocks_to_swap``. Streaming mode
-  supports optional LoRA merge, trainable-parameter support, CUDA
-  prefetch on a secondary stream, and activation checkpointing through
-  autograd backward. By default, trainable params are managed by
+  and ``blocks_to_swap``. Streaming mode supports optional LoRA merge,
+  trainable-parameter support, CUDA prefetch on a secondary stream, and
+  activation checkpointing through autograd backward. By default,
+  trainable params are managed by
   :class:`PinnedComponent` and stay GPU-resident while active; set
   ``stream_trainable_weights=True`` to stream in-block trainable weights
   and materialize them only around ``optimizer.step()``.
 
-- :class:`MpsWeights` — whole-model CPU->MPS materializer. Use for
+- :class:`MpsWeights` -- whole-model CPU->MPS materializer. Use for
   frozen models that should become MPS-resident without retaining a
   separate CPU cache. Construction copies one managed tensor at a time
   and immediately replaces its module registry entry to keep peak host memory
@@ -32,7 +39,7 @@ activates.
 
 Package stores make ``cache_bytes`` final before use: for
 :class:`ModelOffloader`, store construction pins reusable backing storage
-and ``bind(model)`` creates the bound strategy; for self-binding stores
+and ``bind(model)`` creates the bound model binding; for self-binding stores
 like :class:`MpsWeights`, construction owns that work. ``activate(device)``
 then makes the binding usable on the requested device. For
 :class:`ModelOffloader`, ``deactivate()`` returns managed tensors to
@@ -47,7 +54,7 @@ clone so the original source storage can be freed before all buffers
 finish pinning. This avoids a temporary 2x host-memory peak for
 CPU-origin models and promptly frees GPU storage for CUDA-origin models.
 If construction raises after pinning has started,
-recovery of the partially constructed strategy/model is unsupported;
+recovery of the partially constructed resource/model is unsupported;
 drop those references and rebuild from a fresh model instance.
 
 :class:`ModelOffloader` composes (in order):

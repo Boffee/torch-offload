@@ -59,11 +59,11 @@ class PinnedParam:
     Low-peak construction behavior: for plain ``torch.Tensor`` parameters,
     construction immediately repoints the source ``Parameter.data`` at the
     pinned clone. This releases the original source storage before the
-    owning strategy finishes constructing every pinned parameter, avoiding a temporary
+    owning store finishes constructing every pinned parameter, avoiding a temporary
     2x peak for large CPU-resident models and promptly freeing GPU storage
     for CUDA-origin models. It also means construction is not
     rollback-safe after pinning has started: if a later pinned parameter fails
-    to pin, recovery of the partially constructed strategy/model is unsupported.
+    to pin, recovery of the partially constructed store/model is unsupported.
     Drop those references and rebuild from a fresh model instance. Tensor
     subclasses skip this optimization because ``.data =`` can drop wrapper
     state.
@@ -81,7 +81,7 @@ class PinnedParam:
         # Low-peak construction optimization: release the original source
         # storage by repointing the source Parameter at the
         # pinned clone immediately. This is an intentional mutation of
-        # the caller's model before the owning strategy has finished
+        # the caller's model before the owning store has finished
         # construction; see the class docstring for failure semantics.
         # Only safe for plain tensors; subclass wrappers can lose
         # metadata or ignore .data assignment.

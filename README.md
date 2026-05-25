@@ -1,9 +1,8 @@
 # Memory
 
-A model-agnostic GPU/CPU memory manager for PyTorch. Two pluggable
-strategies for moving model weights between host and GPU, plus a
-policy-driven cache that swaps multiple independent models in and out
-of GPU memory.
+A model-agnostic GPU/CPU memory manager for PyTorch. It caches reusable
+host-side stores, creates per-use model bindings, and swaps independent
+models in and out of GPU memory under a policy-driven cache.
 
 Self-contained, library-friendly: no dependencies beyond `torch` (plus
 optional `optimum.quanto`, `gguf`, and `torchao` for quantized models). Designed
@@ -13,10 +12,11 @@ to be lifted into its own package when a second consumer appears.
 
 | Module | Role |
 |---|---|
+| `model_cache.py` | `ModelCache`, `ModelSpec`, `LoRASpec` — high-level public API for cached model and LoRA resources |
 | `protocols.py` | `ResourceStore`, `ResourceBinding`, `ModelStrategy` / `ModelStrategyComponent` plug-in contracts |
-| `model_offloader.py` | `ModelOffloader` — whole-model bulk pinned-CPU↔GPU or streamed block offload strategy |
-| `pinned_component.py` | `PinnedComponent`, `PinnedComponentStore` — reusable pinned backing storage plus lifecycle-only pinned component used by `ModelOffloader` |
-| `streamed_component.py` | `StreamedComponent`, `StreamedComponentStore` — reusable streamed backing storage plus sharp per-block-list streaming component |
+| `model_offloader.py` | `ModelOffloaderStore`, `ModelOffloader` — lower-level store/binding for whole-model bulk pinned-CPU↔GPU or streamed block offload |
+| `pinned_component.py` | `PinnedComponentStore`, `PinnedComponent` — lower-level reusable pinned backing storage plus lifecycle-only pinned component used by `ModelOffloader` |
+| `streamed_component.py` | `StreamedComponentStore`, `StreamedComponent` — lower-level streamed backing storage plus per-block-list streaming component |
 | `lora.py` | `LoRA`, `LoRATransform`, `LoRARouteHandle` — pinned factor storage + merge / routed-hook application |
 | `merge.py` | `merge_lora()` — permanent in-place LoRA merge into base weights (alternative to `set_loras`) |
 | `pinned_param.py` | `PinnedParam` — per-parameter pinning primitive (handles quanto, GGUF, and TorchAO NVFP4 via adapters) |
@@ -26,7 +26,6 @@ to be lifted into its own package when a second consumer appears.
 | `module_names.py` | Internal name traversal and mutation helpers |
 | `_quanto.py` | Internal: optimum-quanto optional-import + layout validation; consumed by `quanto_adapter.py` and `merge.py` |
 | `_torchao_nvfp4.py` | Internal: TorchAO NVFP4 optional-import + layout validation; consumed by `nvfp4_adapter.py` |
-| `model_cache.py` | `ModelCache` — policy-driven pool over cached stores with per-use bindings |
 
 ## Why use this
 
@@ -42,58 +41,88 @@ same host-memory budget.
 
 This library gives you:
 
-1. **Strategies** that pin a model's weights to host RAM and
-   bulk-DMA them to GPU on demand.
-2. **A cache** that holds multiple pinned models, evicts least-recently-
+1. **Stores** that pin reusable model or LoRA state to host RAM.
+2. **Bindings** that attach a cached store to a concrete model instance
+   for one activation.
+3. **A cache** that holds multiple pinned models, evicts least-recently-
    used inactive entries when a new model needs room, and tracks active
    bindings so you can't accidentally evict something you're using.
-3. **A clean plug-in contract** so you can write your own store/binding
+4. **A clean plug-in contract** so you can write your own store/binding
    resource (disk-mmap, NVMe-paged, multi-GPU shard) and it fits in.
 
 ## When to use what
 
 | Situation | Use |
 |---|---|
-| Model fits on GPU when active; want fast eviction between calls | **`ModelOffloaderStore.from_module(model).bind(model)`** — bulk DMA, ~200 ms for 12 GB at PCIe Gen5 x16 |
-| Model too big for a CUDA GPU even when active | **`ModelOffloaderStore.from_module(model, layers_attr=..., blocks_to_swap=...).bind(model)`** — streams transformer blocks via forward hooks |
-| Multiple models swap in/out across a script | Register model factories with **`ModelCache`** via **`ModelSpec`** |
+| Most application code, especially multiple models or repeated calls | Register model factories with **`ModelCache`** via **`ModelSpec`** |
+| Model too big for a CUDA GPU even when active | Use **`ModelSpec(..., layers_attr=..., blocks_to_swap=...)`** so the cache creates streamed bindings |
+| LoRA adapters reused across calls | Register/apply **`LoRASpec`** through **`ModelCache.use(..., loras=[...])`** |
+| Low-level/manual lifecycle for one model | Use **`ModelOffloaderStore.from_module(model).bind(model)`** directly |
+| Component or resource development | Use the lower-level store/binding protocols and component stores directly |
 
-## Quick start: whole-model offload
+## Quick start: cached model use
+
+```python
+import torch
+from torch_offload import ModelCache, ModelSpec
+
+cache = ModelCache(max_cache_bytes=24 * 1024**3)
+cache.register(ModelSpec(
+    key="main",
+    estimated_cache_bytes=12 * 1024**3,
+    factory=build_my_model,  # returns a fresh nn.Module
+))
+device = torch.device("cuda")
+
+# First use builds the cached store. Later uses create bindings from it.
+with cache.use("main", device=device) as gpu_model:
+    output = gpu_model(input_tensor)
+
+with cache.use("main", device=device) as gpu_model:
+    output = gpu_model(input_tensor_2)
+```
+
+`ModelSpec` factories should build fresh modules. The cache owns store
+construction, binding, activation, deactivation, and eviction. Frozen
+models get fresh allocation-light bindings for each use; trainable model
+specs reuse the primary factory-created model across sequential uses and
+reject concurrent same-key bindings so optimizer parameter identity stays
+stable. To release pinned host memory, evict or clear inactive cache
+entries and drop any escaped model references.
+
+## Manual offloader binding
+
+Use the store/binding API directly when you want explicit lifecycle
+control without `ModelCache`.
 
 ```python
 import torch
 from torch_offload import ModelOffloaderStore
 
-model = build_my_model()  # any nn.Module
+model = build_my_model()
 store = ModelOffloaderStore.from_module(model)
-strategy = store.bind(model)
+offload = store.bind(model)
 device = torch.device("cuda")
 
-# Store construction pays the pinning cost (clone + pin_memory).
-# Each use is bulk-DMA only.
-with strategy.use(device) as gpu_model:
+with offload.use(device) as gpu_model:
     output = gpu_model(input_tensor)
 
-with strategy.use(device) as gpu_model:
-    output = gpu_model(input_tensor_2)
-
-del strategy, model  # drop refs to free pinned host memory
+del offload, store, model  # drop refs to free pinned host memory
 ```
 
-`ModelOffloader` mutates the model in place: frozen `nn.Parameter`
-registry entries get repointed at Parameters wrapping pinned CPU storage,
-trainable Parameter objects keep their identity and point their
-`.data` at pinned CPU storage, and buffers are replaced with pinned
-copies. After construction, only access the model through the strategy's
-`use(device)` context manager (or `activate(device)` / `deactivate()`).
-For CUDA training, wrap `optimizer.step()` in
-`strategy.optimizer_step()` so trainable GPU updates are copied back to
+`ModelOffloaderStore.from_module()` mutates the source model while
+pinning: frozen `nn.Parameter` registry entries get repointed at
+Parameters wrapping pinned CPU storage, trainable Parameter objects keep
+their identity and point their `.data` at pinned CPU storage, and buffers
+are replaced with pinned copies. After construction, only access the
+bound model through `offload.use(device)` (or `activate(device)` /
+`deactivate()`). For CUDA training, wrap `optimizer.step()` in
+`offload.optimizer_step()` so trainable GPU updates are copied back to
 the pinned CPU cache before deactivation.
-**Drop the strategy and model references to release pinned host
-memory** — there's no `close()`; resource cleanup is reference-drop
-+ GC.
+**Drop the store, binding, and model references to release pinned host
+memory** — there's no `close()`; resource cleanup is reference-drop + GC.
 
-## Quick start: block streaming
+## Manual block streaming
 
 For models too big to fit on GPU even when active. Streams transformer
 blocks through a small GPU-resident window using forward-pre hooks
@@ -116,10 +145,10 @@ device = torch.device("cuda")
 with offload.use(device) as gpu_model:
     output = gpu_model(input_tensor)
 
-del offload, model  # drop refs to free pinned host memory
+del offload, store, model  # drop refs to free pinned host memory
 ```
 
-`ModelOffloader` only streams on CUDA. Activating the strategy on
+`ModelOffloader` only streams on CUDA. Activating the binding on
 `cpu` is a pass-through over the already-installed pinned CPU storage:
 no target pool, no streaming hooks, no weight copies.
 `set_loras(..., mode="merge")` is CUDA-only; use routed LoRA mode for
@@ -337,7 +366,7 @@ This boundary is not optimizer-specific. It runs whatever
 `optimizer.step()` does, copies updated trainable data back to pinned
 CPU storage, and leaves gradients on GPU.
 
-## Quick start: ModelCache
+## ModelCache details
 
 For multiple independent models swapping in and out of GPU.
 
@@ -475,7 +504,7 @@ function to `ResourceSpec`:
 ```python
 from torch import nn
 
-class MyStrategy:
+class MyBinding:
     @property
     def model(self) -> nn.Module: ...
     @property
@@ -486,7 +515,7 @@ class MyStrategy:
 class MyStore:
     @property
     def cache_bytes(self) -> int: ...
-    def bind(self) -> MyStrategy: ...
+    def bind(self) -> MyBinding: ...
 
 spec = ResourceSpec(
     key="my-resource",
@@ -498,7 +527,7 @@ spec = ResourceSpec(
 
 A narrower `ModelStrategyComponent` Protocol (just `activate` +
 `deactivate`, no `model`) describes pieces composable inside a top-level
-strategy — `StreamedComponent` and `PinnedComponent` both satisfy it.
+model binding. `StreamedComponent` and `PinnedComponent` both satisfy it.
 
 `TensorAdapter` is the per-parameter extension point. Its base contract
 only covers inference movement: clone/pin, H2D copy, GPU wrapper rebuild,
@@ -634,7 +663,7 @@ merge-mode LoRA. Use routed LoRA when the target module is a logical
 
 ## Failure modes
 
-The cache and strategies surface failures as typed exceptions rather
+The cache and bindings surface failures as typed exceptions rather
 than silent corruption.
 
 | Exception | When |

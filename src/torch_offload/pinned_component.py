@@ -5,7 +5,7 @@ bulk-copies them to the activation device. This is the component used
 by :class:`ModelOffloader` for both non-streamed names and whole-model
 pinning. It satisfies
 :class:`~torch_offload.protocols.ModelStrategyComponent`, not the
-top-level model strategy protocol.
+top-level model binding protocol.
 
 Cross-cutting compatibility caveats (``torch.compile`` incompatibility,
 DDP/FSDP wrap-before requirement, single-thread contract) live in the
@@ -13,7 +13,7 @@ DDP/FSDP wrap-before requirement, single-thread contract) live in the
 
 Class-specific caveats
 ----------------------
-- The constructor *mutates* the wrapped ``model`` — frozen parameter
+- Binding mutates the wrapped ``model`` — frozen parameter
   registry entries (``module._parameters[leaf]``) are replaced with Parameters
   wrapping pinned CPU storage, trainable parameter ``.data`` points at
   pinned CPU storage while preserving the user's Parameter objects, and
@@ -313,7 +313,7 @@ class PinnedComponent:
             return canonical_device(device)
         raise ValueError(
             "PinnedComponent.activate() requires a device; pass "
-            "activate(device) from the owning strategy/component."
+            "activate(device) from the owning binding/component."
         )
 
 

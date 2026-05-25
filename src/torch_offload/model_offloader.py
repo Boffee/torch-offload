@@ -1,4 +1,4 @@
-"""Unified CUDA offload strategy with optional LoRA application.
+"""Unified CUDA offload binding with optional LoRA application.
 
 Supports whole-model pinned bulk offload or block streaming, with optional
 per-weight LoRA application in both modes.
@@ -179,9 +179,9 @@ class ModelOffloader:
     CUDA, with optional LoRA merge and trainable-parameter support.
 
     Instances are normally created by binding a
-    :class:`ModelOffloaderStore` to a compatible model. The constructor
-    accepts already-bound components for low-level composition; it does
-    not build stores or pin model state itself.
+    :class:`ModelOffloaderStore` to a compatible model. Direct
+    construction accepts already-bound components for low-level
+    composition; it does not build stores or pin model state itself.
 
     When ``layers_attr`` is omitted, CUDA activation bulk-copies every
     managed parameter and buffer to CUDA. When ``layers_attr`` is set,
@@ -194,8 +194,8 @@ class ModelOffloader:
     are recorded via
     :meth:`set_loras` and applied on :meth:`activate`, where merge mode
     installs activation-scoped post-copy hooks so the merge fires
-    immediately after each CPU->GPU weight copy — no separate merge
-    strategy needed.
+    immediately after each CPU->GPU weight copy. No separate merge
+    binding is needed.
 
     Training
     --------
@@ -227,7 +227,7 @@ class ModelOffloader:
 
     By default, trainable params are not streamed through the block
     residency pool. They are managed by :class:`PinnedComponent`, stay
-    GPU-resident while the offload strategy is active on CUDA, and must be
+    GPU-resident while the offloader binding is active on CUDA, and must be
     updated inside :meth:`optimizer_step` so CUDA updates are copied
     back to the pinned CPU cache. CPU activation leaves them in the
     host-backed module state.
@@ -374,7 +374,7 @@ class ModelOffloader:
         """
         if self._teardown_stack is not None:
             raise RuntimeError(
-                "ModelOffloader.set_loras() requires the strategy "
+                "ModelOffloader.set_loras() requires the binding "
                 "to be inactive. Call deactivate() first."
             )
         if mode not in ("merge", "routed"):
@@ -554,7 +554,7 @@ class ModelOffloader:
             return canonical_device(device)
         raise ValueError(
             "ModelOffloader.activate() requires a device; pass "
-            "activate(device) or use this strategy through "
+            "activate(device) or use this binding through "
             "ModelCache.use(..., device=...)"
         )
 

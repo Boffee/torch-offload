@@ -650,7 +650,7 @@ class StreamedComponent:
     It deliberately does NOT implement
     :class:`~torch_offload.protocols.ModelStrategy` (its
     :meth:`activate` returns ``None`` because it doesn't own the
-    model). For top-level use, build a strategy via
+    model). For top-level use, build a model binding via
     :class:`~torch_offload.model_offloader.ModelOffloader`.
 
     Lifecycle is uniform with :class:`PinnedComponent`: store construction
@@ -659,12 +659,12 @@ class StreamedComponent:
     ``activate`` brings to CUDA or marks CPU active, ``deactivate`` returns state to
     pinned CPU and removes hooks. There is no ``close()``; pinned
     memory in module state is freed when the caller drops the
-    strategy and model references.
+    binding and model references.
 
-    **Calling deactivate() before dropping the strategy is preferred**
+    **Calling deactivate() before dropping the binding is preferred**
     — it removes the forward hooks (cleaner model state) and reverts
     GPU-resident blocks back to pinned CPU. The hook closure uses
-    ``weakref.ref(self)`` so dropping the strategy without deactivate
+    ``weakref.ref(self)`` so dropping the binding without deactivate
     is non-fatal: the orphaned hooks remain installed on the model
     but no-op; resident blocks stay on GPU until the model itself is
     dropped. Forward calls through still-resident blocks work; calls
@@ -967,7 +967,7 @@ class StreamedComponent:
         before activate or multiple times. Every step in
         ``_teardown_active_resources`` null-checks; partial state
         from a failed activate cleans up correctly. Drop the
-        strategy reference after deactivate to release pinned
+        binding reference after deactivate to release pinned
         memory."""
         if self._active_device == torch.device("cpu"):
             self._active_device = None
@@ -1505,10 +1505,10 @@ class StreamedComponent:
         num_layers = len(self._blocks)
         wrap_threshold = num_layers // 2  # |Δidx| > this counts as wraparound
         # weakref breaks the cycle: layer → hook → closure → streamer
-        # → _blocks → layer. Without it, dropping the strategy without
+        # → _blocks → layer. Without it, dropping the binding without
         # first calling deactivate() would keep everything alive until
         # Python's cycle collector runs (not refcount-based GC). The
-        # weak ref lets refcount immediately free the strategy when the
+        # weak ref lets refcount immediately free the binding when the
         # caller drops it; orphaned hooks no-op safely.
         self_ref = weakref.ref(self)
 
