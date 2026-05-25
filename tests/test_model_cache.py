@@ -1139,24 +1139,6 @@ class TestObservability:
         with pytest.raises(ModelNotRegisteredError):
             cache.info("missing")
 
-    def test_label_default_is_none(self) -> None:
-        cache = ModelCache(200)
-        cache.register(_spec("a", 100))
-        assert cache.info("a").label is None
-
-    def test_label_is_passed_through(self) -> None:
-        cache = ModelCache(200)
-        cache.register(
-            ResourceSpec(
-                key="a",
-                estimated_cache_bytes=100,
-                store_factory=_make_factory(100),
-                bind=_bind_fake_store,
-                label="text encoder",
-            ),
-        )
-        assert cache.info("a").label == "text encoder"
-
 
 # ---------------------------------------------------------------------------
 # Host empty cache callback

@@ -89,9 +89,6 @@ class ResourceSpec(Generic[T]):
     construction; if the actual exceeds the estimate enough to overflow
     the budget, the cache evicts more or rejects the admission.
 
-    ``label`` is an optional human-readable name surfaced in errors or
-    caller-managed logging; defaults to ``None`` if omitted.
-
     .. note::
        The ``store_factory`` should build a *fresh* store that the cache
        solely owns. Eviction releases backing storage only when the store
@@ -103,7 +100,6 @@ class ResourceSpec(Generic[T]):
     estimated_cache_bytes: int
     store_factory: Callable[[], ResourceStore]
     bind: Callable[[ResourceStore], ResourceBinding[T]]
-    label: str | None = None
 
 
 class ModelSpec(ResourceSpec[nn.Module]):
@@ -116,13 +112,12 @@ class ModelSpec(ResourceSpec[nn.Module]):
     identity stays stable across sequential ``use()`` calls.
     """
 
-    def __init__(  # noqa: PLR0913
+    def __init__(
         self,
         *,
         key: str,
         estimated_cache_bytes: int,
         factory: Callable[[], nn.Module],
-        label: str | None = None,
         layers_attr: str | Sequence[str] | None = None,
         blocks_to_swap: int | Sequence[int] | None = None,
         prefetch_count: int | Sequence[int] = 2,
@@ -160,7 +155,6 @@ class ModelSpec(ResourceSpec[nn.Module]):
             estimated_cache_bytes=estimated_cache_bytes,
             store_factory=store_factory,
             bind=bind,
-            label=label,
         )
 
 
@@ -174,7 +168,6 @@ class LoRASpec(ResourceSpec[LoRA]):
         estimated_cache_bytes: int,
         factory: Callable[[], dict[str, torch.Tensor]],
         key_transform: KeyTransformT = default_key_transform,
-        label: str | None = None,
     ) -> None:
         def store_factory() -> ResourceStore:
             return LoRA(factory(), key_transform=key_transform)
@@ -187,7 +180,6 @@ class LoRASpec(ResourceSpec[LoRA]):
             estimated_cache_bytes=estimated_cache_bytes,
             store_factory=store_factory,
             bind=bind,
-            label=label,
         )
 
 
@@ -199,7 +191,6 @@ class ModelInfo:
     """Per-key state returned by :meth:`ModelCache.info`."""
 
     key: str
-    label: str | None
     estimated_cache_bytes: int
     cache_bytes: int | None  # None when not built (registered but never used)
     cached: bool
@@ -213,7 +204,6 @@ class EvictionCandidate:
     key: str
     cache_bytes: int
     estimated_cache_bytes: int
-    label: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -599,7 +589,6 @@ class ModelCache:
                 raise ModelNotRegisteredError(f"{key!r} is not registered")
             return ModelInfo(
                 key=entry.spec.key,
-                label=entry.spec.label,
                 estimated_cache_bytes=entry.spec.estimated_cache_bytes,
                 cache_bytes=entry.cache_bytes if entry.store is not None else None,
                 cached=entry.store is not None,
@@ -822,7 +811,6 @@ class ModelCache:
                     key=key,
                     cache_bytes=entry.cache_bytes,
                     estimated_cache_bytes=entry.spec.estimated_cache_bytes,
-                    label=entry.spec.label,
                 )
             )
         return tuple(candidates)
