@@ -459,35 +459,46 @@ the cache lock. `choose_victims()` must return unique keys from
 ## Architecture
 
 ```
-                       ┌──────────────────┐
-                       │   ModelCache     │  policy eviction, bindings,
-                       │                  │  transactional admission
-                       └────────┬─────────┘
-                                │ stores + per-use bindings
-                                ▼
-            ┌───────────────────┴────────────────────┐
-            │                                        │
-   ┌──────────────────┐                ┌────────────────────────────┐
-   │   ModelOffloader   │                │        ModelOffloader         │
-   │ whole-model DMA  │                │    streamed block mode      │
-   └────────┬─────────┘                └─────────────┬──────────────┘
-            │                                        │
-            │             ┌──────────────────────────┴──────────┐
-            │             │  components (ordered):              │
-            │             │  • PinnedComponent (non-streamed,   │
-            │             │    include names from composition)  │
-            │             │  • N × StreamedComponent            │
-            │             │                                     │
-            │             │  optional LoRA:                     │
-            │             │  • post-copy hooks for merge mode   │
-            │             └──────────────────────────┬──────────┘
-            │                                        │
-            └────────────────────┬───────────────────┘
-                                 ▼
-                      ┌──────────────────┐
-                      │ PinnedParam      │  per-parameter pinned-CPU state
-                      │ adapter-capable  │  via tensor adapters
-                      └──────────────────┘
+registration / cache admission
+------------------------------
+ModelSpec / LoRASpec / ResourceSpec
+        |
+        v
+  +-------------+
+  | ModelCache  |  owns admission, accounting, eviction, and active bindings
+  +-------------+
+        |
+        +-- builds/admit --> ModelOffloaderStore
+        |                    |
+        |                    +-- PinnedComponentStore
+        |                    |       |
+        |                    |       +-- PinnedParam(s)
+        |                    |
+        |                    +-- StreamedComponentStore(s)
+        |                            |
+        |                            +-- PinnedParam(s)
+        |
+        +-- builds/admit --> LoRA (store + binding)
+        |
+        +-- builds/admit --> custom ResourceStore
+        |
+        +-- chooses inactive victims via EvictionPolicy
+
+cache.use(...)
+--------------
+ModelCache
+   |
+   +-- creates per-use binding from cached store
+          |
+          +-- ModelOffloader binding
+          |      |
+          |      +-- PinnedComponent
+          |      +-- StreamedComponent(s)
+          |      +-- optional LoRA binding via set_loras before activation
+          |      |
+          |      +-- activate/deactivate --> nn.Module binding value
+          |
+          +-- custom ResourceBinding
 ```
 
 `ResourceStore` is the cache admission contract: it reports
