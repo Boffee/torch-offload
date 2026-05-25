@@ -1629,8 +1629,13 @@ class TestLoRAResource:
             device="cpu",
             loras=["lora:style"],
             lora_mode="routed",
-        ):
+        ) as model:
             assert cache.info("lora:style").active_count == 1
+            actual = model(x)
+            expected = _expected_routed_output(
+                model, x, [(expected_lora, 1.0)]
+            )
+            assert torch.allclose(actual, expected, rtol=1e-5, atol=1e-5)
         assert factory_calls["lora"] == 1
 
     def test_model_cache_lora_strength_length_mismatch(self) -> None:

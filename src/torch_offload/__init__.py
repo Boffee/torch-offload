@@ -71,7 +71,7 @@ and compute dtype.
 :class:`ModelCache` manages cached backing stores with policy-driven
 eviction, creates per-use bindings, and owns transactional admission.
 Trainable model specs reuse their primary model across sequential
-leases and reject concurrent same-key bindings. Custom
+uses and reject concurrent same-key bindings. Custom
 :class:`EvictionPolicy`
 implementations can replace the default LRU behavior. See its docstring
 for design notes.
@@ -82,7 +82,7 @@ Compatibility
 - **Wrap before DDP/FSDP**, not after.
 - **Coarse cache concurrency.** :class:`ModelCache` serializes cache
   metadata/lifecycle operations and releases its lock while caller code
-  runs inside a lease. Individual yielded model objects are not made
+  runs inside a use context. Individual yielded model objects are not made
   safe for concurrent same-key execution by the cache.
 """
 

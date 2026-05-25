@@ -46,7 +46,7 @@ This library gives you:
    bulk-DMA them to GPU on demand.
 2. **A cache** that holds multiple pinned models, evicts least-recently-
    used inactive entries when a new model needs room, and tracks active
-   leases so you can't accidentally evict something you're using.
+   bindings so you can't accidentally evict something you're using.
 3. **A clean plug-in contract** so you can write your own store/binding
    resource (disk-mmap, NVMe-paged, multi-GPU shard) and it fits in.
 
