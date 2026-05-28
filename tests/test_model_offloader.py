@@ -905,7 +905,7 @@ class TestValidation:
 
 
 class TestModelCacheIntegration:
-    def test_model_spec_reuses_store_and_rebinds_skeletons(self) -> None:
+    def test_model_spec_default_reuses_canonical_model(self) -> None:
         from torch_offload import ModelCache, ModelSpec
 
         device = torch.device("cpu")
@@ -925,13 +925,13 @@ class TestModelCacheIntegration:
             blocks_to_swap=2,
         )
 
-        with cache.use(spec, device=device) as model:
-            assert isinstance(model, nn.Module)
-            assert all(not param.is_meta for param in model.parameters())
-            assert all(not buffer.is_meta for buffer in model.buffers())
+        with cache.use(spec, device=device) as first_model:
+            assert isinstance(first_model, nn.Module)
+            assert all(not param.is_meta for param in first_model.parameters())
+            assert all(not buffer.is_meta for buffer in first_model.buffers())
             x = torch.randn(2, 8)
             with torch.no_grad():
-                _ = model(x)
+                _ = first_model(x)
 
         info = cache.info("xformer")
         assert info.cached
@@ -939,13 +939,70 @@ class TestModelCacheIntegration:
         assert info.cache_bytes > 0
         assert info.active_count == 0
 
-        first_model = model
-
-        # Second use is a store cache hit but creates a fresh binding/model.
+        # Second sequential use returns the same canonical model; factory
+        # is not called again.
         with cache.use("xformer", device=device) as second_model:
-            assert second_model is not first_model
-        assert factory_calls == 3
+            assert second_model is first_model
+        assert factory_calls == 1
 
+        cache.clear()
+
+    def test_model_spec_default_rejects_nested_binding(self) -> None:
+        from torch_offload import ModelCache, ModelInUseError, ModelSpec
+
+        cache = ModelCache(max_cache_bytes=10_000_000)
+        spec = ModelSpec(
+            key="xformer",
+            estimated_cache_bytes=1024,
+            factory=lambda: _make_block_model(num_blocks=4, width=8),
+            layers_attr="transformer_blocks",
+            blocks_to_swap=2,
+        )
+
+        with cache.use(spec, device="cpu"):
+            with pytest.raises(ModelInUseError, match="xformer"):
+                with cache.use("xformer", device="cpu"):
+                    pass
+
+        assert cache.info("xformer").active_count == 0
+        cache.clear()
+
+    def test_model_spec_skeleton_factory_supports_nested_bindings(self) -> None:
+        from torch_offload import ModelCache, ModelSpec
+
+        factory_calls = 0
+        skeleton_calls = 0
+
+        def factory():
+            nonlocal factory_calls
+            factory_calls += 1
+            return _make_block_model(num_blocks=4, width=8)
+
+        def skeleton_factory():
+            nonlocal skeleton_calls
+            skeleton_calls += 1
+            with torch.device("meta"):
+                return _make_block_model(num_blocks=4, width=8)
+
+        cache = ModelCache(max_cache_bytes=10_000_000)
+        spec = ModelSpec(
+            key="xformer",
+            estimated_cache_bytes=1024,
+            factory=factory,
+            skeleton_factory=skeleton_factory,
+            layers_attr="transformer_blocks",
+            blocks_to_swap=2,
+        )
+
+        with cache.use(spec, device="cpu") as first_model:
+            with cache.use("xformer", device="cpu") as second_model:
+                assert first_model is not second_model
+                assert all(not p.is_meta for p in first_model.parameters())
+                assert all(not p.is_meta for p in second_model.parameters())
+                assert cache.info("xformer").active_count == 2
+
+        assert factory_calls == 1
+        assert skeleton_calls == 2
         cache.clear()
 
     def test_model_spec_trainable_reuses_primary_model(self) -> None:
@@ -992,6 +1049,37 @@ class TestModelCacheIntegration:
                     pass
 
         assert cache.info("trainable").active_count == 0
+        cache.clear()
+
+    def test_model_spec_trainable_ignores_skeleton_factory(self) -> None:
+        from torch_offload import ModelCache, ModelInUseError, ModelSpec
+
+        skeleton_calls = 0
+
+        def skeleton_factory():
+            nonlocal skeleton_calls
+            skeleton_calls += 1
+            with torch.device("meta"):
+                return nn.Linear(8, 8, bias=False)
+
+        cache = ModelCache(max_cache_bytes=10_000_000)
+        spec = ModelSpec(
+            key="trainable",
+            estimated_cache_bytes=1024,
+            factory=lambda: nn.Linear(8, 8, bias=False),
+            skeleton_factory=skeleton_factory,
+        )
+
+        with cache.use(spec, device="cpu") as first_model:
+            with pytest.raises(ModelInUseError, match="trainable"):
+                with cache.use("trainable", device="cpu"):
+                    pass
+
+        with cache.use("trainable", device="cpu") as second_model:
+            assert second_model is first_model
+
+        # skeleton_factory is ignored for trainable stores.
+        assert skeleton_calls == 0
         cache.clear()
 
 

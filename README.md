@@ -83,12 +83,17 @@ with cache.use("main", device=device) as gpu_model:
 ```
 
 `ModelSpec` factories should build fresh modules. The cache owns store
-construction, binding, activation, deactivation, and eviction. Frozen
-models get fresh allocation-light bindings for each use; trainable model
-specs reuse the primary factory-created model across sequential uses and
-reject concurrent same-key bindings so optimizer parameter identity stays
-stable. To release pinned host memory, evict or clear inactive cache
-entries and drop any escaped model references.
+construction, binding, activation, deactivation, and eviction. By default
+every `use()` rebinds the cached store's canonical model instance and
+the cache rejects a second concurrent same-key binding — matching the
+trainable-model contract. To support concurrent bindings (e.g. the same
+model active on two GPUs at once), pass `skeleton_factory=` so the cache
+builds a fresh module per `use()` that the cached pinned bytes are
+re-bound into; the skeleton must match the original factory's parameter
+and buffer structure. Trainable models always reuse the canonical
+instance so optimizer parameter identity stays stable (any
+`skeleton_factory` is ignored). To release pinned host memory, evict or
+clear inactive cache entries and drop any escaped model references.
 
 ## Manual offloader binding
 
@@ -377,8 +382,8 @@ cache = ModelCache(max_cache_bytes=80 * 1024**3)
 device = "cuda:0"
 
 # Register specs. The factory builds real weights once to create the
-# cached store. Frozen models use allocation-light meta skeletons for
-# bindings; trainable models reuse the primary factory-created model.
+# cached store. Every use() rebinds the cached canonical model; to
+# support concurrent same-key bindings, pass skeleton_factory.
 cache.register(ModelSpec(
     key="text_encoder",
     estimated_cache_bytes=12 * 1024**3,
@@ -392,9 +397,11 @@ cache.register(ModelSpec(
     blocks_to_swap=24,
 ))
 
-# First use builds the store; subsequent uses reuse it. Frozen models
-# get fresh bindings; trainable models reuse the primary model so
-# optimizer parameter identity stays stable.
+# First use builds the store; subsequent uses reuse it. The default
+# rebinds the cached canonical model and rejects same-key concurrent
+# use(); pass skeleton_factory= on the spec to allow concurrent bindings
+# (the cache will call it per use() to build a fresh module the cached
+# pinned bytes are re-bound into).
 with cache.use("text_encoder", device=device) as enc:
     embeddings = enc.encode(prompt)
 
@@ -404,9 +411,7 @@ with cache.use("diffusion_model", device=device) as t:
 # When budget pressure forces eviction, the eviction policy chooses
 # from inactive cached entries. The default policy is LRU.
 # Active entries (currently inside `cache.use(...)`) are never evicted.
-# Nested use of the same frozen key creates a second binding from the
-# same cached store. Trainable same-key nesting is rejected. Caller code
-# owns VRAM planning.
+# Caller code owns VRAM planning.
 ```
 
 You can also auto-register at acquire time:
@@ -508,9 +513,12 @@ per-use lifecycle contract: `value`, `activate(device=None)`, and
 `nn.Module` values and adds `model`.
 
 `ModelCache` caches stores and creates bindings for `use()` calls.
-Stores that manage trainable parameters may reject concurrent same-key
-bindings. A custom resource fits by passing a store factory and binding
-function to `ResourceSpec`:
+Whether a second concurrent same-key binding is allowed is decided by
+the spec's `allow_concurrent_binding(store) -> bool` callable (default:
+always allow). `ModelSpec` plugs in stricter behavior: it rejects
+concurrent bindings unless the caller passes `skeleton_factory=`, and
+always rejects them for trainable stores. A custom resource fits by
+passing a store factory and binding function to `ResourceSpec`:
 
 ```python
 from torch import nn
@@ -604,8 +612,9 @@ This is a low-level library; we don't guard against caller misuse.
   admission, binding, activation, and deactivation with an internal lock.
   The lock is released while caller code runs inside `cache.use(...)`.
   The cache does not make a yielded model object safe for concurrent
-  same-key execution; trainable model specs reject concurrent same-key
-  bindings.
+  same-key execution; default `ModelSpec` bindings reject concurrent
+  same-key use unless `skeleton_factory=` is configured. Trainable model
+  specs always reject concurrent same-key bindings.
 - **Buffer mutations during CUDA activation are discarded** on
   `deactivate()`. CPU activation is pass-through over host-backed
   buffers, so CPU buffer mutations behave like ordinary module

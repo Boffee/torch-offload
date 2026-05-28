@@ -17,8 +17,12 @@ Design highlights
   the protocol pair.
 - **Active bindings.** Multiple keys can be active simultaneously
   (e.g. text encoder and embedding processor in the same call), and the
-  same key can be acquired multiple times when the store supports
-  multiple active bindings. Trainable stores reject concurrent same-key
+  same key can be acquired multiple times when the spec opts in via
+  :attr:`ResourceSpec.allow_concurrent_binding`. The default
+  :class:`ModelSpec` binds the cached store's canonical model and
+  rejects same-key concurrent bindings; passing ``skeleton_factory=...``
+  enables per-bind module instances and concurrent bindings for frozen
+  stores. Trainable model stores always reject concurrent same-key
   bindings so optimizer parameter identity stays unambiguous.
 - **Transactional admission, with one caveat.** Activation failures
   do not publish the failed binding and propagate the original exception.
@@ -74,6 +78,10 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T")
 
 
+def _allow_concurrent_default(_store: ResourceStore) -> bool:
+    return True
+
+
 @dataclass(frozen=True)
 class ResourceSpec(Generic[T]):
     """Registration spec for a cached resource.
@@ -89,6 +97,11 @@ class ResourceSpec(Generic[T]):
     construction; if the actual exceeds the estimate enough to overflow
     the budget, the cache evicts more or rejects the admission.
 
+    ``allow_concurrent_binding`` is called by the cache before issuing a
+    second active binding for the same key. Defaults to always allow;
+    specs that need single-binding semantics (e.g. trainable models, or
+    frozen models without a per-bind skeleton factory) return ``False``.
+
     .. note::
        The ``store_factory`` should build a *fresh* store that the cache
        solely owns. Eviction releases backing storage only when the store
@@ -100,24 +113,47 @@ class ResourceSpec(Generic[T]):
     estimated_cache_bytes: int
     store_factory: Callable[[], ResourceStore]
     bind: Callable[[ResourceStore], ResourceBinding[T]]
+    allow_concurrent_binding: Callable[[ResourceStore], bool] = _allow_concurrent_default
 
 
 class ModelSpec(ResourceSpec[nn.Module]):
     """Model-specific cache spec built from one user model factory.
 
-    The factory runs normally once to construct the cached
-    :class:`ModelOffloaderStore`. Frozen models bind allocation-light
-    skeletons created under ``torch.device("meta")``. Trainable models
-    bind the original factory-created model so optimizer parameter
-    identity stays stable across sequential ``use()`` calls.
+    ``factory`` runs normally once to construct the cached
+    :class:`ModelOffloaderStore`. Each ``use()`` then binds the cached
+    pinned/streamed bytes into a module instance.
+
+    By default, every ``use()`` reuses the canonical model instance
+    owned by the cached store and the cache rejects a second concurrent
+    binding for the same key. This matches the trainable-model contract
+    (optimizer parameter identity stays stable) and removes the hidden
+    requirement that ``factory`` respect ``torch.device("meta")``.
+
+    Pass ``skeleton_factory`` to enable multiple concurrent bindings
+    (e.g. the same model bound on two GPUs at once). The skeleton factory
+    is called once per ``use()`` and must produce a module with the same
+    parameter and buffer structure as ``factory``'s output — the cached
+    bytes are re-bound into the fresh module. Common forms:
+
+    - ``skeleton_factory=lambda: build_under_meta(factory)`` for an
+      allocation-light meta skeleton (only when ``factory`` respects
+      ``torch.device("meta")``).
+    - A factory that uses ``accelerate.init_empty_weights()``.
+    - A factory that loads a lighter config and only materializes the
+      module skeleton.
+
+    ``skeleton_factory`` is ignored for trainable stores; trainable models
+    always reuse the canonical instance so optimizer parameter identity
+    stays stable, and concurrent bindings are still rejected.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         *,
         key: str,
         estimated_cache_bytes: int,
         factory: Callable[[], nn.Module],
+        skeleton_factory: Callable[[], nn.Module] | None = None,
         layers_attr: str | Sequence[str] | None = None,
         blocks_to_swap: int | Sequence[int] | None = None,
         prefetch_count: int | Sequence[int] = 2,
@@ -139,22 +175,27 @@ class ModelSpec(ResourceSpec[nn.Module]):
 
         def bind(store: ResourceStore) -> ResourceBinding[nn.Module]:
             offloader_store = cast(ModelOffloaderStore, store)
-            if offloader_store.has_trainables:
+            if skeleton_factory is None or offloader_store.has_trainables:
                 model = offloader_store.model
             else:
-                with torch.device("meta"):
-                    model = factory()
+                model = skeleton_factory()
             return offloader_store.bind(
                 model,
                 skip_checkpointing_check=skip_checkpointing_check,
                 is_block_checkpointed=is_block_checkpointed,
             )
 
+        def allow_concurrent_binding(store: ResourceStore) -> bool:
+            if skeleton_factory is None:
+                return False
+            return not cast(ModelOffloaderStore, store).has_trainables
+
         super().__init__(
             key=key,
             estimated_cache_bytes=estimated_cache_bytes,
             store_factory=store_factory,
             bind=bind,
+            allow_concurrent_binding=allow_concurrent_binding,
         )
 
 
@@ -351,10 +392,6 @@ class _Entry:
     bindings: list[ResourceBinding[Any]] = field(default_factory=list)
 
 
-def _store_has_trainables(store: ResourceStore) -> bool:
-    return bool(getattr(store, "has_trainables", False))
-
-
 # ---------------------------------------------------------------------------
 # ModelCache
 # ---------------------------------------------------------------------------
@@ -523,11 +560,14 @@ class ModelCache:
         ``device`` optionally selects the activation device for this
         acquire. It is normalized and passed to the binding's
         :meth:`~ResourceBinding.activate` for that binding. Same-key
-        nested acquires create independent bindings when the store
-        supports them; stores with trainable parameters may reject
-        concurrent same-key bindings. Different keys and supported
-        multiple bindings for the same key may be active on the same
-        device at the same time; caller code owns GPU memory planning.
+        nested acquires create independent bindings when the spec opts
+        in (see :attr:`ResourceSpec.allow_concurrent_binding`); specs
+        without that opt-in — including the default :class:`ModelSpec`
+        without a ``skeleton_factory`` and all trainable model specs —
+        reject the second concurrent binding. Different keys and any
+        opted-in multiple bindings for the same key may be active on the
+        same device at the same time; caller code owns GPU memory
+        planning.
 
         ``loras`` optionally selects cached LoRA resources to apply to
         a :class:`ModelOffloader` binding before activation.
@@ -669,10 +709,10 @@ class ModelCache:
         """Create an unpublished binding from the cached store."""
         store = entry.store
         assert store is not None
-        if entry.bindings and _store_has_trainables(store):
+        if entry.bindings and not entry.spec.allow_concurrent_binding(store):
             raise ModelInUseError(
-                f"cannot create multiple active bindings for trainable "
-                f"resource {entry.spec.key!r}"
+                f"cannot create multiple active bindings for resource "
+                f"{entry.spec.key!r}; spec does not allow concurrent bindings"
             )
         return entry.spec.bind(store)
 
