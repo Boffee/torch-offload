@@ -220,6 +220,20 @@ class TestConstructorPins:
 
 
 class TestLifecycle:
+    def test_active_device_property_tracks_lifecycle(self) -> None:
+        m = _make_block_model()
+        strategy = _make_model_offloader(
+            m,
+            layers_attr="transformer_blocks", blocks_to_swap=2,
+        )
+        try:
+            assert strategy.active_device is None
+            with strategy.use("cpu"):
+                assert strategy.active_device == torch.device("cpu")
+            assert strategy.active_device is None
+        finally:
+            strategy.deactivate()
+
     @CUDA
     def test_activate_returns_model(self) -> None:
         m = _make_block_model()

@@ -530,6 +530,11 @@ class ModelOffloader:
         return self._model
 
     @property
+    def active_device(self) -> torch.device | None:
+        """Currently active device, or ``None`` when inactive."""
+        return self._active_device
+
+    @property
     def param_names(self) -> frozenset[str]:
         """Parameter names managed by this offloader."""
         names: set[str] = set()
