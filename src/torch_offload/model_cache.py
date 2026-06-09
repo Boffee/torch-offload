@@ -57,7 +57,7 @@ import threading
 from collections import OrderedDict
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Generic, Protocol, TypeAlias, TypeVar, cast, overload
+from typing import Any, Generic, Protocol, TypeAlias, TypeVar, cast
 
 import torch
 from torch import nn
@@ -519,37 +519,16 @@ class ModelCache:
                 self._evict_inactive(key)
             del self._entries[key]
 
-    @overload
-    def use(
-        self,
-        model: ResourceSpec[T],
-        *,
-        device: torch.device | str | None = None,
-        loras: Sequence[LoRARef] | None = None,
-        lora_strengths: Sequence[float] | None = None,
-        lora_mode: LoraMode = "merge",
-    ) -> contextlib.AbstractContextManager[T]: ...
-    @overload
-    def use(
-        self,
-        model: str,
-        *,
-        device: torch.device | str | None = None,
-        loras: Sequence[LoRARef] | None = None,
-        lora_strengths: Sequence[float] | None = None,
-        lora_mode: LoraMode = "merge",
-    ) -> contextlib.AbstractContextManager[Any]: ...
-
     @contextlib.contextmanager
     def use(
         self,
-        model: str | ResourceSpec,
+        model: str | ResourceSpec[T],
         *,
         device: torch.device | str | None = None,
         loras: Sequence[LoRARef] | None = None,
         lora_strengths: Sequence[float] | None = None,
         lora_mode: LoraMode = "merge",
-    ) -> Iterator[Any]:
+    ) -> Iterator[T]:
         """Acquire an active binding on a cached resource.
 
         Accepts either a registered key (string) or a :class:`ResourceSpec`
