@@ -59,8 +59,8 @@ class ModelOffloaderStore:
         model: nn.Module,
         *,
         blocks_attr: str | Sequence[str] | None = None,
-        num_resident_blocks: int | Sequence[int] | None = None,
-        num_prefetch_blocks: int | Sequence[int] = 2,
+        num_resident_blocks: int | None = None,
+        num_prefetch_blocks: int = 2,
         cyclic: bool = False,
         stream_trainable_weights: bool = False,
     ) -> ModelOffloaderStore:
@@ -838,7 +838,7 @@ def _normalize_blocks_paths(blocks_attr: str | Sequence[str] | None) -> list[str
 def _validate_store_config(
     *,
     blocks_paths: Sequence[str],
-    num_resident_blocks: int | Sequence[int] | None,
+    num_resident_blocks: int | None,
 ) -> None:
     if not blocks_paths and num_resident_blocks is not None:
         raise ValueError("num_resident_blocks requires blocks_attr")
@@ -848,8 +848,8 @@ def _build_streamed_component_stores(
     model: nn.Module,
     *,
     blocks_paths: Sequence[str],
-    num_resident_blocks: int | Sequence[int] | None,
-    num_prefetch_blocks: int | Sequence[int],
+    num_resident_blocks: int | None,
+    num_prefetch_blocks: int,
     cyclic: bool,
     stream_trainable_weights: bool,
 ) -> tuple[tuple[StreamedComponentStore, ...], set[str], set[str]]:
@@ -859,22 +859,16 @@ def _build_streamed_component_stores(
     if not blocks_paths or num_resident_blocks is None:
         return (), set(), set()
 
-    resident_list = _broadcast(
-        num_resident_blocks, len(blocks_paths), "num_resident_blocks"
-    )
-    pf_list = _broadcast(
-        num_prefetch_blocks, len(blocks_paths), "num_prefetch_blocks"
-    )
     streamed_component_stores: list[StreamedComponentStore] = []
     streamed_param_names: set[str] = set()
     streamed_buffer_names: set[str] = set()
 
-    for i, blocks_path in enumerate(blocks_paths):
+    for blocks_path in blocks_paths:
         store = StreamedComponentStore.from_module(
             model,
             blocks_path=blocks_path,
-            num_resident_blocks=resident_list[i],
-            num_prefetch_blocks=pf_list[i],
+            num_resident_blocks=num_resident_blocks,
+            num_prefetch_blocks=num_prefetch_blocks,
             cyclic=cyclic,
             stream_trainable_weights=stream_trainable_weights,
         )
@@ -915,15 +909,6 @@ def _validate_components(
 
 def _component_streams_tensor_state(component: StreamedComponent) -> bool:
     return bool(component.param_names) or any(component.streamed_buffer_names_by_block)
-
-
-def _broadcast(value: int | Sequence[int], n: int, name: str) -> list[int]:
-    if isinstance(value, int):
-        return [value] * n
-    out = list(value)
-    if len(out) != n:
-        raise ValueError(f"{name} length {len(out)} != blocks_attr length {n}")
-    return out
 
 
 def _hf_block_has_checkpointing_flag(block: nn.Module) -> bool:

@@ -282,16 +282,19 @@ standard) and uses an in-place `addmm_` for fp/bf bases. Unlike
 `blocks_attr` accepts a list of dotted paths for models with
 multiple kinds of blocks (e.g. Flux's `transformer_blocks` +
 `single_transformer_blocks`). Each path becomes its own streaming
-group with its own target pool. Blocks within a group must share the
-same parameter layout (names/shapes/dtypes/quant-metadata) — split
-heterogeneous block lists into separate `blocks_attr` entries:
+group with its own target pool; the streaming settings are shared by
+all groups. Blocks within a group must share the same parameter
+layout (names/shapes/dtypes/quant-metadata) — split heterogeneous
+block lists into separate `blocks_attr` entries. For per-group
+streaming settings, compose `StreamedComponentStore` instances
+directly:
 
 ```python
 store = ModelOffloaderStore.from_module(
     model,
     blocks_attr=["transformer_blocks", "single_transformer_blocks"],
-    num_resident_blocks=[1, 1],    # per-group; or pass a single int for both
-    num_prefetch_blocks=[2, 4],
+    num_resident_blocks=1,         # shared by both groups
+    num_prefetch_blocks=2,
 )
 offload = store.bind(model)
 ```
