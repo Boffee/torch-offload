@@ -404,18 +404,20 @@ def _streamed_log_label(name: str | None, block_count: int) -> str:
 
 def _validate_stream_config(
     *,
-    num_blocks: int,
-    blocks_to_swap: int,
-    prefetch_count: int,
+    num_resident_blocks: int,
+    num_prefetch_blocks: int,
 ) -> None:
-    if blocks_to_swap < 0:
-        raise ValueError(f"blocks_to_swap ({blocks_to_swap}) must be >= 0")
-    if blocks_to_swap >= num_blocks:
+    # num_resident_blocks > num_blocks is allowed and clamps at
+    # activation, so one config stays valid across models of
+    # different depths.
+    if num_resident_blocks < 1:
         raise ValueError(
-            f"blocks_to_swap ({blocks_to_swap}) must be < num blocks ({num_blocks})"
+            f"num_resident_blocks ({num_resident_blocks}) must be >= 1"
         )
-    if prefetch_count < 0:
-        raise ValueError(f"prefetch_count ({prefetch_count}) must be >= 0")
+    if num_prefetch_blocks < 0:
+        raise ValueError(
+            f"num_prefetch_blocks ({num_prefetch_blocks}) must be >= 0"
+        )
 
 
 def _resolve_blocks(module: nn.Module, blocks_path: str) -> list[nn.Module]:
@@ -521,8 +523,8 @@ class StreamedComponentStore:
 
     _block_stores: tuple[PinnedModuleStore, ...]
     blocks_path: str
-    blocks_to_swap: int
-    prefetch_count: int = 2
+    num_resident_blocks: int
+    num_prefetch_blocks: int = 2
     cyclic: bool = False
 
     @classmethod
@@ -531,17 +533,16 @@ class StreamedComponentStore:
         model: nn.Module,
         *,
         blocks_path: str,
-        blocks_to_swap: int,
-        prefetch_count: int = 2,
+        num_resident_blocks: int,
+        num_prefetch_blocks: int = 2,
         cyclic: bool = False,
         stream_trainable_weights: bool = False,
     ) -> StreamedComponentStore:
         """Resolve ``blocks_path`` on ``model`` and pin its streamed blocks."""
         blocks = _resolve_blocks(model, blocks_path)
         _validate_stream_config(
-            num_blocks=len(blocks),
-            blocks_to_swap=blocks_to_swap,
-            prefetch_count=prefetch_count,
+            num_resident_blocks=num_resident_blocks,
+            num_prefetch_blocks=num_prefetch_blocks,
         )
         stream_param_names = _streamed_param_names_for_blocks(
             blocks,
@@ -556,8 +557,8 @@ class StreamedComponentStore:
         return cls(
             _block_stores=tuple(block_stores),
             blocks_path=blocks_path,
-            blocks_to_swap=blocks_to_swap,
-            prefetch_count=prefetch_count,
+            num_resident_blocks=num_resident_blocks,
+            num_prefetch_blocks=num_prefetch_blocks,
             cyclic=cyclic,
         )
 
@@ -620,8 +621,8 @@ class StreamedComponentStore:
         ]
         return StreamedComponent(
             instances,
-            blocks_to_swap=self.blocks_to_swap,
-            prefetch_count=self.prefetch_count,
+            num_resident_blocks=self.num_resident_blocks,
+            num_prefetch_blocks=self.num_prefetch_blocks,
             cyclic=self.cyclic,
             name=self.blocks_path,
         )
@@ -678,11 +679,22 @@ class StreamedComponent:
     ----------
     block_instances:
         The concrete bound block instances.
-    blocks_to_swap:
-        Number of blocks to keep offloaded on CPU at any time. Must
-        be ``< len(blocks)``.
-    prefetch_count:
+    num_resident_blocks:
+        Maximum number of streamed blocks resident on GPU at a time.
+        Must be ``>= 1``; values above the block count clamp to it at
+        activation. ``1`` is right for almost all workloads: eviction
+        is LRU, so a sequential scan reloads every block each pass
+        regardless of residency — extra resident slots cost GPU
+        memory without reducing transfer volume. (Unlike kohya-style
+        ``blocks_to_swap``, residency here is a pool cap, not a
+        permanently-resident prefix.) The exception is checkpointed
+        training, whose backward recompute reverses direction and
+        finds the last ``num_resident_blocks`` blocks still resident.
+        Spare VRAM is usually better spent on ``num_prefetch_blocks``.
+    num_prefetch_blocks:
         How many blocks ahead to prefetch on a background thread.
+        The GPU target pool holds
+        ``num_resident_blocks + num_prefetch_blocks`` blocks.
     cyclic:
         Default ``False``. When ``True``, treat the block list as a
         cyclic sequence: large index jumps (``|Δidx| > num_blocks/2``)
@@ -717,16 +729,20 @@ class StreamedComponent:
         self,
         block_instances: Sequence[PinnedModuleInstance],
         *,
-        blocks_to_swap: int,
-        prefetch_count: int = 2,
+        num_resident_blocks: int,
+        num_prefetch_blocks: int = 2,
         cyclic: bool = False,
         name: str | None = None,
     ) -> None:
+        _validate_stream_config(
+            num_resident_blocks=num_resident_blocks,
+            num_prefetch_blocks=num_prefetch_blocks,
+        )
         self._block_instances = list(block_instances)
         self._blocks = [instance.module for instance in self._block_instances]
         self._active_device: torch.device | None = None
-        self._blocks_to_swap = blocks_to_swap
-        self._prefetch_count = prefetch_count
+        self._num_resident_blocks = num_resident_blocks
+        self._num_prefetch_blocks = num_prefetch_blocks
         self._cyclic = cyclic
         self._log_label = _streamed_log_label(name, len(self._blocks))
         self._param_name_to_block_param = _build_param_name_index(
@@ -935,8 +951,8 @@ class StreamedComponent:
 
     def _activate_cuda_resolved(self, active_device: torch.device) -> None:
         num_blocks = len(self._blocks)
-        num_resident = num_blocks - self._blocks_to_swap
-        num_gpu_targets = num_resident + self._prefetch_count
+        num_resident = min(self._num_resident_blocks, num_blocks)
+        num_gpu_targets = num_resident + self._num_prefetch_blocks
 
         self._active_device = active_device
         self._tracker = _BlockTracker()
@@ -949,7 +965,7 @@ class StreamedComponent:
         self._activate_pool(num_gpu_targets, active_device)
         self._move_trainable_grads_to(active_device)
 
-        for block_idx in range(min(num_resident, num_blocks)):
+        for block_idx in range(num_resident):
             self._load_block(block_idx)
             self._tracker.mark_on_gpu(block_idx)
 
@@ -957,8 +973,8 @@ class StreamedComponent:
         self.reset_peak()
 
         logger.info(
-            f"{self._log_label} active: {self._blocks_to_swap}/{num_blocks} on CPU, "
-            f"{num_resident} resident on GPU, prefetch={self._prefetch_count}, "
+            f"{self._log_label} active: {num_resident}/{num_blocks} resident "
+            f"on GPU, prefetch={self._num_prefetch_blocks}, "
             f"gpu_pool_targets={num_gpu_targets}"
         )
 
@@ -1237,7 +1253,7 @@ class StreamedComponent:
             raise ValueError(
                 f"num_gpu_targets must be > 0, got {num_gpu_targets}. "
                 "num_resident is always >= 1 by construction; this only "
-                "fires when prefetch_count is negative."
+                "fires when num_prefetch_blocks is negative."
             )
 
         # Pool template comes from block 0. The constructor's layout
@@ -1451,7 +1467,7 @@ class StreamedComponent:
         *,
         num_resident: int,
         max_on_gpu: int,
-        prefetch_count: int,
+        num_prefetch_blocks: int,
         cyclic: bool,
         num_blocks: int,
         wrap_threshold: int,
@@ -1488,7 +1504,7 @@ class StreamedComponent:
                 if cyclic and abs(diff) > wrap_threshold
                 else 1 if diff >= 0 else -1
             )
-        for offset in range(1, prefetch_count + 1):
+        for offset in range(1, num_prefetch_blocks + 1):
             target = idx + direction * offset
             if cyclic:
                 target %= num_blocks
@@ -1499,8 +1515,8 @@ class StreamedComponent:
 
     def _register_hooks(self, num_resident: int) -> None:
         idx_map: dict[int, int] = {id(block): idx for idx, block in enumerate(self._blocks)}
-        prefetch_count = self._prefetch_count  # capture as local — no `self` ref in closure
-        max_on_gpu = num_resident + prefetch_count
+        num_prefetch_blocks = self._num_prefetch_blocks  # capture as local — no `self` ref in closure
+        max_on_gpu = num_resident + num_prefetch_blocks
         cyclic = self._cyclic
         num_blocks = len(self._blocks)
         wrap_threshold = num_blocks // 2  # |Δidx| > this counts as wraparound
@@ -1526,7 +1542,7 @@ class StreamedComponent:
                 idx,
                 num_resident=num_resident,
                 max_on_gpu=max_on_gpu,
-                prefetch_count=prefetch_count,
+                num_prefetch_blocks=num_prefetch_blocks,
                 cyclic=cyclic,
                 num_blocks=num_blocks,
                 wrap_threshold=wrap_threshold,

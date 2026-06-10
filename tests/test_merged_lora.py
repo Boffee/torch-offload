@@ -46,8 +46,8 @@ def _make_model_offloader(
     model: nn.Module,
     *,
     blocks_attr: str | Sequence[str] | None = None,
-    blocks_to_swap: int | Sequence[int] | None = None,
-    prefetch_count: int | Sequence[int] = 2,
+    num_resident_blocks: int | Sequence[int] | None = None,
+    num_prefetch_blocks: int | Sequence[int] = 2,
     cyclic: bool = False,
     stream_trainable_weights: bool = False,
     skip_checkpointing_check: bool = False,
@@ -56,8 +56,8 @@ def _make_model_offloader(
     store = ModelOffloaderStore.from_module(
         model,
         blocks_attr=blocks_attr,
-        blocks_to_swap=blocks_to_swap,
-        prefetch_count=prefetch_count,
+        num_resident_blocks=num_resident_blocks,
+        num_prefetch_blocks=num_prefetch_blocks,
         cyclic=cyclic,
         stream_trainable_weights=stream_trainable_weights,
     )
@@ -227,13 +227,19 @@ def _expected_routed_output(
 
 
 def _make_strategy(
-    model: nn.Module, blocks_to_swap: int = 1,
+    model: nn.Module, num_resident_blocks: int | None = None,
 ) -> ModelOffloader:
-    """Shorthand for constructing the strategy with sensible defaults."""
+    """Shorthand for constructing the strategy with sensible defaults.
+
+    Defaults to all-but-one blocks resident (the old
+    ``blocks_to_swap=1`` shape) so streaming is engaged regardless
+    of the model's depth."""
+    if num_resident_blocks is None:
+        num_resident_blocks = len(model.transformer_blocks) - 1
     return _make_model_offloader(
         model,
         blocks_attr="transformer_blocks",
-        blocks_to_swap=blocks_to_swap,
+        num_resident_blocks=num_resident_blocks,
     )
 
 
@@ -963,7 +969,7 @@ class TestLoRATransform:
             expected_dense / scale.to(torch.float32)
         ).round().clamp(-128, 127).to(torch.int8)
 
-        s = _make_strategy(m, blocks_to_swap=0)
+        s = _make_strategy(m, num_resident_blocks=1)
         _set_loras(s, [(lora, 0.5)], mode="merge")
         s.activate("cuda")
         try:
@@ -1008,7 +1014,7 @@ class TestLoRATransform:
             expected_dense / scales[0].to(torch.float32)
         ).round().clamp(-128, 127).to(torch.int8)
 
-        s = _make_strategy(m, blocks_to_swap=1)
+        s = _make_strategy(m, num_resident_blocks=1)
         _set_loras(s, [(lora, 0.5)], mode="merge")
         s.activate("cuda")
         try:
@@ -1295,7 +1301,7 @@ class TestRoutedMode:
 
         s = _make_model_offloader(
             model,
-            blocks_attr="transformer_blocks", blocks_to_swap=1,
+            blocks_attr="transformer_blocks", num_resident_blocks=1,
         )
         # Build a LoRA targeting attn.weight (LinearLike, not nn.Linear).
         lora = _make_lora(num_blocks=2, dim=16, seed=3)
@@ -1353,7 +1359,7 @@ class TestRoutedMode:
 
         s = _make_model_offloader(
             model,
-            blocks_attr="transformer_blocks", blocks_to_swap=1,
+            blocks_attr="transformer_blocks", num_resident_blocks=1,
         )
         lora = _make_lora(num_blocks=2, dim=16, seed=99)
         _set_loras(s, [(lora, 1.0)], mode="routed")
@@ -1389,7 +1395,7 @@ class TestRoutedMode:
 
         s = _make_model_offloader(
             model,
-            blocks_attr="transformer_blocks", blocks_to_swap=1,
+            blocks_attr="transformer_blocks", num_resident_blocks=1,
         )
         # Build a LoRA that targets either alias of the tied weight.
         sd = {
@@ -1448,7 +1454,7 @@ class TestRoutedMode:
         loras = [(_make_lora(num_blocks=2, dim=16, seed=55), 0.5)]
         s = _make_model_offloader(
             m,
-            blocks_attr="transformer_blocks", blocks_to_swap=1,
+            blocks_attr="transformer_blocks", num_resident_blocks=1,
         )
         _set_loras(s, loras, mode="routed")
         s.activate("cuda")

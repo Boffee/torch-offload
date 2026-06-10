@@ -155,8 +155,8 @@ class ModelSpec(ResourceSpec[nn.Module]):
         factory: Callable[[], nn.Module],
         skeleton_factory: Callable[[], nn.Module] | None = None,
         blocks_attr: str | Sequence[str] | None = None,
-        blocks_to_swap: int | Sequence[int] | None = None,
-        prefetch_count: int | Sequence[int] = 2,
+        num_resident_blocks: int | Sequence[int] | None = None,
+        num_prefetch_blocks: int | Sequence[int] = 2,
         cyclic: bool = False,
         stream_trainable_weights: bool = False,
         skip_checkpointing_check: bool = False,
@@ -167,8 +167,8 @@ class ModelSpec(ResourceSpec[nn.Module]):
             return ModelOffloaderStore.from_module(
                 model,
                 blocks_attr=blocks_attr,
-                blocks_to_swap=blocks_to_swap,
-                prefetch_count=prefetch_count,
+                num_resident_blocks=num_resident_blocks,
+                num_prefetch_blocks=num_prefetch_blocks,
                 cyclic=cyclic,
                 stream_trainable_weights=stream_trainable_weights,
             )

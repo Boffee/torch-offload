@@ -55,7 +55,7 @@ This library gives you:
 | Situation | Use |
 |---|---|
 | Most application code, especially multiple models or repeated calls | Register model factories with **`ModelCache`** via **`ModelSpec`** |
-| Model too big for a CUDA GPU even when active | Use **`ModelSpec(..., blocks_attr=..., blocks_to_swap=...)`** so the cache creates streamed bindings |
+| Model too big for a CUDA GPU even when active | Use **`ModelSpec(..., blocks_attr=..., num_resident_blocks=...)`** so the cache creates streamed bindings |
 | LoRA adapters reused across calls | Register/apply **`LoRASpec`** through **`ModelCache.use(..., loras=[...])`** |
 | Low-level/manual lifecycle for one model | Use **`ModelOffloaderStore.from_module(model).bind(model)`** directly |
 | Component or resource development | Use the lower-level store/binding protocols and component stores directly |
@@ -141,8 +141,8 @@ from torch_offload import ModelOffloaderStore
 store = ModelOffloaderStore.from_module(
     model,
     blocks_attr="transformer_blocks",  # path to the nn.ModuleList
-    blocks_to_swap=24,                 # offload N blocks; rest GPU-resident
-    prefetch_count=2,
+    num_resident_blocks=1,             # blocks kept on GPU; rest stream in
+    num_prefetch_blocks=2,             # GPU pool = resident + prefetch
 )
 offload = store.bind(model)
 device = torch.device("cuda")
@@ -152,6 +152,15 @@ with offload.use(device) as gpu_model:
 
 del offload, store, model  # drop refs to free pinned host memory
 ```
+
+`num_resident_blocks=1` is right for almost all workloads: eviction is
+LRU, so a sequential pass through the blocks reloads every block each
+iteration regardless of residency — extra resident slots cost GPU
+memory without reducing transfer volume. Spend spare VRAM on
+`num_prefetch_blocks` instead. Values above the block count clamp to
+it, so one config works across models of different depths.
+`num_resident_blocks=None` (the default) disables streaming entirely:
+activation bulk-copies everything to the GPU.
 
 `ModelOffloader` only streams on CUDA. Activating the binding on
 `cpu` is a pass-through over the already-installed pinned CPU storage:
@@ -174,7 +183,7 @@ streaming in-block trainable weights:
 store = ModelOffloaderStore.from_module(
     model,
     blocks_attr="transformer_blocks",
-    blocks_to_swap=24,
+    num_resident_blocks=1,
     stream_trainable_weights=True,
 )
 offload = store.bind(model)
@@ -217,7 +226,7 @@ from safetensors.torch import load_file
 store = ModelOffloaderStore.from_module(
     model,
     blocks_attr="transformer_blocks",
-    blocks_to_swap=24,
+    num_resident_blocks=1,
     # Default: stream_trainable_weights=False
 )
 offload = store.bind(model)
@@ -281,8 +290,8 @@ heterogeneous block lists into separate `blocks_attr` entries:
 store = ModelOffloaderStore.from_module(
     model,
     blocks_attr=["transformer_blocks", "single_transformer_blocks"],
-    blocks_to_swap=[8, 24],   # per-group; or pass a single int for both
-    prefetch_count=[2, 4],
+    num_resident_blocks=[1, 1],    # per-group; or pass a single int for both
+    num_prefetch_blocks=[2, 4],
 )
 offload = store.bind(model)
 ```
@@ -323,7 +332,7 @@ from torch_offload import ModelOffloaderStore
 store = ModelOffloaderStore.from_module(
     model,
     blocks_attr="transformer_blocks",
-    blocks_to_swap=24,
+    num_resident_blocks=1,
 )
 offload = store.bind(model)
 device = torch.device("cuda")
@@ -394,7 +403,7 @@ cache.register(ModelSpec(
     estimated_cache_bytes=24 * 1024**3,
     factory=build_diffusion_model,
     blocks_attr="transformer_blocks",
-    blocks_to_swap=24,
+    num_resident_blocks=1,
 ))
 
 # First use builds the store; subsequent uses reuse it. The default

@@ -59,15 +59,15 @@ class ModelOffloaderStore:
         model: nn.Module,
         *,
         blocks_attr: str | Sequence[str] | None = None,
-        blocks_to_swap: int | Sequence[int] | None = None,
-        prefetch_count: int | Sequence[int] = 2,
+        num_resident_blocks: int | Sequence[int] | None = None,
+        num_prefetch_blocks: int | Sequence[int] = 2,
         cyclic: bool = False,
         stream_trainable_weights: bool = False,
     ) -> ModelOffloaderStore:
         blocks_paths = _normalize_blocks_paths(blocks_attr)
         _validate_store_config(
             blocks_paths=blocks_paths,
-            blocks_to_swap=blocks_to_swap,
+            num_resident_blocks=num_resident_blocks,
         )
         (
             streamed_component_stores,
@@ -76,8 +76,8 @@ class ModelOffloaderStore:
         ) = _build_streamed_component_stores(
             model,
             blocks_paths=blocks_paths,
-            blocks_to_swap=blocks_to_swap,
-            prefetch_count=prefetch_count,
+            num_resident_blocks=num_resident_blocks,
+            num_prefetch_blocks=num_prefetch_blocks,
             cyclic=cyclic,
             stream_trainable_weights=stream_trainable_weights,
         )
@@ -183,11 +183,12 @@ class ModelOffloader:
     construction accepts already-bound components for low-level
     composition; it does not build stores or pin model state itself.
 
-    When ``blocks_attr`` is omitted, CUDA activation bulk-copies every
-    managed parameter and buffer to CUDA. When ``blocks_attr`` is set,
-    CUDA activation streams the selected block groups plus component-level
-    movement for non-streamed state. CPU activation is pass-through over
-    the pinned host-backed module state.
+    When ``blocks_attr`` or ``num_resident_blocks`` is omitted
+    (``num_resident_blocks=None`` disables streaming), CUDA activation
+    bulk-copies every managed parameter and buffer to CUDA. When both
+    are set, CUDA activation streams the selected block groups plus
+    component-level movement for non-streamed state. CPU activation is
+    pass-through over the pinned host-backed module state.
 
     Composes :class:`PinnedComponent` (non-streamed params and buffers)
     and one or more :class:`StreamedComponent`\\ s internally. LoRA requests
@@ -837,32 +838,33 @@ def _normalize_blocks_paths(blocks_attr: str | Sequence[str] | None) -> list[str
 def _validate_store_config(
     *,
     blocks_paths: Sequence[str],
-    blocks_to_swap: int | Sequence[int] | None,
+    num_resident_blocks: int | Sequence[int] | None,
 ) -> None:
-    if blocks_paths and blocks_to_swap is None:
-        raise TypeError(
-            "ModelOffloaderStore.from_module requires blocks_to_swap "
-            "when blocks_attr is set"
-        )
-    if not blocks_paths and blocks_to_swap is not None:
-        raise ValueError("blocks_to_swap requires blocks_attr")
+    if not blocks_paths and num_resident_blocks is not None:
+        raise ValueError("num_resident_blocks requires blocks_attr")
 
 
 def _build_streamed_component_stores(
     model: nn.Module,
     *,
     blocks_paths: Sequence[str],
-    blocks_to_swap: int | Sequence[int] | None,
-    prefetch_count: int | Sequence[int],
+    num_resident_blocks: int | Sequence[int] | None,
+    num_prefetch_blocks: int | Sequence[int],
     cyclic: bool,
     stream_trainable_weights: bool,
 ) -> tuple[tuple[StreamedComponentStore, ...], set[str], set[str]]:
-    if not blocks_paths:
+    # num_resident_blocks=None disables streaming even when
+    # blocks_attr is set — the blocks are then managed by the
+    # whole-model pinned component like any other module state.
+    if not blocks_paths or num_resident_blocks is None:
         return (), set(), set()
 
-    assert blocks_to_swap is not None
-    swap_list = _broadcast(blocks_to_swap, len(blocks_paths), "blocks_to_swap")
-    pf_list = _broadcast(prefetch_count, len(blocks_paths), "prefetch_count")
+    resident_list = _broadcast(
+        num_resident_blocks, len(blocks_paths), "num_resident_blocks"
+    )
+    pf_list = _broadcast(
+        num_prefetch_blocks, len(blocks_paths), "num_prefetch_blocks"
+    )
     streamed_component_stores: list[StreamedComponentStore] = []
     streamed_param_names: set[str] = set()
     streamed_buffer_names: set[str] = set()
@@ -871,8 +873,8 @@ def _build_streamed_component_stores(
         store = StreamedComponentStore.from_module(
             model,
             blocks_path=blocks_path,
-            blocks_to_swap=swap_list[i],
-            prefetch_count=pf_list[i],
+            num_resident_blocks=resident_list[i],
+            num_prefetch_blocks=pf_list[i],
             cyclic=cyclic,
             stream_trainable_weights=stream_trainable_weights,
         )
