@@ -37,6 +37,9 @@ class _FakePinnedParam:
         self.target_layout = PinnedParam.target_layout_for(
             nn.Parameter(target_data, requires_grad=requires_grad),
         )
+        self.bind_layout = PinnedParam.bind_layout_for(
+            nn.Parameter(target_data, requires_grad=requires_grad),
+        )
 
     @property
     def cache_bytes(self) -> int:
@@ -875,6 +878,48 @@ class TestPinnedModuleInstance:
 
         with pytest.raises(ValueError, match="Buffer 'running' layout mismatch"):
             store.bind(target)
+
+    def test_bind_allows_param_dtype_mismatch(self) -> None:
+        # A config-built skeleton's placeholder dtype (e.g. fp32 default)
+        # need not match the store: binding replaces the placeholder with
+        # store-backed storage, so the store's dtype wins.
+        prototype = nn.Module()
+        prototype.weight = nn.Parameter(
+            torch.randn(2, 2, dtype=torch.bfloat16), requires_grad=False
+        )
+        store = PinnedModuleStore.from_module(prototype)
+
+        target = nn.Module()
+        target.weight = nn.Parameter(torch.randn(2, 2), requires_grad=False)
+        store.bind(target)
+
+        assert target.weight.dtype == torch.bfloat16
+
+    def test_bind_allows_meta_skeleton_dtype_mismatch(self) -> None:
+        prototype = nn.Module()
+        prototype.weight = nn.Parameter(
+            torch.randn(2, 2, dtype=torch.bfloat16), requires_grad=False
+        )
+        store = PinnedModuleStore.from_module(prototype)
+
+        with torch.device("meta"):
+            skeleton = nn.Module()
+            skeleton.weight = nn.Parameter(torch.empty(2, 2), requires_grad=False)
+        store.bind(skeleton)
+
+        assert skeleton.weight.dtype == torch.bfloat16
+        assert skeleton.weight.device.type == "cpu"
+
+    def test_bind_allows_buffer_dtype_mismatch(self) -> None:
+        prototype = nn.Module()
+        prototype.register_buffer("running", torch.randn(2, dtype=torch.bfloat16))
+        store = PinnedModuleStore.from_module(prototype)
+
+        target = nn.Module()
+        target.register_buffer("running", torch.randn(2))
+        store.bind(target)
+
+        assert target.running.dtype == torch.bfloat16
 
     def test_bind_allows_param_sharing_mismatch(self) -> None:
         prototype = nn.Module()

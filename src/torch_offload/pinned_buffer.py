@@ -38,6 +38,20 @@ class PinnedBuffer:
             buffer.layout,
         )
 
+    @staticmethod
+    def bind_layout_for(buffer: torch.Tensor) -> tuple[object, ...]:
+        """Opaque bind-compatibility layout for ``buffer``.
+
+        dtype excluded: binding replaces the module's buffer with the
+        pinned tensor, so a placeholder's dtype carries no information
+        past validation (mirrors :meth:`PinnedParam.bind_layout_for`).
+        """
+        return (
+            tuple(buffer.shape),
+            tuple(buffer.stride()),
+            buffer.layout,
+        )
+
     @property
     def cache_bytes(self) -> int:
         return self.tensor.numel() * self.tensor.element_size()

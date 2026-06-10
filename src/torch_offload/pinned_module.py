@@ -363,6 +363,14 @@ def _items_for_names(
 def _validate_module_matches_store(
     store: PinnedModuleStore, module: nn.Module,
 ) -> None:
+    """Validate that ``module`` is a structurally compatible bind target.
+
+    Compares bind layouts, not full target layouts: binding replaces every
+    managed tensor with store-backed storage, so placeholder fields the
+    bind overwrites (dtype, for plain tensors) are not required to match —
+    a config-built meta skeleton binds against a store pinned from
+    natively loaded weights.
+    """
     params = _named_parameters(module)
     buffers = _named_buffers(module)
 
@@ -375,19 +383,19 @@ def _validate_module_matches_store(
                 f"Param {name!r} requires_grad mismatch: store has "
                 f"{pinned.requires_grad}, module has {param.requires_grad}."
             )
-        layout = PinnedParam.target_layout_for(param)
-        if layout != pinned.target_layout:
+        layout = PinnedParam.bind_layout_for(param)
+        if layout != pinned.bind_layout:
             raise ValueError(
                 f"Param {name!r} layout mismatch: store has "
-                f"{pinned.target_layout!r}, module has {layout!r}."
+                f"{pinned.bind_layout!r}, module has {layout!r}."
             )
 
     for name, pinned in store.buffers.items():
-        layout = PinnedBuffer.target_layout_for(buffers[name])
-        if layout != pinned.target_layout:
+        layout = PinnedBuffer.bind_layout_for(buffers[name])
+        if layout != PinnedBuffer.bind_layout_for(pinned.tensor):
             raise ValueError(
                 f"Buffer {name!r} layout mismatch: store has "
-                f"{pinned.target_layout!r}, module has {layout!r}."
+                f"{PinnedBuffer.bind_layout_for(pinned.tensor)!r}, module has {layout!r}."
             )
 
 

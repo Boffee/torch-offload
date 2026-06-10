@@ -24,6 +24,7 @@ from torch import nn
 
 from .tensor_adapter_registry import select_adapter
 from .tensor_adapters import (
+    BindLayoutTensorAdapter,
     CpuRoundTripTensorAdapter,
     ParameterDataSwapTensorAdapter,
     TensorAdapter,
@@ -69,11 +70,20 @@ class PinnedParam:
     state.
     """
 
-    __slots__ = ("_target_layout", "adapter", "pinned_state", "requires_grad")
+    __slots__ = (
+        "_bind_layout",
+        "_target_layout",
+        "adapter",
+        "pinned_state",
+        "requires_grad",
+    )
 
     def __init__(self, param: nn.Parameter) -> None:
         self.adapter: TensorAdapter[Any, Any] = select_adapter(param.data)
         self._target_layout = self._target_layout_from_adapter(
+            self.adapter, param.data,
+        )
+        self._bind_layout = self._bind_layout_from_adapter(
             self.adapter, param.data,
         )
         self.requires_grad: bool = param.requires_grad
@@ -94,6 +104,14 @@ class PinnedParam:
     ) -> tuple[object, object]:
         return (type(adapter), adapter.layout_signature(tensor))
 
+    @staticmethod
+    def _bind_layout_from_adapter(
+        adapter: TensorAdapter[Any, Any], tensor: torch.Tensor,
+    ) -> tuple[object, object]:
+        if isinstance(adapter, BindLayoutTensorAdapter):
+            return (type(adapter), adapter.bind_layout_signature(tensor))
+        return (type(adapter), adapter.layout_signature(tensor))
+
     @classmethod
     def target_layout_for(cls, param: nn.Parameter) -> tuple[object, object]:
         """Opaque target-compatibility layout for ``param``.
@@ -105,10 +123,28 @@ class PinnedParam:
         adapter = select_adapter(param.data)
         return cls._target_layout_from_adapter(adapter, param.data)
 
+    @classmethod
+    def bind_layout_for(cls, param: nn.Parameter) -> tuple[object, object]:
+        """Opaque bind-compatibility layout for ``param``.
+
+        Relaxed counterpart of :meth:`target_layout_for` for store↔module
+        bind validation: adapters opting into
+        :class:`BindLayoutTensorAdapter` drop fields that binding
+        overwrites (dtype for plain tensors), so config-built skeletons
+        bind against stores pinned from natively loaded weights.
+        """
+        adapter = select_adapter(param.data)
+        return cls._bind_layout_from_adapter(adapter, param.data)
+
     @property
     def target_layout(self) -> tuple[object, object]:
         """Opaque target-compatibility layout for this pinned backing."""
         return self._target_layout
+
+    @property
+    def bind_layout(self) -> tuple[object, object]:
+        """Opaque bind-compatibility layout for this pinned backing."""
+        return self._bind_layout
 
     def make_cpu_param(self) -> nn.Parameter:
         """Build a CPU :class:`nn.Parameter` wrapper over this pinned state.

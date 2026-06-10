@@ -38,6 +38,7 @@ from torch import nn
 
 __all__ = [
     "DENSE_ADDMM_DTYPES",
+    "BindLayoutTensorAdapter",
     "CpuRoundTripTensorAdapter",
     "DenseAddmmTensorAdapter",
     "DequantRequantCopyIntoTensorAdapter",
@@ -268,6 +269,28 @@ class TensorCopyIntoAdapter(TensorAdapter[PinnedStateT, GpuStateT], Protocol):
 
 
 @runtime_checkable
+class BindLayoutTensorAdapter(TensorAdapter[PinnedStateT, GpuStateT], Protocol):
+    """Optional capability: relaxed layout for store↔module bind validation.
+
+    Binding replaces every managed tensor in the target module with
+    store-backed storage, so a placeholder's dtype carries no information
+    past validation — a meta skeleton built from config alone (e.g. fp32
+    defaults) is structurally compatible with a store pinned from natively
+    loaded bf16 or mixed-precision weights. Adapters that opt in supply a
+    bind signature without the fields binding discards; adapters that
+    don't (quantized wrappers, whose placeholder representation is
+    structural) keep the strict :meth:`TensorAdapter.layout_signature`
+    comparison.
+    """
+
+    @staticmethod
+    def bind_layout_signature(t: torch.Tensor) -> tuple:
+        """Hashable structural layout for bind validation; excludes
+        fields binding overwrites (dtype for plain tensors)."""
+        ...
+
+
+@runtime_checkable
 class DequantRequantCopyIntoTensorAdapter(
     DequantRequantTensorAdapter[PinnedStateT, GpuStateT],
     TensorCopyIntoAdapter[PinnedStateT, GpuStateT],
@@ -439,6 +462,12 @@ class RegularAdapter:
     @staticmethod
     def layout_signature(t: torch.Tensor) -> tuple:
         return (tuple(t.shape), t.dtype)
+
+    @staticmethod
+    def bind_layout_signature(t: torch.Tensor) -> tuple:
+        # dtype excluded: bind replaces plain-tensor placeholders with
+        # store-backed storage, so only the shape is structural.
+        return (tuple(t.shape),)
 
     @staticmethod
     def clone_pin(t: torch.Tensor) -> _RegularPinned:

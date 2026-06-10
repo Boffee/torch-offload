@@ -133,7 +133,11 @@ class ModelSpec(ResourceSpec[nn.Module]):
     (e.g. the same model bound on two GPUs at once). The skeleton factory
     is called once per ``use()`` and must produce a module with the same
     parameter and buffer structure as ``factory``'s output — the cached
-    bytes are re-bound into the fresh module. Common forms:
+    bytes are re-bound into the fresh module. Placeholder dtypes need not
+    match for plain tensors (binding overwrites them with store-backed
+    storage), so a config-built skeleton binds against natively loaded
+    weights; shapes and quantized-wrapper representations must match.
+    Common forms:
 
     - ``skeleton_factory=lambda: build_under_meta(factory)`` for an
       allocation-light meta skeleton (only when ``factory`` respects
