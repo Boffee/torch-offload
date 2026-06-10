@@ -12,6 +12,7 @@ from typing import Any
 import torch
 from torch import nn
 
+from .float8_adapter import Float8Adapter
 from .gguf_adapter import GgufAdapter
 from .nvfp4_adapter import Nvfp4Adapter
 from .quanto_adapter import QuantoAdapter
@@ -24,6 +25,8 @@ def select_adapter(t: torch.Tensor) -> TensorAdapter[Any, Any]:
         return QuantoAdapter()
     if Nvfp4Adapter.matches(t):
         return Nvfp4Adapter()
+    if Float8Adapter.matches(t):
+        return Float8Adapter()
     if GgufAdapter.matches(t):
         return GgufAdapter()
     if RegularAdapter.matches(t):

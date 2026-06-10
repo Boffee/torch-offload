@@ -29,7 +29,8 @@ lives in :mod:`tensor_adapter_registry`.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import asdict, dataclass, is_dataclass
 from typing import Any, Protocol, TypeVar, runtime_checkable
 
 import torch
@@ -46,6 +47,10 @@ __all__ = [
     "TensorCopyIntoAdapter",
     "adapter_name",
     "clone_to_pinned_cpu",
+    "empty_like_strided",
+    "metadata_key",
+    "optional_tensor_id",
+    "tensor_layout",
 ]
 
 
@@ -213,6 +218,11 @@ class DequantRequantTensorAdapter(TensorAdapter[PinnedStateT, GpuStateT], Protoc
     converts a shape-compatible dense tensor back into the same
     representation/layout as ``like``. Device follows the dense input
     tensor; callers can move tensors explicitly before calling.
+
+    Scale strategy is implementation-defined: an adapter may reuse
+    ``like``'s quantization scales (quanto) or recompute them from the
+    new dense values (float8). Both satisfy this contract; callers must
+    not assume scale bytes survive a dequantize/requantize round trip.
     """
 
     @staticmethod
@@ -296,6 +306,83 @@ def clone_to_pinned_cpu(
         ).pin_memory()
     pinned.copy_(source)
     return pinned
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers for structured-tensor adapters (nvfp4, float8, ...)
+# ---------------------------------------------------------------------------
+
+
+def empty_like_strided(t: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """Allocate an empty tensor on ``device`` mirroring ``t``'s shape,
+    stride, and dtype. Structured-tensor adapters use this so inner
+    storage tensors keep their stride ordering (e.g. transposed packed
+    data) across the host/GPU boundary."""
+    return torch.empty_strided(
+        tuple(t.shape),
+        t.stride(),
+        dtype=t.dtype,
+        device=device,
+    )
+
+
+def optional_tensor_id(t: torch.Tensor | None) -> tuple[object, ...] | None:
+    """Identity key fragment for one (possibly absent) inner storage
+    tensor, for use in adapter :meth:`TensorAdapter.tensor_id` keys."""
+    if t is None:
+        return None
+    return (
+        t.device,
+        t.data_ptr(),
+        t.dtype,
+        tuple(t.shape),
+        t.stride(),
+        t.storage_offset(),
+    )
+
+
+def tensor_layout(t: torch.Tensor | None) -> tuple[object, ...] | None:
+    """Identity-free layout fragment for one (possibly absent) inner
+    storage tensor, for use in adapter
+    :meth:`TensorAdapter.layout_signature` values."""
+    if t is None:
+        return None
+    return (tuple(t.shape), t.dtype, t.stride())
+
+
+def metadata_key(value: object | None) -> object | None:
+    """Hashable key for opaque quant metadata (dataclasses, configs).
+
+    Dataclass instances become a structural (type, fields) key so two
+    equal-valued instances compare equal; anything else falls back to
+    ``repr`` for stability over unhashable or unknown types.
+    """
+    if value is None:
+        return None
+    if is_dataclass(value) and not isinstance(value, type):
+        return (
+            type(value).__module__,
+            type(value).__qualname__,
+            _make_hashable(asdict(value)),
+        )
+    return repr(value)
+
+
+def _make_hashable(value: object) -> object:
+    if isinstance(value, Mapping):
+        return tuple(
+            (repr(k), _make_hashable(v))
+            for k, v in sorted(value.items(), key=lambda item: repr(item[0]))
+        )
+    if isinstance(value, (tuple, list)):
+        return tuple(_make_hashable(v) for v in value)
+    if isinstance(value, set):
+        return tuple(sorted((_make_hashable(v) for v in value), key=repr))
+    try:
+        hash(value)
+    except TypeError:
+        return repr(value)
+    return value
 
 
 @dataclass(slots=True)

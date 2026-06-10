@@ -9,6 +9,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+fp8 = ["torch>=2.8", "torchao>=0.17"]
 gguf = ["gguf"]
 nvfp4 = ["numpy", "torch>=2.8", "torchao>=0.17"]
 quanto = ["optimum-quanto"]

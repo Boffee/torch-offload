@@ -15,8 +15,7 @@ merge. Routed LoRA remains possible when the owning module is a logical
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import dataclass
 
 import torch
 from torch import nn
@@ -27,7 +26,13 @@ from ._torchao_nvfp4 import (
     require_nvfp4_tensor,
     validate_layout,
 )
-from .tensor_adapters import clone_to_pinned_cpu
+from .tensor_adapters import (
+    clone_to_pinned_cpu,
+    empty_like_strided,
+    metadata_key,
+    optional_tensor_id,
+    tensor_layout,
+)
 
 
 @dataclass(slots=True)
@@ -59,63 +64,6 @@ def _clone_pin(t: torch.Tensor) -> torch.Tensor:
     # Preserve qdata/scale strides: TorchAO uses qdata stride ordering to
     # represent transposed NVFP4 tensors.
     return clone_to_pinned_cpu(t)
-
-
-def _empty_like_strided(t: torch.Tensor, device: torch.device) -> torch.Tensor:
-    return torch.empty_strided(
-        tuple(t.shape),
-        t.stride(),
-        dtype=t.dtype,
-        device=device,
-    )
-
-
-def _optional_tensor_id(t: torch.Tensor | None) -> tuple[object, ...] | None:
-    if t is None:
-        return None
-    return (
-        t.device,
-        t.data_ptr(),
-        t.dtype,
-        tuple(t.shape),
-        t.stride(),
-        t.storage_offset(),
-    )
-
-
-def _tensor_layout(t: torch.Tensor | None) -> tuple[object, ...] | None:
-    if t is None:
-        return None
-    return (tuple(t.shape), t.dtype, t.stride())
-
-
-def _metadata_key(value: object | None) -> object | None:
-    if value is None:
-        return None
-    if is_dataclass(value) and not isinstance(value, type):
-        return (
-            type(value).__module__,
-            type(value).__qualname__,
-            _make_hashable(asdict(value)),
-        )
-    return repr(value)
-
-
-def _make_hashable(value: object) -> object:
-    if isinstance(value, Mapping):
-        return tuple(
-            (repr(k), _make_hashable(v))
-            for k, v in sorted(value.items(), key=lambda item: repr(item[0]))
-        )
-    if isinstance(value, (tuple, list)):
-        return tuple(_make_hashable(v) for v in value)
-    if isinstance(value, set):
-        return tuple(sorted((_make_hashable(v) for v in value), key=repr))
-    try:
-        hash(value)
-    except TypeError:
-        return repr(value)
-    return value
 
 
 def _build_nvfp4(
@@ -153,17 +101,17 @@ class Nvfp4Adapter:
         qt = require_nvfp4_tensor(t)
         return (
             "torchao-nvfp4",
-            _optional_tensor_id(qt.qdata),
-            _optional_tensor_id(qt.scale),
-            _optional_tensor_id(qt.per_tensor_scale),
-            _optional_tensor_id(qt.act_per_tensor_scale),
+            optional_tensor_id(qt.qdata),
+            optional_tensor_id(qt.scale),
+            optional_tensor_id(qt.per_tensor_scale),
+            optional_tensor_id(qt.act_per_tensor_scale),
             tuple(qt.shape),
             qt.stride(),
             qt.block_size,
             qt.orig_dtype,
             qt.is_swizzled_scales,
             qt.use_triton_kernel,
-            _metadata_key(qt.act_quant_kwargs),
+            metadata_key(qt.act_quant_kwargs),
         )
 
     @staticmethod
@@ -207,15 +155,15 @@ class Nvfp4Adapter:
     @staticmethod
     def alloc_gpu(state: _Nvfp4Pinned, device: torch.device) -> _Nvfp4Gpu:
         return _Nvfp4Gpu(
-            qdata=_empty_like_strided(state.qdata, device),
-            scale=_empty_like_strided(state.scale, device),
+            qdata=empty_like_strided(state.qdata, device),
+            scale=empty_like_strided(state.scale, device),
             per_tensor_scale=(
-                _empty_like_strided(state.per_tensor_scale, device)
+                empty_like_strided(state.per_tensor_scale, device)
                 if state.per_tensor_scale is not None
                 else None
             ),
             act_per_tensor_scale=(
-                _empty_like_strided(state.act_per_tensor_scale, device)
+                empty_like_strided(state.act_per_tensor_scale, device)
                 if state.act_per_tensor_scale is not None
                 else None
             ),
@@ -282,9 +230,9 @@ class Nvfp4Adapter:
             qt.orig_dtype,
             qt.is_swizzled_scales,
             qt.use_triton_kernel,
-            _metadata_key(qt.act_quant_kwargs),
-            ("qdata", _tensor_layout(qt.qdata)),
-            ("scale", _tensor_layout(qt.scale)),
-            ("per_tensor_scale", _tensor_layout(qt.per_tensor_scale)),
-            ("act_per_tensor_scale", _tensor_layout(qt.act_per_tensor_scale)),
+            metadata_key(qt.act_quant_kwargs),
+            ("qdata", tensor_layout(qt.qdata)),
+            ("scale", tensor_layout(qt.scale)),
+            ("per_tensor_scale", tensor_layout(qt.per_tensor_scale)),
+            ("act_per_tensor_scale", tensor_layout(qt.act_per_tensor_scale)),
         )

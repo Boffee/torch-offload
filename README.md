@@ -19,13 +19,14 @@ to be lifted into its own package when a second consumer appears.
 | `streamed_component.py` | `StreamedComponentStore`, `StreamedComponent` — lower-level streamed backing storage plus per-block-list streaming component |
 | `lora.py` | `LoRA`, `LoRATransform`, `LoRARouteHandle` — pinned factor storage + merge / routed-hook application |
 | `merge.py` | `merge_lora()` — permanent in-place LoRA merge into base weights (alternative to `set_loras`) |
-| `pinned_param.py` | `PinnedParam` — per-parameter pinning primitive (handles quanto, GGUF, and TorchAO NVFP4 via adapters) |
+| `pinned_param.py` | `PinnedParam` — per-parameter pinning primitive (handles quanto, GGUF, and TorchAO NVFP4 / scaled-FP8 via adapters) |
 | `pinned_module.py` | Internal name-keyed pinned module storage plus concrete module bindings |
-| `tensor_adapters.py`, `quanto_adapter.py`, `gguf_adapter.py`, `nvfp4_adapter.py`, `gguf_dequant.py` | Tensor adapter contracts/implementations and optional optimum-quanto / gguf / torchao support |
+| `tensor_adapters.py`, `quanto_adapter.py`, `gguf_adapter.py`, `nvfp4_adapter.py`, `float8_adapter.py`, `gguf_dequant.py` | Tensor adapter contracts/implementations and optional optimum-quanto / gguf / torchao support |
 | `tensor_adapter_registry.py` | Internal adapter dispatch and tensor-identity helpers |
 | `module_names.py` | Internal name traversal and mutation helpers |
 | `_quanto.py` | Internal: optimum-quanto optional-import + layout validation; consumed by `quanto_adapter.py` and `merge.py` |
 | `_torchao_nvfp4.py` | Internal: TorchAO NVFP4 optional-import + layout validation; consumed by `nvfp4_adapter.py` |
+| `_torchao_float8.py` | Internal: TorchAO scaled-FP8 optional-import + layout validation and dequant/requant; consumed by `float8_adapter.py` |
 
 ## Why use this
 
@@ -692,6 +693,28 @@ opt into CPU round-trip, trainable `Parameter.data` swap, or activation
 merge-mode LoRA. Use routed LoRA when the target module is a logical
 `nn.Linear` with compatible shape and compute dtype. Permanent
 `merge_lora()` does not bake into NVFP4 weights.
+
+## TorchAO scaled FP8 support
+
+TorchAO scaled-fp8 weights (`torchao.quantization.Float8Tensor`, created
+by `quantize_(..., Float8WeightOnlyConfig/Float8DynamicActivationFloat8WeightConfig)`)
+are handled when the `fp8` optional extra is installed. `PinnedParam`
+pins the fp8 `qdata` and fp32 `scale` tensors plus the TorchAO dispatch
+metadata (`block_size`, `mm_config`, `kernel_preference`,
+`act_quant_kwargs`), then rebuilds the `Float8Tensor` wrapper around GPU
+storage on activation. Per-row and per-tensor scale granularities are
+supported; fp8 matmul execution requires SM89+ (Ada/Hopper or newer)
+CUDA hardware.
+
+Unlike NVFP4, scaled-fp8 weights support merged LoRA: the adapter
+exposes dequantize/requantize plus `copy_into`, so both
+`set_loras(mode="merge")` and permanent `merge_lora()` work by
+dequantizing to dense, applying the delta, and re-encoding with
+recomputed scales through the public `Float8Tensor.from_hp` (lossy but
+standard practice for merges into quantized bases). The GPU
+representation is byte-identical to the host one, so the CPU round-trip
+capability is also available. Trainable `Parameter.data` swap is not —
+scaled-fp8 weights stay frozen.
 
 ## Failure modes
 
