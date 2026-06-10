@@ -202,7 +202,7 @@ def _check_block_layouts_match(
                 "same param structure (names, storage grouping, "
                 "requires_grad, shapes, dtypes, and any tensor-adapter "
                 "wrapper metadata). Split heterogeneous block lists "
-                "across separate `layers_attr=[...]` groups in "
+                "across separate `blocks_attr=[...]` groups in "
                 "ModelOffloader."
             )
         if buffer_sig(block_buffers[i]) != ref_buffers:
@@ -211,7 +211,7 @@ def _check_block_layouts_match(
                 "All blocks in a StreamedComponent group must share the "
                 "same buffer structure (names, shapes, dtypes, and "
                 "tensor layouts). Split heterogeneous block lists "
-                "across separate `layers_attr=[...]` groups in "
+                "across separate `blocks_attr=[...]` groups in "
                 "ModelOffloader."
             )
 
@@ -418,15 +418,15 @@ def _validate_stream_config(
         raise ValueError(f"prefetch_count ({prefetch_count}) must be >= 0")
 
 
-def _resolve_layer_blocks(module: nn.Module, layer_path: str) -> list[nn.Module]:
-    obj = walk_attr_path(module, layer_path)
+def _resolve_blocks(module: nn.Module, blocks_path: str) -> list[nn.Module]:
+    obj = walk_attr_path(module, blocks_path)
     if not isinstance(obj, nn.ModuleList):
         raise TypeError(
-            f"Expected nn.ModuleList at '{layer_path}', got {type(obj).__name__}"
+            f"Expected nn.ModuleList at '{blocks_path}', got {type(obj).__name__}"
         )
     blocks = list(obj)
     if not blocks:
-        raise ValueError(f"layers_attr = {layer_path!r} resolved to empty list")
+        raise ValueError(f"blocks_attr = {blocks_path!r} resolved to empty list")
     return blocks
 
 
@@ -520,7 +520,7 @@ class StreamedComponentStore:
     """Reusable pinned backing storage for a streamed block group."""
 
     _block_stores: tuple[PinnedModuleStore, ...]
-    layer_path: str
+    blocks_path: str
     blocks_to_swap: int
     prefetch_count: int = 2
     cyclic: bool = False
@@ -530,14 +530,14 @@ class StreamedComponentStore:
         cls,
         model: nn.Module,
         *,
-        layer_path: str,
+        blocks_path: str,
         blocks_to_swap: int,
         prefetch_count: int = 2,
         cyclic: bool = False,
         stream_trainable_weights: bool = False,
     ) -> StreamedComponentStore:
-        """Resolve ``layer_path`` on ``model`` and pin its streamed blocks."""
-        blocks = _resolve_layer_blocks(model, layer_path)
+        """Resolve ``blocks_path`` on ``model`` and pin its streamed blocks."""
+        blocks = _resolve_blocks(model, blocks_path)
         _validate_stream_config(
             num_blocks=len(blocks),
             blocks_to_swap=blocks_to_swap,
@@ -555,7 +555,7 @@ class StreamedComponentStore:
         )
         return cls(
             _block_stores=tuple(block_stores),
-            layer_path=layer_path,
+            blocks_path=blocks_path,
             blocks_to_swap=blocks_to_swap,
             prefetch_count=prefetch_count,
             cyclic=cyclic,
@@ -575,7 +575,7 @@ class StreamedComponentStore:
     def param_names(self) -> frozenset[str]:
         """Externally addressable streamed parameter names."""
         names = {
-            _streamed_param_name(self.layer_path, block_idx, local_name)
+            _streamed_param_name(self.blocks_path, block_idx, local_name)
             for block_idx, store in enumerate(self._block_stores)
             for local_name in store.params
         }
@@ -585,7 +585,7 @@ class StreamedComponentStore:
     def buffer_names(self) -> frozenset[str]:
         """Externally addressable streamed buffer names."""
         names = {
-            _streamed_param_name(self.layer_path, block_idx, local_name)
+            _streamed_param_name(self.blocks_path, block_idx, local_name)
             for block_idx, store in enumerate(self._block_stores)
             for local_name in store.buffers
         }
@@ -600,8 +600,8 @@ class StreamedComponentStore:
         return any(store.has_trainables for store in self._block_stores)
 
     def resolve_blocks(self, model: nn.Module) -> list[nn.Module]:
-        """Resolve this store's layer path on ``model``."""
-        return _resolve_layer_blocks(model, self.layer_path)
+        """Resolve this store's blocks path on ``model``."""
+        return _resolve_blocks(model, self.blocks_path)
 
     def bind(
         self,
@@ -623,7 +623,7 @@ class StreamedComponentStore:
             blocks_to_swap=self.blocks_to_swap,
             prefetch_count=self.prefetch_count,
             cyclic=self.cyclic,
-            name=self.layer_path,
+            name=self.blocks_path,
         )
 
 
@@ -934,8 +934,8 @@ class StreamedComponent:
         self._active_device = torch.device("cpu")
 
     def _activate_cuda_resolved(self, active_device: torch.device) -> None:
-        num_layers = len(self._blocks)
-        num_resident = num_layers - self._blocks_to_swap
+        num_blocks = len(self._blocks)
+        num_resident = num_blocks - self._blocks_to_swap
         num_gpu_targets = num_resident + self._prefetch_count
 
         self._active_device = active_device
@@ -943,13 +943,13 @@ class StreamedComponent:
         self._executor = ThreadPoolExecutor(max_workers=1)
         self._stream = torch.cuda.Stream(device=active_device, priority=-1)
         self._pending = {}
-        self._prefetch_events = {i: torch.cuda.Event() for i in range(num_layers)}
+        self._prefetch_events = {i: torch.cuda.Event() for i in range(num_blocks)}
         self._last_idx = -1
 
         self._activate_pool(num_gpu_targets, active_device)
         self._move_trainable_grads_to(active_device)
 
-        for block_idx in range(min(num_resident, num_layers)):
+        for block_idx in range(min(num_resident, num_blocks)):
             self._load_block(block_idx)
             self._tracker.mark_on_gpu(block_idx)
 
@@ -957,7 +957,7 @@ class StreamedComponent:
         self.reset_peak()
 
         logger.info(
-            f"{self._log_label} active: {self._blocks_to_swap}/{num_layers} on CPU, "
+            f"{self._log_label} active: {self._blocks_to_swap}/{num_blocks} on CPU, "
             f"{num_resident} resident on GPU, prefetch={self._prefetch_count}, "
             f"gpu_pool_targets={num_gpu_targets}"
         )
@@ -1453,7 +1453,7 @@ class StreamedComponent:
         max_on_gpu: int,
         prefetch_count: int,
         cyclic: bool,
-        num_layers: int,
+        num_blocks: int,
         wrap_threshold: int,
     ) -> None:
         tracker = self._tracker
@@ -1473,9 +1473,9 @@ class StreamedComponent:
             self._ensure_on_gpu(idx)
 
         # Direction inference. In cyclic mode, a large index jump
-        # (|Delta| > num_layers/2) is iteration wraparound, not a
+        # (|Delta| > num_blocks/2) is iteration wraparound, not a
         # reversal: keep the same forward/backward sense and let
-        # prefetch indices wrap modulo num_layers so the next
+        # prefetch indices wrap modulo num_blocks so the next
         # iteration's leading blocks get streamed proactively.
         last = self._last_idx
         self._last_idx = idx
@@ -1491,21 +1491,21 @@ class StreamedComponent:
         for offset in range(1, prefetch_count + 1):
             target = idx + direction * offset
             if cyclic:
-                target %= num_layers
+                target %= num_blocks
             self._submit_prefetch(target, max_on_gpu)
 
         total = len(tracker._on_gpu) + len(pending)
         tracker.peak_gpu_blocks = max(tracker.peak_gpu_blocks, total)
 
     def _register_hooks(self, num_resident: int) -> None:
-        idx_map: dict[int, int] = {id(layer): idx for idx, layer in enumerate(self._blocks)}
+        idx_map: dict[int, int] = {id(block): idx for idx, block in enumerate(self._blocks)}
         prefetch_count = self._prefetch_count  # capture as local — no `self` ref in closure
         max_on_gpu = num_resident + prefetch_count
         cyclic = self._cyclic
-        num_layers = len(self._blocks)
-        wrap_threshold = num_layers // 2  # |Δidx| > this counts as wraparound
-        # weakref breaks the cycle: layer → hook → closure → streamer
-        # → _blocks → layer. Without it, dropping the binding without
+        num_blocks = len(self._blocks)
+        wrap_threshold = num_blocks // 2  # |Δidx| > this counts as wraparound
+        # weakref breaks the cycle: block → hook → closure → streamer
+        # → _blocks → block. Without it, dropping the binding without
         # first calling deactivate() would keep everything alive until
         # Python's cycle collector runs (not refcount-based GC). The
         # weak ref lets refcount immediately free the binding when the
@@ -1528,13 +1528,13 @@ class StreamedComponent:
                 max_on_gpu=max_on_gpu,
                 prefetch_count=prefetch_count,
                 cyclic=cyclic,
-                num_layers=num_layers,
+                num_blocks=num_blocks,
                 wrap_threshold=wrap_threshold,
             )
 
-        for layer in self._blocks:
-            idx = idx_map[id(layer)]
-            h = layer.register_forward_pre_hook(functools.partial(_pre_hook, idx=idx))
+        for block in self._blocks:
+            idx = idx_map[id(block)]
+            h = block.register_forward_pre_hook(functools.partial(_pre_hook, idx=idx))
             self._hooks.append(h)
 
 

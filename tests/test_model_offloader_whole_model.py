@@ -25,7 +25,7 @@ _OFFLOADER_LOGGER = "torch_offload.model_offloader"
 def _make_model_offloader(
     model: nn.Module,
     *,
-    layers_attr: str | Sequence[str] | None = None,
+    blocks_attr: str | Sequence[str] | None = None,
     blocks_to_swap: int | Sequence[int] | None = None,
     prefetch_count: int | Sequence[int] = 2,
     cyclic: bool = False,
@@ -35,7 +35,7 @@ def _make_model_offloader(
 ) -> ModelOffloader:
     store = ModelOffloaderStore.from_module(
         model,
-        layers_attr=layers_attr,
+        blocks_attr=blocks_attr,
         blocks_to_swap=blocks_to_swap,
         prefetch_count=prefetch_count,
         cyclic=cyclic,

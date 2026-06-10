@@ -154,7 +154,7 @@ class ModelSpec(ResourceSpec[nn.Module]):
         estimated_cache_bytes: int,
         factory: Callable[[], nn.Module],
         skeleton_factory: Callable[[], nn.Module] | None = None,
-        layers_attr: str | Sequence[str] | None = None,
+        blocks_attr: str | Sequence[str] | None = None,
         blocks_to_swap: int | Sequence[int] | None = None,
         prefetch_count: int | Sequence[int] = 2,
         cyclic: bool = False,
@@ -166,7 +166,7 @@ class ModelSpec(ResourceSpec[nn.Module]):
             model = factory()
             return ModelOffloaderStore.from_module(
                 model,
-                layers_attr=layers_attr,
+                blocks_attr=blocks_attr,
                 blocks_to_swap=blocks_to_swap,
                 prefetch_count=prefetch_count,
                 cyclic=cyclic,

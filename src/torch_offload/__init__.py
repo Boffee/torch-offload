@@ -11,7 +11,7 @@ Lower-level resource bindings:
 
 - :class:`ModelOffloader` -- whole-model pinned-CPU bulk cache when
   created by ``ModelOffloaderStore.from_module(model).bind(model)``, or
-  per-block streaming when the store is constructed with ``layers_attr``
+  per-block streaming when the store is constructed with ``blocks_attr``
   and ``blocks_to_swap``. Streaming mode supports optional LoRA merge,
   trainable-parameter support, CUDA prefetch on a secondary stream, and
   activation checkpointing through autograd backward. By default,
@@ -60,7 +60,7 @@ drop those references and rebuild from a fresh model instance.
 :class:`ModelOffloader` composes (in order):
   1. A :class:`PinnedComponent` for every non-streamed parameter and
      buffer, including trainables skipped by block streaming.
-  2. One :class:`StreamedComponent` per ``layers_attr`` path when
+  2. One :class:`StreamedComponent` per ``blocks_attr`` path when
      streaming is configured.
 
 Optional LoRA merging is requested via :meth:`ModelOffloader.set_loras`

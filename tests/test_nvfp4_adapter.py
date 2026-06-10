@@ -20,7 +20,7 @@ CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def _make_model_offloader(
     model: nn.Module,
     *,
-    layers_attr: str | Sequence[str] | None = None,
+    blocks_attr: str | Sequence[str] | None = None,
     blocks_to_swap: int | Sequence[int] | None = None,
     prefetch_count: int | Sequence[int] = 2,
     cyclic: bool = False,
@@ -30,7 +30,7 @@ def _make_model_offloader(
 ) -> ModelOffloader:
     store = ModelOffloaderStore.from_module(
         model,
-        layers_attr=layers_attr,
+        blocks_attr=blocks_attr,
         blocks_to_swap=blocks_to_swap,
         prefetch_count=prefetch_count,
         cyclic=cyclic,
@@ -278,7 +278,7 @@ class TestNvfp4Adapter:
             )
         offloader = _make_model_offloader(
             model,
-            layers_attr="blocks",
+            blocks_attr="blocks",
             blocks_to_swap=1,
             prefetch_count=0,
         )

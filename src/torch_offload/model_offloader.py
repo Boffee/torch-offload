@@ -58,15 +58,15 @@ class ModelOffloaderStore:
         cls,
         model: nn.Module,
         *,
-        layers_attr: str | Sequence[str] | None = None,
+        blocks_attr: str | Sequence[str] | None = None,
         blocks_to_swap: int | Sequence[int] | None = None,
         prefetch_count: int | Sequence[int] = 2,
         cyclic: bool = False,
         stream_trainable_weights: bool = False,
     ) -> ModelOffloaderStore:
-        layer_paths = _normalize_layer_paths(layers_attr)
+        blocks_paths = _normalize_blocks_paths(blocks_attr)
         _validate_store_config(
-            layer_paths=layer_paths,
+            blocks_paths=blocks_paths,
             blocks_to_swap=blocks_to_swap,
         )
         (
@@ -75,7 +75,7 @@ class ModelOffloaderStore:
             streamed_buffer_names,
         ) = _build_streamed_component_stores(
             model,
-            layer_paths=layer_paths,
+            blocks_paths=blocks_paths,
             blocks_to_swap=blocks_to_swap,
             prefetch_count=prefetch_count,
             cyclic=cyclic,
@@ -183,8 +183,8 @@ class ModelOffloader:
     construction accepts already-bound components for low-level
     composition; it does not build stores or pin model state itself.
 
-    When ``layers_attr`` is omitted, CUDA activation bulk-copies every
-    managed parameter and buffer to CUDA. When ``layers_attr`` is set,
+    When ``blocks_attr`` is omitted, CUDA activation bulk-copies every
+    managed parameter and buffer to CUDA. When ``blocks_attr`` is set,
     CUDA activation streams the selected block groups plus component-level
     movement for non-streamed state. CPU activation is pass-through over
     the pinned host-backed module state.
@@ -825,52 +825,52 @@ class ModelOffloader:
 # ---------------------------------------------------------------------------
 
 
-def _normalize_layer_paths(layers_attr: str | Sequence[str] | None) -> list[str]:
-    if layers_attr is None:
+def _normalize_blocks_paths(blocks_attr: str | Sequence[str] | None) -> list[str]:
+    if blocks_attr is None:
         return []
-    layer_paths = [layers_attr] if isinstance(layers_attr, str) else list(layers_attr)
-    if not layer_paths:
-        raise ValueError("layers_attr must contain at least one path")
-    return layer_paths
+    blocks_paths = [blocks_attr] if isinstance(blocks_attr, str) else list(blocks_attr)
+    if not blocks_paths:
+        raise ValueError("blocks_attr must contain at least one path")
+    return blocks_paths
 
 
 def _validate_store_config(
     *,
-    layer_paths: Sequence[str],
+    blocks_paths: Sequence[str],
     blocks_to_swap: int | Sequence[int] | None,
 ) -> None:
-    if layer_paths and blocks_to_swap is None:
+    if blocks_paths and blocks_to_swap is None:
         raise TypeError(
             "ModelOffloaderStore.from_module requires blocks_to_swap "
-            "when layers_attr is set"
+            "when blocks_attr is set"
         )
-    if not layer_paths and blocks_to_swap is not None:
-        raise ValueError("blocks_to_swap requires layers_attr")
+    if not blocks_paths and blocks_to_swap is not None:
+        raise ValueError("blocks_to_swap requires blocks_attr")
 
 
 def _build_streamed_component_stores(
     model: nn.Module,
     *,
-    layer_paths: Sequence[str],
+    blocks_paths: Sequence[str],
     blocks_to_swap: int | Sequence[int] | None,
     prefetch_count: int | Sequence[int],
     cyclic: bool,
     stream_trainable_weights: bool,
 ) -> tuple[tuple[StreamedComponentStore, ...], set[str], set[str]]:
-    if not layer_paths:
+    if not blocks_paths:
         return (), set(), set()
 
     assert blocks_to_swap is not None
-    swap_list = _broadcast(blocks_to_swap, len(layer_paths), "blocks_to_swap")
-    pf_list = _broadcast(prefetch_count, len(layer_paths), "prefetch_count")
+    swap_list = _broadcast(blocks_to_swap, len(blocks_paths), "blocks_to_swap")
+    pf_list = _broadcast(prefetch_count, len(blocks_paths), "prefetch_count")
     streamed_component_stores: list[StreamedComponentStore] = []
     streamed_param_names: set[str] = set()
     streamed_buffer_names: set[str] = set()
 
-    for i, layer_path in enumerate(layer_paths):
+    for i, blocks_path in enumerate(blocks_paths):
         store = StreamedComponentStore.from_module(
             model,
-            layer_path=layer_path,
+            blocks_path=blocks_path,
             blocks_to_swap=swap_list[i],
             prefetch_count=pf_list[i],
             cyclic=cyclic,
@@ -920,7 +920,7 @@ def _broadcast(value: int | Sequence[int], n: int, name: str) -> list[int]:
         return [value] * n
     out = list(value)
     if len(out) != n:
-        raise ValueError(f"{name} length {len(out)} != layers_attr length {n}")
+        raise ValueError(f"{name} length {len(out)} != blocks_attr length {n}")
     return out
 
 

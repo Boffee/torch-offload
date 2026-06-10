@@ -45,7 +45,7 @@ CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def _make_model_offloader(
     model: nn.Module,
     *,
-    layers_attr: str | Sequence[str] | None = None,
+    blocks_attr: str | Sequence[str] | None = None,
     blocks_to_swap: int | Sequence[int] | None = None,
     prefetch_count: int | Sequence[int] = 2,
     cyclic: bool = False,
@@ -55,7 +55,7 @@ def _make_model_offloader(
 ) -> ModelOffloader:
     store = ModelOffloaderStore.from_module(
         model,
-        layers_attr=layers_attr,
+        blocks_attr=blocks_attr,
         blocks_to_swap=blocks_to_swap,
         prefetch_count=prefetch_count,
         cyclic=cyclic,
@@ -232,7 +232,7 @@ def _make_strategy(
     """Shorthand for constructing the strategy with sensible defaults."""
     return _make_model_offloader(
         model,
-        layers_attr="transformer_blocks",
+        blocks_attr="transformer_blocks",
         blocks_to_swap=blocks_to_swap,
     )
 
@@ -1295,7 +1295,7 @@ class TestRoutedMode:
 
         s = _make_model_offloader(
             model,
-            layers_attr="transformer_blocks", blocks_to_swap=1,
+            blocks_attr="transformer_blocks", blocks_to_swap=1,
         )
         # Build a LoRA targeting attn.weight (LinearLike, not nn.Linear).
         lora = _make_lora(num_blocks=2, dim=16, seed=3)
@@ -1353,7 +1353,7 @@ class TestRoutedMode:
 
         s = _make_model_offloader(
             model,
-            layers_attr="transformer_blocks", blocks_to_swap=1,
+            blocks_attr="transformer_blocks", blocks_to_swap=1,
         )
         lora = _make_lora(num_blocks=2, dim=16, seed=99)
         _set_loras(s, [(lora, 1.0)], mode="routed")
@@ -1389,7 +1389,7 @@ class TestRoutedMode:
 
         s = _make_model_offloader(
             model,
-            layers_attr="transformer_blocks", blocks_to_swap=1,
+            blocks_attr="transformer_blocks", blocks_to_swap=1,
         )
         # Build a LoRA that targets either alias of the tied weight.
         sd = {
@@ -1448,7 +1448,7 @@ class TestRoutedMode:
         loras = [(_make_lora(num_blocks=2, dim=16, seed=55), 0.5)]
         s = _make_model_offloader(
             m,
-            layers_attr="transformer_blocks", blocks_to_swap=1,
+            blocks_attr="transformer_blocks", blocks_to_swap=1,
         )
         _set_loras(s, loras, mode="routed")
         s.activate("cuda")

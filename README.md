@@ -55,7 +55,7 @@ This library gives you:
 | Situation | Use |
 |---|---|
 | Most application code, especially multiple models or repeated calls | Register model factories with **`ModelCache`** via **`ModelSpec`** |
-| Model too big for a CUDA GPU even when active | Use **`ModelSpec(..., layers_attr=..., blocks_to_swap=...)`** so the cache creates streamed bindings |
+| Model too big for a CUDA GPU even when active | Use **`ModelSpec(..., blocks_attr=..., blocks_to_swap=...)`** so the cache creates streamed bindings |
 | LoRA adapters reused across calls | Register/apply **`LoRASpec`** through **`ModelCache.use(..., loras=[...])`** |
 | Low-level/manual lifecycle for one model | Use **`ModelOffloaderStore.from_module(model).bind(model)`** directly |
 | Component or resource development | Use the lower-level store/binding protocols and component stores directly |
@@ -140,7 +140,7 @@ from torch_offload import ModelOffloaderStore
 # Store construction pins everything; cache_bytes is final immediately.
 store = ModelOffloaderStore.from_module(
     model,
-    layers_attr="transformer_blocks",  # path to the nn.ModuleList
+    blocks_attr="transformer_blocks",  # path to the nn.ModuleList
     blocks_to_swap=24,                 # offload N blocks; rest GPU-resident
     prefetch_count=2,
 )
@@ -173,7 +173,7 @@ streaming in-block trainable weights:
 ```python
 store = ModelOffloaderStore.from_module(
     model,
-    layers_attr="transformer_blocks",
+    blocks_attr="transformer_blocks",
     blocks_to_swap=24,
     stream_trainable_weights=True,
 )
@@ -216,7 +216,7 @@ from safetensors.torch import load_file
 
 store = ModelOffloaderStore.from_module(
     model,
-    layers_attr="transformer_blocks",
+    blocks_attr="transformer_blocks",
     blocks_to_swap=24,
     # Default: stream_trainable_weights=False
 )
@@ -270,17 +270,17 @@ standard) and uses an in-place `addmm_` for fp/bf bases. Unlike
 
 ### Heterogeneous block lists
 
-`layers_attr` accepts a list of dotted paths for models with
+`blocks_attr` accepts a list of dotted paths for models with
 multiple kinds of blocks (e.g. Flux's `transformer_blocks` +
 `single_transformer_blocks`). Each path becomes its own streaming
 group with its own target pool. Blocks within a group must share the
 same parameter layout (names/shapes/dtypes/quant-metadata) — split
-heterogeneous block lists into separate `layers_attr` entries:
+heterogeneous block lists into separate `blocks_attr` entries:
 
 ```python
 store = ModelOffloaderStore.from_module(
     model,
-    layers_attr=["transformer_blocks", "single_transformer_blocks"],
+    blocks_attr=["transformer_blocks", "single_transformer_blocks"],
     blocks_to_swap=[8, 24],   # per-group; or pass a single int for both
     prefetch_count=[2, 4],
 )
@@ -322,7 +322,7 @@ from torch_offload import ModelOffloaderStore
 
 store = ModelOffloaderStore.from_module(
     model,
-    layers_attr="transformer_blocks",
+    blocks_attr="transformer_blocks",
     blocks_to_swap=24,
 )
 offload = store.bind(model)
@@ -393,7 +393,7 @@ cache.register(ModelSpec(
     key="diffusion_model",
     estimated_cache_bytes=24 * 1024**3,
     factory=build_diffusion_model,
-    layers_attr="transformer_blocks",
+    blocks_attr="transformer_blocks",
     blocks_to_swap=24,
 ))
 
