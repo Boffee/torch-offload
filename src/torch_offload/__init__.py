@@ -6,6 +6,9 @@ High-level API:
   creates per-use :class:`ModelOffloader` bindings. Use
   :class:`LoRASpec` with ``ModelCache.use(..., loras=[...])`` to cache
   LoRA resources and apply them during model activation.
+  :class:`ObjectSpec` caches general Python objects (tokenizers,
+  processors, configs) in the same registry; by default they are
+  charged zero bytes and live until explicitly evicted.
 
 Lower-level resource bindings:
 
@@ -110,6 +113,7 @@ from .model_cache import (
     ModelNotRegisteredError,
     ModelSpec,
     ModelTooLargeError,
+    ObjectSpec,
     ResourceSpec,
 )
 from .model_offloader import ModelOffloader, ModelOffloaderStore
@@ -145,6 +149,7 @@ __all__ = [
     "ModelStrategyComponent",
     "ModelTooLargeError",
     "MpsWeights",
+    "ObjectSpec",
     "PinnedComponent",
     "PinnedComponentStore",
     "ResourceBinding",

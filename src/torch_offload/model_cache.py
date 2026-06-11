@@ -236,6 +236,74 @@ class LoRASpec(ResourceSpec[LoRA]):
         )
 
 
+class _ObjectStore(Generic[T]):
+    """Holds one plain Python object for :class:`ObjectSpec`.
+
+    Satisfies both :class:`ResourceStore` and :class:`ResourceBinding`
+    shapes: the store is its own binding because there is no per-use
+    state -- ``activate``/``deactivate`` are lifecycle no-ops and the
+    ``device`` argument is ignored.
+    """
+
+    def __init__(self, value: T, cache_bytes: int) -> None:
+        self._value = value
+        self._cache_bytes = cache_bytes
+
+    @property
+    def cache_bytes(self) -> int:
+        return self._cache_bytes
+
+    @property
+    def value(self) -> T:
+        return self._value
+
+    def activate(self, device: torch.device | str | None = None) -> None:
+        pass
+
+    def deactivate(self) -> None:
+        pass
+
+
+class ObjectSpec(ResourceSpec[T]):
+    """Cache spec for a general Python object (tokenizer, processor,
+    config, ...) that is not a tensor resource.
+
+    ``factory`` runs once on cache miss; every ``use()`` then yields the
+    *same* object instance, including concurrent bindings. Treat the
+    object as read-only while bound -- mutating shared state (e.g. a
+    tokenizer's padding side) from concurrent uses is a caller-side race.
+    The ``device`` argument of ``use()`` is ignored.
+
+    ``estimated_cache_bytes`` defaults to 0 because plain heap objects do
+    not compete with the pinned-host-memory budget the cache enforces.
+    Zero-byte entries are never useful eviction victims (the default LRU
+    policy skips them), so they stay cached until explicitly evicted,
+    unregistered, or replaced. Pass a positive estimate only for objects
+    whose memory should genuinely count against the budget; it is charged
+    as-is since plain objects cannot report actual bytes.
+    """
+
+    def __init__(
+        self,
+        *,
+        key: str,
+        factory: Callable[[], T],
+        estimated_cache_bytes: int = 0,
+    ) -> None:
+        def store_factory() -> ResourceStore:
+            return _ObjectStore(factory(), estimated_cache_bytes)
+
+        def bind(store: ResourceStore) -> ResourceBinding[T]:
+            return cast(_ObjectStore[T], store)
+
+        super().__init__(
+            key=key,
+            estimated_cache_bytes=estimated_cache_bytes,
+            store_factory=store_factory,
+            bind=bind,
+        )
+
+
 LoRARef: TypeAlias = str | LoRASpec
 
 
@@ -379,10 +447,16 @@ class LRUEvictionPolicy:
             return ()
         chosen: list[str] = []
         freed = 0
-        candidate_bytes = {candidate.key: candidate.cache_bytes for candidate in context.candidates}
+        # Zero-byte entries (e.g. ObjectSpec with the default estimate)
+        # free nothing, so evicting them can never help admit an entry.
+        candidate_bytes = {
+            candidate.key: candidate.cache_bytes
+            for candidate in context.candidates
+            if candidate.cache_bytes > 0
+        }
         ordered_keys = [key for key in self._inactive_order if key in candidate_bytes]
         ordered_key_set = set(ordered_keys)
-        ordered_keys.extend(candidate.key for candidate in context.candidates if candidate.key not in ordered_key_set)
+        ordered_keys.extend(key for key in candidate_bytes if key not in ordered_key_set)
         for key in ordered_keys:
             chosen.append(key)
             freed += candidate_bytes[key]
@@ -910,7 +984,8 @@ class ModelCache:
         entry.cache_bytes = 0
         self._eviction.discard(entry.spec.key)
         self._used_bytes -= bytes_freed
-        self._after_release()
+        if bytes_freed > 0:
+            self._after_release()
 
     def _after_release(self) -> None:
         if self._empty_host_cache is None:

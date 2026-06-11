@@ -25,6 +25,7 @@ from torch_offload import (
     ModelInUseError,
     ModelNotRegisteredError,
     ModelTooLargeError,
+    ObjectSpec,
     ResourceSpec,
 )
 from torch_offload.protocols import ModelStrategy, ResourceStore
@@ -1187,3 +1188,101 @@ class TestStrategyConformance:
         s = FakeBinding(store)
         assert isinstance(store, ResourceStore)
         assert isinstance(s, ModelStrategy)
+
+
+# ---------------------------------------------------------------------------
+# ObjectSpec
+# ---------------------------------------------------------------------------
+
+
+class FakeTokenizer:
+    """Stand-in for a non-module Python object (tokenizer, processor)."""
+
+    def __init__(self) -> None:
+        self.vocab = {"hello": 0, "world": 1}
+
+
+class TestObjectSpec:
+    def test_factory_runs_once_and_instance_is_shared(self) -> None:
+        builds = {"n": 0}
+
+        def factory() -> FakeTokenizer:
+            builds["n"] += 1
+            return FakeTokenizer()
+
+        cache = ModelCache(1000)
+        spec = ObjectSpec(key="tok", factory=factory)
+        with cache.use(spec) as first:
+            assert isinstance(first, FakeTokenizer)
+        with cache.use("tok") as second:
+            assert second is first
+        assert builds["n"] == 1
+
+    def test_concurrent_bindings_share_instance(self) -> None:
+        cache = ModelCache(1000)
+        spec = ObjectSpec(key="tok", factory=FakeTokenizer)
+        with cache.use(spec) as outer, cache.use("tok") as inner:
+            assert inner is outer
+            assert cache.info("tok").active_count == 2
+
+    def test_device_is_ignored(self) -> None:
+        cache = ModelCache(1000)
+        spec = ObjectSpec(key="tok", factory=FakeTokenizer)
+        with cache.use(spec, device="cpu") as tok:
+            assert isinstance(tok, FakeTokenizer)
+
+    def test_zero_byte_default_does_not_consume_budget(self) -> None:
+        cache = ModelCache(0)
+        spec = ObjectSpec(key="tok", factory=FakeTokenizer)
+        with cache.use(spec):
+            pass
+        assert cache.used_cache_bytes == 0
+        assert _is_cached(cache, "tok")
+
+    def test_zero_byte_entry_survives_lru_pressure(self) -> None:
+        cache = ModelCache(200)
+        cache.register(ObjectSpec(key="tok", factory=FakeTokenizer))
+        cache.register(_spec("a", 100))
+        cache.register(_spec("b", 150))
+        with cache.use("tok"):
+            pass
+        with cache.use("a"):
+            pass
+        # Admitting "b" must evict; "tok" is the LRU-oldest inactive key
+        # but frees nothing, so the policy must skip it and evict "a".
+        with cache.use("b"):
+            pass
+        assert _is_cached(cache, "tok")
+        assert not _is_cached(cache, "a")
+        assert _is_cached(cache, "b")
+
+    def test_positive_estimate_counts_against_budget(self) -> None:
+        cache = ModelCache(200)
+        cache.register(ObjectSpec(key="big", factory=FakeTokenizer, estimated_cache_bytes=150))
+        cache.register(_spec("a", 100))
+        with cache.use("big"):
+            pass
+        assert cache.used_cache_bytes == 150
+        # Admitting "a" forces eviction of the sized object entry.
+        with cache.use("a"):
+            pass
+        assert not _is_cached(cache, "big")
+
+    def test_zero_byte_eviction_skips_host_cache_flush(self) -> None:
+        calls = {"n": 0}
+        cache = ModelCache(200, empty_host_cache=lambda: calls.__setitem__("n", calls["n"] + 1))
+        cache.register(ObjectSpec(key="tok", factory=FakeTokenizer))
+        with cache.use("tok"):
+            pass
+        cache.evict("tok")
+        assert calls["n"] == 0
+
+    def test_store_satisfies_protocols(self) -> None:
+        spec = ObjectSpec(key="tok", factory=FakeTokenizer)
+        store = spec.store_factory()
+        assert isinstance(store, ResourceStore)
+        binding = spec.bind(store)
+        assert binding is store  # the store is its own binding
+        assert isinstance(binding.value, FakeTokenizer)
+        binding.activate()
+        binding.deactivate()
