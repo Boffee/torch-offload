@@ -76,6 +76,7 @@ logger = logging.getLogger(__name__)
 
 
 T = TypeVar("T")
+M = TypeVar("M", bound=nn.Module)
 
 
 def _allow_concurrent_default(_store: ResourceStore) -> bool:
@@ -116,12 +117,14 @@ class ResourceSpec(Generic[T]):
     allow_concurrent_binding: Callable[[ResourceStore], bool] = _allow_concurrent_default
 
 
-class ModelSpec(ResourceSpec[nn.Module]):
+class ModelSpec(ResourceSpec[M]):
     """Model-specific cache spec built from one user model factory.
 
     ``factory`` runs normally once to construct the cached
     :class:`ModelOffloaderStore`. Each ``use()`` then binds the cached
-    pinned/streamed bytes into a module instance.
+    pinned/streamed bytes into a module instance. The spec is generic
+    over the factory's module type, so ``cache.use(spec)`` yields that
+    concrete type rather than bare :class:`nn.Module`.
 
     By default, every ``use()`` reuses the canonical model instance
     owned by the cached store and the cache rejects a second concurrent
@@ -156,8 +159,8 @@ class ModelSpec(ResourceSpec[nn.Module]):
         *,
         key: str,
         estimated_cache_bytes: int,
-        factory: Callable[[], nn.Module],
-        skeleton_factory: Callable[[], nn.Module] | None = None,
+        factory: Callable[[], M],
+        skeleton_factory: Callable[[], M] | None = None,
         blocks_attr: str | Sequence[str] | None = None,
         num_resident_blocks: int | None = None,
         num_prefetch_blocks: int = 2,
@@ -177,17 +180,22 @@ class ModelSpec(ResourceSpec[nn.Module]):
                 stream_trainable_weights=stream_trainable_weights,
             )
 
-        def bind(store: ResourceStore) -> ResourceBinding[nn.Module]:
+        def bind(store: ResourceStore) -> ResourceBinding[M]:
             offloader_store = cast(ModelOffloaderStore, store)
             if skeleton_factory is None or offloader_store.has_trainables:
-                model = offloader_store.model
+                # The canonical model is factory()'s output; the store
+                # only knows it as nn.Module.
+                model = cast(M, offloader_store.model)
             else:
                 model = skeleton_factory()
-            return offloader_store.bind(
+            binding = offloader_store.bind(
                 model,
                 skip_checkpointing_check=skip_checkpointing_check,
                 is_block_checkpointed=is_block_checkpointed,
             )
+            # ModelOffloader.value is typed nn.Module but yields the
+            # bound module, which is an M.
+            return cast(ResourceBinding[M], binding)
 
         def allow_concurrent_binding(store: ResourceStore) -> bool:
             if skeleton_factory is None:
