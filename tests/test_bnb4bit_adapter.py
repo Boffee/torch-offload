@@ -366,3 +366,60 @@ class TestBnb4bitAdapter:
             assert y.dtype is torch.bfloat16
         finally:
             offloader.deactivate()
+
+    @CUDA
+    def test_model_offloader_streamed_double_quant_blocks(self) -> None:
+        # Double-quant's nested offset is data-dependent and rides in the
+        # host-resident blob; streamed blocks share a pool buffer, so a stale
+        # offset would silently dequantize the wrong weights. Sharply
+        # different per-block magnitudes make a wrong offset blow up.
+        bnb = pytest.importorskip("bitsandbytes")
+
+        class M(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.blocks = nn.ModuleList(
+                    [
+                        bnb.nn.Linear4bit(
+                            128, 128, bias=False, compute_dtype=torch.bfloat16,
+                            compress_statistics=True, quant_type="nf4",
+                            quant_storage=torch.uint8,
+                        )
+                        for _ in range(2)
+                    ]
+                )
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                for block in self.blocks:
+                    x = block(x)
+                return x
+
+        model = M()
+        with torch.no_grad():
+            for block, scale in zip(model.blocks, (0.01, 5.0), strict=True):
+                block.weight = bnb.nn.Params4bit(
+                    torch.randn(128, 128) * scale, requires_grad=False,
+                    compress_statistics=True, quant_type="nf4",
+                    quant_storage=torch.uint8,
+                )
+        model = model.to("cuda")
+        assert (
+            model.blocks[0].weight.quant_state.offset.item()
+            != model.blocks[1].weight.quant_state.offset.item()
+        )
+
+        x = torch.randn(128, 128, dtype=torch.bfloat16, device="cuda")
+        reference = model(x)  # 4-bit forward does not migrate state
+
+        offloader = _make_model_offloader(
+            model, blocks_attr="blocks",
+            num_resident_blocks=1, num_prefetch_blocks=0,
+        )
+        try:
+            for _ in range(3):
+                with offloader.use("cuda") as active:
+                    y = active(x)
+                    torch.cuda.synchronize()
+                torch.testing.assert_close(y, reference)
+        finally:
+            offloader.deactivate()

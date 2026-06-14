@@ -65,6 +65,7 @@ class _Bnb4bitPinned:
     buffers: dict[str, torch.Tensor]      # pinned absmax / quant_map / nested_*
     blob_key: str                         # key of the packed metadata blob
     blob: torch.Tensor                    # uint8 scalar-metadata (host-resident)
+    offset: torch.Tensor | None           # nested double-quant offset (data-dependent)
 
 
 @dataclass(slots=True)
@@ -75,6 +76,7 @@ class _Bnb4bitGpu:
 
     data: torch.Tensor
     buffers: dict[str, torch.Tensor]
+    offset: torch.Tensor | None
 
 
 def _gpu_stats(
@@ -151,6 +153,7 @@ class Bnb4bitAdapter:
     @staticmethod
     def clone_pin(t: torch.Tensor) -> _Bnb4bitPinned:
         qt = require_params_4bit(t)
+        quant_state = qt.quant_state
         stats = quant_stats(qt)
         blob_key = metadata_blob_key(stats)
         return _Bnb4bitPinned(
@@ -169,6 +172,17 @@ class Bnb4bitAdapter:
             # once and inject it at reconstruction; it never DMAs.
             blob=clone_to_pinned_cpu(
                 stats[blob_key], memory_format=torch.contiguous_format
+            ),
+            # The nested double-quant offset is data-dependent but lives in
+            # the (host-resident, template-block) blob, so a wrapper reused
+            # across pooled streamed blocks would keep the wrong offset. Pin
+            # it separately and alias it per load like the other scales.
+            offset=(
+                clone_to_pinned_cpu(
+                    quant_state.offset, memory_format=torch.contiguous_format
+                )
+                if quant_state.nested
+                else None
             ),
         )
 
@@ -192,6 +206,11 @@ class Bnb4bitAdapter:
                 key: empty_like_strided(value, device)
                 for key, value in state.buffers.items()
             },
+            offset=(
+                empty_like_strided(state.offset, device)
+                if state.offset is not None
+                else None
+            ),
         )
 
     @staticmethod
@@ -204,12 +223,19 @@ class Bnb4bitAdapter:
         # Scalar metadata comes from the pinned blob; the packed weight and
         # scale tensors come from the (pre-allocated) GPU side. Reconstruction
         # aliases those buffers, so the later copy_to_gpu DMA is visible here.
-        return build_params_4bit(
+        param = build_params_4bit(
             gpu_state.data,
             _gpu_stats(pinned, gpu_state.buffers),
             device=gpu_state.data.device,
             requires_grad=requires_grad,
         )
+        if gpu_state.offset is not None:
+            # from_prequantized baked the offset from the (template) blob;
+            # re-point it at the per-load DMA'd buffer so a wrapper reused
+            # across pooled streamed blocks sees each block's own offset
+            # (the absmax/nested_absmax buffers already alias this way).
+            param.quant_state.offset = gpu_state.offset
+        return param
 
     @staticmethod
     def copy_to_gpu(
@@ -218,6 +244,8 @@ class Bnb4bitAdapter:
         dst.data.copy_(src.data, non_blocking=non_blocking)
         for key, value in src.buffers.items():
             dst.buffers[key].copy_(value, non_blocking=non_blocking)
+        if src.offset is not None and dst.offset is not None:
+            dst.offset.copy_(src.offset, non_blocking=non_blocking)
 
     @staticmethod
     def compute_dtype(t: torch.Tensor) -> torch.dtype:
@@ -253,4 +281,6 @@ class Bnb4bitAdapter:
         total += state.blob.numel() * state.blob.element_size()
         for value in state.buffers.values():
             total += value.numel() * value.element_size()
+        if state.offset is not None:
+            total += state.offset.numel() * state.offset.element_size()
         return total
