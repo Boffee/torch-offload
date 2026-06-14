@@ -1,0 +1,37 @@
+# Hooks run on `git commit`. Install once with `pre-commit install`.
+# Run manually across the whole repo: `pre-commit run --all-files`.
+#
+# Local hooks (vs the pinned-rev pattern) so the tool versions match
+# whatever `uv` resolves for the dev group — single source of truth, no
+# drift between pre-commit and `uv run ruff`.
+#
+# The test hook is CPU-only (CUDA_VISIBLE_DEVICES= hides the GPU): this is a
+# GPU offloading library, so the CUDA-bound tests self-skip on CPU (see
+# tests/conftest.py) and the fast device-agnostic subset runs. Run the full
+# suite on a GPU box with `uv run pytest`.
+
+repos:
+  - repo: local
+    hooks:
+      - id: ruff-check
+        name: ruff check
+        entry: uv run --frozen ruff check --fix
+        language: system
+        types_or: [python, pyi]
+        require_serial: true
+
+      - id: pyright
+        name: pyright
+        entry: uv run --frozen pyright
+        language: system
+        types: [python]
+        pass_filenames: false
+        require_serial: true
+
+      - id: tests
+        name: tests (cpu-only)
+        entry: env CUDA_VISIBLE_DEVICES= uv run --frozen pytest -q
+        language: system
+        files: ^(src/|tests/|pyproject\.toml)
+        pass_filenames: false
+        require_serial: true

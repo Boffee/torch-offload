@@ -52,8 +52,9 @@ def _float8_modules():
             QuantizeTensorToFloat8Kwargs,
         )
     except ImportError as exc:
-        # TorchAO relocates this surface across versions; skip (don't error)
-        # when the installed version doesn't expose it, matching importorskip.
+        # The float8 adapter targets the torchao>=0.17 Float8Tensor workflow;
+        # skip (don't error) when the installed torchao predates it — or a
+        # future release moves it — matching the importorskip above.
         pytest.skip(f"torchao float8 API unavailable: {exc}")
 
     return Float8Tensor, QuantizeTensorToFloat8Kwargs, PerRow, PerTensor

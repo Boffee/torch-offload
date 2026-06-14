@@ -5,16 +5,16 @@ description = "Model-agnostic GPU/CPU memory management for PyTorch — pinned-h
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "torch>=2.7",
+    "numpy>=2.0",
+    "torch>=2.12",
 ]
 
 [project.optional-dependencies]
-bnb = ["bitsandbytes"]
-fp8 = ["torch>=2.8", "torchao>=0.17"]
-gguf = ["gguf"]
-nvfp4 = ["numpy", "torch>=2.8", "torchao>=0.17"]
-quanto = ["optimum-quanto"]
-all = ["bitsandbytes", "gguf", "numpy", "optimum-quanto", "torch>=2.8", "torchao>=0.17"]
+bnb = ["bitsandbytes>=0.49"]
+torchao = ["torchao>=0.17"]
+gguf = ["gguf>=0.18"]
+quanto = ["optimum-quanto>=0.2"]
+all = ["bitsandbytes>=0.49", "gguf>=0.18", "optimum-quanto>=0.2", "torchao>=0.17"]
 
 [build-system]
 requires = ["uv_build>=0.9.8,<0.10.0"]
@@ -22,9 +22,13 @@ build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
+    "pre-commit>=4.0",
     "pyright>=1.1.409",
     "pytest~=9.0",
     "ruff>=0.14.3",
+    # Every adapter backend, so `uv sync` yields a complete test environment
+    # (otherwise the bnb / torchao / gguf / quanto adapter suites silently skip).
+    "torch-offload[all]",
 ]
 
 [tool.ruff]

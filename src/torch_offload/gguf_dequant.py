@@ -13,10 +13,16 @@ Vendored code — lint rules relaxed intentionally.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import gguf
 import torch
 
-GGML_QUANT_SIZES: dict[int, tuple[int, int]] = gguf.GGML_QUANT_SIZES
+# gguf keys these by GGMLQuantizationType (an IntEnum); re-key to plain int
+# since callers look up by the raw quant_type int.
+GGML_QUANT_SIZES: dict[int, tuple[int, int]] = {
+    int(qtype): sizes for qtype, sizes in gguf.GGML_QUANT_SIZES.items()
+}
 
 QK_K = 256
 K_SCALE_SIZE = 12
@@ -271,7 +277,7 @@ def _dequantize_IQ4_XS(blocks: torch.Tensor, block_size: int, type_size: int, dt
 # Dispatch table and public API
 # -------------------------------------------------------------------
 
-_DEQUANT_FUNCTIONS = {
+_DEQUANT_FUNCTIONS: dict[int, Callable[..., torch.Tensor]] = {
     gguf.GGMLQuantizationType.F32: _dequantize_F32,
     gguf.GGMLQuantizationType.F16: _dequantize_F16,
     gguf.GGMLQuantizationType.BF16: _dequantize_BF16,
