@@ -181,8 +181,11 @@ def requantize_params_4bit(t: torch.Tensor, *, like: torch.Tensor) -> Any:  # no
 
     Recomputes block scales from ``t``'s values (4-bit absmax is
     data-dependent, so the scales cannot be reused the way an int8 affine
-    scale could), preserving ``like``'s quant type, blocksize, and
-    double-quant setting.
+    scale could), preserving ``like``'s quant type, blocksize, double-quant
+    setting, and packed ``quant_storage`` dtype. Propagating quant_storage
+    matters: a weight stored as bf16/fp16 (FSDP-oriented checkpoints) packs
+    into a different shape than the default uint8, and ``copy_into`` would
+    otherwise hit a shape mismatch.
     """
     ref = require_params_4bit(like)
     quant_state = ref.quant_state
@@ -196,6 +199,7 @@ def requantize_params_4bit(t: torch.Tensor, *, like: torch.Tensor) -> Any:  # no
         blocksize=quant_state.blocksize,
         compress_statistics=quant_state.nested,
         quant_type=quant_state.quant_type,
+        quant_storage=ref.data.dtype,
     )
     return build_params_4bit(
         qdata,

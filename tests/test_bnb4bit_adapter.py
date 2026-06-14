@@ -51,6 +51,7 @@ def _make_nf4(
     dtype: torch.dtype = torch.bfloat16,
     quant_type: str = "nf4",
     double_quant: bool = False,
+    quant_storage: torch.dtype = torch.uint8,
     device: str = "cpu",
     weight: torch.Tensor | None = None,
 ) -> Any:
@@ -72,7 +73,7 @@ def _make_nf4(
         requires_grad=False,
         quant_type=quant_type,
         compress_statistics=double_quant,
-        quant_storage=torch.uint8,
+        quant_storage=quant_storage,
     ).to(device)
 
 
@@ -192,6 +193,19 @@ class TestBnb4bitAdapter:
         p = _make_nf4(rows=64, cols=32)
         with pytest.raises(ValueError, match="Cannot requantize"):
             Bnb4bitAdapter.requantize(torch.randn(32, 64), like=p)
+
+    def test_requantize_preserves_quant_storage(self) -> None:
+        # A non-default quant_storage (bf16, FSDP-oriented checkpoints) packs
+        # to a different shape than uint8; requantize must preserve it or
+        # copy_into hits a shape mismatch.
+        p = _make_nf4(rows=64, cols=128, quant_storage=torch.bfloat16)
+        assert p.data.dtype == torch.bfloat16
+
+        again = Bnb4bitAdapter.requantize(Bnb4bitAdapter.dequantize(p), like=p)
+        assert again.data.dtype == torch.bfloat16
+        assert tuple(again.data.shape) == tuple(p.data.shape)
+        # copy_into must not raise on the packed-storage mismatch.
+        Bnb4bitAdapter.copy_into(again, target=p)
 
     def test_copy_into_preserves_target_identity(self) -> None:
         target = _make_nf4()
