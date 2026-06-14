@@ -306,10 +306,12 @@ def requantize_int8_params(t: torch.Tensor, *, like: torch.Tensor) -> Any:  # no
     """Encode dense ``t`` in the same int8 layout as ``like``.
 
     Recomputes the per-row scale from ``t`` via ``int8_vectorwise_quant``;
-    ``like`` only supplies the expected shape. Quantizes in fp32 rather than
-    fp16: a merged value past fp16 max (65504) would otherwise overflow to
-    ``inf``, poisoning the whole row's scale to ``inf`` (and the dequantized
-    row to ``NaN``); fp32 also avoids dropping mantissa bits during merge.
+    ``like`` only supplies the expected shape. ``int8_vectorwise_quant``'s
+    CUDA kernel requires fp16 input (LLM.int8's compute dtype), and
+    production merges run on GPU — so quant happens in fp16. ``t`` is first
+    clamped to the fp16 range so a merged value past fp16 max (65504) cannot
+    overflow to ``inf`` (which would poison the row's scale to ``inf`` and
+    the dequantized row to ``NaN``).
     """
     ref = require_int8_params(like)
     if tuple(t.shape) != tuple(ref.CB.shape):
@@ -317,5 +319,8 @@ def requantize_int8_params(t: torch.Tensor, *, like: torch.Tensor) -> Any:  # no
             f"Cannot requantize tensor with shape {tuple(t.shape)} like "
             f"Int8Params with shape {tuple(ref.CB.shape)}."
         )
-    cb, scb, _outliers = bnb_functional.int8_vectorwise_quant(t.to(torch.float32))
+    fp16_max = torch.finfo(torch.float16).max
+    cb, scb, _outliers = bnb_functional.int8_vectorwise_quant(
+        t.clamp(-fp16_max, fp16_max).to(torch.float16)
+    )
     return build_int8_params(cb, scb)

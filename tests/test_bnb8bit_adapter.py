@@ -203,6 +203,49 @@ class TestBnb8bitAdapter:
         assert not torch.equal(model.lin.weight.CB, original_cb)
 
     @CUDA
+    def test_merge_lora_int8_on_cuda(self) -> None:
+        # Production LoRA merge runs the requantize on the GPU int8 kernel,
+        # which requires fp16 input — a CPU-only merge test misses that.
+        class M(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.lin = nn.Linear(32, 64, bias=False, dtype=torch.float16)
+
+        model = M().to("cuda")
+        model.lin.weight = _make_int8(rows=64, cols=32, device="cuda")
+        original_cb = model.lin.weight.CB.clone()
+        lora = LoRA(
+            state_dict={
+                "lin.lora_A.weight": torch.randn(4, 32),
+                "lin.lora_B.weight": torch.randn(64, 4),
+            }
+        )
+
+        merged = merge_lora(model, [(lora, 1.0)])
+
+        assert merged == 1
+        assert torch.isfinite(model.lin.weight.SCB).all()
+        assert not torch.equal(model.lin.weight.CB, original_cb)
+
+    def test_tied_int8_weights_rejected(self) -> None:
+        # int8 quant state migrates onto the module on first forward, so a
+        # single shared wrapper cannot serve two tied modules; reject at pin.
+        shared = _make_int8(rows=64, cols=64)
+
+        class M(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.a = nn.Linear(64, 64, bias=False)
+                self.b = nn.Linear(64, 64, bias=False)
+
+        model = M()
+        model.a.weight = shared
+        model.b.weight = shared  # tied
+
+        with pytest.raises(NotImplementedError, match="Tied"):
+            ModelOffloaderStore.from_module(model)
+
+    @CUDA
     def test_allocate_copy_make_gpu_param_preserves_wrapper(self) -> None:
         pytest.importorskip("bitsandbytes")
         from bitsandbytes.nn import Int8Params
