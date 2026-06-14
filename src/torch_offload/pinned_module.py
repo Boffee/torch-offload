@@ -563,6 +563,9 @@ def _copy_params_to_target(
         if key in copied:
             continue
         pinned.copy_to_gpu(targets[name]._state, non_blocking=non_blocking)
+        # Re-arm the reused wrapper at the freshly-loaded buffers (no-op
+        # unless the adapter migrates state off the wrapper, e.g. bnb int8).
+        pinned.rearm_after_load(targets[name].param, targets[name]._state)
         copied.add(key)
 
 

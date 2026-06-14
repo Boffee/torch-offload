@@ -17,7 +17,7 @@ are exposed through adapter capability methods.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 import torch
 from torch import nn
@@ -27,6 +27,7 @@ from .tensor_adapters import (
     BindLayoutTensorAdapter,
     CpuRoundTripTensorAdapter,
     ParameterDataSwapTensorAdapter,
+    PostLoadRearmTensorAdapter,
     TensorAdapter,
     adapter_name,
 )
@@ -72,6 +73,7 @@ class PinnedParam:
 
     __slots__ = (
         "_bind_layout",
+        "_needs_rearm",
         "_target_layout",
         "adapter",
         "pinned_state",
@@ -86,6 +88,12 @@ class PinnedParam:
         # Params4bit). See ``param_representation``.
         representation = param_representation(param)
         self.adapter: TensorAdapter[Any, Any] = select_adapter(representation)
+        # Precompute the rearm capability once: the per-load check is a hot
+        # path (every param, every block rotation), and a runtime_checkable
+        # Protocol isinstance structurally probes every member each call.
+        self._needs_rearm: bool = isinstance(
+            self.adapter, PostLoadRearmTensorAdapter
+        )
         self._target_layout = self._target_layout_from_adapter(
             self.adapter, representation,
         )
@@ -204,6 +212,19 @@ class PinnedParam:
         self.adapter.copy_to_cpu(
             gpu_state, self.pinned_state, non_blocking=non_blocking
         )
+
+    def rearm_after_load(self, param: nn.Parameter, gpu_state: object) -> None:
+        """Re-arm the active GPU wrapper after a load, if the adapter needs it.
+
+        No-op for adapters whose reconstructed wrapper stays self-describing
+        across buffer refills (the common case); delegates to adapters that
+        implement :class:`PostLoadRearmTensorAdapter`. Capability is decided
+        once at construction (:attr:`_needs_rearm`).
+        """
+        if self._needs_rearm:
+            cast(
+                "PostLoadRearmTensorAdapter[Any, Any]", self.adapter
+            ).rearm_after_load(param, gpu_state)
 
     @property
     def compute_dtype(self) -> torch.dtype:

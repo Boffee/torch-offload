@@ -13,27 +13,32 @@ import torch
 from torch import nn
 
 from .bnb4bit_adapter import Bnb4bitAdapter
+from .bnb8bit_adapter import Bnb8bitAdapter
 from .float8_adapter import Float8Adapter
 from .gguf_adapter import GgufAdapter
 from .nvfp4_adapter import Nvfp4Adapter
 from .quanto_adapter import QuantoAdapter
 from .tensor_adapters import RegularAdapter, TensorAdapter
 
+# Built-in adapters in dispatch order; first match wins. RegularAdapter is
+# last — it matches only exact torch.Tensor/nn.Parameter, so structured
+# subclasses reach their dedicated adapter first.
+_BUILTIN_ADAPTERS: tuple[type[TensorAdapter[Any, Any]], ...] = (
+    QuantoAdapter,
+    Bnb4bitAdapter,
+    Bnb8bitAdapter,
+    Nvfp4Adapter,
+    Float8Adapter,
+    GgufAdapter,
+    RegularAdapter,
+)
+
 
 def select_adapter(t: torch.Tensor) -> TensorAdapter[Any, Any]:
     """Return the built-in adapter that handles ``t``."""
-    if QuantoAdapter.matches(t):
-        return QuantoAdapter()
-    if Bnb4bitAdapter.matches(t):
-        return Bnb4bitAdapter()
-    if Nvfp4Adapter.matches(t):
-        return Nvfp4Adapter()
-    if Float8Adapter.matches(t):
-        return Float8Adapter()
-    if GgufAdapter.matches(t):
-        return GgufAdapter()
-    if RegularAdapter.matches(t):
-        return RegularAdapter()
+    for adapter_cls in _BUILTIN_ADAPTERS:
+        if adapter_cls.matches(t):
+            return adapter_cls()
     raise NotImplementedError(
         f"No TensorAdapter for tensor type {type(t).__name__!r}. "
         "Plain tensors are handled by RegularAdapter; tensor subclasses "

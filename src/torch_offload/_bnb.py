@@ -1,7 +1,12 @@
-"""Internal optional-import module for ``bitsandbytes`` 4-bit support.
+"""Internal optional-import module for ``bitsandbytes`` support (4-bit + 8-bit).
 
-Single source of truth for everything this repo depends on from the
-bitsandbytes 4-bit path (NF4 and FP4, with or without double-quant):
+Single source of truth for everything this repo depends on from
+bitsandbytes — both the 4-bit ``Params4bit`` path (NF4/FP4) and the 8-bit
+LLM.int8 ``Int8Params`` path. The two share one optional import and the
+:data:`BNB_AVAILABLE` flag; the 8-bit helpers live at the bottom of the
+module.
+
+4-bit path (NF4 and FP4, with or without double-quant):
 
 - The ``from bitsandbytes.nn import Params4bit`` optional import and the
   :data:`BNB_AVAILABLE` flag.
@@ -44,12 +49,13 @@ generic ``AttributeError`` deeper in the access path.
 
 try:
     from bitsandbytes import functional as bnb_functional
-    from bitsandbytes.nn import Params4bit
+    from bitsandbytes.nn import Int8Params, Params4bit
 
     BNB_AVAILABLE = True
 except ImportError:
     BNB_AVAILABLE = False
     Params4bit: Any = None
+    Int8Params: Any = None
     bnb_functional: Any = None
 
 
@@ -196,3 +202,116 @@ def requantize_params_4bit(t: torch.Tensor, *, like: torch.Tensor) -> Any:  # no
         new_quant_state.as_dict(packed=True),
         device=qdata.device,
     )
+
+
+# ---------------------------------------------------------------------------
+# bitsandbytes 8-bit (Int8Params / LLM.int8) support
+# ---------------------------------------------------------------------------
+
+INT8_LAYOUT_ATTRS = ("CB", "SCB")
+"""Attributes this repo reads from a quantized ``Int8Params``.
+
+``CB`` is the row-major int8 weight (and ``weight.data``); ``SCB`` is the
+per-output-row float32 scale. Both live on the parameter only *before* the
+owning ``Linear8bitLt`` runs its first forward — after that bitsandbytes
+migrates them onto the module's ``MatmulLtState`` and nulls them here. The
+adapter therefore pins a not-yet-forwarded weight; a post-forward (or
+unquantized) weight is reported by :func:`validate_int8_layout`.
+"""
+
+
+def is_int8_params(t: object) -> bool:
+    """Return whether ``t`` is a bitsandbytes ``Int8Params`` (LLM.int8)."""
+    return BNB_AVAILABLE and isinstance(t, Int8Params)
+
+
+def require_int8_params(t: torch.Tensor) -> Any:  # noqa: ANN401
+    """Return ``t`` as a validated ``Int8Params`` tensor, or raise."""
+    if not is_int8_params(t):
+        raise TypeError(
+            f"expected bitsandbytes Int8Params, got {type(t).__name__}"
+        )
+    validate_int8_layout(t)
+    return t
+
+
+def validate_int8_layout(t: torch.Tensor) -> None:
+    """Raise if ``t`` is not a quantized, not-yet-forwarded ``Int8Params``.
+
+    Unlike 4-bit, the int8 quant state (``CB`` + ``SCB``) lives on the
+    parameter only until the owning ``Linear8bitLt`` runs its first
+    forward, which migrates it onto the module (``MatmulLtState``) and nulls
+    ``CB``/``SCB`` here. A tensor-scoped adapter cannot reach the module, so
+    it can only pin a pre-forward weight — this validates that and otherwise
+    raises a framed error rather than silently capturing ``None``.
+    """
+    missing = [
+        attr
+        for attr in INT8_LAYOUT_ATTRS
+        if getattr(t, attr, None) is None
+    ]
+    if not missing:
+        return
+    raise RuntimeError(
+        f"Int8Params is missing {missing!r}; this repo reads {INT8_LAYOUT_ATTRS}. "
+        "Either bitsandbytes refactored the int8 wrapper, or — most likely — "
+        "the owning Linear8bitLt already ran a forward, which migrates CB/SCB "
+        "onto the module and nulls them on the weight. Pin int8 weights before "
+        "the first forward (e.g. build the offload store at load time)."
+    )
+
+
+def build_int8_params(
+    cb: torch.Tensor,
+    scb: torch.Tensor,
+    *,
+    requires_grad: bool = False,
+) -> Any:  # noqa: ANN401
+    """Reconstruct an ``Int8Params`` from raw int8 ``CB`` + float32 ``SCB``.
+
+    Passes ``CB``/``SCB`` explicitly so bitsandbytes wraps them in place
+    without re-quantizing — the wrapper aliases the caller's buffers (and
+    ``weight.data is CB``), so a later in-place DMA into them is visible
+    through the wrapper. ``has_fp16_weights=False`` keeps the weight
+    statically int8; ``requires_grad`` must stay ``False`` (assigning int8
+    data to a grad-requiring Parameter raises).
+    """
+    if not BNB_AVAILABLE:
+        raise RuntimeError("bitsandbytes is required to build an Int8Params")
+    return Int8Params(
+        cb,
+        requires_grad=requires_grad,
+        has_fp16_weights=False,
+        CB=cb,
+        SCB=scb,
+    )
+
+
+def dequantize_int8_params(t: torch.Tensor) -> torch.Tensor:
+    """Return the dense logical value of an ``Int8Params`` as fp32.
+
+    Row-wise affine dequant: ``CB * SCB / 127`` per output row.
+    """
+    qt = require_int8_params(t)
+    scale = (qt.SCB.to(torch.float32) / 127.0).view(-1, 1)
+    # int8 * fp32 promotes to fp32 directly; no explicit CB widening copy.
+    return qt.CB * scale
+
+
+def requantize_int8_params(t: torch.Tensor, *, like: torch.Tensor) -> Any:  # noqa: ANN401
+    """Encode dense ``t`` in the same int8 layout as ``like``.
+
+    Recomputes the per-row scale from ``t`` via ``int8_vectorwise_quant``;
+    ``like`` only supplies the expected shape. Quantizes in fp32 rather than
+    fp16: a merged value past fp16 max (65504) would otherwise overflow to
+    ``inf``, poisoning the whole row's scale to ``inf`` (and the dequantized
+    row to ``NaN``); fp32 also avoids dropping mantissa bits during merge.
+    """
+    ref = require_int8_params(like)
+    if tuple(t.shape) != tuple(ref.CB.shape):
+        raise ValueError(
+            f"Cannot requantize tensor with shape {tuple(t.shape)} like "
+            f"Int8Params with shape {tuple(ref.CB.shape)}."
+        )
+    cb, scb, _outliers = bnb_functional.int8_vectorwise_quant(t.to(torch.float32))
+    return build_int8_params(cb, scb)

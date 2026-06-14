@@ -33,8 +33,8 @@ The CUDA-oriented :class:`ModelOffloader` shares the underlying
 per-parameter pinned storage from
 :class:`~torch_offload.pinned_param.PinnedParam` (clone + pin
 + optional quanto ``WeightQBytesTensor`` decomposition, bitsandbytes
-4-bit ``Params4bit`` (NF4/FP4) decomposition, GGUF packed weights, and
-TorchAO NVFP4 packed weights).
+4-bit ``Params4bit`` (NF4/FP4) and 8-bit ``Int8Params`` (LLM.int8)
+decomposition, GGUF packed weights, and TorchAO NVFP4 packed weights).
 
 :class:`ModelOffloader` and :class:`MpsWeights` implement the
 :class:`ModelStrategy` Protocol —
