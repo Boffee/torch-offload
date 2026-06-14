@@ -25,6 +25,9 @@ dev = [
     "pyright>=1.1.409",
     "pytest~=9.0",
     "ruff>=0.14.3",
+    # All adapter backends, so `uv sync` yields a complete test environment
+    # (otherwise the bnb / fp8 / nvfp4 / gguf / quanto suites silently skip).
+    "torch-offload[all]",
 ]
 
 [tool.ruff]
