@@ -13,6 +13,7 @@ from collections.abc import (
     Iterator,
     Mapping,
     MutableMapping,
+    Sequence,
 )
 from dataclasses import dataclass, field
 from typing import TypeVar
@@ -321,9 +322,32 @@ def _pin_params(params: Mapping[str, nn.Parameter]) -> dict[str, PinnedParam]:
     ):
         _validate_param_storage_group_requires_grad(names, params)
         pinned = PinnedParam(params[names[0]])
+        _validate_param_storage_group_tieable(names, pinned)
         for name in names:
             pinned_by_name[name] = pinned
     return pinned_by_name
+
+
+def _validate_param_storage_group_tieable(
+    names: Sequence[str], pinned: PinnedParam
+) -> None:
+    """Reject tied weights whose adapter migrates wrapper state on forward.
+
+    A migrate-state adapter (bitsandbytes int8) shares one reconstructed
+    wrapper across all tied leaves, but the first module's forward migrates
+    its quant state onto that module and nulls it on the wrapper — so a
+    second tied module computes against missing state (garbage or a crash).
+    The per-load rearm cannot fix this: it fires once per load, not once per
+    consuming module. ``_needs_rearm`` flags exactly these adapters.
+    """
+    if len(names) > 1 and pinned._needs_rearm:
+        raise NotImplementedError(
+            f"Tied weights {sorted(names)!r} use an adapter whose quant state "
+            f"migrates onto the owning module on first forward "
+            f"({type(pinned.adapter).__name__}); one shared wrapper cannot "
+            "serve multiple tied modules. Untie these weights, or keep them "
+            "resident instead of offloading."
+        )
 
 
 def _pin_buffers(buffers: Mapping[str, torch.Tensor]) -> dict[str, PinnedBuffer]:
@@ -563,6 +587,9 @@ def _copy_params_to_target(
         if key in copied:
             continue
         pinned.copy_to_gpu(targets[name]._state, non_blocking=non_blocking)
+        # Re-arm the reused wrapper at the freshly-loaded buffers (no-op
+        # unless the adapter migrates state off the wrapper, e.g. bnb int8).
+        pinned.rearm_after_load(targets[name].param, targets[name]._state)
         copied.add(key)
 
 

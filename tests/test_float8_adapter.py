@@ -45,11 +45,16 @@ def _make_model_offloader(
 
 def _float8_modules():
     pytest.importorskip("torchao")
-    from torchao.quantization.granularity import PerRow, PerTensor
-    from torchao.quantization.quantize_.workflows.float8.float8_tensor import (
-        Float8Tensor,
-        QuantizeTensorToFloat8Kwargs,
-    )
+    try:
+        from torchao.quantization.granularity import PerRow, PerTensor
+        from torchao.quantization.quantize_.workflows.float8.float8_tensor import (
+            Float8Tensor,
+            QuantizeTensorToFloat8Kwargs,
+        )
+    except ImportError as exc:
+        # TorchAO relocates this surface across versions; skip (don't error)
+        # when the installed version doesn't expose it, matching importorskip.
+        pytest.skip(f"torchao float8 API unavailable: {exc}")
 
     return Float8Tensor, QuantizeTensorToFloat8Kwargs, PerRow, PerTensor
 

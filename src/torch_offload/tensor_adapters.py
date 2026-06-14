@@ -44,6 +44,7 @@ __all__ = [
     "DequantRequantCopyIntoTensorAdapter",
     "DequantRequantTensorAdapter",
     "ParameterDataSwapTensorAdapter",
+    "PostLoadRearmTensorAdapter",
     "TensorAdapter",
     "TensorCopyIntoAdapter",
     "adapter_name",
@@ -287,6 +288,32 @@ class BindLayoutTensorAdapter(TensorAdapter[PinnedStateT, GpuStateT], Protocol):
     def bind_layout_signature(t: torch.Tensor) -> tuple:
         """Hashable structural layout for bind validation; excludes
         fields binding overwrites (dtype for plain tensors)."""
+        ...
+
+
+@runtime_checkable
+class PostLoadRearmTensorAdapter(TensorAdapter[PinnedStateT, GpuStateT], Protocol):
+    """Optional capability: re-arm the active GPU wrapper after each load.
+
+    The offloader builds one GPU wrapper per pool target and reuses it
+    across loads, refilling its buffers each time. That assumes the wrapper
+    keeps describing itself across refills — true for plain tensors, 4-bit,
+    and quanto, whose reconstructed wrapper aliases the refilled buffers.
+
+    bitsandbytes int8 breaks the assumption: the first forward migrates
+    ``CB``/``SCB`` onto the owning module (``MatmulLtState``) and nulls them
+    on the wrapper, so the reused wrapper never re-initializes — and in the
+    pooled streaming path, where blocks share buffers, the stale module
+    state reads another block's bytes. Adapters that opt in re-point the
+    wrapper's migrated state at the freshly-loaded GPU storage after each
+    copy, so the next forward re-initializes from the current data.
+    """
+
+    @staticmethod
+    def rearm_after_load(param: nn.Parameter, gpu_state: GpuStateT) -> None:
+        """Re-point ``param``'s migrated quant state at ``gpu_state``,
+        called once per load after :meth:`TensorAdapter.copy_to_gpu` and
+        before the wrapper is installed into its module."""
         ...
 
 

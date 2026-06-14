@@ -71,6 +71,9 @@ class _FakePinnedParam:
         del target_state, non_blocking
         self.copied += 1
 
+    def rearm_after_load(self, param: nn.Parameter, gpu_state: object) -> None:
+        del param, gpu_state  # no-op: the fake adapter migrates no state
+
     def copy_to_cpu(
         self,
         target_state: object,

@@ -17,16 +17,17 @@ are exposed through adapter capability methods.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 import torch
 from torch import nn
 
-from .tensor_adapter_registry import select_adapter
+from .tensor_adapter_registry import param_representation, select_adapter
 from .tensor_adapters import (
     BindLayoutTensorAdapter,
     CpuRoundTripTensorAdapter,
     ParameterDataSwapTensorAdapter,
+    PostLoadRearmTensorAdapter,
     TensorAdapter,
     adapter_name,
 )
@@ -72,6 +73,7 @@ class PinnedParam:
 
     __slots__ = (
         "_bind_layout",
+        "_needs_rearm",
         "_target_layout",
         "adapter",
         "pinned_state",
@@ -79,23 +81,35 @@ class PinnedParam:
     )
 
     def __init__(self, param: nn.Parameter) -> None:
-        self.adapter: TensorAdapter[Any, Any] = select_adapter(param.data)
+        # The adapter operates on the tensor that carries the parameter's
+        # representation: ``param.data`` for plain Parameters (including ones
+        # wrapping a quant subclass), but the param object itself for a
+        # Parameter subclass whose ``.data`` is lossy (bitsandbytes
+        # Params4bit). See ``param_representation``.
+        representation = param_representation(param)
+        self.adapter: TensorAdapter[Any, Any] = select_adapter(representation)
+        # Precompute the rearm capability once: the per-load check is a hot
+        # path (every param, every block rotation), and a runtime_checkable
+        # Protocol isinstance structurally probes every member each call.
+        self._needs_rearm: bool = isinstance(
+            self.adapter, PostLoadRearmTensorAdapter
+        )
         self._target_layout = self._target_layout_from_adapter(
-            self.adapter, param.data,
+            self.adapter, representation,
         )
         self._bind_layout = self._bind_layout_from_adapter(
-            self.adapter, param.data,
+            self.adapter, representation,
         )
         self.requires_grad: bool = param.requires_grad
-        self.pinned_state = self.adapter.clone_pin(param.data)
+        self.pinned_state = self.adapter.clone_pin(representation)
         # Low-peak construction optimization: release the original source
         # storage by repointing the source Parameter at the
         # pinned clone immediately. This is an intentional mutation of
         # the caller's model before the owning store has finished
         # construction; see the class docstring for failure semantics.
-        # Only safe for plain tensors; subclass wrappers can lose
-        # metadata or ignore .data assignment.
-        if type(param.data) is torch.Tensor:
+        # Only safe for plain tensors; subclass wrappers (and Parameter
+        # subclasses) can lose metadata or ignore .data assignment.
+        if type(representation) is torch.Tensor:
             param.data = self.make_cpu_param().data
 
     @staticmethod
@@ -120,8 +134,9 @@ class PinnedParam:
         :class:`PinnedParam` mutates the source parameter. Callers should
         compare the returned value for equality only.
         """
-        adapter = select_adapter(param.data)
-        return cls._target_layout_from_adapter(adapter, param.data)
+        representation = param_representation(param)
+        adapter = select_adapter(representation)
+        return cls._target_layout_from_adapter(adapter, representation)
 
     @classmethod
     def bind_layout_for(cls, param: nn.Parameter) -> tuple[object, object]:
@@ -133,8 +148,9 @@ class PinnedParam:
         overwrites (dtype for plain tensors), so config-built skeletons
         bind against stores pinned from natively loaded weights.
         """
-        adapter = select_adapter(param.data)
-        return cls._bind_layout_from_adapter(adapter, param.data)
+        representation = param_representation(param)
+        adapter = select_adapter(representation)
+        return cls._bind_layout_from_adapter(adapter, representation)
 
     @property
     def target_layout(self) -> tuple[object, object]:
@@ -197,10 +213,25 @@ class PinnedParam:
             gpu_state, self.pinned_state, non_blocking=non_blocking
         )
 
+    def rearm_after_load(self, param: nn.Parameter, gpu_state: object) -> None:
+        """Re-arm the active GPU wrapper after a load, if the adapter needs it.
+
+        No-op for adapters whose reconstructed wrapper stays self-describing
+        across buffer refills (the common case); delegates to adapters that
+        implement :class:`PostLoadRearmTensorAdapter`. Capability is decided
+        once at construction (:attr:`_needs_rearm`).
+        """
+        if self._needs_rearm:
+            cast(
+                "PostLoadRearmTensorAdapter[Any, Any]", self.adapter
+            ).rearm_after_load(param, gpu_state)
+
     @property
     def compute_dtype(self) -> torch.dtype:
         """Logical compute dtype reported by this pinned parameter's adapter."""
-        return self.adapter.compute_dtype(self.make_cpu_param().data)
+        return self.adapter.compute_dtype(
+            param_representation(self.make_cpu_param())
+        )
 
     def validate_parameter_data_swap_target(self) -> None:
         """Raise if this pinned parameter cannot use trainable streaming.
