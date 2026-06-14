@@ -26,7 +26,7 @@ from .module_names import (
 from .pinned_component import PinnedComponent, PinnedComponentStore
 from .protocols import ModelStrategyComponent
 from .streamed_component import StreamedComponent, StreamedComponentStore
-from .tensor_adapter_registry import select_adapter
+from .tensor_adapter_registry import param_representation, select_adapter
 
 logger = logging.getLogger(__name__)
 
@@ -158,9 +158,10 @@ def _routed_factor_dtype(module: nn.Module) -> torch.dtype:
 
     - ``module.compute_dtype`` — BitsAndBytes ``Linear4bit`` and
       similar modules that carry an explicit compute-dtype attribute.
-    - ``select_adapter(module.weight.data).compute_dtype(...)`` — plain
-      tensors return ``weight.dtype``; structured/quantized wrappers can
-      return their logical matmul dtype instead of packed storage dtype.
+    - ``select_adapter(...).compute_dtype(...)`` on the weight's
+      representation — plain tensors return ``weight.dtype``;
+      structured/quantized wrappers can return their logical matmul dtype
+      instead of packed storage dtype.
     """
     compute = getattr(module, "compute_dtype", None)
     if compute is not None:
@@ -171,7 +172,8 @@ def _routed_factor_dtype(module: nn.Module) -> torch.dtype:
             f"Routed LoRA mode requires a tensor-like weight on "
             f"{type(module).__name__}; got {type(weight).__name__}"
         )
-    return select_adapter(weight.data).compute_dtype(weight.data)
+    representation = param_representation(weight)
+    return select_adapter(representation).compute_dtype(representation)
 
 
 class ModelOffloader:

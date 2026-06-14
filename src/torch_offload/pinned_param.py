@@ -22,7 +22,7 @@ from typing import Any
 import torch
 from torch import nn
 
-from .tensor_adapter_registry import select_adapter
+from .tensor_adapter_registry import param_representation, select_adapter
 from .tensor_adapters import (
     BindLayoutTensorAdapter,
     CpuRoundTripTensorAdapter,
@@ -79,23 +79,29 @@ class PinnedParam:
     )
 
     def __init__(self, param: nn.Parameter) -> None:
-        self.adapter: TensorAdapter[Any, Any] = select_adapter(param.data)
+        # The adapter operates on the tensor that carries the parameter's
+        # representation: ``param.data`` for plain Parameters (including ones
+        # wrapping a quant subclass), but the param object itself for a
+        # Parameter subclass whose ``.data`` is lossy (bitsandbytes
+        # Params4bit). See ``param_representation``.
+        representation = param_representation(param)
+        self.adapter: TensorAdapter[Any, Any] = select_adapter(representation)
         self._target_layout = self._target_layout_from_adapter(
-            self.adapter, param.data,
+            self.adapter, representation,
         )
         self._bind_layout = self._bind_layout_from_adapter(
-            self.adapter, param.data,
+            self.adapter, representation,
         )
         self.requires_grad: bool = param.requires_grad
-        self.pinned_state = self.adapter.clone_pin(param.data)
+        self.pinned_state = self.adapter.clone_pin(representation)
         # Low-peak construction optimization: release the original source
         # storage by repointing the source Parameter at the
         # pinned clone immediately. This is an intentional mutation of
         # the caller's model before the owning store has finished
         # construction; see the class docstring for failure semantics.
-        # Only safe for plain tensors; subclass wrappers can lose
-        # metadata or ignore .data assignment.
-        if type(param.data) is torch.Tensor:
+        # Only safe for plain tensors; subclass wrappers (and Parameter
+        # subclasses) can lose metadata or ignore .data assignment.
+        if type(representation) is torch.Tensor:
             param.data = self.make_cpu_param().data
 
     @staticmethod
@@ -120,8 +126,9 @@ class PinnedParam:
         :class:`PinnedParam` mutates the source parameter. Callers should
         compare the returned value for equality only.
         """
-        adapter = select_adapter(param.data)
-        return cls._target_layout_from_adapter(adapter, param.data)
+        representation = param_representation(param)
+        adapter = select_adapter(representation)
+        return cls._target_layout_from_adapter(adapter, representation)
 
     @classmethod
     def bind_layout_for(cls, param: nn.Parameter) -> tuple[object, object]:
@@ -133,8 +140,9 @@ class PinnedParam:
         overwrites (dtype for plain tensors), so config-built skeletons
         bind against stores pinned from natively loaded weights.
         """
-        adapter = select_adapter(param.data)
-        return cls._bind_layout_from_adapter(adapter, param.data)
+        representation = param_representation(param)
+        adapter = select_adapter(representation)
+        return cls._bind_layout_from_adapter(adapter, representation)
 
     @property
     def target_layout(self) -> tuple[object, object]:
@@ -200,7 +208,9 @@ class PinnedParam:
     @property
     def compute_dtype(self) -> torch.dtype:
         """Logical compute dtype reported by this pinned parameter's adapter."""
-        return self.adapter.compute_dtype(self.make_cpu_param().data)
+        return self.adapter.compute_dtype(
+            param_representation(self.make_cpu_param())
+        )
 
     def validate_parameter_data_swap_target(self) -> None:
         """Raise if this pinned parameter cannot use trainable streaming.

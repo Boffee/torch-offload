@@ -36,7 +36,7 @@ from typing import Any
 import torch
 from torch import nn
 
-from .tensor_adapter_registry import select_adapter
+from .tensor_adapter_registry import param_representation, select_adapter
 from .tensor_adapters import (
     DenseAddmmTensorAdapter,
     DequantRequantCopyIntoTensorAdapter,
@@ -149,18 +149,43 @@ class LoRATransform:
         error. :meth:`apply` uses the same validation path immediately
         before mutating the target parameter.
         """
-        self._target_adapter(param)
+        representation = param_representation(param)
+        adapter = _dequant_requant_adapter(representation)
+        _validate_factor_shapes(
+            self._refs, self._logical_shape(representation, adapter),
+        )
 
     def apply(self, param: nn.Parameter) -> None:
-        adapter = self._target_adapter(param)
+        # Operate on the representation tensor: ``param.data`` for plain and
+        # wrapped-quant parameters, but the param itself for a Parameter
+        # subclass whose ``.data`` is lossy (bitsandbytes Params4bit).
+        representation = param_representation(param)
+        adapter = _dequant_requant_adapter(representation)
         if adapter is None:
-            self._apply_dense(param.data)
+            _validate_factor_shapes(self._refs, tuple(representation.shape))
+            self._apply_dense(representation)
             return
 
-        dense = adapter.dequantize(param.data)
+        dense = adapter.dequantize(representation)
+        # Validate against the dense LOGICAL shape, not the wrapper's shape:
+        # Params4bit reports its packed (numel/2, 1) storage shape, so the
+        # factor check must use the dequantized shape to be correct.
+        _validate_factor_shapes(self._refs, tuple(dense.shape))
         self._apply_dense(dense)
-        new_data = adapter.requantize(dense, like=param.data)
-        adapter.copy_into(new_data, target=param.data)
+        new_data = adapter.requantize(dense, like=representation)
+        adapter.copy_into(new_data, target=representation)
+
+    @staticmethod
+    def _logical_shape(
+        representation: torch.Tensor,
+        adapter: DequantRequantCopyIntoTensorAdapter[Any, Any] | None,
+    ) -> tuple[int, ...]:
+        # Plain / dense-addmm targets carry their logical shape directly;
+        # dequant/requant targets may wrap a different storage shape, so the
+        # logical shape comes from a dequantized view.
+        if adapter is None:
+            return tuple(representation.shape)
+        return tuple(adapter.dequantize(representation).shape)
 
     def _apply_dense(self, data: torch.Tensor) -> None:
         dev, dt = data.device, data.dtype
@@ -169,17 +194,10 @@ class LoRATransform:
             b_gpu = b.to(device=dev, dtype=dt, non_blocking=True)
             data.addmm_(b_gpu, a_gpu, alpha=strength)
 
-    def _target_adapter(
-        self, param: nn.Parameter,
-    ) -> DequantRequantCopyIntoTensorAdapter[Any, Any] | None:
-        _validate_factor_shapes(self._refs, param.data)
-        return _dequant_requant_adapter(param.data)
-
 
 def _validate_factor_shapes(
-    refs: list[_LoraFactorRef], data: torch.Tensor,
+    refs: list[_LoraFactorRef], target_shape: tuple[int, ...],
 ) -> None:
-    target_shape = tuple(data.shape)
     for a, b, _strength in refs:
         if a.ndim != 2 or b.ndim != 2 or a.shape[0] != b.shape[1]:
             raise ValueError(
