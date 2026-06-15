@@ -77,6 +77,22 @@ def _make_nf4(
     ).to(device)
 
 
+def _unquantized_params4bit(*, rows: int = 64, cols: int = 32) -> Any:
+    """A ``Params4bit`` never moved onto a device, so ``quant_state`` is None.
+
+    This is the shape a config-built meta skeleton's 4-bit weight has: the
+    module replacement (``Linear``→``Linear4bit``) ran, but no quantization
+    did, so the wrapper is a structural placeholder.
+    """
+    pytest.importorskip("bitsandbytes")
+    from bitsandbytes.nn import Params4bit
+
+    params4bit: Any = Params4bit
+    return params4bit(
+        torch.randn(rows, cols, dtype=torch.bfloat16), requires_grad=False
+    )
+
+
 class TestBnb4bitAdapter:
     def test_matches_nf4_only(self) -> None:
         p = _make_nf4()
@@ -89,18 +105,18 @@ class TestBnb4bitAdapter:
         # One adapter covers the whole 4-bit family, not just NF4.
         assert Bnb4bitAdapter.matches(_make_nf4(quant_type="fp4"))
 
-    def test_matches_rejects_unquantized_params4bit(self) -> None:
-        pytest.importorskip("bitsandbytes")
-        from bitsandbytes.nn import Params4bit
+    def test_matches_accepts_unquantized_placeholder(self) -> None:
+        # An unquantized Params4bit (quant_state is None) is a legitimate bind
+        # target — a config-built meta skeleton carries one. matches is pure
+        # type recognition, so it accepts it; the "must be quantized" guard
+        # moves to the pin/read path (test_pin_rejects_unquantized_placeholder).
+        assert Bnb4bitAdapter.matches(_unquantized_params4bit())
 
-        # A Params4bit that was never moved onto a device carries no
-        # quant_state — it cannot be offloaded, and matches says so loudly.
-        params4bit: Any = Params4bit
-        placeholder = params4bit(
-            torch.randn(64, 32, dtype=torch.bfloat16), requires_grad=False
-        )
+    def test_pin_rejects_unquantized_placeholder(self) -> None:
+        # Pinning decomposes the quant state, so an unquantized placeholder
+        # still fails loudly — just at the read path now, not at matches.
         with pytest.raises(RuntimeError, match="not quantized"):
-            Bnb4bitAdapter.matches(placeholder)
+            PinnedParam(_unquantized_params4bit())
 
     def test_pin_preserves_storage_and_metadata(self) -> None:
         pytest.importorskip("bitsandbytes")
@@ -156,6 +172,77 @@ class TestBnb4bitAdapter:
         nested = _make_nf4(double_quant=True)
 
         assert _param_target_layout(single) != _param_target_layout(nested)
+
+    def test_bind_layout_matches_real_param_and_placeholder(self) -> None:
+        # The enabling check: a config-built placeholder (quant_state is None,
+        # logical .shape) must bind against a store pinned from a real
+        # quantized param (packed .shape, logical quant_state.shape). Both
+        # sides must yield the same bind layout — the logical [out, in] shape.
+        real = _make_nf4(rows=64, cols=32)
+        placeholder = _unquantized_params4bit(rows=64, cols=32)
+        assert Bnb4bitAdapter.bind_layout_signature(real) == ((64, 32),)
+        assert Bnb4bitAdapter.bind_layout_signature(
+            placeholder
+        ) == Bnb4bitAdapter.bind_layout_signature(real)
+
+    def test_bind_layout_drops_store_reconstructed_fields(self) -> None:
+        # Unlike the strict target layout, the bind layout keeps only the
+        # logical shape — everything the store reconstructs (quant_type,
+        # blocksize, double-quant, dtype) is dropped — so nf4 and fp4
+        # placeholders of equal shape are bind-compatible.
+        nf4 = _make_nf4(quant_type="nf4")
+        fp4 = _make_nf4(quant_type="fp4")
+        assert _param_target_layout(nf4) != _param_target_layout(fp4)
+        assert Bnb4bitAdapter.bind_layout_signature(
+            nf4
+        ) == Bnb4bitAdapter.bind_layout_signature(fp4)
+
+    @pytest.mark.parametrize(
+        "variant",
+        [
+            {"quant_type": "nf4"},
+            {"quant_type": "fp4"},
+            {"quant_type": "nf4", "double_quant": True},
+            {"quant_type": "nf4", "quant_storage": torch.bfloat16},
+        ],
+    )
+    def test_bind_layout_is_logical_shape_regardless_of_quant(
+        self, variant: dict[str, Any]
+    ) -> None:
+        # The placeholder branch reads t.shape, reliable only because an
+        # unquantized Params4bit wraps the dense [out, in] weight: bnb packs
+        # data solely during quantization (which is also when quant_state is
+        # set), so quant_type / double-quant / quant_storage never change the
+        # placeholder shape. The real param's .shape is the *packed* storage and
+        # varies with quant_storage (e.g. (1024,1) uint8 vs (512,1) bf16) — hence
+        # the quant_state.shape branch. Both must reduce to the logical shape.
+        real = _make_nf4(rows=64, cols=32, **variant)
+        placeholder = _unquantized_params4bit(rows=64, cols=32)
+        assert Bnb4bitAdapter.bind_layout_signature(real) == ((64, 32),)
+        assert Bnb4bitAdapter.bind_layout_signature(placeholder) == ((64, 32),)
+
+    def test_store_binds_unquantized_skeleton(self) -> None:
+        # End to end: a store pinned from a real quantized model accepts a
+        # separately-built skeleton whose 4-bit weights are unquantized
+        # placeholders (quant_state is None) — the meta-skeleton case the
+        # native quantizer produces. Previously bind raised, because matches
+        # rejected the placeholder before the layout was ever compared.
+        bnb = pytest.importorskip("bitsandbytes")
+
+        def linear() -> Any:
+            return bnb.nn.Linear4bit(
+                32, 64, bias=False, compute_dtype=torch.bfloat16,
+                quant_type="nf4", quant_storage=torch.uint8,
+            )
+
+        real = linear().to("cpu")  # bnb 0.49+ quantizes on CPU
+        assert real.weight.quant_state is not None
+        skeleton = linear()
+        assert skeleton.weight.quant_state is None
+
+        store = ModelOffloaderStore.from_module(real)
+        binding = store.bind(skeleton)
+        assert binding is not None
 
     def test_no_cpu_round_trip_or_trainable_swap_capability(self) -> None:
         pinned_param = PinnedParam(_make_nf4())

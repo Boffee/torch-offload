@@ -23,8 +23,10 @@ keeps host-resident; only the packed weight and the per-block scales DMA
 to the GPU.
 
 Reaches into bitsandbytes' 4-bit layout through :mod:`._bnb`; if
-bitsandbytes refactors, :meth:`Bnb4bitAdapter.matches` fails with a clear
-validation error (it validates the expected attributes on first match).
+bitsandbytes refactors, the pin/read paths fail with a clear validation
+error (``require_params_4bit`` checks the expected attributes before reading
+the quant state). :meth:`Bnb4bitAdapter.matches` stays pure type recognition
+so an unquantized placeholder can still serve as a bind target.
 
 Selected by :mod:`tensor_adapter_registry`. Importing fails silently if
 bitsandbytes is not installed — 4-bit support is optional.
@@ -45,7 +47,6 @@ from ._bnb import (
     quant_stats,
     requantize_params_4bit,
     require_params_4bit,
-    validate_layout,
 )
 from .tensor_adapters import (
     clone_to_pinned_cpu,
@@ -98,12 +99,15 @@ class Bnb4bitAdapter:
 
     @staticmethod
     def matches(t: torch.Tensor) -> bool:
-        if not is_params_4bit(t):
-            return False
-        # Validate the layout we read in clone_pin / reconstruction.
-        # Cheap (a few hasattr calls); runs on every dispatch.
-        validate_layout(t)
-        return True
+        # Pure type recognition — never raises. An unquantized Params4bit
+        # (quant_state is None) is a legitimate *bind target*: a config-built
+        # meta skeleton carries one, and binding replaces it wholesale with a
+        # store-reconstructed Params4bit. The layout validation that *reading*
+        # the quant state needs lives in require_params_4bit, so it still fires
+        # on every pin/read path (clone_pin, layout_signature, tensor_id, …) —
+        # where a real tensor must be fully quantized — without rejecting a
+        # placeholder that is only ever bound, never pinned.
+        return is_params_4bit(t)
 
     @staticmethod
     def tensor_id(t: torch.Tensor) -> tuple:
@@ -149,6 +153,22 @@ class Bnb4bitAdapter:
             ("nested_absmax", tensor_layout(getattr(state2, "absmax", None))),
             ("nested_code", tensor_layout(getattr(state2, "code", None))),
         )
+
+    @staticmethod
+    def bind_layout_signature(t: torch.Tensor) -> tuple:
+        # Relaxed counterpart of layout_signature for store↔module bind
+        # validation. Bind replaces the placeholder with a store-reconstructed
+        # Params4bit — its packed data *and* quant_state — so every
+        # store-supplied field (dtype, quant_type, blocksize, nesting, and the
+        # packed/scale tensor layouts) is overwritten and carries no
+        # information past validation, exactly as RegularAdapter drops dtype.
+        # Only the logical [out, in] shape is structural: read it from
+        # quant_state for a real param (whose ``.shape`` is the *packed*
+        # (numel/2, 1) storage) and from ``.shape`` for an unquantized
+        # placeholder (quant_state is None — its data is still logical).
+        quant_state = getattr(t, "quant_state", None)
+        shape = tuple(quant_state.shape) if quant_state is not None else tuple(t.shape)
+        return (shape,)
 
     @staticmethod
     def clone_pin(t: torch.Tensor) -> _Bnb4bitPinned:
