@@ -93,9 +93,9 @@ class TestNvfp4Adapter:
         assert pinned.scale.is_pinned()
         assert pinned.per_tensor_scale is not None
         assert pinned.per_tensor_scale.is_pinned()
-        assert pinned.qdata.data_ptr() == pinned_param.pinned_state.qdata.data_ptr()
-        assert pinned.scale.data_ptr() == pinned_param.pinned_state.scale.data_ptr()
-        assert pinned.per_tensor_scale.data_ptr() == pinned_param.pinned_state.per_tensor_scale.data_ptr()
+        assert pinned.qdata.data_ptr() == pinned_param.pinned_state.storage[0].data_ptr()
+        assert pinned.scale.data_ptr() == pinned_param.pinned_state.storage[1].data_ptr()
+        assert pinned.per_tensor_scale.data_ptr() == pinned_param.pinned_state.storage[2].data_ptr()
         assert pinned.block_size == qt.block_size
         assert pinned.orig_dtype == qt.orig_dtype
         assert pinned.is_swizzled_scales == qt.is_swizzled_scales

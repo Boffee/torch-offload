@@ -156,8 +156,8 @@ class TestMxAdapter:
         assert isinstance(pinned, mx_cls)
         assert pinned.qdata.is_pinned()
         assert pinned.scale.is_pinned()
-        assert pinned.qdata.data_ptr() == pinned_param.pinned_state.qdata.data_ptr()
-        assert pinned.scale.data_ptr() == pinned_param.pinned_state.scale.data_ptr()
+        assert pinned.qdata.data_ptr() == pinned_param.pinned_state.storage[0].data_ptr()
+        assert pinned.scale.data_ptr() == pinned_param.pinned_state.storage[1].data_ptr()
         assert pinned.elem_dtype == qt.elem_dtype
         assert pinned.block_size == qt.block_size
         assert pinned.orig_dtype == qt.orig_dtype
