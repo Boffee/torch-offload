@@ -108,8 +108,8 @@ class TestFloat8Adapter:
         assert isinstance(pinned, float8_tensor_cls)
         assert pinned.qdata.is_pinned()
         assert pinned.scale.is_pinned()
-        assert pinned.qdata.data_ptr() == pinned_param.pinned_state.qdata.data_ptr()
-        assert pinned.scale.data_ptr() == pinned_param.pinned_state.scale.data_ptr()
+        assert pinned.qdata.data_ptr() == pinned_param.pinned_state.storage[0].data_ptr()
+        assert pinned.scale.data_ptr() == pinned_param.pinned_state.storage[1].data_ptr()
         assert pinned.block_size == f8.block_size
         assert pinned.mm_config == f8.mm_config
         assert pinned.kernel_preference == f8.kernel_preference
@@ -162,16 +162,16 @@ class TestFloat8Adapter:
         state = pinned_param.allocate_gpu_storage(torch.device("cpu"))
         pinned_param.copy_to_gpu(state)
 
-        original_qdata = pinned_param.pinned_state.qdata.view(torch.uint8).clone()
-        original_scale = pinned_param.pinned_state.scale.clone()
-        pinned_param.pinned_state.qdata.view(torch.uint8).zero_()
-        pinned_param.pinned_state.scale.zero_()
+        original_qdata = pinned_param.pinned_state.storage[0].view(torch.uint8).clone()
+        original_scale = pinned_param.pinned_state.storage[1].clone()
+        pinned_param.pinned_state.storage[0].view(torch.uint8).zero_()
+        pinned_param.pinned_state.storage[1].zero_()
         pinned_param.copy_to_cpu(state)
 
         assert torch.equal(
-            pinned_param.pinned_state.qdata.view(torch.uint8), original_qdata
+            pinned_param.pinned_state.storage[0].view(torch.uint8), original_qdata
         )
-        assert torch.equal(pinned_param.pinned_state.scale, original_scale)
+        assert torch.equal(pinned_param.pinned_state.storage[1], original_scale)
 
     def test_no_trainable_swap_capability(self) -> None:
         pinned_param = PinnedParam(

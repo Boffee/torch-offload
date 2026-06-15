@@ -1,4 +1,4 @@
-"""Tests for TorchAO NVFP4 adapter integration."""
+"""Tests for TorchAO Int8 (``Int8Tensor``) adapter integration."""
 
 from __future__ import annotations
 
@@ -9,10 +9,10 @@ import torch
 from torch import nn
 
 from torch_offload import LoRA, ModelOffloader, ModelOffloaderStore, merge_lora
-from torch_offload.nvfp4_adapter import Nvfp4Adapter
+from torch_offload.int8_adapter import Int8Adapter
 from torch_offload.pinned_param import PinnedParam
-from torch_offload.tensor_adapter_registry import tensor_id
 from torch_offload.streamed_component import _param_target_layout
+from torch_offload.tensor_adapter_registry import select_adapter, tensor_id
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -43,97 +43,111 @@ def _make_model_offloader(
     )
 
 
-def _nvfp4_modules():
-    pytest.importorskip("numpy")
-    mod = pytest.importorskip("torchao.prototype.mx_formats.nvfp4_tensor")
-    return mod.NVFP4Tensor, mod.QuantizeTensorToNVFP4Kwargs
+def _int8_config(*, dynamic_activation: bool) -> object:
+    pytest.importorskip("torchao")
+    try:
+        from torchao.quantization import (
+            Int8DynamicActivationInt8WeightConfig,
+            Int8WeightOnlyConfig,
+        )
+    except ImportError as exc:
+        # The int8 adapter targets the torchao>=0.17 version-2 Int8Tensor
+        # workflow; skip (don't error) when the installed torchao predates
+        # it — or a future release moves it.
+        pytest.skip(f"torchao int8 API unavailable: {exc}")
+
+    return (
+        Int8DynamicActivationInt8WeightConfig(version=2)
+        if dynamic_activation
+        else Int8WeightOnlyConfig(version=2)
+    )
 
 
-def _make_nvfp4(
+def _int8_tensor_cls() -> type:
+    pytest.importorskip("torchao")
+    try:
+        from torchao.quantization.quantize_.workflows.int8.int8_tensor import (
+            Int8Tensor,
+        )
+    except ImportError as exc:
+        pytest.skip(f"torchao Int8Tensor unavailable: {exc}")
+    return Int8Tensor
+
+
+def _make_int8(
     *,
-    rows: int = 16,
+    rows: int = 32,
     cols: int = 16,
     dtype: torch.dtype = torch.bfloat16,
-    dynamic_activation: bool = True,
-    swizzled: bool = False,
+    dynamic_activation: bool = False,
+    weight: torch.Tensor | None = None,
+    device: str = "cpu",
 ) -> torch.Tensor:
-    nvfp4_tensor_cls, kwargs_cls = _nvfp4_modules()
-    act_quant_kwargs = (
-        kwargs_cls(
-            is_swizzled_scales=swizzled,
-            use_dynamic_per_tensor_scale=True,
-        )
-        if dynamic_activation
-        else None
-    )
-    return nvfp4_tensor_cls.to_nvfp4(
-        torch.randn(rows, cols, dtype=dtype),
-        per_tensor_scale=torch.tensor(0.01, dtype=torch.float32),
-        is_swizzled_scales=swizzled,
-        use_triton_kernel=False,
-        act_quant_kwargs=act_quant_kwargs,
-    )
+    from torchao.quantization import quantize_
+
+    cfg = _int8_config(dynamic_activation=dynamic_activation)
+    layer = nn.Linear(cols, rows, bias=False).to(dtype)
+    if weight is not None:
+        with torch.no_grad():
+            layer.weight.copy_(weight)
+    layer = layer.to(device)
+    quantize_(layer, cfg)
+    return layer.weight.data
 
 
-class TestNvfp4Adapter:
-    def test_matches_nvfp4_only(self) -> None:
-        qt = _make_nvfp4()
-        assert Nvfp4Adapter.matches(qt)
-        assert not Nvfp4Adapter.matches(torch.zeros(16, 16, dtype=torch.bfloat16))
+class TestInt8Adapter:
+    def test_matches_and_dispatches_int8_only(self) -> None:
+        qt = _make_int8()
+        assert Int8Adapter.matches(qt)
+        assert not Int8Adapter.matches(torch.zeros(16, 16, dtype=torch.bfloat16))
+        # Registry dispatch resolves Int8Tensor to this adapter (disjoint
+        # from the other TorchAO structured adapters in the dispatch order).
+        assert isinstance(select_adapter(qt), Int8Adapter)
 
     def test_pin_preserves_storage_and_metadata(self) -> None:
-        nvfp4_tensor_cls, _ = _nvfp4_modules()
-        qt = _make_nvfp4(swizzled=True)
-        p = nn.Parameter(qt, requires_grad=False)
-        pinned_param = PinnedParam(p)
+        int8_cls = _int8_tensor_cls()
+        qt = _make_int8()
+        pinned_param = PinnedParam(nn.Parameter(qt, requires_grad=False))
 
         pinned = pinned_param.make_cpu_param().data
-        assert isinstance(pinned, nvfp4_tensor_cls)
+        assert isinstance(pinned, int8_cls)
         assert pinned.qdata.is_pinned()
         assert pinned.scale.is_pinned()
-        assert pinned.per_tensor_scale is not None
-        assert pinned.per_tensor_scale.is_pinned()
         assert pinned.qdata.data_ptr() == pinned_param.pinned_state.storage[0].data_ptr()
         assert pinned.scale.data_ptr() == pinned_param.pinned_state.storage[1].data_ptr()
-        assert pinned.per_tensor_scale.data_ptr() == pinned_param.pinned_state.storage[2].data_ptr()
+        if qt.zero_point is not None:
+            assert pinned.zero_point is not None
+            assert pinned.zero_point.is_pinned()
+            assert (
+                pinned.zero_point.data_ptr()
+                == pinned_param.pinned_state.storage[2].data_ptr()
+            )
         assert pinned.block_size == qt.block_size
-        assert pinned.orig_dtype == qt.orig_dtype
-        assert pinned.is_swizzled_scales == qt.is_swizzled_scales
-        assert pinned.use_triton_kernel == qt.use_triton_kernel
-        assert pinned.act_quant_kwargs == qt.act_quant_kwargs
+        assert pinned.dtype == qt.dtype
         assert pinned_param.compute_dtype is torch.bfloat16
+        assert torch.equal(pinned.dequantize(), qt.dequantize())
 
-    def test_transposed_qdata_stride_is_preserved(self) -> None:
-        qt = _make_nvfp4(rows=16, cols=32).t()
-        pinned_param = PinnedParam(nn.Parameter(qt, requires_grad=False))
-        pinned = pinned_param.make_cpu_param().data
-
-        assert pinned.shape == qt.shape
-        assert pinned.qdata.stride() == qt.qdata.stride()
-        assert pinned.scale.stride() == qt.scale.stride()
-        assert pinned.dequantize().shape == qt.dequantize().shape
-
-    def test_tensor_id_tracks_optional_scale_tensor(self) -> None:
-        qt = _make_nvfp4()
+    def test_tensor_id_tracks_buffers(self) -> None:
+        qt = _make_int8()
         key = tensor_id(qt)
-        assert key[0] == "torchao-nvfp4"
+        assert key[0] == "torchao-int8"
         assert key[1][0] == qt.qdata.device
         assert key[2][0] == qt.scale.device
-        assert key[3][0] == qt.per_tensor_scale.device
         assert key == tensor_id(qt)
+        assert key != tensor_id(_make_int8())
 
     def test_target_layout_ignores_tensor_id(self) -> None:
-        p1 = nn.Parameter(_make_nvfp4(), requires_grad=False)
-        p2 = nn.Parameter(_make_nvfp4(), requires_grad=False)
+        p1 = nn.Parameter(_make_int8(), requires_grad=False)
+        p2 = nn.Parameter(_make_int8(), requires_grad=False)
 
         assert _param_target_layout(p1) == _param_target_layout(p2)
 
     def test_target_layout_tracks_activation_quantization(self) -> None:
         with_activation = nn.Parameter(
-            _make_nvfp4(dynamic_activation=True), requires_grad=False
+            _make_int8(dynamic_activation=True), requires_grad=False
         )
         weight_only = nn.Parameter(
-            _make_nvfp4(dynamic_activation=False), requires_grad=False
+            _make_int8(dynamic_activation=False), requires_grad=False
         )
 
         assert _param_target_layout(with_activation) != _param_target_layout(
@@ -142,7 +156,7 @@ class TestNvfp4Adapter:
 
     def test_no_cpu_round_trip_or_trainable_swap_capability(self) -> None:
         pinned_param = PinnedParam(
-            nn.Parameter(_make_nvfp4(), requires_grad=True),
+            nn.Parameter(_make_int8(), requires_grad=True),
         )
         state = pinned_param.allocate_gpu_storage(torch.device("cpu"))
 
@@ -151,7 +165,7 @@ class TestNvfp4Adapter:
         with pytest.raises(NotImplementedError, match="Parameter.data-swap"):
             pinned_param.validate_parameter_data_swap_target()
 
-    def test_merge_lora_rejects_nvfp4_weight(self) -> None:
+    def test_merge_lora_rejects_int8_weight(self) -> None:
         class M(nn.Module):
             def __init__(self) -> None:
                 super().__init__()
@@ -160,7 +174,7 @@ class TestNvfp4Adapter:
         model = M()
         model.lin.weight.requires_grad = False
         model.lin.weight = nn.Parameter(
-            _make_nvfp4(dynamic_activation=False),
+            _make_int8(rows=16, cols=16, dynamic_activation=False),
             requires_grad=False,
         )
         lora = LoRA(
@@ -170,15 +184,29 @@ class TestNvfp4Adapter:
             }
         )
 
-        with pytest.raises(ValueError, match="Nvfp4Adapter.*routed LoRA"):
+        with pytest.raises(ValueError, match="Int8Adapter.*routed LoRA"):
             merge_lora(model, [(lora, 1.0)])
+
+    def test_reconstructed_cpu_forward_matches(self) -> None:
+        # int8 matmul runs on CPU, so reconstruction correctness is checked
+        # without a GPU: the rebuilt wrapper must produce the same output.
+        int8_cls = _int8_tensor_cls()
+        weight = torch.randn(32, 16, dtype=torch.bfloat16)
+        qt = _make_int8(rows=32, cols=16, weight=weight)
+        x = torch.randn(4, 16, dtype=torch.bfloat16)
+        ref = torch.nn.functional.linear(x, qt)
+
+        pinned_param = PinnedParam(nn.Parameter(qt, requires_grad=False))
+        reconstructed = pinned_param.make_cpu_param().data
+        assert isinstance(reconstructed, int8_cls)
+        out = torch.nn.functional.linear(x, reconstructed)
+        torch.testing.assert_close(out, ref)
 
     @CUDA
     def test_allocate_copy_make_gpu_param_preserves_wrapper(self) -> None:
-        nvfp4_tensor_cls, _ = _nvfp4_modules()
-        pinned_param = PinnedParam(
-            nn.Parameter(_make_nvfp4(swizzled=True), requires_grad=False),
-        )
+        int8_cls = _int8_tensor_cls()
+        qt = _make_int8()
+        pinned_param = PinnedParam(nn.Parameter(qt, requires_grad=False))
 
         gpu_state = pinned_param.allocate_gpu_storage(torch.device("cuda"))
         pinned_param.copy_to_gpu(gpu_state, non_blocking=True)
@@ -186,42 +214,26 @@ class TestNvfp4Adapter:
         torch.cuda.synchronize()
         pinned = pinned_param.make_cpu_param().data
 
-        assert isinstance(gpu_param.data, nvfp4_tensor_cls)
+        assert isinstance(gpu_param.data, int8_cls)
         assert gpu_param.data.qdata.is_cuda
         assert gpu_param.data.scale.is_cuda
-        assert gpu_param.data.per_tensor_scale is not None
-        assert gpu_param.data.per_tensor_scale.is_cuda
         assert gpu_param.data.block_size == pinned.block_size
-        assert gpu_param.data.orig_dtype == pinned.orig_dtype
-        assert gpu_param.data.is_swizzled_scales == pinned.is_swizzled_scales
+        assert gpu_param.data.dtype == pinned.dtype
         assert torch.equal(gpu_param.data.qdata.cpu(), pinned.qdata)
         assert torch.equal(gpu_param.data.scale.cpu(), pinned.scale)
-        assert torch.equal(
-            gpu_param.data.per_tensor_scale.cpu(),
-            pinned.per_tensor_scale,
-        )
+        if pinned.zero_point is not None:
+            assert gpu_param.data.zero_point is not None
+            assert torch.equal(
+                gpu_param.data.zero_point.cpu(), pinned.zero_point
+            )
 
     @CUDA
-    def test_model_offloader_cuda_forward_dynamic_nvfp4(self) -> None:
-        nvfp4_mod = pytest.importorskip("torchao.prototype.mx_formats.nvfp4_tensor")
-        _, kwargs_cls = _nvfp4_modules()
+    @pytest.mark.parametrize("dynamic_activation", [False, True])
+    def test_model_offloader_cuda_forward(self, dynamic_activation: bool) -> None:
         layer = nn.Linear(64, 128, bias=False, dtype=torch.bfloat16)
         layer.weight.requires_grad = False
-        weight = layer.weight.detach().contiguous()
         layer.weight = nn.Parameter(
-            nvfp4_mod.NVFP4Tensor.to_nvfp4(
-                weight,
-                per_tensor_scale=nvfp4_mod.per_tensor_amax_to_scale(
-                    torch.max(torch.abs(weight))
-                ),
-                is_swizzled_scales=True,
-                use_triton_kernel=False,
-                act_quant_kwargs=kwargs_cls(
-                    is_swizzled_scales=True,
-                    use_dynamic_per_tensor_scale=True,
-                    use_triton_kernel=False,
-                ),
-            ),
+            _make_int8(rows=128, cols=64, dynamic_activation=dynamic_activation),
             requires_grad=False,
         )
         strategy = _make_model_offloader(layer)
@@ -237,10 +249,7 @@ class TestNvfp4Adapter:
             strategy.deactivate()
 
     @CUDA
-    def test_model_offloader_routed_lora_on_dynamic_nvfp4(self) -> None:
-        nvfp4_mod = pytest.importorskip("torchao.prototype.mx_formats.nvfp4_tensor")
-        _, kwargs_cls = _nvfp4_modules()
-
+    def test_model_offloader_routed_lora_on_int8(self) -> None:
         class M(nn.Module):
             def __init__(self) -> None:
                 super().__init__()
@@ -259,21 +268,8 @@ class TestNvfp4Adapter:
         model = M()
         for block in model.blocks:
             block.weight.requires_grad = False
-            weight = block.weight.detach().contiguous()
             block.weight = nn.Parameter(
-                nvfp4_mod.NVFP4Tensor.to_nvfp4(
-                    weight,
-                    per_tensor_scale=nvfp4_mod.per_tensor_amax_to_scale(
-                        torch.max(torch.abs(weight))
-                    ),
-                    is_swizzled_scales=True,
-                    use_triton_kernel=False,
-                    act_quant_kwargs=kwargs_cls(
-                        is_swizzled_scales=True,
-                        use_dynamic_per_tensor_scale=True,
-                        use_triton_kernel=False,
-                    ),
-                ),
+                _make_int8(rows=128, cols=128, dynamic_activation=True),
                 requires_grad=False,
             )
         offloader = _make_model_offloader(
