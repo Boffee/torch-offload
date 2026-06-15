@@ -16,6 +16,7 @@ from .bnb4bit_adapter import Bnb4bitAdapter
 from .bnb8bit_adapter import Bnb8bitAdapter
 from .float8_adapter import Float8Adapter
 from .gguf_adapter import GgufAdapter
+from .int8_adapter import Int8Adapter
 from .mx_adapter import MxAdapter
 from .nvfp4_adapter import Nvfp4Adapter
 from .quanto_adapter import QuantoAdapter
@@ -31,6 +32,7 @@ _BUILTIN_ADAPTERS: tuple[type[TensorAdapter[Any, Any]], ...] = (
     Nvfp4Adapter,
     MxAdapter,
     Float8Adapter,
+    Int8Adapter,
     GgufAdapter,
     RegularAdapter,
 )

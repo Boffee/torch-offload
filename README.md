@@ -19,9 +19,9 @@ to be lifted into its own package when a second consumer appears.
 | `streamed_component.py` | `StreamedComponentStore`, `StreamedComponent` — lower-level streamed backing storage plus per-block-list streaming component |
 | `lora.py` | `LoRA`, `LoRATransform`, `LoRARouteHandle` — pinned factor storage + merge / routed-hook application |
 | `merge.py` | `merge_lora()` — permanent in-place LoRA merge into base weights (alternative to `set_loras`) |
-| `pinned_param.py` | `PinnedParam` — per-parameter pinning primitive (handles quanto, GGUF, and TorchAO NVFP4 / MX (MXFP8, MXFP4) / scaled-FP8 via adapters) |
+| `pinned_param.py` | `PinnedParam` — per-parameter pinning primitive (handles quanto, GGUF, and TorchAO NVFP4 / MX (MXFP8, MXFP4) / scaled-FP8 / INT8 via adapters) |
 | `pinned_module.py` | Internal name-keyed pinned module storage plus concrete module bindings |
-| `tensor_adapters.py`, `quanto_adapter.py`, `gguf_adapter.py`, `nvfp4_adapter.py`, `mx_adapter.py`, `float8_adapter.py`, `gguf_dequant.py` | Tensor adapter contracts/implementations and optional optimum-quanto / gguf / torchao support |
+| `tensor_adapters.py`, `quanto_adapter.py`, `gguf_adapter.py`, `nvfp4_adapter.py`, `mx_adapter.py`, `float8_adapter.py`, `int8_adapter.py`, `gguf_dequant.py` | Tensor adapter contracts/implementations and optional optimum-quanto / gguf / torchao support |
 | `torchao_structured_adapter.py` | Internal: shared `TorchaoStructuredAdapter` base for the TorchAO subclass adapters (NVFP4 / MX / scaled-FP8) — common pin/move/identity mechanics + per-format hooks; capabilities beyond inference movement are opted into per subclass |
 | `tensor_adapter_registry.py` | Internal adapter dispatch and tensor-identity helpers |
 | `module_names.py` | Internal name traversal and mutation helpers |
@@ -29,6 +29,7 @@ to be lifted into its own package when a second consumer appears.
 | `_torchao_nvfp4.py` | Internal: TorchAO NVFP4 optional-import + layout validation; consumed by `nvfp4_adapter.py` |
 | `_torchao_mx.py` | Internal: TorchAO MX (MXFP8 / MXFP4) optional-import + layout validation and supported-dtype gate; consumed by `mx_adapter.py` |
 | `_torchao_float8.py` | Internal: TorchAO scaled-FP8 optional-import + layout validation and dequant/requant; consumed by `float8_adapter.py` |
+| `_torchao_int8.py` | Internal: TorchAO INT8 optional-import + layout validation; consumed by `int8_adapter.py` |
 
 ## Why use this
 
