@@ -35,7 +35,7 @@ per-parameter pinned storage from
 + optional quanto ``WeightQBytesTensor`` decomposition, bitsandbytes
 4-bit ``Params4bit`` (NF4/FP4) and 8-bit ``Int8Params`` (LLM.int8)
 decomposition, GGUF packed weights, and TorchAO NVFP4 / MX (MXFP8,
-MXFP4) / scaled-FP8 / INT8 packed weights).
+MXFP4) / scaled-FP8 / INT8 / INT4 (tile-packed) packed weights).
 
 :class:`ModelOffloader` and :class:`MpsWeights` implement the
 :class:`ModelStrategy` Protocol —
