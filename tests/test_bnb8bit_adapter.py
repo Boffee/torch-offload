@@ -69,6 +69,23 @@ def _make_int8(
     ).to(device)
 
 
+def _unquantized_int8params(*, rows: int = 64, cols: int = 32) -> Any:
+    """An ``Int8Params`` never moved onto a device, so ``CB``/``SCB`` are None.
+
+    The shape a config-built meta skeleton's int8 weight has: module
+    replacement ran but no quantization did, leaving a structural placeholder.
+    """
+    pytest.importorskip("bitsandbytes")
+    from bitsandbytes.nn import Int8Params
+
+    int8params: Any = Int8Params
+    return int8params(
+        torch.randn(rows, cols, dtype=torch.float16),
+        requires_grad=False,
+        has_fp16_weights=False,
+    )
+
+
 class TestBnb8bitAdapter:
     def test_matches_int8_only(self) -> None:
         p = _make_int8()
@@ -77,15 +94,22 @@ class TestBnb8bitAdapter:
             torch.zeros(64, 32, dtype=torch.float16)
         )
 
-    def test_matches_rejects_post_forward(self) -> None:
+    def test_matches_accepts_unquantized_placeholder(self) -> None:
+        # An Int8Params with CB/SCB None (an unquantized meta-skeleton
+        # placeholder) is a legitimate bind target. matches is pure type
+        # recognition, so it accepts it; the "must be pre-forward / quantized"
+        # guard moves to the pin/read path (test_pin_rejects_post_forward).
+        assert Bnb8bitAdapter.matches(_unquantized_int8params())
+
+    def test_pin_rejects_post_forward(self) -> None:
         # After the first forward bitsandbytes nulls CB/SCB on the weight
-        # (state migrates to the module). Simulate that and confirm the
-        # adapter refuses it loudly instead of capturing None.
+        # (state migrates to the module). Pinning decomposes CB/SCB, so such a
+        # weight still fails loudly — at the read path now, not at matches.
         p = _make_int8()
         p.CB = None
         p.SCB = None
         with pytest.raises(RuntimeError, match="before the first forward"):
-            Bnb8bitAdapter.matches(p)
+            PinnedParam(p)
 
     def test_pin_preserves_storage_and_metadata(self) -> None:
         pytest.importorskip("bitsandbytes")
@@ -122,6 +146,18 @@ class TestBnb8bitAdapter:
         p2 = _make_int8()
 
         assert _param_target_layout(p1) == _param_target_layout(p2)
+
+    def test_bind_layout_matches_real_and_placeholder(self) -> None:
+        # A config-built placeholder (CB None) must bind against a store pinned
+        # from a real quantized param. int8 isn't packed, so both sides' bind
+        # layout is simply the logical [out, in] shape (no quant_state branch,
+        # unlike 4-bit).
+        real = _make_int8(rows=64, cols=32)
+        placeholder = _unquantized_int8params(rows=64, cols=32)
+        assert Bnb8bitAdapter.bind_layout_signature(real) == ((64, 32),)
+        assert Bnb8bitAdapter.bind_layout_signature(
+            placeholder
+        ) == Bnb8bitAdapter.bind_layout_signature(real)
 
     def test_no_cpu_round_trip_or_trainable_swap_capability(self) -> None:
         pinned_param = PinnedParam(_make_int8())
@@ -301,6 +337,45 @@ class TestBnb8bitAdapter:
                 torch.testing.assert_close(y, reference)
         finally:
             strategy.deactivate()
+
+    @CUDA
+    def test_store_binds_unquantized_meta_skeleton(self) -> None:
+        # End to end: a store pinned from a real pre-forward int8 model accepts
+        # a separately-built META skeleton whose weight is an unquantized
+        # placeholder (CB None). Previously bind raised because matches rejected
+        # the placeholder before the layout was ever compared.
+        bnb = pytest.importorskip("bitsandbytes")
+        layer = bnb.nn.Linear8bitLt(
+            64, 128, bias=False, has_fp16_weights=False
+        ).to("cuda")
+        # Reference twin from the SAME pre-forward CB/SCB (never forward `layer`).
+        cb = layer.weight.CB.clone()
+        scb = layer.weight.SCB.clone()
+        ref_layer = bnb.nn.Linear8bitLt(
+            64, 128, bias=False, has_fp16_weights=False
+        ).to("cuda")
+        ref_layer._parameters["weight"] = bnb.nn.Int8Params(
+            cb.clone(), requires_grad=False, has_fp16_weights=False,
+            CB=cb.clone(), SCB=scb.clone(),
+        )
+        x = torch.randn(8, 64, dtype=torch.float16, device="cuda")
+        reference = ref_layer(x)
+
+        # `layer` is still pre-forward here, so the store pins CB/SCB.
+        store = ModelOffloaderStore.from_module(layer)
+        with torch.device("meta"):
+            skeleton = bnb.nn.Linear8bitLt(64, 128, bias=False, has_fp16_weights=False)
+        assert skeleton.weight.CB is None
+        binding = store.bind(skeleton)
+        try:
+            with binding.use("cuda") as active:
+                y = active(x)
+                torch.cuda.synchronize()
+            assert y.shape == (8, 128)
+            assert y.dtype is torch.float16
+            torch.testing.assert_close(y, reference)
+        finally:
+            binding.deactivate()
 
     @CUDA
     def test_model_offloader_streamed_int8_blocks(self) -> None:

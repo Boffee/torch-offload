@@ -17,8 +17,10 @@ Two things differ from 4-bit, both because int8 keeps no self-describing
   ``Linear8bitLt`` runs its first forward. The first forward migrates them
   onto the module's ``MatmulLtState`` and nulls them on the weight. A
   tensor-scoped adapter cannot see the module, so it must pin a pre-forward
-  weight; :meth:`Bnb8bitAdapter.matches` (via ``validate_int8_layout``)
-  raises on a post-forward weight rather than silently capturing ``None``.
+  weight; the pin/read path (``require_int8_params``) raises on a post-forward
+  weight rather than silently capturing ``None``, while
+  :meth:`Bnb8bitAdapter.matches` stays pure type recognition so an unquantized
+  placeholder can still serve as a bind target.
 
 This is safe across activations because the reconstructed ``Int8Params``
 carries ``CB``, so each forward re-runs ``init_8bit_state`` and repopulates
@@ -26,9 +28,10 @@ the module state from the freshly-installed weight — the offloader never
 has to touch the owning module.
 
 Reaches into bitsandbytes' int8 layout through :mod:`._bnb`; if
-bitsandbytes refactors, :meth:`Bnb8bitAdapter.matches` fails with a clear
-validation error. Selected by :mod:`tensor_adapter_registry`. Importing
-fails silently if bitsandbytes is not installed — 8-bit support is optional.
+bitsandbytes refactors, the pin/read path fails with a clear validation error
+(``require_int8_params`` checks the layout before reading CB/SCB). Selected by
+:mod:`tensor_adapter_registry`. Importing fails silently if bitsandbytes is
+not installed — 8-bit support is optional.
 """
 
 from __future__ import annotations
@@ -45,7 +48,6 @@ from ._bnb import (
     is_int8_params,
     requantize_int8_params,
     require_int8_params,
-    validate_int8_layout,
 )
 from .tensor_adapters import (
     clone_to_pinned_cpu,
@@ -83,13 +85,15 @@ class Bnb8bitAdapter:
 
     @staticmethod
     def matches(t: torch.Tensor) -> bool:
-        if not is_int8_params(t):
-            return False
-        # Validate the layout we read in clone_pin / reconstruction, and
-        # that the weight is pre-forward (CB/SCB still present). Cheap; runs
-        # on every dispatch.
-        validate_int8_layout(t)
-        return True
+        # Pure type recognition — never raises. An Int8Params with CB/SCB None
+        # (an unquantized meta-skeleton placeholder) is a legitimate *bind
+        # target*: binding replaces it wholesale with a store-reconstructed
+        # Int8Params. The pre-forward / quantized validation that *reading*
+        # CB/SCB needs lives in require_int8_params, so it still fires on every
+        # pin/read path (clone_pin, layout_signature, tensor_id, …) — rejecting
+        # a post-forward or unquantized weight there — without rejecting a
+        # placeholder that is only ever bound, never pinned.
+        return is_int8_params(t)
 
     @staticmethod
     def tensor_id(t: torch.Tensor) -> tuple:
@@ -114,6 +118,20 @@ class Bnb8bitAdapter:
             ("CB", tensor_layout(qt.CB)),
             ("SCB", tensor_layout(qt.SCB)),
         )
+
+    @staticmethod
+    def bind_layout_signature(t: torch.Tensor) -> tuple:
+        # Relaxed counterpart of layout_signature for store↔module bind
+        # validation. Bind replaces the placeholder with a store-reconstructed
+        # Int8Params (CB + SCB), so those tensors' layouts are store-supplied
+        # and carry no information past validation, as RegularAdapter drops
+        # dtype. Only the logical [out, in] shape is structural — and unlike
+        # 4-bit it is just ``t.shape`` in every state: int8 is full-byte (no
+        # sub-byte packing), so ``.shape`` is logical whether CB is present
+        # (real, ``.shape == CB.shape``) or None (unquantized placeholder). The
+        # only CB-None tensor that reaches bind is the skeleton placeholder; a
+        # post-forward real weight is rejected earlier on the pin/target path.
+        return (tuple(t.shape),)
 
     @staticmethod
     def clone_pin(t: torch.Tensor) -> _Bnb8bitPinned:
