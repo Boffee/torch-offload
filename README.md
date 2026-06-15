@@ -19,13 +19,14 @@ to be lifted into its own package when a second consumer appears.
 | `streamed_component.py` | `StreamedComponentStore`, `StreamedComponent` — lower-level streamed backing storage plus per-block-list streaming component |
 | `lora.py` | `LoRA`, `LoRATransform`, `LoRARouteHandle` — pinned factor storage + merge / routed-hook application |
 | `merge.py` | `merge_lora()` — permanent in-place LoRA merge into base weights (alternative to `set_loras`) |
-| `pinned_param.py` | `PinnedParam` — per-parameter pinning primitive (handles quanto, GGUF, and TorchAO NVFP4 / scaled-FP8 via adapters) |
+| `pinned_param.py` | `PinnedParam` — per-parameter pinning primitive (handles quanto, GGUF, and TorchAO NVFP4 / MX (MXFP8, MXFP4) / scaled-FP8 via adapters) |
 | `pinned_module.py` | Internal name-keyed pinned module storage plus concrete module bindings |
-| `tensor_adapters.py`, `quanto_adapter.py`, `gguf_adapter.py`, `nvfp4_adapter.py`, `float8_adapter.py`, `gguf_dequant.py` | Tensor adapter contracts/implementations and optional optimum-quanto / gguf / torchao support |
+| `tensor_adapters.py`, `quanto_adapter.py`, `gguf_adapter.py`, `nvfp4_adapter.py`, `mx_adapter.py`, `float8_adapter.py`, `gguf_dequant.py` | Tensor adapter contracts/implementations and optional optimum-quanto / gguf / torchao support |
 | `tensor_adapter_registry.py` | Internal adapter dispatch and tensor-identity helpers |
 | `module_names.py` | Internal name traversal and mutation helpers |
 | `_quanto.py` | Internal: optimum-quanto optional-import + layout validation; consumed by `quanto_adapter.py` and `merge.py` |
 | `_torchao_nvfp4.py` | Internal: TorchAO NVFP4 optional-import + layout validation; consumed by `nvfp4_adapter.py` |
+| `_torchao_mx.py` | Internal: TorchAO MX (MXFP8 / MXFP4) optional-import + layout validation and supported-dtype gate; consumed by `mx_adapter.py` |
 | `_torchao_float8.py` | Internal: TorchAO scaled-FP8 optional-import + layout validation and dequant/requant; consumed by `float8_adapter.py` |
 
 ## Why use this
@@ -693,6 +694,31 @@ opt into CPU round-trip, trainable `Parameter.data` swap, or activation
 merge-mode LoRA. Use routed LoRA when the target module is a logical
 `nn.Linear` with compatible shape and compute dtype. Permanent
 `merge_lora()` does not bake into NVFP4 weights.
+
+## TorchAO MX (MXFP8 / MXFP4) support
+
+TorchAO MX (OCP microscaling) weights
+(`torchao.prototype.mx_formats.mx_tensor.MXTensor`, created by
+`quantize_(...)` with an MX inference config or directly via
+`MXTensor.to_mx`) are handled as frozen inference weights when the
+`torchao` optional extra is installed. A single adapter covers both
+MXFP8 (`float8_e4m3fn` / `float8_e5m2`) and MXFP4
+(`float4_e2m1fn_x2`), since TorchAO models them as the same `MXTensor`
+subclass parameterized by `elem_dtype`. `PinnedParam` pins the packed
+`qdata`, the E8M0 block `scale`, and the TorchAO dispatch metadata
+(`elem_dtype`, `block_size`, `kernel_preference`, `act_quant_kwargs`,
+`is_swizzled_scales`), then rebuilds the `MXTensor` wrapper around GPU
+storage on activation. MXFP6 and any other MX element dtype are not
+admitted; such a tensor falls through to a clear "no adapter" error
+rather than being silently mishandled. MX matmul execution still
+depends on Blackwell-class CUDA hardware and the matching PyTorch CUDA
+stack. Use `uv sync --extra torchao --group dev` and then
+`pytest tests/test_mx_adapter.py -q -rs` to exercise the coverage.
+
+Like NVFP4, MX support is intentionally model-weight only. The adapter
+does not opt into CPU round-trip, trainable `Parameter.data` swap, or
+activation merge-mode LoRA. Use routed LoRA when the target module is a
+logical `nn.Linear` with compatible shape and compute dtype.
 
 ## TorchAO scaled FP8 support
 
