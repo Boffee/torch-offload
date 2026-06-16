@@ -14,6 +14,7 @@ from torch import nn
 
 from .bnb4bit_adapter import Bnb4bitAdapter
 from .bnb8bit_adapter import Bnb8bitAdapter
+from .dtensor_adapter import DTensorAdapter
 from .float8_adapter import Float8Adapter
 from .gguf_adapter import GgufAdapter
 from .int4_tile_adapter import Int4TilePackedAdapter
@@ -25,8 +26,12 @@ from .tensor_adapters import RegularAdapter, TensorAdapter
 
 # Built-in adapters in dispatch order; first match wins. RegularAdapter is
 # last — it matches only exact torch.Tensor/nn.Parameter, so structured
-# subclasses reach their dedicated adapter first.
+# subclasses reach their dedicated adapter first. DTensorAdapter is first: a
+# DTensor is an outer wrapper (its local shard, possibly quantized, is moved
+# by whatever adapter the registry selects for it), so it is checked before
+# the local-shard adapters.
 _BUILTIN_ADAPTERS: tuple[type[TensorAdapter[Any, Any]], ...] = (
+    DTensorAdapter,
     QuantoAdapter,
     Bnb4bitAdapter,
     Bnb8bitAdapter,
