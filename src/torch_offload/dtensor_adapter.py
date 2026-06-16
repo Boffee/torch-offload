@@ -109,11 +109,18 @@ class DTensorAdapter:
 
     @staticmethod
     def tensor_id(t: torch.Tensor) -> tuple:
+        # Include the GLOBAL shape/stride (matching layout_signature): two
+        # DTensors can alias the same local shard yet carry different global
+        # views, and tied-weight dedup reuses the first param's pinned state —
+        # so without these, the second would rebuild with the wrong global
+        # metadata.
         dt = require_dtensor(t)
         local = dt.to_local()
         return (
             "dtensor",
             _select(local).tensor_id(local),
+            tuple(dt.shape),
+            dt.stride(),
             mesh_signature(dt.device_mesh),
             placements_key(dt.placements),
         )

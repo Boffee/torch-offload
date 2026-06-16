@@ -170,6 +170,9 @@ class TestDTensorAdapter:
         other, _ = _dtensor_weight(tp_mesh)
         assert tensor_id(dt) != tensor_id(other)
         assert tensor_id(dt) == tensor_id(dt)
+        # The global shape is in the identity key so aliased local shards with
+        # different global views are not deduped onto one PinnedParam.
+        assert tuple(dt.shape) in tensor_id(dt)
 
     def test_cache_bytes_counts_local_shard(self, tp_mesh: Any) -> None:
         dt, _ = _dtensor_weight(tp_mesh, rows=16, cols=8)
