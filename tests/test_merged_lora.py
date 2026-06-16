@@ -963,11 +963,21 @@ class TestLoRATransform:
         }
         lora = LoRA(state_dict=sd, key_transform=None)
         a, b = lora.targets["embed.weight"]
-        expected_dense = qt.dequantize().to(torch.float32)
-        expected_dense.addmm_(b.to(torch.float32), a.to(torch.float32), alpha=0.5)
+        # Compute the reference on CUDA, matching the device the offloader
+        # merges on. A CPU reference flips occasional int8 elements at
+        # quantization bucket edges (CPU vs CUDA round-to-nearest), and the
+        # comparison is exact — so the device must match to be deterministic.
+        qt_cuda = qt.cuda()
+        expected_dense = qt_cuda.dequantize().to(torch.float32)
+        expected_dense.addmm_(
+            b.cuda().to(torch.float32), a.cuda().to(torch.float32), alpha=0.5
+        )
         expected_packed = (
-            expected_dense / scale.to(torch.float32)
-        ).round().clamp(-128, 127).to(torch.int8)
+            (expected_dense / scale.cuda().to(torch.float32))
+            .round()
+            .clamp(-128, 127)
+            .to(torch.int8)
+        )
 
         s = _make_strategy(m, num_resident_blocks=1)
         _set_loras(s, [(lora, 0.5)], mode="merge")
@@ -975,7 +985,7 @@ class TestLoRATransform:
         try:
             merged_qt = m.embed.weight.data
             assert isinstance(merged_qt, WeightQBytesTensor)
-            torch.testing.assert_close(merged_qt._data.cpu(), expected_packed)
+            torch.testing.assert_close(merged_qt._data, expected_packed)
             torch.testing.assert_close(merged_qt._scale.cpu(), scale)
         finally:
             s.deactivate()

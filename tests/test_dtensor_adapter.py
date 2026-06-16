@@ -144,6 +144,24 @@ class TestDTensorAdapter:
         assert tensor_id(sharded) != tensor_id(replicated)
         assert tensor_id(sharded)[0] == "dtensor"
 
+    def test_bind_layout_relaxes_inner_dtype_keeps_global_shape(
+        self, tp_mesh: Any
+    ) -> None:
+        bf16 = _dtensor_weight(tp_mesh, dtype=torch.bfloat16)[0]
+        fp32 = _dtensor_weight(tp_mesh, dtype=torch.float32)[0]
+
+        # bind_layout delegates to the inner adapter's bind signature, which
+        # drops dtype (for meta-skeleton binding) — so the two compare equal;
+        # the strict layout_signature keeps dtype, so they differ.
+        assert DTensorAdapter.layout_signature(bf16) != DTensorAdapter.layout_signature(fp32)
+        assert DTensorAdapter.bind_layout_signature(
+            bf16
+        ) == DTensorAdapter.bind_layout_signature(fp32)
+        # Both keys carry the GLOBAL shape (gpu_param replays it; uneven shards
+        # are not pinned by the local shape alone).
+        assert tuple(bf16.shape) in DTensorAdapter.layout_signature(bf16)
+        assert tuple(bf16.shape) in DTensorAdapter.bind_layout_signature(bf16)
+
     def test_tensor_id_keys_off_local_not_dtensor_dataptr(self, tp_mesh: Any) -> None:
         dt, _ = _dtensor_weight(tp_mesh)
         # The DTensor's own data_ptr is 0 — using it would collapse tied-weight

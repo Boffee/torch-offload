@@ -61,7 +61,7 @@ from ._dtensor import (
     rebuild_dtensor,
     require_dtensor,
 )
-from .tensor_adapters import TensorAdapter
+from .tensor_adapters import BindLayoutTensorAdapter, TensorAdapter
 
 
 @dataclass(slots=True)
@@ -120,10 +120,16 @@ class DTensorAdapter:
 
     @staticmethod
     def layout_signature(t: torch.Tensor) -> tuple:
+        # Include the GLOBAL shape/stride: gpu_param replays them, and for
+        # uneven shards the local shard layout alone doesn't pin them (two
+        # different global shapes can share a local shape on a rank), so a
+        # pool target reused across such blocks would carry the wrong shape.
         dt = require_dtensor(t)
         local = dt.to_local()
         return (
             _select(local).layout_signature(local),
+            tuple(dt.shape),
+            dt.stride(),
             mesh_signature(dt.device_mesh),
             placements_key(dt.placements),
         )
@@ -132,12 +138,21 @@ class DTensorAdapter:
     def bind_layout_signature(t: torch.Tensor) -> tuple:
         # Bind validation compares the store (pinned from the CUDA-mesh weight)
         # against the bound module, whose resting weight cpu_param rebuilt on a
-        # CPU mesh. Drop the mesh device type so the two compare equal — the
-        # shape, ranks, placements, and local layout still pin the structure.
+        # CPU mesh. Drop the mesh device type so the two compare equal. Delegate
+        # the local shard to the inner adapter's *bind* signature (not the
+        # strict layout) so it drops the same binding-overwritten fields it
+        # would standalone (e.g. RegularAdapter drops dtype for meta skeletons).
         dt = require_dtensor(t)
         local = dt.to_local()
+        inner = _select(local)
+        inner_sig = (
+            inner.bind_layout_signature(local)
+            if isinstance(inner, BindLayoutTensorAdapter)
+            else inner.layout_signature(local)
+        )
         return (
-            _select(local).layout_signature(local),
+            inner_sig,
+            tuple(dt.shape),
             mesh_signature(dt.device_mesh, include_device=False),
             placements_key(dt.placements),
         )
