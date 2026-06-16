@@ -21,8 +21,9 @@ to be lifted into its own package when a second consumer appears.
 | `merge.py` | `merge_lora()` — permanent in-place LoRA merge into base weights (alternative to `set_loras`) |
 | `pinned_param.py` | `PinnedParam` — per-parameter pinning primitive (handles quanto, GGUF, and TorchAO NVFP4 / MX (MXFP8, MXFP4) / scaled-FP8 / INT8 / INT4 tile-packed via adapters) |
 | `pinned_module.py` | Internal name-keyed pinned module storage plus concrete module bindings |
-| `tensor_adapters.py`, `quanto_adapter.py`, `gguf_adapter.py`, `nvfp4_adapter.py`, `mx_adapter.py`, `float8_adapter.py`, `int8_adapter.py`, `int4_tile_adapter.py`, `gguf_dequant.py` | Tensor adapter contracts/implementations and optional optimum-quanto / gguf / torchao support |
+| `tensor_adapters.py`, `quanto_adapter.py`, `gguf_adapter.py`, `nvfp4_adapter.py`, `mx_adapter.py`, `float8_adapter.py`, `int8_adapter.py`, `int4_tile_adapter.py`, `dtensor_adapter.py`, `gguf_dequant.py` | Tensor adapter contracts/implementations and optional optimum-quanto / gguf / torchao / DTensor support |
 | `torchao_structured_adapter.py` | Internal: shared `TorchaoStructuredAdapter` base for the TorchAO subclass adapters (NVFP4 / MX / scaled-FP8) — common pin/move/identity mechanics + per-format hooks; capabilities beyond inference movement are opted into per subclass |
+| `dtensor_adapter.py` | Internal: movement-only `DTensorAdapter` for tensor-parallel `DTensor` weights — composes with every other adapter by delegating the local shard to the registry and replaying the `(mesh, placements)` wrapper; frozen-inference scope (see `_dtensor.py`) |
 | `tensor_adapter_registry.py` | Internal adapter dispatch and tensor-identity helpers |
 | `module_names.py` | Internal name traversal and mutation helpers |
 | `_quanto.py` | Internal: optimum-quanto optional-import + layout validation; consumed by `quanto_adapter.py` and `merge.py` |
@@ -31,6 +32,7 @@ to be lifted into its own package when a second consumer appears.
 | `_torchao_float8.py` | Internal: TorchAO scaled-FP8 optional-import + layout validation and dequant/requant; consumed by `float8_adapter.py` |
 | `_torchao_int8.py` | Internal: TorchAO INT8 optional-import + layout validation; consumed by `int8_adapter.py` |
 | `_torchao_int4_tile.py` | Internal: TorchAO INT4 tile-packed (CUDA-native tinygemm) optional-import + layout validation; consumed by `int4_tile_adapter.py` |
+| `_dtensor.py` | Internal: PyTorch `DTensor` optional-import + mesh/placements signatures and local-shard rewrap; consumed by `dtensor_adapter.py` |
 
 ## Why use this
 

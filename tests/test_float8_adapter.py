@@ -346,8 +346,15 @@ class TestFloat8Adapter:
                 "blocks.0.lora_B.weight": b,
             }
         )
-        expected_dense = f8.dequantize().to(torch.float32)
-        expected_dense.addmm_(b.to(torch.float32), a.to(torch.float32), alpha=0.5)
+        # Compute the reference on CUDA, matching the device the offloader
+        # merges on. A CPU reference flips a couple of float8 boundary elements
+        # relative to the CUDA merge (CPU vs CUDA round-to-nearest at bucket
+        # edges), making the tight tolerance RNG/CUDA-state sensitive.
+        f8_cuda = f8.cuda()
+        expected_dense = f8_cuda.dequantize().to(torch.float32)
+        expected_dense.addmm_(
+            b.cuda().to(torch.float32), a.cuda().to(torch.float32), alpha=0.5
+        )
         expected = float8_tensor_cls.from_hp(
             expected_dense.to(f8.dtype), granularity=per_row_cls(),
         )
@@ -366,7 +373,7 @@ class TestFloat8Adapter:
                 merged = active.blocks[0].weight.data
                 assert isinstance(merged, float8_tensor_cls)
                 torch.testing.assert_close(
-                    merged.dequantize().cpu().to(torch.float32),
+                    merged.dequantize().to(torch.float32),
                     expected.dequantize().to(torch.float32),
                 )
                 y = active(x)
