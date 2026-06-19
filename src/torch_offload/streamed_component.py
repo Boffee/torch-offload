@@ -320,41 +320,6 @@ def _pin_block_module_stores(
     ]
 
 
-def _iter_instance_trainable_params(
-    instance: PinnedModuleInstance,
-) -> Iterator[nn.Parameter]:
-    params = dict(instance.module.named_parameters(remove_duplicate=False))
-    seen: set[int] = set()
-    for name, pinned in instance.params.items():
-        if not pinned.requires_grad:
-            continue
-        param = params[name]
-        param_id = id(param)
-        if param_id in seen:
-            continue
-        seen.add(param_id)
-        yield param
-
-
-def _move_instance_trainable_grads_to(
-    instance: PinnedModuleInstance,
-    device: torch.device,
-) -> None:
-    for param in _iter_instance_trainable_params(instance):
-        if param.grad is None or param.grad.device == device:
-            continue
-        moved = param.grad.to(device)
-        if param.data.device == device:
-            param.grad = moved
-        else:
-            # PyTorch's grad setter rejects cross-device grad/data
-            # pairs. Streamed trainables intentionally have CPU data
-            # and GPU grads while active between block loads, so move
-            # the grad storage in place when the data is currently
-            # offloaded.
-            param.grad.data = moved.data
-
-
 def _build_param_name_index(
     instances: Sequence[PinnedModuleInstance],
     prefix: str | None,
@@ -1190,7 +1155,7 @@ class StreamedComponent:
                     buffer_names=(),
                 )
                 instance.load_to_target(trainable_target, non_blocking=True)
-                _move_instance_trainable_grads_to(instance, device)
+                instance.move_trainable_grads_to(device)
                 loaded.append((instance, trainable_target))
         # User's current stream now waits for step_stream's H2D. After
         # this point the optimizer can safely read param.data on its own
@@ -1233,7 +1198,7 @@ class StreamedComponent:
         placed it.
         """
         for instance in self._block_instances:
-            _move_instance_trainable_grads_to(instance, device)
+            instance.move_trainable_grads_to(device)
 
     # ------------------------------------------------------------------
     # Pool and block movement

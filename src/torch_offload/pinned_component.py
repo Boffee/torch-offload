@@ -203,9 +203,12 @@ class PinnedComponent:
 
         CUDA activation bulk-DMAs pinned weights to GPU: per-tensor
         ``.to()`` (non-blocking), then a single ``cuda.synchronize`` to
-        make the writes visible. Tied parameter names all receive the
-        same GPU Parameter. CPU activation repoints registry entries
-        back to the pinned CPU Parameters and performs no device copy.
+        make the writes visible, then realigns any retained trainable
+        ``.grad`` to the GPU so the next backward accumulates on-device
+        (mirrors :meth:`deactivate` moving grad to CPU). Tied parameter
+        names all receive the same GPU Parameter. CPU activation repoints
+        registry entries back to the pinned CPU Parameters and performs no
+        device copy.
 
         Calling activate() twice without an intervening deactivate()
         raises before any registry movement or GPU allocation.
@@ -239,6 +242,10 @@ class PinnedComponent:
                 non_blocking=True,
             )
             torch.cuda.synchronize(active_device)
+            # Realign trainable grads with their now-GPU data so the next
+            # backward accumulates on-device. A no-op unless a prior CPU
+            # optimizer step left a retained CPU grad (set_to_none=False).
+            self._instance.move_trainable_grads_to(active_device)
             self._active_target = target
         else:
             raise ValueError(
@@ -252,9 +259,18 @@ class PinnedComponent:
         safe to call before activate or multiple times. After
         deactivate, drop the component reference to release pinned
         memory (and the model reference too if you don't need it
-        anymore)."""
+        anymore).
+
+        Trainable ``.grad`` follows ``.data`` to pinned CPU here (grads
+        otherwise linger wherever ``AccumulateGrad`` left them, i.e. on the
+        GPU, pinning device memory and stranding the gradient off-host).
+        This gives a uniform deactivated resting state — ``.data`` and
+        ``.grad`` both on pinned CPU — so a context-free CPU
+        ``optimizer.step()`` works the same for pinned and streamed
+        trainables."""
         try:
             self._instance.restore_pinned()
+            self._instance.move_trainable_grads_to(torch.device("cpu"))
         finally:
             self._active_target = None
             self._active_device = None
@@ -270,7 +286,12 @@ class PinnedComponent:
 
         On CPU activation, or when inactive, this is a guarded no-op
         because trainable data is already resident in pinned CPU storage.
-        ``param.grad`` is untouched.
+
+        This context does not move ``param.grad``; grad placement is owned
+        by the activate/deactivate cycle, which keeps grad on the same
+        device as ``.data`` (GPU while active, pinned CPU once deactivated).
+        Use this context to step on the GPU; to step on the CPU instead,
+        call ``optimizer.step()`` while deactivated.
         """
         if self._optimizer_step_active:
             raise RuntimeError(

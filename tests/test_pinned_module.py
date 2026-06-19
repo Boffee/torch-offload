@@ -972,3 +972,39 @@ class TestPinnedModuleInstance:
         store.bind(target)
 
         assert target.running is target.running_alias
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_move_trainable_grads_to_realigns_across_devices(self) -> None:
+        # The shared grad-movement primitive used by PinnedComponent and
+        # StreamedComponent. Exercises the cross-device in-place branch
+        # (offloaded CPU data, grad moved to GPU), the None skip, and
+        # frozen-param exclusion.
+        torch.manual_seed(0)
+        model = nn.Linear(4, 3, bias=True)
+        model.bias.requires_grad = False  # frozen
+        instance = PinnedModuleStore.from_module(model).bind(model)
+        instance.restore_pinned()  # trainable .data on pinned CPU
+
+        # No grad yet -> no-op, no crash on the None case.
+        instance.move_trainable_grads_to(torch.device("cuda"))
+        assert model.weight.grad is None
+
+        # CPU grad while data stays offloaded (pinned CPU).
+        grad = torch.randn_like(model.weight)
+        model.weight.grad = grad.clone()
+        model.bias.grad = torch.randn_like(model.bias)  # frozen: ignored
+
+        # data is CPU, target is CUDA -> cross-device in-place branch.
+        instance.move_trainable_grads_to(torch.device("cuda"))
+        assert model.weight.grad is not None
+        assert model.weight.grad.device.type == "cuda"
+        torch.testing.assert_close(model.weight.grad.cpu(), grad)
+        # The frozen param is excluded -> its grad is left where it was.
+        assert model.bias.grad is not None
+        assert model.bias.grad.device.type == "cpu"
+
+        # Moving back to CPU (data co-located) -> clean grad-setter branch.
+        instance.move_trainable_grads_to(torch.device("cpu"))
+        assert model.weight.grad is not None
+        assert model.weight.grad.device.type == "cpu"
+        torch.testing.assert_close(model.weight.grad, grad)

@@ -639,26 +639,20 @@ class ModelOffloader:
                 optimizer.step()
             optimizer.zero_grad()
 
-        This context steps on the *GPU* for speed. The optimizer can step on
-        the *CPU* instead — keeping its state on the host — **only when every
-        parameter it touches is owned by a streamed component**
-        (``stream_trainable_weights=True``): on ``deactivate()`` those
-        trainables get their ``.data`` restored to pinned CPU storage *and*
-        their ``.grad`` moved to CPU. Calling ``optimizer.step()`` **outside**
-        ``use()`` (deactivated) then runs on CPU and the in-place update is
-        streamed on the next forward. Keep such trainables in fp32 so the
-        update is a correct master-weight update::
+        This context steps on the *GPU* for speed. To run the optimizer on
+        *CPU* instead — keeping its state on the host — call
+        ``optimizer.step()`` **outside** ``use()`` (deactivated) without this
+        context. On ``deactivate()`` every managed trainable has its ``.data``
+        restored to pinned CPU storage *and* its ``.grad`` moved to CPU
+        (:class:`PinnedComponent` and :class:`StreamedComponent` alike), so
+        the step runs on CPU and the in-place update is streamed to GPU on the
+        next forward. Keep such trainables in fp32 so the update is a correct
+        master-weight update::
 
             with offload.use("cuda"):
                 loss = model(x); loss.backward()
             optimizer.step()        # runs on CPU; states stay on host
             optimizer.zero_grad()
-
-        Non-streamed trainables — the default
-        :class:`PinnedComponent`-managed params, including any outside
-        ``blocks_attr`` such as embeddings or heads — keep their ``.grad`` on
-        GPU after ``deactivate()``, so a CPU step over them raises a
-        device-mismatch error. Step those inside this context instead.
         """
         with contextlib.ExitStack() as stack:
             if self._pinned_component is not None:
