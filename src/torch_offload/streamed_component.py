@@ -5,11 +5,18 @@ storage for a single block list whose blocks share the same parameter
 layout (names, shapes, dtypes, and any tensor-adapter wrapper metadata).
 Binding that store to a compatible model creates a
 :class:`StreamedComponent` that streams the resolved blocks to GPU on
-demand via forward-pre hooks, and uses a pre-allocated GPU target pool plus
+demand via forward-pre hooks, and uses a reusable GPU target pool plus
 a background prefetcher to overlap DMA with compute. On CPU, the
-host-backed pinned state is used directly without streaming. Heterogeneous
-block lists (e.g. Flux's two block kinds) split into multiple
-:class:`StreamedComponent` instances composed via :class:`ModelOffloader`.
+host-backed pinned state is used directly without streaming.
+
+Blocks in one list may be heterogeneously quantized (mixed dtypes or
+quant formats on the same-named weights): the GPU target pool keys its
+reusable targets by per-block layout signature, so each block streams
+into a target matching its own format and no cross-format ``copy_`` ever
+happens. Only block lists whose blocks differ in *structure* — different
+parameter or buffer *names*, e.g. Flux's two block kinds — must split
+into multiple :class:`StreamedComponent` instances composed via
+:class:`ModelOffloader`.
 
 In-block trainable params (LoRA adapters) flow through the same target
 pool; pinned module instances branch on the source trainable flag to swap
@@ -54,7 +61,6 @@ from torch import nn
 
 from ._devices import canonical_device
 from .module_names import group_names, walk_attr_path
-from .pinned_buffer import PinnedBuffer
 from .pinned_module import (
     PinnedModuleInstance,
     PinnedModuleStore,
@@ -63,7 +69,6 @@ from .pinned_module import (
     PostCopyHookHandle,
 )
 from .pinned_param import PinnedParam
-from .tensor_adapter_registry import buffer_tensor_id, param_tensor_id
 
 logger = logging.getLogger(__name__)
 
@@ -88,46 +93,112 @@ def _release_cuda_cache_on_drop(is_cuda: bool) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Pre-allocated GPU target pool
+# Morphing GPU target pool
 # ---------------------------------------------------------------------------
 
 
-class _PinnedModuleTargetPool:
-    """Pool of pre-allocated :class:`PinnedModuleTarget` instances."""
+BlockSignature = tuple[object, ...]
 
-    def __init__(
+
+def _instance_target_signature(instance: PinnedModuleInstance) -> BlockSignature:
+    r"""Layout-equivalence key for one block's GPU targets.
+
+    Two block instances with equal signatures allocate structurally
+    identical :class:`PinnedModuleTarget`\ s, so a target freed by one can
+    be refilled by the other with a plain ``copy_`` — matching names,
+    storage grouping, ``requires_grad``, and per-tensor target layouts
+    (shapes, dtypes, and any tensor-adapter wrapper metadata). Blocks with
+    *different* signatures — e.g. an int4 layer next to an int8 layer in
+    one block list — get their own pooled targets, so heterogeneous
+    quantization streams correctly without a cross-format ``copy_``.
+    """
+    params = instance.params
+    param_sig = tuple(
+        (
+            tuple(names),
+            params[names[0]].requires_grad,
+            params[names[0]].target_layout,
+        )
+        for names in group_names(params.keys(), lambda name: id(params[name]))
+    )
+    buffers = instance.buffers
+    buffer_sig = tuple(
+        (tuple(names), buffers[names[0]].target_layout)
+        for names in group_names(buffers.keys(), lambda name: id(buffers[name]))
+    )
+    return (param_sig, buffer_sig)
+
+
+class _MorphingTargetPool:
+    r"""Signature-keyed pool of reusable :class:`PinnedModuleTarget`\ s.
+
+    A single pool serves a block list whose blocks may be heterogeneously
+    quantized. Targets are keyed by per-block layout signature
+    (:func:`_instance_target_signature`): :meth:`acquire` returns a free
+    target matching the requested signature, lazily allocating one from
+    the requesting block instance on first demand. Targets are retained in
+    per-signature free lists and released to the CUDA allocator only when
+    the pool is dropped at deactivate — never mid-stream.
+
+    That retain-until-deactivate lifecycle is deliberate. Eagerly freeing
+    a target the instant a block of a different format reuses its slot
+    would hand mid-stream-freed bytes back to the caching allocator while
+    a different stream might still read them (targets are filled on the
+    prefetch stream and read by compute on the default stream); the
+    allocator segregates free blocks by their allocation stream and would
+    reuse them without the cross-stream event the homogeneous pool never
+    needed. Keeping targets parked in free lists matches the homogeneous
+    pool exactly — allocate, reuse, free only under the full stream sync
+    that deactivate performs.
+
+    Total resident targets self-size to the actual interleaving: the sum
+    over signatures of each signature's peak concurrent residency. For
+    clustered mixed-precision layouts (contiguous runs per format, the
+    common case) that is close to the homogeneous
+    ``num_resident + num_prefetch``; strict per-block alternation across
+    ``k`` formats can approach ``k`` times that, still a handful of small
+    targets.
+
+    Compute events key on target identity, not a slot index, so the load
+    that refills a target waits on exactly the compute that last read
+    *that* target's bytes.
+    """
+
+    def __init__(self, device: torch.device) -> None:
+        self._device = device
+        self._free: dict[BlockSignature, list[PinnedModuleTarget]] = {}
+        self._events: dict[int, torch.cuda.Event] = {}
+
+    def acquire(
         self,
-        template_instance: PinnedModuleInstance,
-        num_targets: int,
-        device: torch.device,
+        signature: BlockSignature,
+        instance: PinnedModuleInstance,
+    ) -> PinnedModuleTarget:
+        free = self._free.get(signature)
+        if free:
+            return free.pop()
+        return instance.allocate_target(self._device)
+
+    def release(
+        self,
+        signature: BlockSignature,
+        target: PinnedModuleTarget,
     ) -> None:
-        self._targets = [
-            template_instance.allocate_target(device)
-            for _ in range(num_targets)
-        ]
-        self._free: list[int] = list(range(num_targets))
-        self._events: list[torch.cuda.Event | None] = [None] * num_targets
+        self._free.setdefault(signature, []).append(target)
 
-    def acquire(self) -> int:
-        return self._free.pop()
-
-    def release(self, target_idx: int) -> None:
-        self._free.append(target_idx)
-
-    def target(self, target_idx: int) -> PinnedModuleTarget:
-        return self._targets[target_idx]
-
-    def set_compute_event(self, target_idx: int, event: torch.cuda.Event) -> None:
-        self._events[target_idx] = event
+    def set_compute_event(
+        self, target: PinnedModuleTarget, event: torch.cuda.Event,
+    ) -> None:
+        self._events[id(target)] = event
 
     def wait_if_needed(
-        self, target_idx: int, stream: torch.cuda.Stream | None
+        self, target: PinnedModuleTarget, stream: torch.cuda.Stream | None,
     ) -> None:
-        ev = self._events[target_idx]
-        if ev is not None:
-            if stream is not None and not ev.query():
-                stream.wait_event(ev)
-            self._events[target_idx] = None
+        ev = self._events.pop(id(target), None)
+        if ev is None:
+            return
+        if stream is not None and not ev.query():
+            stream.wait_event(ev)
 
 
 # ---------------------------------------------------------------------------
@@ -136,84 +207,27 @@ class _PinnedModuleTargetPool:
 
 
 def _param_target_layout(p: nn.Parameter) -> tuple[object, object]:
-    """Layout fields that block 0's pool template must match across blocks.
+    """Per-parameter target-compatibility layout, computed pre-pin.
 
-    ``Tensor.copy_`` silently casts dtype and silently broadcasts
-    compatible shapes — both invisible failure modes that would
-    silently corrupt a load. Wrapper metadata (qtype, axis,
-    activation_qtype, quant_type) is similarly invisible to copy_.
+    Two params with equal values pool into structurally identical GPU
+    targets, so a refill is a plain ``Tensor.copy_``; unequal values must
+    never share a target, because ``copy_`` silently casts dtype and
+    silently broadcasts compatible shapes, and wrapper metadata (qtype,
+    axis, activation_qtype, quant_type) is similarly invisible to it.
 
-    :class:`PinnedParam` owns the tensor-adapter details needed for the
-    opaque target layout because wrapper metadata is type-specific. The
-    returned value intentionally excludes tensor identity so distinct
-    block instances with the same layout can share one pool template.
+    This is the standalone form of the same value
+    :func:`_instance_target_signature` reads from each pinned param's
+    :attr:`PinnedParam.target_layout` to key the streamer's pool; it is
+    not called on the streaming path. Kept as the package's documented
+    way to compare two params' target compatibility directly (e.g. in
+    adapter tests) without pinning either.
+
+    :class:`PinnedParam` owns the tensor-adapter details because wrapper
+    metadata is type-specific. The returned value intentionally excludes
+    tensor identity so distinct blocks with the same layout share one
+    pooled target.
     """
     return PinnedParam.target_layout_for(p)
-
-
-def _buffer_target_layout(buffer: torch.Tensor) -> tuple[object, ...]:
-    return PinnedBuffer.target_layout_for(buffer)
-
-
-def _check_block_layouts_match(
-    block_params: Sequence[dict[str, nn.Parameter]],
-    block_buffers: Sequence[dict[str, torch.Tensor]],
-) -> None:
-    """Raise if blocks have mismatched param/buffer layouts. Called before
-    pinning so layout failures leave parameters, buffers, and storage untouched.
-
-    See :func:`_param_target_layout` for what counts as "matched."
-    """
-    if len(block_params) <= 1:
-        return
-
-    def sig(params: dict[str, nn.Parameter]) -> tuple:
-        return tuple(
-            (
-                tuple(names),
-                params[names[0]].requires_grad,
-                _param_target_layout(params[names[0]]),
-            )
-            for names in group_names(
-                params.keys(),
-                lambda name: param_tensor_id(params[name]),
-            )
-        )
-
-    def buffer_sig(buffers: dict[str, torch.Tensor]) -> tuple:
-        return tuple(
-            (
-                tuple(names),
-                _buffer_target_layout(buffers[names[0]]),
-            )
-            for names in group_names(
-                buffers.keys(),
-                lambda name: buffer_tensor_id(buffers[name]),
-            )
-        )
-
-    ref = sig(block_params[0])
-    ref_buffers = buffer_sig(block_buffers[0])
-    for i in range(1, len(block_params)):
-        if sig(block_params[i]) != ref:
-            raise ValueError(
-                f"Block {i} param layout differs from block 0. "
-                "All blocks in a StreamedComponent group must share the "
-                "same param structure (names, storage grouping, "
-                "requires_grad, shapes, dtypes, and any tensor-adapter "
-                "wrapper metadata). Split heterogeneous block lists "
-                "across separate `blocks_attr=[...]` groups in "
-                "ModelOffloader."
-            )
-        if buffer_sig(block_buffers[i]) != ref_buffers:
-            raise ValueError(
-                f"Block {i} buffer layout differs from block 0. "
-                "All blocks in a StreamedComponent group must share the "
-                "same buffer structure (names, shapes, dtypes, and "
-                "tensor layouts). Split heterogeneous block lists "
-                "across separate `blocks_attr=[...]` groups in "
-                "ModelOffloader."
-            )
 
 
 def _collect_streamed_entries(
@@ -280,6 +294,40 @@ def _format_names(names: Sequence[str]) -> str:
     return ", ".join(repr(name) for name in names)
 
 
+def _check_block_requires_grad_consistent(
+    block_params: Sequence[dict[str, nn.Parameter]],
+) -> None:
+    """Reject blocks that disagree on ``requires_grad`` for a shared name.
+
+    Per-block tensor *layouts* (shape, dtype, quant format, tying) may
+    differ — the morphing target pool keys targets by layout signature.
+    But mixing a trainable and a frozen weight under the same selected
+    name in one streamed group is unsupported: trainable streaming swaps
+    ``.data`` under an activation-checkpointing guard, so a half-trainable
+    group has no coherent optimizer-step / checkpointing contract.
+    Validated before pinning so a mismatch leaves the model unmutated.
+    """
+    if len(block_params) <= 1:
+        return
+    ref = block_params[0]
+    for i in range(1, len(block_params)):
+        for name, param in block_params[i].items():
+            ref_param = ref.get(name)
+            if (
+                ref_param is not None
+                and param.requires_grad != ref_param.requires_grad
+            ):
+                raise ValueError(
+                    f"Block {i} param {name!r} requires_grad="
+                    f"{param.requires_grad} differs from block 0 "
+                    f"(requires_grad={ref_param.requires_grad}). All blocks "
+                    "in a StreamedComponent group must agree on requires_grad "
+                    "per parameter; quantization formats, shapes, and dtypes "
+                    "may differ, but trainable and frozen weights cannot be "
+                    "mixed in one streamed group."
+                )
+
+
 def _pin_block_module_stores(
     blocks: Sequence[nn.Module],
     *,
@@ -294,19 +342,18 @@ def _pin_block_module_stores(
     a pin-time failure is unsupported, matching :class:`PinnedComponent`.
     """
     # Walk each block to collect selected param/buffer names WITHOUT
-    # pinning anything. Pinning runs only after the block layout check
-    # passes, so invalid configurations raise before model mutation.
+    # pinning anything. Cross-block name consistency is enforced upstream
+    # (``_streamed_param_names_for_blocks`` / ``_streamed_buffer_names_for_blocks``);
+    # per-block tensor *layouts* may differ (heterogeneous quantization),
+    # since the streamer's morphing target pool keys reusable GPU targets
+    # by per-block layout signature so blocks of different formats never
+    # share a target.
     block_params, block_buffers = _collect_streamed_entries(
         list(blocks),
         stream_param_names,
         stream_buffer_names,
     )
-
-    # Validate before pinning. ``Tensor.copy_`` silently casts dtype and
-    # silently broadcasts compatible shapes, so any block N with
-    # mismatched dtype, name, or wrapper metadata would otherwise load
-    # into block 0's pool target without raising and corrupt forward.
-    _check_block_layouts_match(block_params, block_buffers)
+    _check_block_requires_grad_consistent(block_params)
 
     return [
         PinnedModuleStore.from_module(
@@ -406,9 +453,11 @@ def _streamed_param_names_for_blocks(
     for i, block in enumerate(blocks[1:], start=1):
         if _block_param_names(block, stream_trainables=stream_trainables) != param_names:
             raise ValueError(
-                f"Block {i} param layout differs from block 0: selected "
-                "parameter names differ. All blocks in a StreamedComponent "
-                "group must select the same parameter names."
+                f"Block {i} selected parameter names differ from block 0. "
+                "All blocks in a StreamedComponent group must select the "
+                "same parameter names (their shapes, dtypes, and quant "
+                "formats may differ). Split structurally different block "
+                "kinds across separate `blocks_attr=[...]` groups."
             )
     return param_names
 
@@ -418,9 +467,11 @@ def _streamed_buffer_names_for_blocks(blocks: Sequence[nn.Module]) -> set[str]:
     for i, block in enumerate(blocks[1:], start=1):
         if _block_buffer_names(block) != buffer_names:
             raise ValueError(
-                f"Block {i} buffer layout differs from block 0: selected "
-                "buffer names differ. All blocks in a StreamedComponent "
-                "group must select the same buffer names."
+                f"Block {i} selected buffer names differ from block 0. "
+                "All blocks in a StreamedComponent group must select the "
+                "same buffer names (their shapes, dtypes, and layouts may "
+                "differ). Split structurally different block kinds across "
+                "separate `blocks_attr=[...]` groups."
             )
     return buffer_names
 
@@ -657,9 +708,13 @@ class StreamedComponent:
         finds the last ``num_resident_blocks`` blocks still resident.
         Spare VRAM is usually better spent on ``num_prefetch_blocks``.
     num_prefetch_blocks:
-        How many blocks ahead to prefetch on a background thread.
-        The GPU target pool holds
-        ``num_resident_blocks + num_prefetch_blocks`` blocks.
+        How many blocks ahead to prefetch on a background thread. At most
+        ``num_resident_blocks + num_prefetch_blocks`` blocks are
+        GPU-resident at once; for a homogeneous block list the GPU target
+        pool holds exactly that many targets. A heterogeneously quantized
+        list keeps one reusable target per distinct block-layout
+        signature, so its pool can grow to that bound per distinct layout
+        (closer to the homogeneous bound when formats run contiguously).
     cyclic:
         Default ``False``. When ``True``, treat the block list as a
         cyclic sequence: large index jumps (``|Δidx| > num_blocks/2``)
@@ -705,6 +760,12 @@ class StreamedComponent:
         )
         self._block_instances = list(block_instances)
         self._blocks = [instance.module for instance in self._block_instances]
+        # Per-block layout signature: blocks with equal signatures share
+        # pooled GPU targets, so a block list may mix quant formats.
+        self._block_signatures = [
+            _instance_target_signature(instance)
+            for instance in self._block_instances
+        ]
         self._active_device: torch.device | None = None
         self._num_resident_blocks = num_resident_blocks
         self._num_prefetch_blocks = num_prefetch_blocks
@@ -723,8 +784,8 @@ class StreamedComponent:
         self._move_trainable_grads_to(torch.device("cpu"))
 
         # Active resources allocated on CUDA activate().
-        self._pool: _PinnedModuleTargetPool | None = None
-        self._block_to_target: dict[int, int] = {}
+        self._pool: _MorphingTargetPool | None = None
+        self._block_to_target: dict[int, PinnedModuleTarget] = {}
         self._pool_config: tuple[int, torch.device] | None = None
         self._tracker: _BlockTracker | None = None
         self._hooks: list[torch.utils.hooks.RemovableHandle] = []
@@ -940,7 +1001,7 @@ class StreamedComponent:
         logger.info(
             f"{self._log_label} active: {num_resident}/{num_blocks} resident "
             f"on GPU, prefetch={self._num_prefetch_blocks}, "
-            f"gpu_pool_targets={num_gpu_targets}"
+            f"max_gpu_resident={num_gpu_targets}"
         )
 
     def deactivate(self) -> None:
@@ -1221,13 +1282,11 @@ class StreamedComponent:
                 "fires when num_prefetch_blocks is negative."
             )
 
-        # Pool template comes from block 0. The constructor's layout
-        # check has already verified every other block matches.
-        self._pool = _PinnedModuleTargetPool(
-            self._block_instances[0],
-            num_gpu_targets,
-            device,
-        )
+        # Targets are allocated lazily per block-layout signature, so one
+        # pool serves heterogeneously quantized blocks. ``num_gpu_targets``
+        # bounds concurrent residency (enforced by the residency/prefetch
+        # logic), not a fixed pre-allocation.
+        self._pool = _MorphingTargetPool(device)
         self._pool_config = (num_gpu_targets, device)
 
     def _deactivate_pool(self) -> None:
@@ -1246,13 +1305,14 @@ class StreamedComponent:
 
         instance = self._block_instances[block_idx]
 
-        target_idx = self._block_to_target.get(block_idx)
-        if target_idx is None:
-            target_idx = self._pool.acquire()
-            self._block_to_target[block_idx] = target_idx
+        target = self._block_to_target.get(block_idx)
+        if target is None:
+            target = self._pool.acquire(
+                self._block_signatures[block_idx], instance,
+            )
+            self._block_to_target[block_idx] = target
 
-        self._pool.wait_if_needed(target_idx, stream)
-        target = self._pool.target(target_idx)
+        self._pool.wait_if_needed(target, stream)
         instance.load_to_target(
             target,
             run_post_copy_hooks=True,
@@ -1263,9 +1323,9 @@ class StreamedComponent:
         self._block_instances[block_idx].restore_pinned()
         if self._pool is None:
             return
-        target_idx = self._block_to_target.pop(block_idx, None)
-        if target_idx is not None:
-            self._pool.release(target_idx)
+        target = self._block_to_target.pop(block_idx, None)
+        if target is not None:
+            self._pool.release(self._block_signatures[block_idx], target)
 
     def _evict_allocated_blocks(self) -> None:
         """Evict every block that currently holds a pool target.
@@ -1288,9 +1348,9 @@ class StreamedComponent:
         self, block_idx: int, event: torch.cuda.Event,
     ) -> None:
         assert self._pool is not None, "_activate_pool not called"
-        target_idx = self._block_to_target.get(block_idx)
-        if target_idx is not None:
-            self._pool.set_compute_event(target_idx, event)
+        target = self._block_to_target.get(block_idx)
+        if target is not None:
+            self._pool.set_compute_event(target, event)
 
     # ------------------------------------------------------------------
     # Drain and teardown
