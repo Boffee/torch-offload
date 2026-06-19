@@ -22,9 +22,13 @@ Lower-level resource bindings:
   :class:`PinnedComponent` and stay GPU-resident while active; set
   ``stream_trainable_weights=True`` to stream in-block trainable weights
   and materialize them only around ``optimizer.step()``. That step runs on
-  the GPU via the ``optimizer_step()`` context; calling ``optimizer.step()``
-  outside ``use()`` instead runs the optimizer on CPU over the pinned
-  weights (state stays on host) — keep such trainables in fp32.
+  the GPU via the ``optimizer_step()`` context. When *every* trainable the
+  optimizer touches is streamed, its ``.grad`` lands on CPU on deactivation,
+  so calling ``optimizer.step()`` outside ``use()`` instead runs the
+  optimizer on CPU over the pinned weights (state stays on host) — keep such
+  trainables in fp32. Non-streamed trainables (the default, or params
+  outside ``blocks_attr`` like embeddings/heads) keep their grad on GPU, so
+  step those inside ``optimizer_step()``.
 
 - :class:`MpsWeights` -- whole-model CPU->MPS materializer. Use for
   frozen models that should become MPS-resident without retaining a
