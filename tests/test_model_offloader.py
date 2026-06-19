@@ -1720,13 +1720,20 @@ class TestActivatePoolIdempotency:
 
 
 class TestBlockLayoutCompatibility:
-    """Block 0 is the pool template; later blocks copy raw bytes into
-    its target. ``Tensor.copy_`` silently casts dtype and silently
-    broadcasts compatible shapes, so mismatches that don't trip the
-    copy_ shape check would silently corrupt forward. The constructor's
-    block layout check rejects them up front."""
+    """Blocks in one streamed group may differ in tensor *layout* — shape,
+    dtype, quant format, storage tying, buffer shape/stride — because the
+    morphing target pool keys reusable GPU targets by per-block layout
+    signature, so a block never copies its bytes into a target shaped for
+    a different layout. What blocks must still share is *structure*: the
+    selected parameter and buffer *name* sets, plus ``requires_grad`` per
+    name (trainable and frozen weights cannot be mixed in one group)."""
 
-    def test_shape_mismatch_raises(self) -> None:
+    @staticmethod
+    def _signatures(component: object) -> list[object]:
+        return component._block_signatures  # type: ignore[attr-defined]
+
+    def test_shape_mismatch_is_supported(self) -> None:
+        # Different weight shapes → distinct pool signatures, not a reject.
         class M(nn.Module):
             def __init__(self):
                 super().__init__()
@@ -1737,58 +1744,29 @@ class TestBlockLayoutCompatibility:
         m = M()
         for p in m.parameters():
             p.requires_grad = False
-        with pytest.raises(ValueError, match="layout differs"):
-            _make_streamed_component(
-                blocks=list(m.blocks),
-                num_resident_blocks=1,
-            )
+        component = _make_streamed_component(
+            blocks=list(m.blocks),
+            num_resident_blocks=1,
+        )
+        assert len(set(self._signatures(component))) == 2
 
-    def test_dtype_mismatch_raises(self) -> None:
-        # Same shape, different dtype: Tensor.copy_ would silently
-        # cast — the silent corruption surface this check exists for.
+    def test_dtype_mismatch_is_supported(self) -> None:
+        # Same shape, different dtype: separate signatures, so no silent
+        # cross-dtype ``copy_``.
         b0 = nn.Linear(4, 4, bias=False).to(torch.float16)
         b1 = nn.Linear(4, 4, bias=False).to(torch.bfloat16)
         for b in (b0, b1):
             for p in b.parameters():
                 p.requires_grad = False
-        with pytest.raises(ValueError, match="layout differs"):
-            _make_streamed_component(
-                blocks=[b0, b1],
-                num_resident_blocks=1,
-            )
+        component = _make_streamed_component(
+            blocks=[b0, b1],
+            num_resident_blocks=1,
+        )
+        assert len(set(self._signatures(component))) == 2
 
-    def test_param_name_mismatch_raises(self) -> None:
-        # Different param names per block — would be a KeyError later;
-        # the check catches it cleanly at construction.
-        class A(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.foo = nn.Parameter(torch.randn(4, 4), requires_grad=False)
-
-        class B(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.bar = nn.Parameter(torch.randn(4, 4), requires_grad=False)
-
-        with pytest.raises(ValueError, match="layout differs"):
-            _make_streamed_component(
-                blocks=[A(), B()],
-                num_resident_blocks=1,
-            )
-
-    def test_requires_grad_mismatch_raises(self) -> None:
-        block_0 = nn.Linear(4, 4, bias=False)
-        block_1 = nn.Linear(4, 4, bias=False)
-        block_0.weight.requires_grad_(False)
-        block_1.weight.requires_grad_(True)
-
-        with pytest.raises(ValueError, match="layout differs"):
-            _make_streamed_component(
-                blocks=[block_0, block_1],
-                num_resident_blocks=1,
-            )
-
-    def test_param_alias_topology_mismatch_raises(self) -> None:
+    def test_param_alias_topology_is_supported(self) -> None:
+        # Differing storage-tying topology → distinct signatures; each
+        # block loads into a target allocated from its own instance.
         class TiedBlock(nn.Module):
             def __init__(self):
                 super().__init__()
@@ -1805,13 +1783,13 @@ class TestBlockLayoutCompatibility:
                 self.q.weight.requires_grad_(False)
                 self.k.weight.requires_grad_(False)
 
-        with pytest.raises(ValueError, match="layout differs"):
-            _make_streamed_component(
-                blocks=[TiedBlock(), UntiedBlock()],
-                num_resident_blocks=1,
-            )
+        component = _make_streamed_component(
+            blocks=[TiedBlock(), UntiedBlock()],
+            num_resident_blocks=1,
+        )
+        assert len(set(self._signatures(component))) == 2
 
-    def test_buffer_shape_mismatch_raises(self) -> None:
+    def test_buffer_shape_mismatch_is_supported(self) -> None:
         class Block(nn.Module):
             def __init__(self, buffer_size: int):
                 super().__init__()
@@ -1820,13 +1798,13 @@ class TestBlockLayoutCompatibility:
                 )
                 self.register_buffer("table", torch.randn(buffer_size))
 
-        with pytest.raises(ValueError, match="buffer layout differs"):
-            _make_streamed_component(
-                blocks=[Block(4), Block(8)],
-                num_resident_blocks=1,
-            )
+        component = _make_streamed_component(
+            blocks=[Block(4), Block(8)],
+            num_resident_blocks=1,
+        )
+        assert len(set(self._signatures(component))) == 2
 
-    def test_buffer_stride_mismatch_raises(self) -> None:
+    def test_buffer_stride_mismatch_is_supported(self) -> None:
         class Block(nn.Module):
             def __init__(self, table: torch.Tensor):
                 super().__init__()
@@ -1840,9 +1818,42 @@ class TestBlockLayoutCompatibility:
         assert contiguous.shape == non_contiguous.shape
         assert contiguous.stride() != non_contiguous.stride()
 
-        with pytest.raises(ValueError, match="buffer layout differs"):
+        # No reject. Pinning clones buffers contiguous, so the two
+        # collapse to one signature — what matters is the old hard layout
+        # check no longer rejects the group.
+        component = _make_streamed_component(
+            blocks=[Block(contiguous), Block(non_contiguous)],
+            num_resident_blocks=1,
+        )
+        assert len(self._signatures(component)) == 2
+
+    def test_param_name_mismatch_raises(self) -> None:
+        # Differing selected param *names* is still a structural reject.
+        class A(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.foo = nn.Parameter(torch.randn(4, 4), requires_grad=False)
+
+        class B(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.bar = nn.Parameter(torch.randn(4, 4), requires_grad=False)
+
+        with pytest.raises(ValueError, match="parameter names differ"):
             _make_streamed_component(
-                blocks=[Block(contiguous), Block(non_contiguous)],
+                blocks=[A(), B()],
+                num_resident_blocks=1,
+            )
+
+    def test_requires_grad_mismatch_raises(self) -> None:
+        block_0 = nn.Linear(4, 4, bias=False)
+        block_1 = nn.Linear(4, 4, bias=False)
+        block_0.weight.requires_grad_(False)
+        block_1.weight.requires_grad_(True)
+
+        with pytest.raises(ValueError, match="requires_grad"):
+            _make_streamed_component(
+                blocks=[block_0, block_1],
                 num_resident_blocks=1,
             )
 
@@ -1863,44 +1874,42 @@ class TestBlockLayoutCompatibility:
                 )
                 self.register_buffer("bar", torch.randn(4))
 
-        with pytest.raises(ValueError, match="buffer layout differs"):
+        with pytest.raises(ValueError, match="buffer names differ"):
             _make_streamed_component(
                 blocks=[A(), B()],
                 num_resident_blocks=1,
             )
 
     def test_failure_leaves_model_unpinned_and_unmutated(self) -> None:
-        # Strong-exception-safety: the validator runs in pass 1
-        # (collect names) before pass 2 (pin) and pass 3 (restore
-        # selected state). On a layout mismatch, the user's Parameter
-        # objects must be the same identities and not pinned.
-        class M(nn.Module):
+        # Strong-exception-safety: structural validation runs before any
+        # pinning, so on a reject the user's Parameter objects keep their
+        # identities and are not pinned.
+        class A(nn.Module):
             def __init__(self):
                 super().__init__()
-                self.blocks = nn.ModuleList(
-                    [nn.Linear(4, 4, bias=False), nn.Linear(8, 8, bias=False)]
-                )
+                self.foo = nn.Parameter(torch.randn(4, 4), requires_grad=False)
 
-        m = M()
-        for p in m.parameters():
-            p.requires_grad = False
+        class B(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.bar = nn.Parameter(torch.randn(4, 4), requires_grad=False)
 
-        original_params = [b.weight for b in m.blocks]
-        original_pinned = [b.weight.is_pinned() for b in m.blocks]
+        blocks = [A(), B()]
+        original_params = [blocks[0].foo, blocks[1].bar]
+        original_pinned = [p.is_pinned() for p in original_params]
 
-        with pytest.raises(ValueError, match="layout differs"):
+        with pytest.raises(ValueError, match="parameter names differ"):
             _make_streamed_component(
-                blocks=list(m.blocks),
+                blocks=blocks,
                 num_resident_blocks=1,
             )
 
-        for block, orig_p, orig_pin in zip(
-            m.blocks, original_params, original_pinned, strict=True,
+        assert blocks[0].foo is original_params[0]
+        assert blocks[1].bar is original_params[1]
+        for param, orig_pin in zip(
+            original_params, original_pinned, strict=True,
         ):
-            assert block.weight is orig_p, (
-                "parameter identity changed despite pre-pin validation failure"
-            )
-            assert block.weight.is_pinned() == orig_pin, (
+            assert param.is_pinned() == orig_pin, (
                 "param was pinned despite pre-pin validation failure"
             )
 
