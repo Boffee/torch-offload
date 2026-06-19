@@ -294,6 +294,74 @@ class TestTrainableParams:
         finally:
             pw.deactivate()
 
+    @CUDA
+    def test_cuda_deactivate_moves_trainable_grad_to_cpu(self) -> None:
+        # A pinned trainable's grad must follow its data to CPU on
+        # deactivate, mirroring the streamed component. Otherwise grads
+        # linger on the GPU (pinning device memory and stranding the
+        # gradient off-host), which breaks the context-free CPU step.
+        torch.manual_seed(0)
+        m = nn.Linear(4, 2, bias=False)
+        pw = _make_model_offloader(m)
+        try:
+            with pw.use("cuda"):
+                m(torch.ones(1, 4, device="cuda")).sum().backward()
+                torch.cuda.synchronize()
+                # Mid-cycle: grad lives on GPU (native AccumulateGrad).
+                assert m.weight.grad is not None
+                assert m.weight.grad.device.type == "cuda"
+
+            # Deactivated: data and grad are both host-resident, and the
+            # grad is preserved (moved, not cleared).
+            assert m.weight.data.device.type == "cpu" and m.weight.is_pinned()
+            assert m.weight.grad is not None
+            assert m.weight.grad.device.type == "cpu"
+        finally:
+            pw.deactivate()
+
+    @CUDA
+    def test_cuda_context_free_cpu_optimizer_step(self) -> None:
+        """A plain ``optimizer.step()`` outside ``use()`` (and outside
+        ``optimizer_step()``) runs the optimizer on CPU over the pinned
+        trainable: Adam state allocates on the host and the in-place update
+        writes through to what the next forward loads. Pins the context-free
+        CPU-optimizer pattern for the pinned (whole-model) path; fp32
+        trainables make the update a correct master-weight update."""
+        torch.manual_seed(0)
+        m = nn.Linear(8, 8, bias=False)
+        pw = _make_model_offloader(m)
+        opt = torch.optim.AdamW(m.parameters(), lr=0.1)
+        try:
+            for _ in range(2):
+                x = torch.randn(4, 8, device="cuda")
+                with pw.use("cuda") as gpu_model:
+                    gpu_model(x).sum().backward()
+
+                # Deactivated: trainable data + grad are host-resident.
+                assert m.weight.device.type == "cpu" and m.weight.is_pinned()
+                assert m.weight.grad is not None
+                assert m.weight.grad.device.type == "cpu"
+
+                before = m.weight.detach().clone()
+                opt.step()  # CPU step — no optimizer_step() context
+                opt.zero_grad(set_to_none=True)
+                assert not torch.equal(m.weight.detach(), before)
+                updated = m.weight.detach().clone()
+
+                # Write-through: the next forward loads the updated weight.
+                with pw.use("cuda"):
+                    assert torch.equal(m.weight.detach().cpu(), updated)
+
+            # The optimizer's state (Adam moments) lives on the host.
+            assert all(
+                not t.is_cuda
+                for state in opt.state.values()
+                for t in state.values()
+                if torch.is_tensor(t)
+            )
+        finally:
+            pw.deactivate()
+
 
 # ---------------------------------------------------------------------------
 # Lifecycle: activate / deactivate

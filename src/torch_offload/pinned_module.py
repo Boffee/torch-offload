@@ -313,6 +313,42 @@ class PinnedModuleInstance:
             non_blocking=non_blocking,
         )
 
+    def move_trainable_grads_to(self, device: torch.device) -> None:
+        """Move each trainable param's ``.grad`` (if any) to ``device``.
+
+        During backward, PyTorch's native ``AccumulateGrad`` writes grads on
+        the param's data device. As ``.data`` is moved between pinned CPU and
+        a GPU target, ``.grad`` keeps living wherever ``AccumulateGrad`` placed
+        it; this realigns grad with data so the optimizer reads both on the
+        same device. Tied params are deduplicated, and ``None`` grads (no
+        backward yet, or ``zero_grad(set_to_none=True)``) are skipped.
+        """
+        for param in self._iter_trainable_params():
+            grad = param.grad
+            if grad is None or grad.device == device:
+                continue
+            moved = grad.to(device)
+            if param.data.device == device:
+                param.grad = moved
+            else:
+                # PyTorch's grad setter rejects cross-device grad/data pairs.
+                # A trainable can transiently have offloaded (pinned-CPU) data
+                # and a GPU grad, so move the grad storage in place instead.
+                grad.data = moved.data
+
+    def _iter_trainable_params(self) -> Iterator[nn.Parameter]:
+        params = dict(self.module.named_parameters(remove_duplicate=False))
+        seen: set[int] = set()
+        for name, pinned in self.params.items():
+            if not pinned.requires_grad:
+                continue
+            param = params[name]
+            param_id = id(param)
+            if param_id in seen:
+                continue
+            seen.add(param_id)
+            yield param
+
 
 def _pin_params(params: Mapping[str, nn.Parameter]) -> dict[str, PinnedParam]:
     pinned_by_name: dict[str, PinnedParam] = {}

@@ -2609,6 +2609,88 @@ class TestTrainingWithCheckpointing:
             )
 
     @CUDA
+    def test_streamed_trainable_cpu_optimizer_step_without_context(self) -> None:
+        """A plain ``optimizer.step()`` outside ``use()`` (and outside
+        ``optimizer_step()``) runs the optimizer on CPU over the pinned
+        trainable weights: states allocate on the host, and the in-place
+        update writes through to what the next forward streams.
+
+        This pins the context-free CPU-optimizer pattern — the offloader
+        leaves the trainable ``.data`` (pinned CPU) and ``.grad`` (CPU) ready
+        for a host-side step, so ``optimizer_step()`` is only needed when you
+        want the step on GPU for speed. fp32 trainables make the in-place
+        update a correct master-weight update.
+        """
+        torch.manual_seed(0)
+
+        class Block(nn.Module):
+            def __init__(self, width: int) -> None:
+                super().__init__()
+                self.lin = nn.Linear(width, width, bias=False)  # trainable
+                self.gradient_checkpointing = True
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                return torch.relu(self.lin(x))
+
+        class M(nn.Module):
+            def __init__(self, width: int, n: int) -> None:
+                super().__init__()
+                self.transformer_blocks = nn.ModuleList(
+                    Block(width) for _ in range(n)
+                )
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                for block in self.transformer_blocks:
+                    x = torch.utils.checkpoint.checkpoint(
+                        block, x, use_reentrant=False
+                    )
+                return x
+
+        m = M(8, 3)
+        offloader = _make_model_offloader(
+            m,
+            blocks_attr="transformer_blocks",
+            num_resident_blocks=1,
+            num_prefetch_blocks=0,
+            stream_trainable_weights=True,
+        )
+        opt = torch.optim.AdamW(m.parameters(), lr=0.1)
+        weight = m.transformer_blocks[0].lin.weight
+        try:
+            for _ in range(2):
+                x = torch.randn(4, 8, device="cuda")
+                with offloader.use("cuda") as gpu_model:
+                    gpu_model(x).sum().backward()
+
+                # Deactivated: trainable data + grad are host-resident.
+                assert weight.device.type == "cpu" and weight.is_pinned()
+                assert weight.grad is not None
+                assert weight.grad.device.type == "cpu"
+
+                before = weight.detach().clone()
+                opt.step()  # CPU step — no optimizer_step() context
+                opt.zero_grad(set_to_none=True)
+                assert not torch.equal(weight.detach(), before)
+                updated = weight.detach().clone()
+
+                # Write-through: the next forward streams the updated weight.
+                with offloader.use("cuda"):
+                    assert torch.equal(
+                        m.transformer_blocks[0].lin.weight.detach().cpu(),
+                        updated,
+                    )
+
+            # The optimizer's state (Adam moments) lives on the host, not GPU.
+            assert all(
+                not t.is_cuda
+                for state in opt.state.values()
+                for t in state.values()
+                if torch.is_tensor(t)
+            )
+        finally:
+            offloader.deactivate()
+
+    @CUDA
     def test_backward_without_checkpointing_raises_in_place_error(self) -> None:
         """Without checkpointing, target reuse during forward bumps the
         version counter on a target tensor whose forward-time reference
