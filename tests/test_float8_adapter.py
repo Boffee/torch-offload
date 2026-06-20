@@ -207,6 +207,32 @@ class TestFloat8Adapter:
         with pytest.raises(ValueError, match="Cannot requantize"):
             Float8Adapter.requantize(torch.randn(8, 4), like=f8)
 
+    def test_requantize_zero_row_does_not_nan(self) -> None:
+        # torchao's from_hp computes scale = amax / fp8_max with no eps
+        # floor, so an all-zero row (per-row scaling) gets scale 0 and
+        # qdata 0/0 = NaN. requantize must repair that to an exact zero row
+        # while leaving the other rows intact.
+        f8 = _make_float8(rows=16, cols=64, dynamic_activation=False)
+        dense = Float8Adapter.dequantize(f8)
+        dense[3] = 0  # one fully cancelled row
+
+        again = Float8Adapter.requantize(dense, like=f8)
+        deq = again.dequantize().to(torch.float32)
+        assert not torch.isnan(deq).any()
+        assert torch.count_nonzero(deq[3]).item() == 0
+        assert torch.count_nonzero(deq[[0, 1, 2, 4]]).item() > 0
+
+    def test_requantize_all_zero_does_not_nan(self) -> None:
+        # Per-tensor scaling: a fully cancelled weight gives a scalar scale
+        # of 0; the repair must still yield a clean all-zero tensor.
+        f8 = _make_float8(rows=16, cols=16, per_tensor=True)
+        again = Float8Adapter.requantize(
+            torch.zeros(16, 16, dtype=torch.float32), like=f8
+        )
+        deq = again.dequantize().to(torch.float32)
+        assert not torch.isnan(deq).any()
+        assert torch.count_nonzero(deq).item() == 0
+
     def test_lora_transform_requantizes_param_in_place(self) -> None:
         float8_tensor_cls, _, per_row_cls, _ = _float8_modules()
         rows, cols, rank = 4, 8, 2
