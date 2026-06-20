@@ -10,11 +10,19 @@ this module supplies the NVFP4-specific hooks. The two global scales are
 optional, represented as ``None`` entries in the storage tuple so the
 base's clone/alloc/copy/accounting skip them.
 
-The adapter exposes inference movement only. NVFP4 model weights are
-treated as frozen: no CPU round-trip, no trainable ``Parameter.data``
-swap, and no activation-scoped dense ``addmm_`` LoRA merge. Routed LoRA
-remains possible when the owning module is a logical ``nn.Linear`` with
-compatible shape/dtype.
+Beyond inference movement, this adapter opts into dequantize/requantize
+plus ``copy_into``, enabling merged (permanent) LoRA on NVFP4 bases.
+Requantization re-derives the FP8 (E4M3) block scales — and, for
+two-level scaling, the global ``per_tensor_scale`` — from the merged
+values via the public ``NVFP4Tensor.to_nvfp4``; like any merge into a
+quantized base it is lossy, and NVFP4's 4-bit grid makes it coarse, so
+choosing merge vs routed (non-destructive) LoRA is the caller's tradeoff.
+
+It does not opt into CPU round-trip or trainable ``Parameter.data`` swap:
+the quant state lives in the wrapper object, not its bytes, so NVFP4
+weights stay frozen for streaming/training. Routed LoRA remains the
+non-destructive alternative when the owning module is a logical
+``nn.Linear`` with compatible shape/dtype.
 """
 
 from __future__ import annotations
@@ -26,12 +34,14 @@ import torch
 
 from ._torchao_nvfp4 import (
     create_nvfp4_tensor,
+    dequantize_nvfp4_tensor,
     is_nvfp4_tensor,
+    requantize_nvfp4_tensor,
     require_nvfp4_tensor,
     validate_layout,
 )
 from .tensor_adapters import metadata_key
-from .torchao_structured_adapter import TorchaoStructuredAdapter
+from .torchao_structured_adapter import TorchaoStructuredAdapter, copy_storage_into
 
 
 @dataclass(slots=True, frozen=True)
@@ -109,3 +119,24 @@ class Nvfp4Adapter(TorchaoStructuredAdapter[_Nvfp4Meta]):
     @staticmethod
     def _compute_dtype(t: Any) -> torch.dtype:  # noqa: ANN401
         return t.orig_dtype
+
+    # --- capabilities beyond inference movement ---------------------------
+
+    @staticmethod
+    def dequantize(t: torch.Tensor) -> torch.Tensor:
+        return dequantize_nvfp4_tensor(t)
+
+    @staticmethod
+    def requantize(t: torch.Tensor, *, like: torch.Tensor) -> torch.Tensor:
+        return requantize_nvfp4_tensor(t, like=like)
+
+    @staticmethod
+    def copy_into(src: torch.Tensor, *, target: torch.Tensor) -> None:
+        # Fill target's present storage slots (packed FP4 + E4M3 block
+        # scales, plus the optional global per-tensor/activation scales)
+        # from the requantized src, preserving target's wrapper identity.
+        copy_storage_into(
+            Nvfp4Adapter._storage_of(require_nvfp4_tensor(src)),
+            Nvfp4Adapter._storage_of(require_nvfp4_tensor(target)),
+            non_blocking=False,
+        )

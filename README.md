@@ -27,7 +27,7 @@ to be lifted into its own package when a second consumer appears.
 | `tensor_adapter_registry.py` | Internal adapter dispatch and tensor-identity helpers |
 | `module_names.py` | Internal name traversal and mutation helpers |
 | `_quanto.py` | Internal: optimum-quanto optional-import + layout validation; consumed by `quanto_adapter.py` and `merge.py` |
-| `_torchao_nvfp4.py` | Internal: TorchAO NVFP4 optional-import + layout validation; consumed by `nvfp4_adapter.py` |
+| `_torchao_nvfp4.py` | Internal: TorchAO NVFP4 optional-import + layout validation and dequant/requant; consumed by `nvfp4_adapter.py` |
 | `_torchao_mx.py` | Internal: TorchAO MX (MXFP8 / MXFP4) optional-import + layout validation, supported-dtype gate, and dequant/requant; consumed by `mx_adapter.py` |
 | `_torchao_float8.py` | Internal: TorchAO scaled-FP8 optional-import + layout validation and dequant/requant; consumed by `float8_adapter.py` |
 | `_torchao_int8.py` | Internal: TorchAO INT8 optional-import + layout validation and dequant/requant; consumed by `int8_adapter.py` |
@@ -680,8 +680,8 @@ success but silently leaves `_data` untouched). Use
 ## TorchAO NVFP4 support
 
 TorchAO NVFP4 weights
-(`torchao.prototype.mx_formats.nvfp4_tensor.NVFP4Tensor`) are handled as
-frozen inference weights when the `nvfp4` optional extra is installed.
+(`torchao.prototype.mx_formats.nvfp4_tensor.NVFP4Tensor`) are handled
+when the `nvfp4` optional extra is installed.
 `PinnedParam` pins the packed FP4 `qdata`, FP8 block `scale`,
 optional per-tensor scales, and the TorchAO dispatch metadata, then
 rebuilds the `NVFP4Tensor` wrapper around GPU storage on activation.
@@ -694,11 +694,23 @@ For uv-managed installs on Linux/Windows, this repo routes `torch` and
 `pytest tests/test_nvfp4_adapter.py -q -rs` to exercise the optional
 TorchAO NVFP4 coverage.
 
-NVFP4 support is intentionally model-weight only. The adapter does not
-opt into CPU round-trip, trainable `Parameter.data` swap, or activation
-merge-mode LoRA. Use routed LoRA when the target module is a logical
-`nn.Linear` with compatible shape and compute dtype. Permanent
-`merge_lora()` does not bake into NVFP4 weights.
+NVFP4 weights support merged LoRA: the adapter exposes
+dequantize/requantize plus `copy_into`, so both `set_loras(mode="merge")`
+and permanent `merge_lora()` re-derive the FP8 (E4M3) block scales — and,
+for two-level scaling, the global `per_tensor_scale` — from the merged
+values via `NVFP4Tensor.to_nvfp4`. Re-encoding uses the torch reference
+path (`use_triton_kernel=False`), which produces the identical
+swizzled-scale layout without NVFP4's optional Triton/`mslk` dependency;
+the merged bytes are copied into the existing wrapper, which keeps its own
+`use_triton_kernel` flag for the forward matmul. Like any merge into a
+quantized base it is lossy, and NVFP4's 4-bit grid makes it coarse, so
+choosing merge vs routed LoRA is the caller's tradeoff.
+
+The adapter does not opt into CPU round-trip or trainable
+`Parameter.data` swap: the quant state lives in the wrapper object, not
+its bytes, so NVFP4 weights stay frozen for streaming/training. Routed
+LoRA remains the non-destructive alternative when the target module is a
+logical `nn.Linear` with compatible shape and compute dtype.
 
 ## TorchAO MX (MXFP8 / MXFP4) support
 
@@ -745,8 +757,8 @@ storage on activation. Per-row and per-tensor scale granularities are
 supported; fp8 matmul execution requires SM89+ (Ada/Hopper or newer)
 CUDA hardware.
 
-Like MX and INT8 (but unlike NVFP4), scaled-fp8 weights support merged
-LoRA: the adapter exposes dequantize/requantize plus `copy_into`, so both
+Like MX, INT8, and NVFP4, scaled-fp8 weights support merged LoRA: the
+adapter exposes dequantize/requantize plus `copy_into`, so both
 `set_loras(mode="merge")` and permanent `merge_lora()` work by
 dequantizing to dense, applying the delta, and re-encoding with
 recomputed scales through the public `Float8Tensor.from_hp` (lossy but

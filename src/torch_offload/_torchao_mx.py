@@ -153,6 +153,18 @@ def requantize_mx_tensor(
             f"Cannot requantize tensor with shape {tuple(t.shape)} like "
             f"MXTensor with shape {tuple(mx.shape)}."
         )
+    if not mx.qdata.is_contiguous():
+        # A transposed/strided MX weight has a packed layout the re-encode
+        # (which always produces the standard contiguous packing) can
+        # neither consume nor fill — to_mx rejects non-contiguous input and
+        # the block partition would not line up. Reject early with an
+        # actionable error rather than an opaque kernel assertion.
+        raise ValueError(
+            "Cannot merge LoRA into a non-contiguous (e.g. transposed) MX "
+            "weight: requantization produces the standard packed layout, "
+            "which cannot fill a transposed target. Use routed LoRA for "
+            "this weight."
+        )
     scaling_mode = getattr(mx.act_quant_kwargs, "scaling_mode", None)
     scaling_mode_kwarg = {} if scaling_mode is None else {"scaling_mode": scaling_mode}
     return MXTensor.to_mx(
