@@ -189,7 +189,7 @@ def _expected_merged_weight(
         factors = lora.targets.get(target_name)
         if factors is None:
             continue
-        a, b = factors
+        a, b = factors.a, factors.b
         out.addmm_(
             b.to(device=out.device, dtype=out.dtype),
             a.to(device=out.device, dtype=out.dtype),
@@ -214,7 +214,7 @@ def _expected_routed_output(
             factors = lora.targets.get(target_name)
             if factors is None:
                 continue
-            a, b = factors
+            a, b = factors.a, factors.b
             a_parts.append(a.to(device=h.device, dtype=h.dtype))
             b_part = b.to(device=h.device, dtype=h.dtype).clone()
             b_part.mul_(strength)
@@ -326,9 +326,9 @@ class TestLoRAConstruction:
 
     def test_factors_are_pinned(self) -> None:
         lora = _make_lora(4, 16)
-        for a, b in lora.targets.values():
-            assert a.is_pinned()
-            assert b.is_pinned()
+        for factor in lora.targets.values():
+            assert factor.a.is_pinned()
+            assert factor.b.is_pinned()
 
     def test_cache_bytes(self) -> None:
         lora = _make_lora(4, 16, rank=4)
@@ -800,7 +800,8 @@ class TestMergeCorrectness:
         _set_loras(s, [(lora, 0.5)])
         s.activate("cuda")
         try:
-            a, b = lora.targets["embed.weight"]
+            factor = lora.targets["embed.weight"]
+            a, b = factor.a, factor.b
             expected = (
                 captured_embed + 0.5 * (b.to(torch.bfloat16) @ a.to(torch.bfloat16))
             ).to("cuda")
@@ -963,7 +964,8 @@ class TestLoRATransform:
             "embed.lora_B.weight": torch.randn(rows, rank),
         }
         lora = LoRA(state_dict=sd, key_transform=None)
-        a, b = lora.targets["embed.weight"]
+        factor = lora.targets["embed.weight"]
+        a, b = factor.a, factor.b
         # Compute the reference on CUDA, matching the device the offloader
         # merges on. A CPU reference flips occasional int8 elements at
         # quantization bucket edges (CPU vs CUDA round-to-nearest), and the
@@ -1018,7 +1020,8 @@ class TestLoRATransform:
             "transformer_blocks.0.attn.lora_B.weight": torch.randn(rows, rank),
         }
         lora = LoRA(state_dict=sd, key_transform=None)
-        a, b = lora.targets["transformer_blocks.0.attn.weight"]
+        factor = lora.targets["transformer_blocks.0.attn.weight"]
+        a, b = factor.a, factor.b
         expected_dense = original_qt.dequantize().to(torch.float32)
         expected_dense.addmm_(b.to(torch.float32), a.to(torch.float32), alpha=0.5)
         expected_packed = (
@@ -1064,7 +1067,8 @@ class TestPermanentMerge:
             "target.lora_B.weight": torch.randn(rows, rank),
         }
         lora = LoRA(state_dict=sd, key_transform=None)
-        a, b = lora.targets["target.weight"]
+        factor = lora.targets["target.weight"]
+        a, b = factor.a, factor.b
 
         expected_dense = qt.dequantize().to(torch.float32)
         expected_dense.addmm_(b.to(torch.float32), a.to(torch.float32), alpha=0.5)
@@ -1093,7 +1097,8 @@ class TestPermanentMerge:
             "head.lora_B.weight": torch.randn(16, 4),
         }
         lora = LoRA(state_dict=sd, key_transform=None)
-        a, b = lora.targets["head.weight"]
+        factor = lora.targets["head.weight"]
+        a, b = factor.a, factor.b
 
         merged = merge_lora(m, [(lora, 0.25)])
 
@@ -1143,7 +1148,8 @@ class TestPermanentMerge:
             "target.lora_B.weight": torch.randn(16, 4),
         }
         lora = LoRA(state_dict=sd, key_transform=None)
-        a, b = lora.targets["target.weight"]
+        factor = lora.targets["target.weight"]
+        a, b = factor.a, factor.b
 
         merged = merge_lora(m, [(lora, 0.5)])
 
@@ -1484,9 +1490,8 @@ class TestRoutedMode:
                 )
                 lora = loras[0][0]
                 strength = loras[0][1]
-                a, b = lora.targets[
-                    f"transformer_blocks.{i}.attn.weight"
-                ]
+                factor = lora.targets[f"transformer_blocks.{i}.attn.weight"]
+                a, b = factor.a, factor.b
                 a_dev = a.to(device=h.device, dtype=h.dtype)
                 b_dev = b.to(device=h.device, dtype=h.dtype)
                 attn_out = base_attn + strength * (h @ a_dev.T @ b_dev.T)

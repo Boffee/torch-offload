@@ -48,6 +48,7 @@ __all__ = [
     "FusedLoRAFactors",
     "KeyTransformT",
     "LoRA",
+    "LoRAFactor",
     "LoRARouteHandle",
     "LoRATransform",
     "ScaledLoRAFactor",
@@ -59,21 +60,19 @@ KeyTransformT = Callable[[str], str] | None
 
 
 @dataclass(slots=True, frozen=True)
-class ScaledLoRAFactor:
-    """One LoRA's scaled contribution to a single target weight.
+class LoRAFactor:
+    """A LoRA's pinned factor pair for one target weight.
 
     ``a`` is the ``(rank, in_dim)`` down-projection and ``b`` the
-    ``(out_dim, rank)`` up-projection; the contribution to the base weight
-    is ``strength * (b @ a)``. The factor pair is intrinsic to the LoRA;
-    ``strength`` is extrinsic — it is fixed when the LoRA is bound to a
-    target (e.g. via ``set_loras``). Per-pair shape validity is checked at
-    construction; the match against a concrete target shape is checked
-    separately, where the target is known.
+    ``(out_dim, rank)`` up-projection. Strength is *not* part of the pair —
+    it is extrinsic and supplied when the LoRA is bound to a target (see
+    :meth:`scaled` / :class:`ScaledLoRAFactor`). Per-pair shape validity is
+    checked at construction; the match against a concrete target shape is
+    checked separately, where the target is known.
     """
 
     a: torch.Tensor
     b: torch.Tensor
-    strength: float
 
     def __post_init__(self) -> None:
         if self.a.ndim != 2 or self.b.ndim != 2 or self.a.shape[0] != self.b.shape[1]:
@@ -97,6 +96,21 @@ class ScaledLoRAFactor:
     def produced_shape(self) -> tuple[int, int]:
         """Shape of ``b @ a`` — the base-weight shape this factor targets."""
         return (self.b.shape[0], self.a.shape[1])
+
+    def scaled(self, strength: float) -> ScaledLoRAFactor:
+        """Bind this factor pair to an application ``strength``."""
+        return ScaledLoRAFactor(self.a, self.b, strength)
+
+
+@dataclass(slots=True, frozen=True)
+class ScaledLoRAFactor(LoRAFactor):
+    """A :class:`LoRAFactor` bound to the ``strength`` it is applied at.
+
+    The contribution to the base weight is ``strength * (b @ a)``; strength
+    is fixed when the LoRA is bound to a target (e.g. via ``set_loras``).
+    """
+
+    strength: float
 
 
 @dataclass(slots=True, frozen=True)
@@ -209,13 +223,13 @@ class LoRA:
         self._factors = _pair_and_pin(state_dict, key_transform)
 
     @property
-    def targets(self) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
-        """Map of target weight name to (A_pinned, B_pinned)."""
+    def targets(self) -> dict[str, LoRAFactor]:
+        """Map of target weight name to its pinned :class:`LoRAFactor`."""
         return self._factors
 
     @property
     def cache_bytes(self) -> int:
-        return sum(a.nbytes + b.nbytes for a, b in self._factors.values())
+        return sum(factor.a.nbytes + factor.b.nbytes for factor in self._factors.values())
 
     @property
     def value(self) -> LoRA:
@@ -443,7 +457,7 @@ class LoRARouteHandle:
 def _pair_and_pin(
     state_dict: dict[str, torch.Tensor],
     key_transform: KeyTransformT,
-) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
+) -> dict[str, LoRAFactor]:
     a_tensors: dict[str, torch.Tensor] = {}
     b_tensors: dict[str, torch.Tensor] = {}
     for key, tensor in state_dict.items():
@@ -463,7 +477,7 @@ def _pair_and_pin(
             f".lora_A.weight and .lora_B.weight."
         )
 
-    factors: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+    factors: dict[str, LoRAFactor] = {}
     for base_key, a in a_tensors.items():
         b = b_tensors[base_key]
         target_key = f"{base_key}.weight"
@@ -486,7 +500,7 @@ def _pair_and_pin(
             raise ValueError(
                 f"Duplicate LoRA target {target_key!r}: key_transform mapped multiple source keys to the same target."
             )
-        factors[target_key] = (
+        factors[target_key] = LoRAFactor(
             a.contiguous().pin_memory(),
             b.contiguous().pin_memory(),
         )

@@ -410,7 +410,7 @@ class ModelOffloader:
             for param_name in param_names
         }
         for lora, strength in loras:
-            for target_key, (a, b) in lora.targets.items():
+            for target_key, factor in lora.targets.items():
                 param_name = canonical_param_names.get(target_key)
                 if param_name is None:
                     sample_index = sorted(canonical_param_names)[:3]
@@ -421,7 +421,7 @@ class ModelOffloader:
                         f"keys: {sample_index} ..."
                     )
                 per_param.setdefault(param_name, []).append(
-                    ScaledLoRAFactor(a, b, strength)
+                    factor.scaled(strength)
                 )
 
         return per_param

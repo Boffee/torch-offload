@@ -106,7 +106,7 @@ Compatibility
 """
 
 from .gguf_adapter import GGUFWeight
-from .lora import FusedLoRAFactors, LoRA, LoRATransform, ScaledLoRAFactor
+from .lora import FusedLoRAFactors, LoRA, LoRAFactor, LoRATransform, ScaledLoRAFactor
 from .merge import merge_lora
 from .model_cache import (
     DuplicateModelKeyError,
@@ -146,6 +146,7 @@ __all__ = [
     "GGUFWeight",
     "LRUEvictionPolicy",
     "LoRA",
+    "LoRAFactor",
     "LoRASpec",
     "LoRATransform",
     "ModelCache",
