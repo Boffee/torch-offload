@@ -8,7 +8,13 @@ import pytest
 import torch
 from torch import nn
 
-from torch_offload import LoRA, ModelOffloader, ModelOffloaderStore, merge_lora
+from torch_offload import (
+    LoRA,
+    LoRATransform,
+    ModelOffloader,
+    ModelOffloaderStore,
+    merge_lora,
+)
 from torch_offload.nvfp4_adapter import Nvfp4Adapter
 from torch_offload.pinned_param import PinnedParam
 from torch_offload.tensor_adapter_registry import tensor_id
@@ -72,6 +78,27 @@ def _make_nvfp4(
         is_swizzled_scales=swizzled,
         use_triton_kernel=False,
         act_quant_kwargs=act_quant_kwargs,
+    )
+
+
+def _make_nvfp4_amax(
+    *, rows: int = 16, cols: int = 64, swizzled: bool = True,
+) -> torch.Tensor:
+    """NVFP4 weight whose two-level ``per_tensor_scale`` is amax-derived,
+    matching the real ``quantize_`` configs — so a dequant/requant round
+    trip reproduces the representation exactly (requantize recomputes the
+    same amax-derived global scale)."""
+    nvfp4_tensor_cls, _ = _nvfp4_modules()
+    mod = pytest.importorskip("torchao.prototype.mx_formats.nvfp4_tensor")
+    weight = torch.randn(rows, cols, dtype=torch.bfloat16)
+    per_tensor_scale = mod.per_tensor_amax_to_scale(
+        weight.abs().max().to(torch.float32)
+    )
+    return nvfp4_tensor_cls.to_nvfp4(
+        weight,
+        per_tensor_scale=per_tensor_scale,
+        is_swizzled_scales=swizzled,
+        use_triton_kernel=False,
     )
 
 
@@ -151,27 +178,93 @@ class TestNvfp4Adapter:
         with pytest.raises(NotImplementedError, match="Parameter.data-swap"):
             pinned_param.validate_parameter_data_swap_target()
 
-    def test_merge_lora_rejects_nvfp4_weight(self) -> None:
+    @pytest.mark.parametrize("swizzled", [False, True])
+    def test_dequantize_requantize_preserves_representation(
+        self, swizzled: bool
+    ) -> None:
+        nvfp4_cls, _ = _nvfp4_modules()
+        # Amax-derived per-tensor scale (as the real configs produce) makes
+        # the round trip exact: requantize recomputes the same global scale.
+        nv = _make_nvfp4_amax(rows=16, cols=64, swizzled=swizzled)
+        dense = Nvfp4Adapter.dequantize(nv)
+        assert dense.dtype is torch.float32
+        torch.testing.assert_close(
+            dense, nv.dequantize(nv.orig_dtype).to(torch.float32)
+        )
+
+        again = Nvfp4Adapter.requantize(dense, like=nv)
+        assert isinstance(again, nvfp4_cls)
+        assert again.block_size == nv.block_size
+        assert again.orig_dtype == nv.orig_dtype
+        assert again.is_swizzled_scales == nv.is_swizzled_scales
+        assert (again.per_tensor_scale is None) == (nv.per_tensor_scale is None)
+        # Re-encoding uses the torch path; the swizzled layout and packed
+        # bytes match the original regardless of its use_triton_kernel flag.
+        assert torch.equal(again.qdata, nv.qdata)
+        assert torch.equal(
+            again.scale.view(torch.uint8), nv.scale.view(torch.uint8)
+        )
+
+    def test_requantize_rejects_shape_mismatch(self) -> None:
+        nv = _make_nvfp4(rows=16, cols=64)
+        with pytest.raises(ValueError, match="Cannot requantize"):
+            Nvfp4Adapter.requantize(torch.randn(64, 16), like=nv)
+
+    def test_lora_transform_requantizes_param_in_place(self) -> None:
+        nvfp4_cls, _ = _nvfp4_modules()
+        rows, cols, rank = 16, 64, 2
+        nv = _make_nvfp4(rows=rows, cols=cols, dynamic_activation=False)
+        param = nn.Parameter(nv, requires_grad=False)
+        a = torch.randn(rank, cols)
+        b = torch.randn(rows, rank)
+        transform = LoRATransform([(a, b, 0.5)])
+        original_param = param
+        original_qdata_ptr = param.data.qdata.data_ptr()
+
+        # Mirror the merge path exactly so the comparison is deterministic.
+        expected_dense = nv.dequantize(nv.orig_dtype).to(torch.float32)
+        expected_dense.addmm_(b.to(torch.float32), a.to(torch.float32), alpha=0.5)
+        expected = Nvfp4Adapter.requantize(expected_dense, like=nv)
+
+        transform.apply(param)
+
+        # copy_into mutates the existing wrapper's storage in place, so the
+        # Parameter object and its packed-FP4 buffer keep their identity.
+        assert param is original_param
+        assert param.data.qdata.data_ptr() == original_qdata_ptr
+        assert isinstance(param.data, nvfp4_cls)
+        assert torch.equal(param.data.qdata, expected.qdata)
+        assert torch.equal(
+            param.data.scale.view(torch.uint8), expected.scale.view(torch.uint8)
+        )
+
+    def test_merge_lora_merges_nvfp4_weight(self) -> None:
         class M(nn.Module):
             def __init__(self) -> None:
                 super().__init__()
-                self.lin = nn.Linear(16, 16, bias=False, dtype=torch.bfloat16)
+                self.lin = nn.Linear(64, 16, bias=False, dtype=torch.bfloat16)
 
         model = M()
         model.lin.weight.requires_grad = False
         model.lin.weight = nn.Parameter(
-            _make_nvfp4(dynamic_activation=False),
+            _make_nvfp4(rows=16, cols=64, dynamic_activation=False),
             requires_grad=False,
         )
+        # copy_into mutates the weight's storage in place, so snapshot the
+        # original packed bytes rather than holding a tensor ref.
+        original_qdata = model.lin.weight.data.qdata.clone()
         lora = LoRA(
             state_dict={
-                "lin.lora_A.weight": torch.randn(4, 16),
+                "lin.lora_A.weight": torch.randn(4, 64),
                 "lin.lora_B.weight": torch.randn(16, 4),
             }
         )
 
-        with pytest.raises(ValueError, match="Nvfp4Adapter.*routed LoRA"):
-            merge_lora(model, [(lora, 1.0)])
+        merged = merge_lora(model, [(lora, 1.0)])
+
+        assert merged == 1
+        assert isinstance(model.lin.weight.data, _nvfp4_modules()[0])
+        assert not torch.equal(model.lin.weight.data.qdata, original_qdata)
 
     @CUDA
     def test_allocate_copy_make_gpu_param_preserves_wrapper(self) -> None:
@@ -235,6 +328,90 @@ class TestNvfp4Adapter:
             assert y.dtype is torch.bfloat16
         finally:
             strategy.deactivate()
+
+    @CUDA
+    def test_streamed_nvfp4_merge_requantizes_on_activate(self) -> None:
+        nvfp4_mod = pytest.importorskip("torchao.prototype.mx_formats.nvfp4_tensor")
+        nvfp4_cls, kwargs_cls = _nvfp4_modules()
+
+        def _quantize(weight: torch.Tensor) -> torch.Tensor:
+            return nvfp4_cls.to_nvfp4(
+                weight,
+                per_tensor_scale=nvfp4_mod.per_tensor_amax_to_scale(
+                    torch.max(torch.abs(weight))
+                ),
+                is_swizzled_scales=True,
+                use_triton_kernel=False,
+                act_quant_kwargs=kwargs_cls(
+                    is_swizzled_scales=True,
+                    use_dynamic_per_tensor_scale=True,
+                    use_triton_kernel=False,
+                ),
+            )
+
+        class M(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.blocks = nn.ModuleList(
+                    [
+                        nn.Linear(64, 64, bias=False, dtype=torch.bfloat16),
+                        nn.Linear(64, 64, bias=False, dtype=torch.bfloat16),
+                    ]
+                )
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                for block in self.blocks:
+                    x = block(x)
+                return x
+
+        model = M()
+        for block in model.blocks:
+            block.weight.requires_grad = False
+            block.weight = nn.Parameter(
+                _quantize(block.weight.detach().contiguous()),
+                requires_grad=False,
+            )
+        nv = model.blocks[0].weight.data
+        rank = 4
+        a = torch.randn(rank, 64)
+        b = torch.randn(64, rank)
+        lora = LoRA(
+            state_dict={
+                "blocks.0.lora_A.weight": a,
+                "blocks.0.lora_B.weight": b,
+            }
+        )
+        # Reference on CUDA, matching the device the offloader merges on: the
+        # offloader merges into a byte-identical GPU copy of the weight.
+        nv_cuda = nv.cuda()
+        expected_dense = nv_cuda.dequantize(nv.orig_dtype).to(torch.float32)
+        expected_dense.addmm_(
+            b.cuda().to(torch.float32), a.cuda().to(torch.float32), alpha=0.5
+        )
+        expected = Nvfp4Adapter.requantize(expected_dense, like=nv_cuda)
+
+        offloader = _make_model_offloader(
+            model,
+            blocks_attr="blocks",
+            num_resident_blocks=1,
+            num_prefetch_blocks=0,
+        )
+        offloader.set_loras([lora], strengths=[0.5], mode="merge")
+
+        try:
+            x = torch.randn(8, 64, dtype=torch.bfloat16, device="cuda")
+            with offloader.use("cuda") as active:
+                merged = active.blocks[0].weight.data
+                assert isinstance(merged, nvfp4_cls)
+                torch.testing.assert_close(
+                    merged.dequantize(nv.orig_dtype).to(torch.float32),
+                    expected.dequantize(nv.orig_dtype).to(torch.float32),
+                )
+                y = active(x)
+                torch.cuda.synchronize()
+            assert y.shape == (8, 64)
+        finally:
+            offloader.deactivate()
 
     @CUDA
     def test_model_offloader_routed_lora_on_dynamic_nvfp4(self) -> None:
