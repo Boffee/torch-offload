@@ -210,6 +210,45 @@ class TestNvfp4Adapter:
         with pytest.raises(ValueError, match="Cannot requantize"):
             Nvfp4Adapter.requantize(torch.randn(64, 16), like=nv)
 
+    def test_requantize_rejects_non_scalar_per_tensor_scale(self) -> None:
+        # A non-scalar per_tensor_scale (per-expert grouped/MoE scales) is
+        # not constructible via to_nvfp4 today, and a 3-D weight is rejected
+        # earlier by LoRA factor-shape validation — but guard requantize
+        # itself so a future per-expert layout fails loudly instead of
+        # collapsing every expert to one global scale. Build it through the
+        # raw wrapper to exercise the guard.
+        from torch_offload._torchao_nvfp4 import create_nvfp4_tensor
+
+        nvfp4_cls, _ = _nvfp4_modules()
+        mod = pytest.importorskip("torchao.prototype.mx_formats.nvfp4_tensor")
+        experts, n, k = 4, 64, 64
+        weight = torch.randn(experts, n, k, dtype=torch.bfloat16)
+        base = nvfp4_cls.to_nvfp4(
+            weight,
+            per_tensor_scale=mod.per_tensor_amax_to_scale(
+                weight.abs().max().to(torch.float32)
+            ),
+            is_swizzled_scales=False,
+            use_triton_kernel=False,
+        )
+        per_expert = create_nvfp4_tensor(
+            base.qdata,
+            base.scale,
+            base.block_size,
+            base.orig_dtype,
+            torch.rand(experts, 1, 1, dtype=torch.float32),
+            None,
+            base.is_swizzled_scales,
+            base.use_triton_kernel,
+            base.act_quant_kwargs,
+        )
+        assert per_expert.per_tensor_scale.numel() == experts
+        with pytest.raises(ValueError, match="non-scalar per_tensor_scale"):
+            Nvfp4Adapter.requantize(
+                torch.randn(experts, n, k, dtype=torch.float32),
+                like=per_expert,
+            )
+
     def test_merge_rejects_transposed_weight(self) -> None:
         # A transposed NVFP4 weight has non-contiguous packed qdata, which
         # the standard-layout re-encode cannot fill. The adapter preserves

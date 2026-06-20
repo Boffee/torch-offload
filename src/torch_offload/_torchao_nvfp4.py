@@ -140,11 +140,25 @@ def requantize_nvfp4_tensor(
             "layout, which cannot fill a transposed target. Use routed LoRA "
             "for this weight."
         )
-    per_tensor_scale = (
-        per_tensor_amax_to_scale(t.detach().abs().max())
-        if nv.per_tensor_scale is not None
-        else None
-    )
+    per_tensor_scale = None
+    if nv.per_tensor_scale is not None:
+        if nv.per_tensor_scale.numel() != 1:
+            # The merge recomputes one global per-tensor scale from the
+            # merged amax. A non-scalar per_tensor_scale (e.g. per-expert
+            # scales on a 3-D grouped/MoE weight) would be collapsed to a
+            # single global range — silently dropping per-group precision,
+            # with copy_into broadcasting the scalar across every slot.
+            # TorchAO's to_nvfp4 only accepts a scalar per_tensor_scale
+            # today (and a 3-D weight is rejected earlier by LoRA
+            # factor-shape validation), so this guards a future layout:
+            # reject it loudly rather than collapse it.
+            raise ValueError(
+                "Cannot merge LoRA into an NVFP4 weight with a non-scalar "
+                "per_tensor_scale (e.g. per-expert grouped/MoE scales); the "
+                "merge recomputes a single global scale and would drop "
+                "per-group precision. Use routed LoRA for this weight."
+            )
+        per_tensor_scale = per_tensor_amax_to_scale(t.detach().abs().max())
     return NVFP4Tensor.to_nvfp4(
         t.to(dtype=nv.orig_dtype),
         block_size=nv.block_size,
