@@ -19,10 +19,10 @@ to be lifted into its own package when a second consumer appears.
 | `streamed_component.py` | `StreamedComponentStore`, `StreamedComponent` — lower-level streamed backing storage plus per-block-list streaming component |
 | `lora.py` | `LoRA`, `LoRATransform`, `LoRARouteHandle` — pinned factor storage + merge / routed-hook application |
 | `merge.py` | `merge_lora()` — permanent in-place LoRA merge into base weights (alternative to `set_loras`) |
-| `pinned_param.py` | `PinnedParam` — per-parameter pinning primitive (handles quanto, GGUF, and TorchAO NVFP4 / MX (MXFP8, MXFP4) / scaled-FP8 / INT8 / INT4 tile-packed via adapters) |
+| `pinned_param.py` | `PinnedParam` — per-parameter pinning primitive (handles plain tensors, quanto, GGUF, bitsandbytes, DTensor, and TorchAO scaled-FP8 / INT8 / MX (MXFP8, MXFP4) / NVFP4 / INT4 tile-packed via adapters; see [Quantized weight support](#quantized-weight-support)) |
 | `pinned_module.py` | Internal name-keyed pinned module storage plus concrete module bindings |
 | `tensor_adapters.py`, `quanto_adapter.py`, `gguf_adapter.py`, `nvfp4_adapter.py`, `mx_adapter.py`, `float8_adapter.py`, `int8_adapter.py`, `int4_tile_adapter.py`, `dtensor_adapter.py`, `gguf_dequant.py` | Tensor adapter contracts/implementations and optional optimum-quanto / gguf / torchao / DTensor support |
-| `torchao_structured_adapter.py` | Internal: shared `TorchaoStructuredAdapter` base for the TorchAO subclass adapters (NVFP4 / MX / scaled-FP8) — common pin/move/identity mechanics + per-format hooks; capabilities beyond inference movement are opted into per subclass |
+| `torchao_structured_adapter.py` | Internal: shared `TorchaoStructuredAdapter` base for the TorchAO subclass adapters (scaled-FP8 / INT8 / MX / NVFP4 / INT4 tile-packed) — common pin/move/identity mechanics + per-format hooks; capabilities beyond inference movement (CPU round-trip, dequant/requant LoRA merge) are opted into per subclass |
 | `dtensor_adapter.py` | Internal: movement-only `DTensorAdapter` for tensor-parallel `DTensor` weights — composes with every other adapter by delegating the local shard to the registry and replaying the `(mesh, placements)` wrapper; frozen-inference scope (see `_dtensor.py`) |
 | `tensor_adapter_registry.py` | Internal adapter dispatch and tensor-identity helpers |
 | `module_names.py` | Internal name traversal and mutation helpers |
@@ -280,8 +280,12 @@ from torch_offload import merge_lora, LoRA
 merge_lora(model, [(LoRA(state_dict=load_file("lora.safetensors")), 0.8)])
 ```
 
-This dequantizes-and-requantizes for quanto bases (lossy but
-standard) and uses an in-place `addmm_` for fp/bf bases. Unlike
+This uses an in-place `addmm_` for plain fp/bf bases and
+dequantize/requantize for quantized bases that expose it (quanto,
+bitsandbytes, and TorchAO scaled-FP8 / INT8 / MX / NVFP4 — lossy but
+standard); formats without a merge path (GGUF, TorchAO INT4 tile-packed)
+need routed LoRA instead. See [Quantized weight
+support](#quantized-weight-support) for the full matrix. Unlike
 `set_loras`, this is not reversible.
 
 ### Heterogeneous block lists
@@ -571,8 +575,9 @@ model binding. `StreamedComponent` and `PinnedComponent` both satisfy it.
 only covers inference movement: clone/pin, H2D copy, GPU wrapper rebuild,
 cache bytes, logical compute dtype, and block-layout signatures. Extra
 behaviors are explicit capabilities: CPU round-trip for optimizer-step
-sync, `Parameter.data` swap for trainable streaming, and dense in-place
-`addmm_` for activation LoRA merge.
+sync, `Parameter.data` swap for trainable streaming, and — for LoRA merge
+— either dense in-place `addmm_` (plain bases) or dequantize/requantize
+plus `copy_into` (quantized wrappers).
 
 ## Store and Binding Lifecycle
 
@@ -658,6 +663,47 @@ distinct quanto wrappers around shared inner `_data` storage.
 the streamed block weights are independent. It does not prevalidate
 unusual shared-storage layouts that cross block/non-block boundaries;
 use whole-model `ModelOffloader` if that sharing must be preserved.
+
+## Quantized weight support
+
+Every supported weight type can be offloaded (pinned host ↔ GPU
+movement). LoRA differs by type: a base can be **merged** into when its
+adapter exposes an in-place update path, and **routed** LoRA
+(`set_loras(mode="routed")` — a forward hook) is available for any of them
+whose owning module is a logical `nn.Linear` with compatible shape and
+dtype, no merge capability required.
+
+| Weight type | Offload | LoRA merge (`mode="merge"` / `merge_lora`) |
+|---|---|---|
+| Plain bf16 / fp16 / fp32 | ✓ | dense in-place `addmm_` |
+| optimum-quanto (int8 / int4 / …) | ✓ | dequant / requant |
+| bitsandbytes NF4 / FP4 | ✓ | dequant / requant |
+| bitsandbytes int8 | ✓ | dequant / requant |
+| TorchAO scaled-FP8 | ✓ | dequant / requant |
+| TorchAO INT8 | ✓ | dequant / requant |
+| TorchAO MX (MXFP8 / MXFP4) | ✓ | dequant / requant † |
+| TorchAO NVFP4 | ✓ | dequant / requant † |
+| GGUF (k-quants) | ✓ | — routed only |
+| TorchAO INT4 tile-packed | ✓ | — routed only |
+| DTensor (tensor-parallel shard) | ✓ | via the wrapped local shard |
+
+Notes:
+
+- **Merging into a quantized base is lossy** (dequantize → apply delta →
+  re-encode) but standard; choosing merge vs routed is the caller's
+  accuracy/latency tradeoff, and is coarser the fewer bits the format has
+  (e.g. MXFP4 / NVFP4 at 4 bits). Re-encoding recomputes scales from the
+  merged values, and zero-amax blocks are floored to avoid NaN scales.
+- **†** MX and NVFP4 store weights in a block-structured packed layout, so
+  the standard re-encode (which produces the contiguous layout) cannot fill
+  a transposed (non-contiguous `qdata`) target's storage; those raise a
+  clear error pointing to routed LoRA. int8 cannot be transposed, and
+  scaled-FP8 is unpacked (1 byte/element), so neither is affected.
+- **CPU round-trip** (D2H, for context-free CPU optimizer steps) and
+  **trainable `Parameter.data` swap** are separate capabilities: plain
+  tensors have both; quanto and scaled-FP8 add CPU round-trip; the other
+  quantized formats are movement + (where shown) merge only. See the
+  per-format sections below.
 
 ## Quanto support
 
