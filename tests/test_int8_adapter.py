@@ -8,7 +8,13 @@ import pytest
 import torch
 from torch import nn
 
-from torch_offload import LoRA, ModelOffloader, ModelOffloaderStore, merge_lora
+from torch_offload import (
+    LoRA,
+    LoRATransform,
+    ModelOffloader,
+    ModelOffloaderStore,
+    merge_lora,
+)
 from torch_offload.int8_adapter import Int8Adapter
 from torch_offload.pinned_param import PinnedParam
 from torch_offload.streamed_component import _param_target_layout
@@ -95,6 +101,23 @@ def _make_int8(
     return layer.weight.data
 
 
+def _make_int8_pergroup(
+    *, rows: int = 32, cols: int = 128, group_size: int = 64,
+) -> torch.Tensor:
+    pytest.importorskip("torchao")
+    try:
+        from torchao.quantization import Int8WeightOnlyConfig, quantize_
+        from torchao.quantization.granularity import PerGroup
+    except ImportError as exc:
+        pytest.skip(f"torchao per-group int8 API unavailable: {exc}")
+
+    layer = nn.Linear(cols, rows, bias=False).to(torch.bfloat16)
+    quantize_(
+        layer, Int8WeightOnlyConfig(granularity=PerGroup(group_size), version=2)
+    )
+    return layer.weight.data
+
+
 class TestInt8Adapter:
     def test_matches_and_dispatches_int8_only(self) -> None:
         qt = _make_int8()
@@ -165,7 +188,126 @@ class TestInt8Adapter:
         with pytest.raises(NotImplementedError, match="Parameter.data-swap"):
             pinned_param.validate_parameter_data_swap_target()
 
-    def test_merge_lora_rejects_int8_weight(self) -> None:
+    @pytest.mark.parametrize("dynamic_activation", [False, True])
+    def test_dequantize_requantize_preserves_representation(
+        self, dynamic_activation: bool
+    ) -> None:
+        int8_cls = _int8_tensor_cls()
+        qt = _make_int8(
+            rows=32, cols=16, dynamic_activation=dynamic_activation
+        )
+        dense = Int8Adapter.dequantize(qt)
+        assert dense.dtype is torch.float32
+        torch.testing.assert_close(dense, qt.dequantize().to(torch.float32))
+
+        again = Int8Adapter.requantize(dense, like=qt)
+        assert isinstance(again, int8_cls)
+        assert again.block_size == qt.block_size
+        assert again.dtype == qt.dtype
+        assert again.qdata.dtype is torch.int8
+        assert tuple(again.qdata.shape) == tuple(qt.qdata.shape)
+        assert again.act_quant_kwargs == qt.act_quant_kwargs
+        # int8's 256-level grid is too coarse for a bit-exact round trip
+        # (boundary values flip ±1 bucket), but re-encoding stays within one
+        # quantization step of the dense input it was given. Dequantize
+        # directly to fp32: the default bf16 dequant rounds qdata*scale and
+        # would occasionally push the error a hair past the bound.
+        err = (again.dequantize(torch.float32) - dense).abs()
+        assert err.max().item() <= again.scale.to(torch.float32).max().item()
+
+    def test_requantize_rejects_shape_mismatch(self) -> None:
+        qt = _make_int8(rows=32, cols=16)
+        with pytest.raises(ValueError, match="Cannot requantize"):
+            Int8Adapter.requantize(torch.randn(16, 32), like=qt)
+
+    def test_requantize_recovers_per_group_granularity(self) -> None:
+        # Int8WeightOnlyConfig(granularity=PerGroup(g)) gives block_size
+        # [1, g] with g < in_features; requantize must recover PerGroup and
+        # reproduce the partition rather than rejecting it as non-PerRow.
+        int8_cls = _int8_tensor_cls()
+        qt = _make_int8_pergroup(rows=32, cols=128, group_size=64)
+        assert list(qt.block_size) == [1, 64]
+
+        again = Int8Adapter.requantize(Int8Adapter.dequantize(qt), like=qt)
+        assert isinstance(again, int8_cls)
+        assert list(again.block_size) == [1, 64]
+        assert tuple(again.scale.shape) == tuple(qt.scale.shape)
+
+    def test_merge_lora_merges_per_group_int8_weight(self) -> None:
+        class M(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.lin = nn.Linear(128, 32, bias=False, dtype=torch.bfloat16)
+
+        model = M()
+        model.lin.weight.requires_grad = False
+        model.lin.weight = nn.Parameter(
+            _make_int8_pergroup(rows=32, cols=128, group_size=64),
+            requires_grad=False,
+        )
+        original_qdata = model.lin.weight.data.qdata.clone()
+        lora = LoRA(
+            state_dict={
+                "lin.lora_A.weight": torch.randn(4, 128),
+                "lin.lora_B.weight": torch.randn(32, 4),
+            }
+        )
+
+        merged = merge_lora(model, [(lora, 1.0)])
+
+        assert merged == 1
+        assert list(model.lin.weight.data.block_size) == [1, 64]
+        assert not torch.equal(model.lin.weight.data.qdata, original_qdata)
+
+    def test_copy_into_preserves_absent_zero_point(self) -> None:
+        # A symmetric int8 weight may carry zero_point=None, but
+        # Int8Tensor.from_hp (used by requantize) always re-emits a zeros
+        # zero_point. copy_into must fill only the slots the target has, not
+        # assert on the recomputed zero_point the target lacks.
+        int8_cls = _int8_tensor_cls()
+        base = _make_int8(rows=32, cols=16)
+        like = int8_cls(
+            base.qdata, base.scale, list(base.block_size), base.dtype,
+            zero_point=None,
+        )
+        assert like.zero_point is None
+
+        dense = Int8Adapter.dequantize(like)
+        dense.addmm_(torch.randn(32, 4), torch.randn(4, 16), alpha=0.5)
+        new = Int8Adapter.requantize(dense, like=like)
+        assert new.zero_point is not None  # from_hp always emits one
+
+        Int8Adapter.copy_into(new, target=like)  # must not raise
+        assert like.zero_point is None  # target representation preserved
+        assert torch.equal(like.qdata, new.qdata)
+
+    def test_lora_transform_requantizes_param_in_place(self) -> None:
+        int8_cls = _int8_tensor_cls()
+        rows, cols, rank = 32, 16, 2
+        qt = _make_int8(rows=rows, cols=cols, dynamic_activation=False)
+        param = nn.Parameter(qt, requires_grad=False)
+        a = torch.randn(rank, cols)
+        b = torch.randn(rows, rank)
+        transform = LoRATransform([(a, b, 0.5)])
+        original_param = param
+        original_qdata_ptr = param.data.qdata.data_ptr()
+
+        # The merge path dequantizes, applies the delta, then requantizes;
+        # mirror it exactly so the comparison is deterministic (not a lossy
+        # round-trip property).
+        expected_dense = qt.dequantize().to(torch.float32)
+        expected_dense.addmm_(b.to(torch.float32), a.to(torch.float32), alpha=0.5)
+        expected = Int8Adapter.requantize(expected_dense, like=qt)
+
+        transform.apply(param)
+
+        assert param is original_param
+        assert param.data.qdata.data_ptr() == original_qdata_ptr
+        assert isinstance(param.data, int8_cls)
+        assert torch.equal(param.data.qdata, expected.qdata)
+        assert torch.equal(param.data.scale, expected.scale)
+
+    def test_merge_lora_merges_int8_weight(self) -> None:
         class M(nn.Module):
             def __init__(self) -> None:
                 super().__init__()
@@ -177,6 +319,9 @@ class TestInt8Adapter:
             _make_int8(rows=16, cols=16, dynamic_activation=False),
             requires_grad=False,
         )
+        # copy_into mutates the weight's storage in place, so snapshot the
+        # original int8 bytes rather than holding a tensor ref.
+        original_qdata = model.lin.weight.data.qdata.clone()
         lora = LoRA(
             state_dict={
                 "lin.lora_A.weight": torch.randn(4, 16),
@@ -184,8 +329,10 @@ class TestInt8Adapter:
             }
         )
 
-        with pytest.raises(ValueError, match="Int8Adapter.*routed LoRA"):
-            merge_lora(model, [(lora, 1.0)])
+        merged = merge_lora(model, [(lora, 1.0)])
+
+        assert merged == 1
+        assert not torch.equal(model.lin.weight.data.qdata, original_qdata)
 
     def test_reconstructed_cpu_forward_matches(self) -> None:
         # int8 matmul runs on CPU, so reconstruction correctness is checked
@@ -293,5 +440,73 @@ class TestInt8Adapter:
                 torch.cuda.synchronize()
             assert y.shape == (128, 128)
             assert y.dtype is torch.bfloat16
+        finally:
+            offloader.deactivate()
+
+    @CUDA
+    def test_streamed_int8_merge_requantizes_on_activate(self) -> None:
+        int8_cls = _int8_tensor_cls()
+
+        class M(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.blocks = nn.ModuleList(
+                    [
+                        nn.Linear(32, 32, bias=False, dtype=torch.bfloat16),
+                        nn.Linear(32, 32, bias=False, dtype=torch.bfloat16),
+                    ]
+                )
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                for block in self.blocks:
+                    x = block(x)
+                return x
+
+        model = M()
+        for block in model.blocks:
+            block.weight.requires_grad = False
+            block.weight = nn.Parameter(
+                _make_int8(rows=32, cols=32, dynamic_activation=False),
+                requires_grad=False,
+            )
+        qt = model.blocks[0].weight.data
+        rank = 4
+        a = torch.randn(rank, 32)
+        b = torch.randn(32, rank)
+        lora = LoRA(
+            state_dict={
+                "blocks.0.lora_A.weight": a,
+                "blocks.0.lora_B.weight": b,
+            }
+        )
+        # Reference on CUDA, matching the device the offloader merges on: the
+        # offloader merges into a byte-identical GPU copy of the weight.
+        qt_cuda = qt.cuda()
+        expected_dense = qt_cuda.dequantize().to(torch.float32)
+        expected_dense.addmm_(
+            b.cuda().to(torch.float32), a.cuda().to(torch.float32), alpha=0.5
+        )
+        expected = Int8Adapter.requantize(expected_dense, like=qt_cuda)
+
+        offloader = _make_model_offloader(
+            model,
+            blocks_attr="blocks",
+            num_resident_blocks=1,
+            num_prefetch_blocks=0,
+        )
+        offloader.set_loras([lora], strengths=[0.5], mode="merge")
+
+        try:
+            x = torch.randn(8, 32, dtype=torch.bfloat16, device="cuda")
+            with offloader.use("cuda") as active:
+                merged = active.blocks[0].weight.data
+                assert isinstance(merged, int8_cls)
+                torch.testing.assert_close(
+                    merged.dequantize().to(torch.float32),
+                    expected.dequantize().to(torch.float32),
+                )
+                y = active(x)
+                torch.cuda.synchronize()
+            assert y.shape == (8, 32)
         finally:
             offloader.deactivate()

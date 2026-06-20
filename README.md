@@ -28,9 +28,9 @@ to be lifted into its own package when a second consumer appears.
 | `module_names.py` | Internal name traversal and mutation helpers |
 | `_quanto.py` | Internal: optimum-quanto optional-import + layout validation; consumed by `quanto_adapter.py` and `merge.py` |
 | `_torchao_nvfp4.py` | Internal: TorchAO NVFP4 optional-import + layout validation; consumed by `nvfp4_adapter.py` |
-| `_torchao_mx.py` | Internal: TorchAO MX (MXFP8 / MXFP4) optional-import + layout validation and supported-dtype gate; consumed by `mx_adapter.py` |
+| `_torchao_mx.py` | Internal: TorchAO MX (MXFP8 / MXFP4) optional-import + layout validation, supported-dtype gate, and dequant/requant; consumed by `mx_adapter.py` |
 | `_torchao_float8.py` | Internal: TorchAO scaled-FP8 optional-import + layout validation and dequant/requant; consumed by `float8_adapter.py` |
-| `_torchao_int8.py` | Internal: TorchAO INT8 optional-import + layout validation; consumed by `int8_adapter.py` |
+| `_torchao_int8.py` | Internal: TorchAO INT8 optional-import + layout validation and dequant/requant; consumed by `int8_adapter.py` |
 | `_torchao_int4_tile.py` | Internal: TorchAO INT4 tile-packed (CUDA-native tinygemm) optional-import + layout validation; consumed by `int4_tile_adapter.py` |
 | `_dtensor.py` | Internal: PyTorch `DTensor` optional-import + mesh/placements signatures and local-shard rewrap; consumed by `dtensor_adapter.py` |
 
@@ -705,8 +705,8 @@ merge-mode LoRA. Use routed LoRA when the target module is a logical
 TorchAO MX (OCP microscaling) weights
 (`torchao.prototype.mx_formats.mx_tensor.MXTensor`, created by
 `quantize_(...)` with an MX inference config or directly via
-`MXTensor.to_mx`) are handled as frozen inference weights when the
-`torchao` optional extra is installed. A single adapter covers both
+`MXTensor.to_mx`) are handled when the `torchao` optional extra is
+installed. A single adapter covers both
 MXFP8 (`float8_e4m3fn` / `float8_e5m2`) and MXFP4
 (`float4_e2m1fn_x2`), since TorchAO models them as the same `MXTensor`
 subclass parameterized by `elem_dtype`. `PinnedParam` pins the packed
@@ -720,10 +720,18 @@ depends on Blackwell-class CUDA hardware and the matching PyTorch CUDA
 stack. Use `uv sync --extra torchao --group dev` and then
 `pytest tests/test_mx_adapter.py -q -rs` to exercise the coverage.
 
-Like NVFP4, MX support is intentionally model-weight only. The adapter
-does not opt into CPU round-trip, trainable `Parameter.data` swap, or
-activation merge-mode LoRA. Use routed LoRA when the target module is a
-logical `nn.Linear` with compatible shape and compute dtype.
+MX weights support merged LoRA: the adapter exposes dequantize/requantize
+plus `copy_into`, so both `set_loras(mode="merge")` and permanent
+`merge_lora()` work by dequantizing to dense, applying the delta, and
+re-encoding the power-of-two (E8M0) block scales through the public
+`MXTensor.to_mx`. Both element dtypes are mergeable, but MXFP4's 4-bit
+grid makes a requantized merge far coarser than MXFP8 — choosing merge vs
+routed LoRA is the caller's accuracy/latency tradeoff. The adapter does
+not opt into CPU round-trip or trainable `Parameter.data` swap: like
+NVFP4 the wrapper's quant state lives in the object, not its bytes, so MX
+weights stay frozen for streaming/training. Routed LoRA remains available
+when the target module is a logical `nn.Linear` with compatible shape and
+compute dtype.
 
 ## TorchAO scaled FP8 support
 
@@ -737,8 +745,8 @@ storage on activation. Per-row and per-tensor scale granularities are
 supported; fp8 matmul execution requires SM89+ (Ada/Hopper or newer)
 CUDA hardware.
 
-Unlike NVFP4, scaled-fp8 weights support merged LoRA: the adapter
-exposes dequantize/requantize plus `copy_into`, so both
+Like MX and INT8 (but unlike NVFP4), scaled-fp8 weights support merged
+LoRA: the adapter exposes dequantize/requantize plus `copy_into`, so both
 `set_loras(mode="merge")` and permanent `merge_lora()` work by
 dequantizing to dense, applying the delta, and re-encoding with
 recomputed scales through the public `Float8Tensor.from_hp` (lossy but

@@ -8,7 +8,13 @@ import pytest
 import torch
 from torch import nn
 
-from torch_offload import LoRA, ModelOffloader, ModelOffloaderStore, merge_lora
+from torch_offload import (
+    LoRA,
+    LoRATransform,
+    ModelOffloader,
+    ModelOffloaderStore,
+    merge_lora,
+)
 from torch_offload._torchao_mx import is_supported_mx_elem_dtype
 from torch_offload.mx_adapter import MxAdapter
 from torch_offload.pinned_param import PinnedParam
@@ -245,7 +251,132 @@ class TestMxAdapter:
             pinned_param.validate_parameter_data_swap_target()
 
     @pytest.mark.parametrize("elem_dtype", ELEM_DTYPES)
-    def test_merge_lora_rejects_mx_weight(
+    def test_dequantize_requantize_preserves_representation(
+        self, elem_dtype: torch.dtype
+    ) -> None:
+        mx = _make_mx(elem_dtype=elem_dtype, rows=16, cols=64)
+        dense = MxAdapter.dequantize(mx)
+        assert dense.dtype is torch.float32
+        torch.testing.assert_close(
+            dense, mx.dequantize(mx.orig_dtype).to(torch.float32)
+        )
+
+        # MX uses deterministic FLOOR scaling onto power-of-two (E8M0)
+        # block scales, so an unmodified round trip reproduces the packed
+        # bytes and scales exactly.
+        again = MxAdapter.requantize(dense, like=mx)
+        assert again.elem_dtype == mx.elem_dtype
+        assert again.block_size == mx.block_size
+        assert again.orig_dtype == mx.orig_dtype
+        assert again.is_swizzled_scales == mx.is_swizzled_scales
+        assert again.act_quant_kwargs == mx.act_quant_kwargs
+        assert torch.equal(
+            again.qdata.view(torch.uint8), mx.qdata.view(torch.uint8)
+        )
+        assert torch.equal(
+            again.scale.view(torch.uint8), mx.scale.view(torch.uint8)
+        )
+
+    @pytest.mark.parametrize("elem_dtype", ELEM_DTYPES)
+    def test_requantize_preserves_scaling_mode(
+        self, elem_dtype: torch.dtype
+    ) -> None:
+        # The default MX inference recipe quantizes with RCEIL (not to_mx's
+        # FLOOR default) and records the mode on act_quant_kwargs.
+        # requantize must recover it so the merge re-encodes with the same
+        # scale-rounding policy, not silently fall back to FLOOR.
+        mx_cls = _mx_tensor_cls()
+        kwargs_cls = _mx_kwargs_cls()
+        try:
+            from torchao.prototype.mx_formats.config import ScaleCalculationMode
+        except ImportError as exc:
+            pytest.skip(f"torchao ScaleCalculationMode unavailable: {exc}")
+
+        weight = torch.randn(16, 64, dtype=torch.bfloat16)
+        akw = kwargs_cls(
+            elem_dtype=elem_dtype,
+            block_size=32,
+            scaling_mode=ScaleCalculationMode.RCEIL,
+        )
+        like = mx_cls.to_mx(
+            weight,
+            elem_dtype,
+            block_size=32,
+            scaling_mode=ScaleCalculationMode.RCEIL,
+            act_quant_kwargs=akw,
+        )
+
+        # Requantize a fresh dense tensor (not the dequant of ``like``, whose
+        # values already sit on the grid where RCEIL and FLOOR can coincide)
+        # so the two modes genuinely diverge and the recovered mode is
+        # observable.
+        fresh = torch.randn(16, 64, dtype=torch.float32)
+        again = MxAdapter.requantize(fresh, like=like)
+
+        def _reencode(mode: object) -> torch.Tensor:
+            return mx_cls.to_mx(
+                fresh.to(like.orig_dtype),
+                like.elem_dtype,
+                block_size=like.block_size,
+                scaling_mode=mode,
+                act_quant_kwargs=like.act_quant_kwargs,
+                is_swizzled_scales=like.is_swizzled_scales,
+            )
+
+        as_rceil = _reencode(ScaleCalculationMode.RCEIL)
+        as_floor = _reencode(ScaleCalculationMode.FLOOR)
+        # The two modes differ on this input, and requantize reproduces the
+        # RCEIL re-encode — i.e. it recovered the mode rather than using the
+        # FLOOR default.
+        assert not torch.equal(
+            as_rceil.scale.view(torch.uint8), as_floor.scale.view(torch.uint8)
+        )
+        assert torch.equal(
+            again.scale.view(torch.uint8), as_rceil.scale.view(torch.uint8)
+        )
+
+    @pytest.mark.parametrize("elem_dtype", ELEM_DTYPES)
+    def test_requantize_rejects_shape_mismatch(
+        self, elem_dtype: torch.dtype
+    ) -> None:
+        mx = _make_mx(elem_dtype=elem_dtype, rows=16, cols=64)
+        with pytest.raises(ValueError, match="Cannot requantize"):
+            MxAdapter.requantize(torch.randn(64, 16), like=mx)
+
+    @pytest.mark.parametrize("elem_dtype", ELEM_DTYPES)
+    def test_lora_transform_requantizes_param_in_place(
+        self, elem_dtype: torch.dtype
+    ) -> None:
+        mx_cls = _mx_tensor_cls()
+        rows, cols, rank = 16, 64, 2
+        mx = _make_mx(elem_dtype=elem_dtype, rows=rows, cols=cols)
+        param = nn.Parameter(mx, requires_grad=False)
+        a = torch.randn(rank, cols)
+        b = torch.randn(rows, rank)
+        transform = LoRATransform([(a, b, 0.5)])
+        original_param = param
+        original_qdata_ptr = param.data.qdata.data_ptr()
+
+        expected_dense = mx.dequantize(mx.orig_dtype).to(torch.float32)
+        expected_dense.addmm_(b.to(torch.float32), a.to(torch.float32), alpha=0.5)
+        expected = MxAdapter.requantize(expected_dense, like=mx)
+
+        transform.apply(param)
+
+        # copy_into mutates the existing wrapper's storage in place, so the
+        # Parameter object and its packed-element buffer keep their identity.
+        assert param is original_param
+        assert param.data.qdata.data_ptr() == original_qdata_ptr
+        assert isinstance(param.data, mx_cls)
+        assert torch.equal(
+            param.data.qdata.view(torch.uint8), expected.qdata.view(torch.uint8)
+        )
+        assert torch.equal(
+            param.data.scale.view(torch.uint8), expected.scale.view(torch.uint8)
+        )
+
+    @pytest.mark.parametrize("elem_dtype", ELEM_DTYPES)
+    def test_merge_lora_merges_mx_weight(
         self, elem_dtype: torch.dtype
     ) -> None:
         class M(nn.Module):
@@ -259,6 +390,9 @@ class TestMxAdapter:
             _make_mx(elem_dtype=elem_dtype, rows=16, cols=64),
             requires_grad=False,
         )
+        # copy_into mutates the weight's storage in place, so snapshot the
+        # original packed bytes rather than holding a tensor ref.
+        original_qdata = model.lin.weight.data.qdata.view(torch.uint8).clone()
         lora = LoRA(
             state_dict={
                 "lin.lora_A.weight": torch.randn(4, 64),
@@ -266,8 +400,12 @@ class TestMxAdapter:
             }
         )
 
-        with pytest.raises(ValueError, match="MxAdapter.*routed LoRA"):
-            merge_lora(model, [(lora, 1.0)])
+        merged = merge_lora(model, [(lora, 1.0)])
+
+        assert merged == 1
+        assert not torch.equal(
+            model.lin.weight.data.qdata.view(torch.uint8), original_qdata
+        )
 
     @CUDA
     @pytest.mark.parametrize("elem_dtype", ELEM_DTYPES)
@@ -377,5 +515,82 @@ class TestMxAdapter:
                 torch.cuda.synchronize()
             assert y.shape == (128, 128)
             assert y.dtype is torch.bfloat16
+        finally:
+            offloader.deactivate()
+
+    @CUDA
+    @pytest.mark.parametrize("elem_dtype", ELEM_DTYPES)
+    def test_streamed_mx_merge_requantizes_on_activate(
+        self, elem_dtype: torch.dtype
+    ) -> None:
+        mx_cls = _mx_tensor_cls()
+
+        class M(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.blocks = nn.ModuleList(
+                    [
+                        nn.Linear(64, 64, bias=False, dtype=torch.bfloat16),
+                        nn.Linear(64, 64, bias=False, dtype=torch.bfloat16),
+                    ]
+                )
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                for block in self.blocks:
+                    x = block(x)
+                return x
+
+        model = M()
+        for block in model.blocks:
+            block.weight.requires_grad = False
+            block.weight = nn.Parameter(
+                _quantize_mx(
+                    block.weight.detach().contiguous(),
+                    elem_dtype=elem_dtype,
+                    dynamic_activation=True,
+                ),
+                requires_grad=False,
+            )
+        mx = model.blocks[0].weight.data
+        rank = 4
+        a = torch.randn(rank, 64)
+        b = torch.randn(64, rank)
+        lora = LoRA(
+            state_dict={
+                "blocks.0.lora_A.weight": a,
+                "blocks.0.lora_B.weight": b,
+            }
+        )
+        # Compute the reference on CUDA, matching the device the offloader
+        # merges on (CPU vs CUDA rounding can flip boundary elements). The
+        # offloader merges into a byte-identical GPU copy of the original
+        # weight, so move that same tensor — don't re-quantize from dense.
+        mx_cuda = mx.cuda()
+        expected_dense = mx_cuda.dequantize(mx.orig_dtype).to(torch.float32)
+        expected_dense.addmm_(
+            b.cuda().to(torch.float32), a.cuda().to(torch.float32), alpha=0.5
+        )
+        expected = MxAdapter.requantize(expected_dense, like=mx_cuda)
+
+        offloader = _make_model_offloader(
+            model,
+            blocks_attr="blocks",
+            num_resident_blocks=1,
+            num_prefetch_blocks=0,
+        )
+        offloader.set_loras([lora], strengths=[0.5], mode="merge")
+
+        try:
+            x = torch.randn(8, 64, dtype=torch.bfloat16, device="cuda")
+            with offloader.use("cuda") as active:
+                merged = active.blocks[0].weight.data
+                assert isinstance(merged, mx_cls)
+                torch.testing.assert_close(
+                    merged.dequantize(mx.orig_dtype).to(torch.float32),
+                    expected.dequantize(mx.orig_dtype).to(torch.float32),
+                )
+                y = active(x)
+                torch.cuda.synchronize()
+            assert y.shape == (8, 64)
         finally:
             offloader.deactivate()

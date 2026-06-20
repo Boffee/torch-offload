@@ -82,11 +82,39 @@ def copy_storage(
     non_blocking: bool,
 ) -> None:
     """Per-tensor bulk copy of a parallel storage tuple, skipping absent
-    (``None``) entries. Used for both H2D and the Float8 D2H round-trip."""
+    (``None``) entries. Used for both H2D and the Float8 D2H round-trip.
+
+    Movement keeps the same representation on both sides, so a ``None`` on
+    one side is ``None`` on the other; skipping on ``src`` therefore also
+    leaves the matching ``dst`` slot untouched."""
     for s, d in zip(src, dst, strict=True):
         if s is None:
             continue
         assert d is not None
+        d.copy_(s, non_blocking=non_blocking)
+
+
+def copy_storage_into(
+    src: tuple[torch.Tensor | None, ...],
+    dst: tuple[torch.Tensor | None, ...],
+    *,
+    non_blocking: bool,
+) -> None:
+    """Fill every present ``dst`` slot from its ``src`` counterpart,
+    preserving ``dst``'s slot presence.
+
+    Mirror of :func:`copy_storage` but driven by ``dst``: used by
+    ``copy_into`` after a requantize, where the re-encoded ``src`` may
+    populate an optional slot that ``dst``'s representation omits — e.g. a
+    symmetric int8 weight stored with ``zero_point=None``, while
+    ``Int8Tensor.from_hp`` always emits a zeros ``zero_point``. Such a slot
+    carries no information ``dst`` lacks, so it is skipped rather than
+    forced. A ``dst`` slot that *is* present must have a ``src`` to fill
+    it (the requantized tensor mirrors ``dst``'s required slots)."""
+    for s, d in zip(src, dst, strict=True):
+        if d is None:
+            continue
+        assert s is not None
         d.copy_(s, non_blocking=non_blocking)
 
 

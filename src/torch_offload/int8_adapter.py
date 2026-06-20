@@ -13,11 +13,18 @@ this module supplies the INT8-specific hooks. One adapter covers both
 because TorchAO models them as the same ``Int8Tensor`` parameterized by
 ``act_quant_kwargs``.
 
-The adapter exposes inference movement only. INT8 model weights are
-treated as frozen: no CPU round-trip, no trainable ``Parameter.data``
-swap, and no activation-scoped dense ``addmm_`` LoRA merge. Routed LoRA
-remains possible when the owning module is a logical ``nn.Linear`` with
-compatible shape/dtype.
+Beyond inference movement, this adapter opts into dequantize/requantize
+plus ``copy_into``, enabling merged (permanent) LoRA on int8 bases.
+Requantization recomputes the per-block weight scale from the merged
+values via the public ``Int8Tensor.from_hp``; like any merge into a
+quantized base it is lossy, and int8's 256-level grid makes it lossier
+than fp8 — choosing merge vs routed (non-destructive) LoRA is the
+caller's tradeoff.
+
+It does not opt into CPU round-trip, trainable ``Parameter.data`` swap,
+or activation-scoped dense ``addmm_`` merge: the quant state lives in the
+wrapper object, not its bytes, so int8 weights stay frozen for
+streaming/training. Routed LoRA remains the non-destructive alternative.
 """
 
 from __future__ import annotations
@@ -29,12 +36,14 @@ import torch
 
 from ._torchao_int8 import (
     create_int8_tensor,
+    dequantize_int8_tensor,
     is_int8_tensor,
+    requantize_int8_tensor,
     require_int8_tensor,
     validate_layout,
 )
 from .tensor_adapters import metadata_key
-from .torchao_structured_adapter import TorchaoStructuredAdapter
+from .torchao_structured_adapter import TorchaoStructuredAdapter, copy_storage_into
 
 
 @dataclass(slots=True, frozen=True)
@@ -131,3 +140,26 @@ class Int8Adapter(TorchaoStructuredAdapter[_Int8Meta]):
     @staticmethod
     def _compute_dtype(t: Any) -> torch.dtype:  # noqa: ANN401
         return t.dtype
+
+    # --- capabilities beyond inference movement ---------------------------
+
+    @staticmethod
+    def dequantize(t: torch.Tensor) -> torch.Tensor:
+        return dequantize_int8_tensor(t)
+
+    @staticmethod
+    def requantize(t: torch.Tensor, *, like: torch.Tensor) -> torch.Tensor:
+        return requantize_int8_tensor(t, like=like)
+
+    @staticmethod
+    def copy_into(src: torch.Tensor, *, target: torch.Tensor) -> None:
+        # Fill target's present storage slots (qdata/scale, optional
+        # zero_point, and any activation-quant tensors) from the requantized
+        # src. Driven by target presence: a symmetric base stored with
+        # zero_point=None keeps it, even though from_hp always re-emits a
+        # zeros zero_point that carries nothing the target lacks.
+        copy_storage_into(
+            Int8Adapter._storage_of(require_int8_tensor(src)),
+            Int8Adapter._storage_of(require_int8_tensor(target)),
+            non_blocking=False,
+        )

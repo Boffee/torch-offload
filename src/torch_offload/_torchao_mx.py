@@ -1,10 +1,11 @@
 """Internal optional-import module for TorchAO MX (microscaling) support.
 
 Single source of truth for the TorchAO ``MXTensor`` layout this repo
-needs to move OCP-microscaling weights through :class:`PinnedParam`.
-TorchAO's public workflow creates ``MXTensor`` weights via
-``quantize_(...)`` with an MX inference config (or directly through
-``MXTensor.to_mx``); the adapter only preserves and moves those
+needs to move OCP-microscaling weights through :class:`PinnedParam` and
+to expose the dequantize/requantize adapter capability. TorchAO's public
+workflow creates ``MXTensor`` weights via ``quantize_(...)`` with an MX
+inference config (or directly through ``MXTensor.to_mx``); the adapter
+only preserves, moves, and (for LoRA merge) re-encodes those
 already-quantized tensors.
 
 Scope is intentionally limited to the two element dtypes seen in real
@@ -117,6 +118,51 @@ def validate_layout(t: torch.Tensor) -> None:
         f"this repo is pinned to a layout that exposes {LAYOUT_ATTRS}. "
         "TorchAO likely refactored the wrapper class — upgrade "
         "torch-offload to match."
+    )
+
+
+def dequantize_mx_tensor(t: torch.Tensor) -> torch.Tensor:
+    """Return the dense logical value of an MX tensor as fp32."""
+    mx = require_mx_tensor(t)
+    return mx.dequantize(mx.orig_dtype).to(device=mx.device, dtype=torch.float32)
+
+
+def requantize_mx_tensor(
+    t: torch.Tensor, *, like: torch.Tensor,
+) -> torch.Tensor:
+    """Encode dense ``t`` using the MX layout and metadata from ``like``.
+
+    Goes through the public ``MXTensor.to_mx``, which recomputes the
+    power-of-two (E8M0) block scales from the new values — so a LoRA merge
+    that grows a block's amax is absorbed by a larger shared exponent.
+    Element dtype, block size, original dtype, kernel preference,
+    activation-quant kwargs, and the swizzled-scale layout carry over from
+    ``like``.
+
+    ``MXTensor`` does not store its weight ``ScaleCalculationMode`` on the
+    wrapper, but the dynamic-activation recipe records it on
+    ``act_quant_kwargs`` (one mode configures both weight and activation —
+    e.g. RCEIL for the default inference config). Recover it so the merge
+    re-encodes with the same scale-rounding policy the weight was
+    quantized with; weight-only MX carries no kwargs, so ``to_mx``'s
+    default (FLOOR) is used.
+    """
+    mx = require_mx_tensor(like)
+    if tuple(t.shape) != tuple(mx.shape):
+        raise ValueError(
+            f"Cannot requantize tensor with shape {tuple(t.shape)} like "
+            f"MXTensor with shape {tuple(mx.shape)}."
+        )
+    scaling_mode = getattr(mx.act_quant_kwargs, "scaling_mode", None)
+    scaling_mode_kwarg = {} if scaling_mode is None else {"scaling_mode": scaling_mode}
+    return MXTensor.to_mx(
+        t.to(dtype=mx.orig_dtype),
+        mx.elem_dtype,
+        block_size=mx.block_size,
+        kernel_preference=mx.kernel_preference,
+        act_quant_kwargs=mx.act_quant_kwargs,
+        is_swizzled_scales=mx.is_swizzled_scales,
+        **scaling_mode_kwarg,
     )
 
 
