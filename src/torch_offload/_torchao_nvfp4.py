@@ -127,6 +127,19 @@ def requantize_nvfp4_tensor(
             f"Cannot requantize tensor with shape {tuple(t.shape)} like "
             f"NVFP4Tensor with shape {tuple(nv.shape)}."
         )
+    if not nv.qdata.is_contiguous():
+        # A transposed/strided NVFP4 weight has a packed layout that the
+        # re-encode (which always produces the standard contiguous packing)
+        # can neither consume nor fill — to_nvfp4 rejects non-contiguous
+        # input, and even past that the packed shape would not match the
+        # target's. Reject early with an actionable error rather than an
+        # opaque kernel assertion deep in the merge.
+        raise ValueError(
+            "Cannot merge LoRA into a non-contiguous (e.g. transposed) "
+            "NVFP4 weight: requantization produces the standard packed "
+            "layout, which cannot fill a transposed target. Use routed LoRA "
+            "for this weight."
+        )
     per_tensor_scale = (
         per_tensor_amax_to_scale(t.detach().abs().max())
         if nv.per_tensor_scale is not None

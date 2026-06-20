@@ -344,6 +344,22 @@ class TestMxAdapter:
             MxAdapter.requantize(torch.randn(64, 16), like=mx)
 
     @pytest.mark.parametrize("elem_dtype", ELEM_DTYPES)
+    def test_merge_rejects_transposed_weight(
+        self, elem_dtype: torch.dtype
+    ) -> None:
+        # A transposed MX weight has non-contiguous packed qdata, which the
+        # standard-layout re-encode cannot fill. The adapter preserves this
+        # layout for movement but rejects it for merge with a clear error
+        # (rather than an opaque kernel assertion); routed LoRA still works.
+        transposed = _make_mx(elem_dtype=elem_dtype, rows=16, cols=64).t()
+        assert not transposed.qdata.is_contiguous()
+        with pytest.raises(ValueError, match="non-contiguous.*MX"):
+            MxAdapter.requantize(
+                torch.randn(*transposed.shape, dtype=torch.float32),
+                like=transposed,
+            )
+
+    @pytest.mark.parametrize("elem_dtype", ELEM_DTYPES)
     def test_lora_transform_requantizes_param_in_place(
         self, elem_dtype: torch.dtype
     ) -> None:

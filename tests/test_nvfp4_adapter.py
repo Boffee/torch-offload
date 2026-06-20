@@ -210,6 +210,20 @@ class TestNvfp4Adapter:
         with pytest.raises(ValueError, match="Cannot requantize"):
             Nvfp4Adapter.requantize(torch.randn(64, 16), like=nv)
 
+    def test_merge_rejects_transposed_weight(self) -> None:
+        # A transposed NVFP4 weight has non-contiguous packed qdata, which
+        # the standard-layout re-encode cannot fill. The adapter preserves
+        # this layout for movement but rejects it for merge with a clear
+        # error (rather than an opaque kernel assertion); routed LoRA still
+        # works.
+        transposed = _make_nvfp4(rows=16, cols=64).t()
+        assert not transposed.qdata.is_contiguous()
+        with pytest.raises(ValueError, match="non-contiguous.*NVFP4"):
+            Nvfp4Adapter.requantize(
+                torch.randn(*transposed.shape, dtype=torch.float32),
+                like=transposed,
+            )
+
     def test_lora_transform_requantizes_param_in_place(self) -> None:
         nvfp4_cls, _ = _nvfp4_modules()
         rows, cols, rank = 16, 64, 2
