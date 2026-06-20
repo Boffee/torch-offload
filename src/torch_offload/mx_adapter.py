@@ -12,11 +12,19 @@ this module supplies the MX-specific hooks. One adapter covers both MXFP8
 and MXFP4 because TorchAO models them as the same ``MXTensor`` subclass
 parameterized by ``elem_dtype``.
 
-The adapter exposes inference movement only. MX model weights are treated
-as frozen: no CPU round-trip, no trainable ``Parameter.data`` swap, and
-no activation-scoped dense ``addmm_`` LoRA merge. Routed LoRA remains
-possible when the owning module is a logical ``nn.Linear`` with
-compatible shape/dtype.
+Beyond inference movement, this adapter opts into dequantize/requantize
+plus ``copy_into``, enabling merged (permanent) LoRA on MX bases.
+Requantization re-derives the power-of-two (E8M0) block scales from the
+merged values via the public ``MXTensor.to_mx``; like any merge into a
+quantized base it is lossy. MXFP4's 4-bit grid makes a requantized merge
+far coarser than MXFP8 — choosing merge vs routed (non-destructive) LoRA
+is the caller's tradeoff, and both element dtypes support either route.
+
+It does not opt into CPU round-trip or trainable ``Parameter.data`` swap:
+the quant state lives in the wrapper object, not its bytes, so MX weights
+stay frozen for streaming/training. Routed LoRA remains the
+non-destructive alternative when the owning module is a logical
+``nn.Linear`` with compatible shape/dtype.
 """
 
 from __future__ import annotations
@@ -28,12 +36,14 @@ import torch
 
 from ._torchao_mx import (
     create_mx_tensor,
+    dequantize_mx_tensor,
     is_mx_tensor,
+    requantize_mx_tensor,
     require_mx_tensor,
     validate_layout,
 )
 from .tensor_adapters import metadata_key
-from .torchao_structured_adapter import TorchaoStructuredAdapter
+from .torchao_structured_adapter import TorchaoStructuredAdapter, copy_storage_into
 
 
 @dataclass(slots=True, frozen=True)
@@ -113,3 +123,24 @@ class MxAdapter(TorchaoStructuredAdapter[_MxMeta]):
     @staticmethod
     def _compute_dtype(t: Any) -> torch.dtype:  # noqa: ANN401
         return t.orig_dtype
+
+    # --- capabilities beyond inference movement ---------------------------
+
+    @staticmethod
+    def dequantize(t: torch.Tensor) -> torch.Tensor:
+        return dequantize_mx_tensor(t)
+
+    @staticmethod
+    def requantize(t: torch.Tensor, *, like: torch.Tensor) -> torch.Tensor:
+        return requantize_mx_tensor(t, like=like)
+
+    @staticmethod
+    def copy_into(src: torch.Tensor, *, target: torch.Tensor) -> None:
+        # Copy the packed elements + E8M0 block scales into target's
+        # existing buffers, preserving its wrapper/object identity. MX has
+        # no optional storage, so both slots are always present.
+        copy_storage_into(
+            MxAdapter._storage_of(require_mx_tensor(src)),
+            MxAdapter._storage_of(require_mx_tensor(target)),
+            non_blocking=False,
+        )

@@ -15,6 +15,8 @@ from typing import Any
 
 import torch
 
+from ._torchao_granularity import granularity_from_block_size
+
 LAYOUT_ATTRS = (
     "qdata",
     "scale",
@@ -27,7 +29,6 @@ LAYOUT_ATTRS = (
 
 
 try:
-    from torchao.quantization.granularity import PerRow, PerTensor
     from torchao.quantization.quantize_.workflows.float8.float8_tensor import (
         Float8Tensor,
     )
@@ -36,8 +37,6 @@ try:
 except ImportError:
     TORCHAO_FLOAT8_AVAILABLE = False
     Float8Tensor: Any = None
-    PerRow: Any = None
-    PerTensor: Any = None
 
 
 def is_float8_tensor(t: object) -> bool:
@@ -112,8 +111,8 @@ def requantize_float8_tensor(
             f"Cannot requantize tensor with shape {tuple(t.shape)} like "
             f"Float8Tensor with shape {tuple(f8.shape)}."
         )
-    granularity = _granularity_from_block_size(
-        tuple(f8.block_size), tuple(f8.shape),
+    granularity = granularity_from_block_size(
+        tuple(f8.block_size), tuple(f8.shape), label="Float8Tensor",
     )
     return Float8Tensor.from_hp(
         t.to(dtype=f8.dtype),
@@ -122,28 +121,4 @@ def requantize_float8_tensor(
         mm_config=f8.mm_config,
         kernel_preference=f8.kernel_preference,
         act_quant_kwargs=f8.act_quant_kwargs,
-    )
-
-
-def _granularity_from_block_size(
-    block_size: tuple[int, ...], shape: tuple[int, ...],
-) -> object:
-    """Invert TorchAO's ``get_block_size`` for the FP8 granularities.
-
-    ``Float8Tensor`` supports ``PerTensor`` (block covers the whole
-    tensor) and ``PerRow(dim)`` (block covers axis ``dim`` fully, 1
-    elsewhere). Shapes where both readings coincide (e.g. a dim of
-    size 1) produce identical block partitions either way, so any
-    matching reading is correct.
-    """
-    if block_size == shape:
-        return PerTensor()
-    for dim, size in enumerate(shape):
-        per_row = tuple(size if i == dim else 1 for i in range(len(shape)))
-        if block_size == per_row:
-            return PerRow(dim=dim)
-    raise ValueError(
-        f"Float8Tensor block_size {block_size!r} for shape {shape!r} "
-        "matches neither PerTensor nor PerRow granularity; TorchAO "
-        "likely added a granularity this adapter does not support yet."
     )

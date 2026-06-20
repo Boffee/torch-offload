@@ -1,10 +1,11 @@
 """Internal optional-import module for TorchAO MX (microscaling) support.
 
 Single source of truth for the TorchAO ``MXTensor`` layout this repo
-needs to move OCP-microscaling weights through :class:`PinnedParam`.
-TorchAO's public workflow creates ``MXTensor`` weights via
-``quantize_(...)`` with an MX inference config (or directly through
-``MXTensor.to_mx``); the adapter only preserves and moves those
+needs to move OCP-microscaling weights through :class:`PinnedParam` and
+to expose the dequantize/requantize adapter capability. TorchAO's public
+workflow creates ``MXTensor`` weights via ``quantize_(...)`` with an MX
+inference config (or directly through ``MXTensor.to_mx``); the adapter
+only preserves, moves, and (for LoRA merge) re-encodes those
 already-quantized tensors.
 
 Scope is intentionally limited to the two element dtypes seen in real
@@ -117,6 +118,45 @@ def validate_layout(t: torch.Tensor) -> None:
         f"this repo is pinned to a layout that exposes {LAYOUT_ATTRS}. "
         "TorchAO likely refactored the wrapper class — upgrade "
         "torch-offload to match."
+    )
+
+
+def dequantize_mx_tensor(t: torch.Tensor) -> torch.Tensor:
+    """Return the dense logical value of an MX tensor as fp32."""
+    mx = require_mx_tensor(t)
+    return mx.dequantize(mx.orig_dtype).to(device=mx.device, dtype=torch.float32)
+
+
+def requantize_mx_tensor(
+    t: torch.Tensor, *, like: torch.Tensor,
+) -> torch.Tensor:
+    """Encode dense ``t`` using the MX layout and metadata from ``like``.
+
+    Goes through the public ``MXTensor.to_mx``, which recomputes the
+    power-of-two (E8M0) block scales from the new values — so a LoRA merge
+    that grows a block's amax is absorbed exactly by a larger shared
+    exponent, with no clipping. Element dtype, block size, original dtype,
+    kernel preference, activation-quant kwargs, and the swizzled-scale
+    layout carry over from ``like``.
+
+    ``MXTensor`` does not store its ``ScaleCalculationMode`` on the
+    wrapper, so ``to_mx``'s default (FLOOR) is used — the mode the
+    standard MX inference recipe quantizes with, which reproduces an
+    unmodified tensor exactly.
+    """
+    mx = require_mx_tensor(like)
+    if tuple(t.shape) != tuple(mx.shape):
+        raise ValueError(
+            f"Cannot requantize tensor with shape {tuple(t.shape)} like "
+            f"MXTensor with shape {tuple(mx.shape)}."
+        )
+    return MXTensor.to_mx(
+        t.to(dtype=mx.orig_dtype),
+        mx.elem_dtype,
+        block_size=mx.block_size,
+        kernel_preference=mx.kernel_preference,
+        act_quant_kwargs=mx.act_quant_kwargs,
+        is_swizzled_scales=mx.is_swizzled_scales,
     )
 
 
