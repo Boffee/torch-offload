@@ -249,6 +249,24 @@ class TestNvfp4Adapter:
                 like=per_expert,
             )
 
+    def test_requantize_zero_dense_does_not_nan(self) -> None:
+        # An all-zero merged weight (e.g. a LoRA delta that exactly cancels
+        # the base) recomputes a per_tensor_scale of 0; to_nvfp4's two-level
+        # path would then divide block scales by it and emit NaN. requantize
+        # must fall back to a valid scale and produce a clean all-zero
+        # tensor.
+        nvfp4_cls, _ = _nvfp4_modules()
+        nv = _make_nvfp4(rows=16, cols=64)
+        assert nv.per_tensor_scale is not None  # two-level scaling
+        again = Nvfp4Adapter.requantize(
+            torch.zeros(16, 64, dtype=torch.float32), like=nv
+        )
+        assert isinstance(again, nvfp4_cls)
+        assert not torch.isnan(again.scale.float()).any()
+        dequant = again.dequantize(nv.orig_dtype)
+        assert not torch.isnan(dequant.float()).any()
+        assert torch.count_nonzero(dequant).item() == 0
+
     def test_merge_rejects_transposed_weight(self) -> None:
         # A transposed NVFP4 weight has non-contiguous packed qdata, which
         # the standard-layout re-encode cannot fill. The adapter preserves

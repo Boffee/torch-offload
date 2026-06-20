@@ -158,7 +158,16 @@ def requantize_nvfp4_tensor(
                 "merge recomputes a single global scale and would drop "
                 "per-group precision. Use routed LoRA for this weight."
             )
-        per_tensor_scale = per_tensor_amax_to_scale(t.detach().abs().max())
+        recomputed = per_tensor_amax_to_scale(t.detach().abs().max())
+        # A fully cancelled (all-zero) merged weight has amax 0, so the
+        # recomputed global scale is 0 — and to_nvfp4's two-level path then
+        # divides block scales by it, emitting NaN. Fall back to the base's
+        # existing positive scale; any positive global scale encodes an
+        # all-zero weight identically (every block scale is 0). torch.where
+        # keeps this branchless — no host sync in the merge path.
+        per_tensor_scale = torch.where(
+            recomputed == 0, nv.per_tensor_scale, recomputed
+        )
     return NVFP4Tensor.to_nvfp4(
         t.to(dtype=nv.orig_dtype),
         block_size=nv.block_size,
