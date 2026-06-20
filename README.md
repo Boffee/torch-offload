@@ -685,7 +685,7 @@ dtype, no merge capability required.
 | TorchAO NVFP4 | ✓ | dequant / requant † |
 | GGUF (k-quants) | ✓ | — routed only |
 | TorchAO INT4 tile-packed | ✓ | — routed only |
-| DTensor (tensor-parallel shard) | ✓ | via the wrapped local shard |
+| DTensor (tensor-parallel shard) | ✓ | — routed only ‡ |
 
 Notes:
 
@@ -699,6 +699,10 @@ Notes:
   a transposed (non-contiguous `qdata`) target's storage; those raise a
   clear error pointing to routed LoRA. int8 cannot be transposed, and
   scaled-FP8 is unpacked (1 byte/element), so neither is affected.
+- **‡** `DTensorAdapter` delegates the local shard to the inner adapter
+  only for *movement*; it exposes no merge capability of its own, so a
+  merge into a DTensor weight raises (frozen-inference scope). Routed LoRA
+  is the intended path for tensor-parallel weights.
 - **CPU round-trip** (D2H, for context-free CPU optimizer steps) and
   **trainable `Parameter.data` swap** are separate capabilities: plain
   tensors have both; quanto and scaled-FP8 add CPU round-trip; the other
