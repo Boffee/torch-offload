@@ -104,6 +104,12 @@ def requantize_float8_tensor(
     amax past what ``like``'s scale covers). Granularity is recovered
     from ``like.block_size``; all dispatch metadata (mm config, kernel
     preference, activation quant kwargs, fp8 dtype) carries over.
+
+    Zero blocks are repaired afterwards: ``from_hp`` computes
+    ``scale = amax / fp8_max`` with no epsilon floor, so an all-zero block
+    (a zeroed row under per-row scaling, or a fully cancelled weight under
+    per-tensor) gets ``scale = 0`` and ``qdata = 0 / 0 = NaN``. See
+    :func:`_repair_zero_scale_blocks`.
     """
     f8 = require_float8_tensor(like)
     if tuple(t.shape) != tuple(f8.shape):
@@ -114,11 +120,41 @@ def requantize_float8_tensor(
     granularity = granularity_from_block_size(
         tuple(f8.block_size), tuple(f8.shape), label="Float8Tensor",
     )
-    return Float8Tensor.from_hp(
+    out = Float8Tensor.from_hp(
         t.to(dtype=f8.dtype),
         float8_dtype=f8.qdata.dtype,
         granularity=granularity,
         mm_config=f8.mm_config,
         kernel_preference=f8.kernel_preference,
         act_quant_kwargs=f8.act_quant_kwargs,
+    )
+    return _repair_zero_scale_blocks(out)
+
+
+def _repair_zero_scale_blocks(f8: Any) -> torch.Tensor:  # noqa: ANN401
+    """Repair NaN produced by an all-zero scaling block.
+
+    TorchAO's ``Float8Tensor.from_hp`` computes ``scale = amax / fp8_max``
+    with no epsilon floor, so a block whose values are all zero gets
+    ``scale = 0`` and ``qdata = 0 / 0 = NaN`` (inherited from torchao —
+    ``quantize_`` of a zeroed row produces the same NaN). Floor those zero
+    scales to a minimum epsilon — the standard zero-amax guard, matching
+    int8's ``choose_qparams`` ``eps`` — and zero the NaN ``qdata``: a zero
+    block dequantizes to 0 under any positive scale, so the result is an
+    exact zero rather than NaN. Non-zero blocks are untouched.
+    """
+    zero = f8.scale == 0
+    if not bool(zero.any()):
+        return f8
+    eps = torch.finfo(torch.float32).eps
+    scale = torch.where(zero, torch.full_like(f8.scale, eps), f8.scale)
+    qdata = torch.where(zero, torch.zeros_like(f8.qdata), f8.qdata)
+    return create_float8_tensor(
+        qdata,
+        scale,
+        list(f8.block_size),
+        f8.mm_config,
+        f8.act_quant_kwargs,
+        f8.kernel_preference,
+        f8.dtype,
     )
