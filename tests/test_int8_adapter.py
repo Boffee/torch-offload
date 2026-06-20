@@ -101,6 +101,23 @@ def _make_int8(
     return layer.weight.data
 
 
+def _make_int8_pergroup(
+    *, rows: int = 32, cols: int = 128, group_size: int = 64,
+) -> torch.Tensor:
+    pytest.importorskip("torchao")
+    try:
+        from torchao.quantization import Int8WeightOnlyConfig, quantize_
+        from torchao.quantization.granularity import PerGroup
+    except ImportError as exc:
+        pytest.skip(f"torchao per-group int8 API unavailable: {exc}")
+
+    layer = nn.Linear(cols, rows, bias=False).to(torch.bfloat16)
+    quantize_(
+        layer, Int8WeightOnlyConfig(granularity=PerGroup(group_size), version=2)
+    )
+    return layer.weight.data
+
+
 class TestInt8Adapter:
     def test_matches_and_dispatches_int8_only(self) -> None:
         qt = _make_int8()
@@ -202,6 +219,45 @@ class TestInt8Adapter:
         qt = _make_int8(rows=32, cols=16)
         with pytest.raises(ValueError, match="Cannot requantize"):
             Int8Adapter.requantize(torch.randn(16, 32), like=qt)
+
+    def test_requantize_recovers_per_group_granularity(self) -> None:
+        # Int8WeightOnlyConfig(granularity=PerGroup(g)) gives block_size
+        # [1, g] with g < in_features; requantize must recover PerGroup and
+        # reproduce the partition rather than rejecting it as non-PerRow.
+        int8_cls = _int8_tensor_cls()
+        qt = _make_int8_pergroup(rows=32, cols=128, group_size=64)
+        assert list(qt.block_size) == [1, 64]
+
+        again = Int8Adapter.requantize(Int8Adapter.dequantize(qt), like=qt)
+        assert isinstance(again, int8_cls)
+        assert list(again.block_size) == [1, 64]
+        assert tuple(again.scale.shape) == tuple(qt.scale.shape)
+
+    def test_merge_lora_merges_per_group_int8_weight(self) -> None:
+        class M(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.lin = nn.Linear(128, 32, bias=False, dtype=torch.bfloat16)
+
+        model = M()
+        model.lin.weight.requires_grad = False
+        model.lin.weight = nn.Parameter(
+            _make_int8_pergroup(rows=32, cols=128, group_size=64),
+            requires_grad=False,
+        )
+        original_qdata = model.lin.weight.data.qdata.clone()
+        lora = LoRA(
+            state_dict={
+                "lin.lora_A.weight": torch.randn(4, 128),
+                "lin.lora_B.weight": torch.randn(32, 4),
+            }
+        )
+
+        merged = merge_lora(model, [(lora, 1.0)])
+
+        assert merged == 1
+        assert list(model.lin.weight.data.block_size) == [1, 64]
+        assert not torch.equal(model.lin.weight.data.qdata, original_qdata)
 
     def test_copy_into_preserves_absent_zero_point(self) -> None:
         # A symmetric int8 weight may carry zero_point=None, but

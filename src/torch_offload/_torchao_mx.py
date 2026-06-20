@@ -134,15 +134,18 @@ def requantize_mx_tensor(
 
     Goes through the public ``MXTensor.to_mx``, which recomputes the
     power-of-two (E8M0) block scales from the new values — so a LoRA merge
-    that grows a block's amax is absorbed exactly by a larger shared
-    exponent, with no clipping. Element dtype, block size, original dtype,
-    kernel preference, activation-quant kwargs, and the swizzled-scale
-    layout carry over from ``like``.
+    that grows a block's amax is absorbed by a larger shared exponent.
+    Element dtype, block size, original dtype, kernel preference,
+    activation-quant kwargs, and the swizzled-scale layout carry over from
+    ``like``.
 
-    ``MXTensor`` does not store its ``ScaleCalculationMode`` on the
-    wrapper, so ``to_mx``'s default (FLOOR) is used — the mode the
-    standard MX inference recipe quantizes with, which reproduces an
-    unmodified tensor exactly.
+    ``MXTensor`` does not store its weight ``ScaleCalculationMode`` on the
+    wrapper, but the dynamic-activation recipe records it on
+    ``act_quant_kwargs`` (one mode configures both weight and activation —
+    e.g. RCEIL for the default inference config). Recover it so the merge
+    re-encodes with the same scale-rounding policy the weight was
+    quantized with; weight-only MX carries no kwargs, so ``to_mx``'s
+    default (FLOOR) is used.
     """
     mx = require_mx_tensor(like)
     if tuple(t.shape) != tuple(mx.shape):
@@ -150,6 +153,8 @@ def requantize_mx_tensor(
             f"Cannot requantize tensor with shape {tuple(t.shape)} like "
             f"MXTensor with shape {tuple(mx.shape)}."
         )
+    scaling_mode = getattr(mx.act_quant_kwargs, "scaling_mode", None)
+    scaling_mode_kwarg = {} if scaling_mode is None else {"scaling_mode": scaling_mode}
     return MXTensor.to_mx(
         t.to(dtype=mx.orig_dtype),
         mx.elem_dtype,
@@ -157,6 +162,7 @@ def requantize_mx_tensor(
         kernel_preference=mx.kernel_preference,
         act_quant_kwargs=mx.act_quant_kwargs,
         is_swizzled_scales=mx.is_swizzled_scales,
+        **scaling_mode_kwarg,
     )
 
 

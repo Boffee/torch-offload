@@ -278,6 +278,64 @@ class TestMxAdapter:
         )
 
     @pytest.mark.parametrize("elem_dtype", ELEM_DTYPES)
+    def test_requantize_preserves_scaling_mode(
+        self, elem_dtype: torch.dtype
+    ) -> None:
+        # The default MX inference recipe quantizes with RCEIL (not to_mx's
+        # FLOOR default) and records the mode on act_quant_kwargs.
+        # requantize must recover it so the merge re-encodes with the same
+        # scale-rounding policy, not silently fall back to FLOOR.
+        mx_cls = _mx_tensor_cls()
+        kwargs_cls = _mx_kwargs_cls()
+        try:
+            from torchao.prototype.mx_formats.config import ScaleCalculationMode
+        except ImportError as exc:
+            pytest.skip(f"torchao ScaleCalculationMode unavailable: {exc}")
+
+        weight = torch.randn(16, 64, dtype=torch.bfloat16)
+        akw = kwargs_cls(
+            elem_dtype=elem_dtype,
+            block_size=32,
+            scaling_mode=ScaleCalculationMode.RCEIL,
+        )
+        like = mx_cls.to_mx(
+            weight,
+            elem_dtype,
+            block_size=32,
+            scaling_mode=ScaleCalculationMode.RCEIL,
+            act_quant_kwargs=akw,
+        )
+
+        # Requantize a fresh dense tensor (not the dequant of ``like``, whose
+        # values already sit on the grid where RCEIL and FLOOR can coincide)
+        # so the two modes genuinely diverge and the recovered mode is
+        # observable.
+        fresh = torch.randn(16, 64, dtype=torch.float32)
+        again = MxAdapter.requantize(fresh, like=like)
+
+        def _reencode(mode: object) -> torch.Tensor:
+            return mx_cls.to_mx(
+                fresh.to(like.orig_dtype),
+                like.elem_dtype,
+                block_size=like.block_size,
+                scaling_mode=mode,
+                act_quant_kwargs=like.act_quant_kwargs,
+                is_swizzled_scales=like.is_swizzled_scales,
+            )
+
+        as_rceil = _reencode(ScaleCalculationMode.RCEIL)
+        as_floor = _reencode(ScaleCalculationMode.FLOOR)
+        # The two modes differ on this input, and requantize reproduces the
+        # RCEIL re-encode — i.e. it recovered the mode rather than using the
+        # FLOOR default.
+        assert not torch.equal(
+            as_rceil.scale.view(torch.uint8), as_floor.scale.view(torch.uint8)
+        )
+        assert torch.equal(
+            again.scale.view(torch.uint8), as_rceil.scale.view(torch.uint8)
+        )
+
+    @pytest.mark.parametrize("elem_dtype", ELEM_DTYPES)
     def test_requantize_rejects_shape_mismatch(
         self, elem_dtype: torch.dtype
     ) -> None:
