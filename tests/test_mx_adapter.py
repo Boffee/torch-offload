@@ -13,6 +13,7 @@ from torch_offload import (
     LoRATransform,
     ModelOffloader,
     ModelOffloaderStore,
+    ScaledLoRAFactor,
     merge_lora,
 )
 from torch_offload._torchao_mx import is_supported_mx_elem_dtype
@@ -369,7 +370,7 @@ class TestMxAdapter:
         param = nn.Parameter(mx, requires_grad=False)
         a = torch.randn(rank, cols)
         b = torch.randn(rows, rank)
-        transform = LoRATransform([(a, b, 0.5)])
+        transform = LoRATransform([ScaledLoRAFactor(a, b, 0.5)])
         original_param = param
         original_qdata_ptr = param.data.qdata.data_ptr()
 

@@ -16,7 +16,7 @@ import torch
 from torch import nn
 
 from ._devices import canonical_device
-from .lora import LoRA, LoRARouteHandle, LoRATransform
+from .lora import LoRA, LoRARouteHandle, LoRATransform, ScaledLoRAFactor
 from .module_names import (
     buffer_names,
     canonical_param_name,
@@ -31,8 +31,7 @@ from .tensor_adapter_registry import param_representation, select_adapter
 logger = logging.getLogger(__name__)
 
 LoraMode = Literal["merge", "routed"]
-_LoraFactorRef = tuple[torch.Tensor, torch.Tensor, float]
-_LoraParamMap = dict[str, list[_LoraFactorRef]]
+_LoraParamMap = dict[str, list[ScaledLoRAFactor]]
 
 
 class _RemovableHook(Protocol):
@@ -411,7 +410,7 @@ class ModelOffloader:
             for param_name in param_names
         }
         for lora, strength in loras:
-            for target_key, (a, b) in lora.targets.items():
+            for target_key, factor in lora.targets.items():
                 param_name = canonical_param_names.get(target_key)
                 if param_name is None:
                     sample_index = sorted(canonical_param_names)[:3]
@@ -422,7 +421,7 @@ class ModelOffloader:
                         f"keys: {sample_index} ..."
                     )
                 per_param.setdefault(param_name, []).append(
-                    (a, b, strength)
+                    factor.scaled(strength)
                 )
 
         return per_param
@@ -450,8 +449,8 @@ class ModelOffloader:
                 "for CPU activation."
             )
 
-        for param_name, refs in targets.items():
-            transform = LoRATransform(refs)
+        for param_name, factors in targets.items():
+            transform = LoRATransform(factors)
             handle = self._register_post_copy_hook(
                 param_name, transform.apply,
             )
@@ -462,7 +461,7 @@ class ModelOffloader:
         active_device: torch.device,
         targets: _LoraParamMap,
     ) -> None:
-        for param_name, refs in targets.items():
+        for param_name, factors in targets.items():
             parent, _leaf = resolve_parent_leaf(self._model, param_name)
             if not isinstance(parent, nn.Linear):
                 raise ValueError(
@@ -473,7 +472,7 @@ class ModelOffloader:
                     f"PEFT for richer per-type routing."
                 )
             handle = LoRARouteHandle(
-                parent, refs, active_device,
+                parent, factors, active_device,
                 dtype=_routed_factor_dtype(parent),
             )
             self._lora_hook_handles.append(handle)

@@ -13,6 +13,7 @@ from torch_offload import (
     LoRATransform,
     ModelOffloader,
     ModelOffloaderStore,
+    ScaledLoRAFactor,
     merge_lora,
 )
 from torch_offload.int8_adapter import Int8Adapter
@@ -288,7 +289,7 @@ class TestInt8Adapter:
         param = nn.Parameter(qt, requires_grad=False)
         a = torch.randn(rank, cols)
         b = torch.randn(rows, rank)
-        transform = LoRATransform([(a, b, 0.5)])
+        transform = LoRATransform([ScaledLoRAFactor(a, b, 0.5)])
         original_param = param
         original_qdata_ptr = param.data.qdata.data_ptr()
 

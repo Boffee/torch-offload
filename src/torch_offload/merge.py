@@ -56,7 +56,7 @@ def merge_lora(
     param_groups_by_tensor_id: dict[tuple[Any, ...], _MergeParamGroup] = {}
     target_by_tensor_id: dict[tuple[Any, ...], str] = {}
     for lora, strength in loras:
-        for target_key, (a, b) in lora.targets.items():
+        for target_key, factor in lora.targets.items():
             param = params_by_target.get(target_key)
             if param is None:
                 continue
@@ -74,7 +74,7 @@ def merge_lora(
                     f"merge_lora() call; otherwise the same base weight "
                     f"would receive multiple logical updates."
                 )
-            transform = LoRATransform([(a, b, strength)])
+            transform = LoRATransform([factor.scaled(strength)])
             merge_ops.append(_MergeOp(group, target_key, transform))
 
     for op in merge_ops:
