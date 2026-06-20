@@ -106,7 +106,7 @@ Compatibility
 """
 
 from .gguf_adapter import GGUFWeight
-from .lora import LoRA, LoRATransform
+from .lora import FusedLoRAFactors, LoRA, LoRATransform, ScaledLoRAFactor
 from .merge import merge_lora
 from .model_cache import (
     DuplicateModelKeyError,
@@ -142,6 +142,7 @@ __all__ = [
     "EvictionContext",
     "EvictionPolicy",
     "EvictionPolicyError",
+    "FusedLoRAFactors",
     "GGUFWeight",
     "LRUEvictionPolicy",
     "LoRA",
@@ -164,6 +165,7 @@ __all__ = [
     "ResourceBinding",
     "ResourceSpec",
     "ResourceStore",
+    "ScaledLoRAFactor",
     "StreamedComponent",
     "StreamedComponentStore",
     "merge_lora",

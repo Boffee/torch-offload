@@ -20,7 +20,7 @@ from typing import Any
 
 from torch import nn
 
-from .lora import LoRA, LoRATransform
+from .lora import LoRA, LoRATransform, ScaledLoRAFactor
 from .module_names import canonical_param_name
 from .tensor_adapter_registry import param_tensor_id
 
@@ -74,7 +74,7 @@ def merge_lora(
                     f"merge_lora() call; otherwise the same base weight "
                     f"would receive multiple logical updates."
                 )
-            transform = LoRATransform([(a, b, strength)])
+            transform = LoRATransform([ScaledLoRAFactor(a, b, strength)])
             merge_ops.append(_MergeOp(group, target_key, transform))
 
     for op in merge_ops:

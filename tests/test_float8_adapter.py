@@ -8,7 +8,7 @@ import pytest
 import torch
 from torch import nn
 
-from torch_offload import LoRA, LoRATransform, ModelOffloader, ModelOffloaderStore, merge_lora
+from torch_offload import LoRA, LoRATransform, ModelOffloader, ModelOffloaderStore, ScaledLoRAFactor, merge_lora
 from torch_offload.float8_adapter import Float8Adapter
 from torch_offload.pinned_param import PinnedParam
 from torch_offload.streamed_component import _param_target_layout
@@ -240,7 +240,7 @@ class TestFloat8Adapter:
         param = nn.Parameter(f8, requires_grad=False)
         a = torch.randn(rank, cols)
         b = torch.randn(rows, rank)
-        transform = LoRATransform([(a, b, 0.5)])
+        transform = LoRATransform([ScaledLoRAFactor(a, b, 0.5)])
         original_param = param
         original_qdata_ptr = param.data.qdata.data_ptr()
 

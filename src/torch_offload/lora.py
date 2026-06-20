@@ -29,7 +29,8 @@ on deactivate.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from types import TracebackType
 from typing import Any
 
@@ -44,16 +45,132 @@ from .tensor_adapters import (
 )
 
 __all__ = [
+    "FusedLoRAFactors",
     "KeyTransformT",
     "LoRA",
     "LoRARouteHandle",
     "LoRATransform",
+    "ScaledLoRAFactor",
     "default_key_transform",
 ]
 
 
 KeyTransformT = Callable[[str], str] | None
-_LoraFactorRef = tuple[torch.Tensor, torch.Tensor, float]
+
+
+@dataclass(slots=True, frozen=True)
+class ScaledLoRAFactor:
+    """One LoRA's scaled contribution to a single target weight.
+
+    ``a`` is the ``(rank, in_dim)`` down-projection and ``b`` the
+    ``(out_dim, rank)`` up-projection; the contribution to the base weight
+    is ``strength * (b @ a)``. The factor pair is intrinsic to the LoRA;
+    ``strength`` is extrinsic — it is fixed when the LoRA is bound to a
+    target (e.g. via ``set_loras``). Per-pair shape validity is checked at
+    construction; the match against a concrete target shape is checked
+    separately, where the target is known.
+    """
+
+    a: torch.Tensor
+    b: torch.Tensor
+    strength: float
+
+    def __post_init__(self) -> None:
+        if self.a.ndim != 2 or self.b.ndim != 2 or self.a.shape[0] != self.b.shape[1]:
+            raise ValueError(
+                f"LoRA factor shape mismatch: A shape is {tuple(self.a.shape)}, B shape is {tuple(self.b.shape)}."
+            )
+
+    @property
+    def rank(self) -> int:
+        return self.a.shape[0]
+
+    @property
+    def in_dim(self) -> int:
+        return self.a.shape[1]
+
+    @property
+    def out_dim(self) -> int:
+        return self.b.shape[0]
+
+    @property
+    def produced_shape(self) -> tuple[int, int]:
+        """Shape of ``b @ a`` — the base-weight shape this factor targets."""
+        return (self.b.shape[0], self.a.shape[1])
+
+
+@dataclass(slots=True, frozen=True)
+class FusedLoRAFactors:
+    """Several :class:`ScaledLoRAFactor` against one target, fused into a
+    single rank-stacked pair on a target device.
+
+    ``a_fused`` has shape ``(sum_i r_i, in_dim)`` — each factor's ``a``
+    stacked along the rank axis. ``b_fused`` has shape
+    ``(out_dim, sum_i r_i)`` — each factor's ``b`` scaled by its strength,
+    stacked along the rank axis. The identity
+    ``b_fused @ a_fused == sum_i strength_i * (b_i @ a_i)`` falls out of the
+    block structure: every fused-rank column belongs to exactly one factor's
+    slice, so there are no cross terms. Mixed ranks are handled naturally —
+    the fused rank is ``sum_i r_i`` rather than ``N * r``.
+
+    This is a **per-target** fusion (several adapters against one base
+    weight); it is not a cross-block batching mechanism.
+    """
+
+    a_fused: torch.Tensor
+    b_fused: torch.Tensor
+
+    @classmethod
+    def from_factors(
+        cls,
+        factors: Sequence[ScaledLoRAFactor],
+        *,
+        device: torch.device,
+        dtype: torch.dtype | None = None,
+    ) -> FusedLoRAFactors:
+        """Stack ``factors`` into one fused pair on ``device``.
+
+        Each factor's pinned ``a``/``b`` is DMA'd straight into its rank
+        slice (``copy_`` casts dtype during the transfer, so fp32-stored
+        factors land as the layer's bf16/fp16 in one op), and ``strength``
+        is baked into ``b`` in place — no intermediate scaled-``b`` tensor.
+        All factors must share ``in_dim``/``out_dim`` (they parameterize the
+        same base weight); this is validated defensively.
+        """
+        if not factors:
+            raise ValueError("FusedLoRAFactors.from_factors requires at least one ScaledLoRAFactor.")
+        in_dim = factors[0].in_dim
+        out_dim = factors[0].out_dim
+        for factor in factors:
+            if factor.in_dim != in_dim or factor.out_dim != out_dim:
+                raise ValueError(
+                    f"LoRA factor shape mismatch: expected A=(r, {in_dim}), "
+                    f"B=({out_dim}, r); got A={tuple(factor.a.shape)}, "
+                    f"B={tuple(factor.b.shape)}."
+                )
+        total_rank = sum(factor.rank for factor in factors)
+        factor_dtype = dtype if dtype is not None else factors[0].a.dtype
+
+        a_fused = torch.empty(
+            (total_rank, in_dim),
+            device=device,
+            dtype=factor_dtype,
+        )
+        b_fused = torch.empty(
+            (out_dim, total_rank),
+            device=device,
+            dtype=factor_dtype,
+        )
+        offset = 0
+        for factor in factors:
+            r = factor.rank
+            a_fused[offset : offset + r].copy_(factor.a, non_blocking=True)
+            b_slice = b_fused[:, offset : offset + r]
+            b_slice.copy_(factor.b, non_blocking=True)
+            b_slice.mul_(factor.strength)
+            offset += r
+
+        return cls(a_fused=a_fused, b_fused=b_fused)
 
 
 def default_key_transform(key: str) -> str:
@@ -137,10 +254,10 @@ class LoRATransform:
     :class:`~torch.nn.Parameter` object is always preserved.
     """
 
-    __slots__ = ("_refs",)
+    __slots__ = ("_factors",)
 
-    def __init__(self, refs: list[_LoraFactorRef]) -> None:
-        self._refs = refs
+    def __init__(self, factors: list[ScaledLoRAFactor]) -> None:
+        self._factors = factors
 
     def validate_target(self, param: nn.Parameter) -> None:
         """Raise if ``param`` cannot receive this LoRA merge.
@@ -152,7 +269,8 @@ class LoRATransform:
         representation = param_representation(param)
         adapter = _dequant_requant_adapter(representation)
         _validate_factor_shapes(
-            self._refs, self._logical_shape(representation, adapter),
+            self._factors,
+            self._logical_shape(representation, adapter),
         )
 
     def apply(self, param: nn.Parameter) -> None:
@@ -162,7 +280,7 @@ class LoRATransform:
         representation = param_representation(param)
         adapter = _dequant_requant_adapter(representation)
         if adapter is None:
-            _validate_factor_shapes(self._refs, tuple(representation.shape))
+            _validate_factor_shapes(self._factors, tuple(representation.shape))
             self._apply_dense(representation)
             return
 
@@ -170,7 +288,7 @@ class LoRATransform:
         # Validate against the dense LOGICAL shape, not the wrapper's shape:
         # Params4bit reports its packed (numel/2, 1) storage shape, so the
         # factor check must use the dequantized shape to be correct.
-        _validate_factor_shapes(self._refs, tuple(dense.shape))
+        _validate_factor_shapes(self._factors, tuple(dense.shape))
         self._apply_dense(dense)
         new_data = adapter.requantize(dense, like=representation)
         adapter.copy_into(new_data, target=representation)
@@ -189,26 +307,23 @@ class LoRATransform:
 
     def _apply_dense(self, data: torch.Tensor) -> None:
         dev, dt = data.device, data.dtype
-        for a, b, strength in self._refs:
-            a_gpu = a.to(device=dev, dtype=dt, non_blocking=True)
-            b_gpu = b.to(device=dev, dtype=dt, non_blocking=True)
-            data.addmm_(b_gpu, a_gpu, alpha=strength)
+        for factor in self._factors:
+            a_gpu = factor.a.to(device=dev, dtype=dt, non_blocking=True)
+            b_gpu = factor.b.to(device=dev, dtype=dt, non_blocking=True)
+            data.addmm_(b_gpu, a_gpu, alpha=factor.strength)
 
 
 def _validate_factor_shapes(
-    refs: list[_LoraFactorRef], target_shape: tuple[int, ...],
+    factors: Sequence[ScaledLoRAFactor],
+    target_shape: tuple[int, ...],
 ) -> None:
-    for a, b, _strength in refs:
-        if a.ndim != 2 or b.ndim != 2 or a.shape[0] != b.shape[1]:
+    # Per-pair validity (2-D, matching inner rank) is guaranteed by
+    # ScaledLoRAFactor construction; only the match against this concrete
+    # target shape is checked here.
+    for factor in factors:
+        if factor.produced_shape != target_shape:
             raise ValueError(
-                "LoRA factor shape mismatch: "
-                f"A shape is {tuple(a.shape)}, B shape is {tuple(b.shape)}."
-            )
-        produced_shape = (b.shape[0], a.shape[1])
-        if target_shape != produced_shape:
-            raise ValueError(
-                "LoRA factor shape mismatch: "
-                f"B@A produces {produced_shape}, target shape is {target_shape}."
+                f"LoRA factor shape mismatch: B@A produces {factor.produced_shape}, target shape is {target_shape}."
             )
 
 
@@ -281,56 +396,25 @@ class LoRARouteHandle:
     LoraLayer subclasses).
     """
 
-    __slots__ = ("_a_fused", "_b_fused", "_handle")
+    __slots__ = ("_fused", "_handle")
 
     def __init__(
         self,
         parent: nn.Module,
-        refs: list[tuple[torch.Tensor, torch.Tensor, float]],
+        factors: Sequence[ScaledLoRAFactor],
         device: torch.device,
         dtype: torch.dtype | None = None,
     ) -> None:
-        if not refs:
-            raise ValueError("LoRARouteHandle requires at least one (A, B, strength) ref")
-
-        # Pull shape from the first ref, then verify the rest agree.
-        # All LoRAs against the same target share in_dim / out_dim by
-        # construction (they parameterize the same base weight); we
-        # validate defensively to fail loud on caller misuse.
-        in_dim = refs[0][0].shape[1]
-        out_dim = refs[0][1].shape[0]
-        ranks = [a.shape[0] for a, _, _ in refs]
-        for a, b, _ in refs:
-            if a.shape[1] != in_dim or b.shape[0] != out_dim:
-                raise ValueError(
-                    f"LoRA factor shape mismatch: expected A=(r, {in_dim}), "
-                    f"B=({out_dim}, r); got A={tuple(a.shape)}, "
-                    f"B={tuple(b.shape)}."
-                )
-        total_rank = sum(ranks)
-        factor_dtype = dtype if dtype is not None else refs[0][0].dtype
-
-        # Preallocate the fused tensors, then DMA each per-LoRA factor
-        # straight into its slice. `copy_` casts dtype as part of the
-        # transfer, so factors stored as fp32 land as the layer's
-        # bf16/fp16 in one operation. `mul_` bakes the strength
-        # in-place — no intermediate scaled-B tensor.
-        a_fused = torch.empty(
-            (total_rank, in_dim), device=device, dtype=factor_dtype,
+        fused = FusedLoRAFactors.from_factors(
+            factors,
+            device=device,
+            dtype=dtype,
         )
-        b_fused = torch.empty(
-            (out_dim, total_rank), device=device, dtype=factor_dtype,
-        )
-        offset = 0
-        for (a, b, strength), r in zip(refs, ranks, strict=True):
-            a_fused[offset : offset + r].copy_(a, non_blocking=True)
-            b_slice = b_fused[:, offset : offset + r]
-            b_slice.copy_(b, non_blocking=True)
-            b_slice.mul_(strength)
-            offset += r
-
-        self._a_fused = a_fused
-        self._b_fused = b_fused
+        # Bind the fused tensors as locals so the hook closure keeps them
+        # alive; self._fused holds the same refs so remove() can drop them.
+        a_fused = fused.a_fused
+        b_fused = fused.b_fused
+        self._fused = fused
 
         def hook(
             _module: nn.Module,
@@ -344,12 +428,11 @@ class LoRARouteHandle:
 
     def remove(self) -> None:
         self._handle.remove()
-        # Drop the GPU factor refs. The closure also holds them via
-        # the captured locals, but unregistering removes the hook
-        # function from the module's _forward_hooks dict, so the
-        # closure becomes unreachable and Python refcount-GCs it.
-        self._a_fused = None
-        self._b_fused = None
+        # Drop the fused GPU factors. The closure also holds them via the
+        # captured locals, but unregistering removes the hook function from
+        # the module's _forward_hooks dict, so the closure becomes
+        # unreachable and Python refcount-GCs it.
+        self._fused = None
 
 
 # ---------------------------------------------------------------------------
@@ -389,9 +472,7 @@ def _pair_and_pin(
 
         if not a.is_floating_point() or not b.is_floating_point():
             raise ValueError(
-                f"LoRA factors for {target_key!r}: must be "
-                f"floating-point; got A.dtype={a.dtype}, "
-                f"B.dtype={b.dtype}."
+                f"LoRA factors for {target_key!r}: must be floating-point; got A.dtype={a.dtype}, B.dtype={b.dtype}."
             )
         if a.dim() != 2 or b.dim() != 2 or a.shape[0] != b.shape[1]:
             raise ValueError(
@@ -403,8 +484,7 @@ def _pair_and_pin(
 
         if target_key in factors:
             raise ValueError(
-                f"Duplicate LoRA target {target_key!r}: key_transform "
-                f"mapped multiple source keys to the same target."
+                f"Duplicate LoRA target {target_key!r}: key_transform mapped multiple source keys to the same target."
             )
         factors[target_key] = (
             a.contiguous().pin_memory(),
