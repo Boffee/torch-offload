@@ -45,7 +45,6 @@ from .tensor_adapters import (
 )
 
 __all__ = [
-    "FusedLoRAFactors",
     "KeyTransformT",
     "LoRA",
     "LoRAFactor",
@@ -111,80 +110,6 @@ class ScaledLoRAFactor(LoRAFactor):
     """
 
     strength: float
-
-
-@dataclass(slots=True, frozen=True)
-class FusedLoRAFactors:
-    """Several :class:`ScaledLoRAFactor` against one target, fused into a
-    single rank-stacked pair on a target device.
-
-    ``a_fused`` has shape ``(sum_i r_i, in_dim)`` — each factor's ``a``
-    stacked along the rank axis. ``b_fused`` has shape
-    ``(out_dim, sum_i r_i)`` — each factor's ``b`` scaled by its strength,
-    stacked along the rank axis. The identity
-    ``b_fused @ a_fused == sum_i strength_i * (b_i @ a_i)`` falls out of the
-    block structure: every fused-rank column belongs to exactly one factor's
-    slice, so there are no cross terms. Mixed ranks are handled naturally —
-    the fused rank is ``sum_i r_i`` rather than ``N * r``.
-
-    This is a **per-target** fusion (several adapters against one base
-    weight); it is not a cross-block batching mechanism.
-    """
-
-    a_fused: torch.Tensor
-    b_fused: torch.Tensor
-
-    @classmethod
-    def from_factors(
-        cls,
-        factors: Sequence[ScaledLoRAFactor],
-        *,
-        device: torch.device,
-        dtype: torch.dtype | None = None,
-    ) -> FusedLoRAFactors:
-        """Stack ``factors`` into one fused pair on ``device``.
-
-        Each factor's pinned ``a``/``b`` is DMA'd straight into its rank
-        slice (``copy_`` casts dtype during the transfer, so fp32-stored
-        factors land as the layer's bf16/fp16 in one op), and ``strength``
-        is baked into ``b`` in place — no intermediate scaled-``b`` tensor.
-        All factors must share ``in_dim``/``out_dim`` (they parameterize the
-        same base weight); this is validated defensively.
-        """
-        if not factors:
-            raise ValueError("FusedLoRAFactors.from_factors requires at least one ScaledLoRAFactor.")
-        in_dim = factors[0].in_dim
-        out_dim = factors[0].out_dim
-        for factor in factors:
-            if factor.in_dim != in_dim or factor.out_dim != out_dim:
-                raise ValueError(
-                    f"LoRA factor shape mismatch: expected A=(r, {in_dim}), "
-                    f"B=({out_dim}, r); got A={tuple(factor.a.shape)}, "
-                    f"B={tuple(factor.b.shape)}."
-                )
-        total_rank = sum(factor.rank for factor in factors)
-        factor_dtype = dtype if dtype is not None else factors[0].a.dtype
-
-        a_fused = torch.empty(
-            (total_rank, in_dim),
-            device=device,
-            dtype=factor_dtype,
-        )
-        b_fused = torch.empty(
-            (out_dim, total_rank),
-            device=device,
-            dtype=factor_dtype,
-        )
-        offset = 0
-        for factor in factors:
-            r = factor.rank
-            a_fused[offset : offset + r].copy_(factor.a, non_blocking=True)
-            b_slice = b_fused[:, offset : offset + r]
-            b_slice.copy_(factor.b, non_blocking=True)
-            b_slice.mul_(factor.strength)
-            offset += r
-
-        return cls(a_fused=a_fused, b_fused=b_fused)
 
 
 def default_key_transform(key: str) -> str:
@@ -372,37 +297,48 @@ def _dequant_requant_adapter(
     )
 
 
+def _routed_residual(
+    x: torch.Tensor,
+    factors: Sequence[ScaledLoRAFactor],
+) -> torch.Tensor:
+    """Routed LoRA contribution ``Σ_i strength_i · (x @ A_i.T) @ B_i.T``.
+
+    Each adapter pair is applied independently and summed — no fusion.
+    Strength scales the intermediate ``M·r`` projection (cheaper than
+    scaling the ``M·out`` result, and keeps it extrinsic to the stored
+    factors rather than baked into a buffer). The overwhelmingly common
+    single-adapter case is one scaled pair of GEMMs.
+    """
+    total: torch.Tensor | None = None
+    for factor in factors:
+        part = ((x @ factor.a.T) * factor.strength) @ factor.b.T
+        total = part if total is None else total + part
+    if total is None:
+        raise ValueError("Routed LoRA residual requires at least one factor.")
+    return total
+
+
 class LoRARouteHandle:
     """Live forward-hook for one routed LoRA target.
 
     Owns GPU copies of the LoRA factors plus the registered hook on
     the parent module. Forward path becomes::
 
-        y = base(x) + sum_i strength_i * (x @ A_i.T @ B_i.T)
+        y = base(x) + sum_i strength_i * (x @ A_i.T) @ B_i.T
 
-    When the target has multiple LoRAs (merging multiple adapters
-    against the same weight), factors are pre-fused at install time:
+    Each adapter's ``(A, B)`` pair is applied independently and summed
+    (see :func:`_routed_residual`); strength is applied at the
+    intermediate ``M·r`` projection, never baked into a stored buffer.
+    The overwhelmingly common single-adapter case is one scaled pair of
+    GEMMs; multiple adapters against one weight (rare) do N small GEMMs.
+    Keeping the pairs separate makes each factor a plain tensor the mover
+    handles directly and keeps the path DTensor-friendly — no fused
+    buffer that would discard tensor-parallel placement.
 
-    - ``A_fused``  shape ``(sum_i r_i, in_dim)``     — A_i stacked along the rank axis
-    - ``B_fused``  shape ``(out_dim, sum_i r_i)``    — B_i scaled by strength_i, stacked along the rank axis
-
-    The math identity ``B_fused @ A_fused == sum_i strength_i * B_i @ A_i``
-    falls out from the stacking: each ``m`` in the fused rank dimension
-    lands in exactly one LoRA's slice. Mixed ranks are handled
-    naturally — the fused rank is ``sum_i r_i`` rather than ``N · r``.
-
-    Single fused GEMM at the combined rank replaces N per-LoRA GEMMs:
-    fewer kernel launches, better tensor-core utilization, better
-    memory locality.
-
-    The fused tensors are preallocated empty and filled by per-slice
-    pinned-CPU → GPU DMA (``copy_`` casts dtype during the transfer);
-    strength is baked via in-place ``mul_`` on the slice. This avoids
-    the staging-then-cat path's transient peak (one per-LoRA GPU
-    tensor *plus* the fused result both live momentarily).
-
-    Construction installs the hook; :meth:`remove` removes it and
-    drops the GPU factor refs so refcount-GC reclaims them.
+    The factors are copied pinned-CPU → GPU once at install (``to`` casts
+    dtype during the transfer, so fp32-stored factors land as the layer's
+    bf16/fp16). Construction installs the hook; :meth:`remove` removes it
+    and drops the GPU factor refs so refcount-GC reclaims them.
 
     Restricted to ``nn.Linear``-shaped forwards. The math assumes
     ``base(x) = x @ W.T (+ bias)``; LoRA applied to Conv2d, Embedding,
@@ -410,7 +346,7 @@ class LoRARouteHandle:
     LoraLayer subclasses).
     """
 
-    __slots__ = ("_fused", "_handle")
+    __slots__ = ("_factors", "_handle")
 
     def __init__(
         self,
@@ -419,34 +355,36 @@ class LoRARouteHandle:
         device: torch.device,
         dtype: torch.dtype | None = None,
     ) -> None:
-        fused = FusedLoRAFactors.from_factors(
-            factors,
-            device=device,
-            dtype=dtype,
-        )
-        # Bind the fused tensors as locals so the hook closure keeps them
-        # alive; self._fused holds the same refs so remove() can drop them.
-        a_fused = fused.a_fused
-        b_fused = fused.b_fused
-        self._fused = fused
+        # Move each factor pair to the target device/dtype once; strength
+        # stays extrinsic and is applied at the hook, not baked in.
+        gpu_factors = [
+            ScaledLoRAFactor(
+                factor.a.to(device=device, dtype=dtype, non_blocking=True),
+                factor.b.to(device=device, dtype=dtype, non_blocking=True),
+                factor.strength,
+            )
+            for factor in factors
+        ]
+        # The closure captures `gpu_factors` so the GPU tensors stay alive
+        # while the hook is registered; self._factors holds the same refs
+        # so remove() can drop them.
+        self._factors = gpu_factors
 
         def hook(
             _module: nn.Module,
             inputs: tuple[torch.Tensor, ...],
             output: torch.Tensor,
         ) -> torch.Tensor:
-            x = inputs[0]
-            return output + (x @ a_fused.T) @ b_fused.T
+            return output + _routed_residual(inputs[0], gpu_factors)
 
         self._handle = parent.register_forward_hook(hook)
 
     def remove(self) -> None:
         self._handle.remove()
-        # Drop the fused GPU factors. The closure also holds them via the
-        # captured locals, but unregistering removes the hook function from
-        # the module's _forward_hooks dict, so the closure becomes
-        # unreachable and Python refcount-GCs it.
-        self._fused = None
+        # Drop the GPU factors. Unregistering removes the hook function from
+        # the module's _forward_hooks dict, so the closure that also captured
+        # them becomes unreachable and Python refcount-GCs it.
+        self._factors = None
 
 
 # ---------------------------------------------------------------------------

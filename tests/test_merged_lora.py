@@ -1247,11 +1247,11 @@ class TestRoutedMode:
             s.deactivate()
 
     @CUDA
-    def test_routed_concat_handles_mixed_ranks(self) -> None:
+    def test_routed_mixed_ranks(self) -> None:
         # Multiple LoRAs targeting the same weight at different ranks
-        # must produce the same forward output as the fused route math:
-        # fused rank = r1 + r2 + ..., and B_fused @ A_fused equals
-        # sum_i strength_i * B_i @ A_i.
+        # must produce the same forward output as the per-adapter route
+        # math: each (A_i, B_i) is applied independently and summed,
+        # output = base(x) + sum_i strength_i * (x @ A_i.T) @ B_i.T.
         m = _make_bf16_model(num_blocks=2, dim=16)
         # Two LoRAs targeting the same blocks with different ranks.
         lora_r4 = _make_lora(num_blocks=2, dim=16, rank=4, seed=101)
@@ -1267,7 +1267,7 @@ class TestRoutedMode:
             torch.cuda.synchronize()
             expected = self._expected_routed_output(m, x, loras)
             assert torch.allclose(actual, expected, rtol=0.1, atol=0.1), (
-                f"mixed-rank concat output mismatch:\n"
+                f"mixed-rank routed output mismatch:\n"
                 f"  expected: {expected.flatten()[:4]}\n"
                 f"  actual:   {actual.flatten()[:4]}"
             )
@@ -1384,9 +1384,9 @@ class TestRoutedMode:
             _activate_loras_for_test(s)
 
     @CUDA
-    def test_routed_single_lora_skips_concat(self) -> None:
-        # Single-LoRA case takes the no-cat fast path. Forward output
-        # must still match the manual baseline.
+    def test_routed_single_adapter(self) -> None:
+        # Single-adapter case: one (A, B) pair, no summation. Forward
+        # output must still match the manual baseline.
         m = _make_bf16_model(num_blocks=2, dim=16)
         loras = [(_make_lora(num_blocks=2, dim=16, seed=33), 0.7)]
 
