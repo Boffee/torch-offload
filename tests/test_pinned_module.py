@@ -34,6 +34,10 @@ class _FakePinnedParam:
         self.copy_to_cpu_non_blocking: list[bool] = []
         self.requires_grad = requires_grad
         self.target_data = target_data
+        # Stable pinned-CPU backing aliased by every make_cpu_param() call,
+        # mirroring real adapters (whose CPU wrapper aliases shared pinned
+        # storage). A fresh wrapper object each call, but the same storage.
+        self._cpu_data = torch.empty_like(target_data)
         self.target_layout = PinnedParam.target_layout_for(
             nn.Parameter(target_data, requires_grad=requires_grad),
         )
@@ -47,7 +51,7 @@ class _FakePinnedParam:
 
     def make_cpu_param(self) -> nn.Parameter:
         return nn.Parameter(
-            torch.empty_like(self.target_data),
+            self._cpu_data,
             requires_grad=self.requires_grad,
         )
 
@@ -287,16 +291,16 @@ class TestPinnedModuleStore:
             calls.append("validate")
             raise NotImplementedError("unsupported")
 
-        def fail_restore(*_args: object, **_kwargs: object) -> None:
-            calls.append("restore")
-            raise AssertionError("restore should not run before validation")
+        def fail_install(*_args: object, **_kwargs: object) -> None:
+            calls.append("install")
+            raise AssertionError("install should not run before validation")
 
         monkeypatch.setattr(
             PinnedParam,
             "validate_parameter_data_swap_target",
             fail_validate,
         )
-        monkeypatch.setattr(pinned_module, "_restore_params", fail_restore)
+        monkeypatch.setattr(pinned_module, "_install_pinned_params", fail_install)
 
         with pytest.raises(NotImplementedError, match="Trainable param 'weight'"):
             PinnedModuleStore.from_module(module)
@@ -337,9 +341,6 @@ class TestPinnedModuleInstance:
             module=nn.Module(),
             params=store.params,
             buffers=store.buffers,
-            cpu_params_by_pinned_id={
-                id(pinned_param): pinned_param.make_cpu_param(),
-            },
         )
 
         target = instance.allocate_target(torch.device("cuda"))
@@ -353,7 +354,6 @@ class TestPinnedModuleInstance:
             module=nn.Module(),
             params={},
             buffers={},
-            cpu_params_by_pinned_id={},
         )
 
         with pytest.raises(ValueError, match="requires a CUDA device"):
@@ -377,7 +377,6 @@ class TestPinnedModuleInstance:
             module=module,
             params=store.params,
             buffers=store.buffers,
-            cpu_params_by_pinned_id={id(pinned): pinned.make_cpu_param()},
         )
         target = instance.allocate_target(torch.device("cuda"))
         hook_calls: list[nn.Parameter] = []
@@ -408,7 +407,6 @@ class TestPinnedModuleInstance:
             module=module,
             params=store.params,
             buffers=store.buffers,
-            cpu_params_by_pinned_id={id(pinned): pinned.make_cpu_param()},
         )
         target = instance.allocate_target(torch.device("cuda"))
         hook_calls: list[nn.Parameter] = []
@@ -438,7 +436,6 @@ class TestPinnedModuleInstance:
             module=module,
             params=store.params,
             buffers=store.buffers,
-            cpu_params_by_pinned_id={id(pinned): pinned.make_cpu_param()},
         )
         target = instance.allocate_target(torch.device("cuda"))
 
@@ -502,7 +499,6 @@ class TestPinnedModuleInstance:
             module=module,
             params=store.params,
             buffers=store.buffers,
-            cpu_params_by_pinned_id={id(pinned): pinned.make_cpu_param()},
         )
         target = PinnedModuleTarget(
             param_targets={
@@ -533,7 +529,6 @@ class TestPinnedModuleInstance:
             module=module,
             params=store.params,
             buffers=store.buffers,
-            cpu_params_by_pinned_id={},
         )
         target = PinnedModuleTarget(
             param_targets={},
@@ -562,7 +557,6 @@ class TestPinnedModuleInstance:
             module=nn.Module(),
             params=store.params,
             buffers=store.buffers,
-            cpu_params_by_pinned_id={id(pinned): pinned.make_cpu_param()},
         )
         target = instance.allocate_target(torch.device("cuda"))
 
@@ -585,10 +579,6 @@ class TestPinnedModuleInstance:
             module=nn.Module(),
             params=store.params,
             buffers=store.buffers,
-            cpu_params_by_pinned_id={
-                id(frozen): frozen.make_cpu_param(),
-                id(trainable): trainable.make_cpu_param(),
-            },
         )
         target = instance.allocate_target(torch.device("cuda"))
 
@@ -611,10 +601,6 @@ class TestPinnedModuleInstance:
             module=nn.Module(),
             params=store.params,
             buffers=store.buffers,
-            cpu_params_by_pinned_id={
-                id(frozen): frozen.make_cpu_param(),
-                id(trainable): trainable.make_cpu_param(),
-            },
         )
         target = instance.allocate_target(
             torch.device("cuda"),
@@ -637,7 +623,6 @@ class TestPinnedModuleInstance:
             module=nn.Module(),
             params=store.params,
             buffers=store.buffers,
-            cpu_params_by_pinned_id={id(pinned): pinned.make_cpu_param()},
         )
 
         with pytest.raises(ValueError, match="param target names mismatch"):
@@ -666,10 +651,6 @@ class TestPinnedModuleInstance:
             module=module,
             params=store.params,
             buffers=store.buffers,
-            cpu_params_by_pinned_id={
-                id(frozen): frozen.make_cpu_param(),
-                id(trainable): trainable.make_cpu_param(),
-            },
         )
 
         target = instance.allocate_target(
@@ -693,7 +674,7 @@ class TestPinnedModuleInstance:
             target.param_targets["trainable"].param.data_ptr()
         )
 
-    def test_restore_pinned_restores_partially_loaded_trainables(self) -> None:
+    def test_install_pinned_partially_loaded_trainables(self) -> None:
         module = nn.Module()
         module.frozen = nn.Parameter(torch.zeros(2), requires_grad=False)
         module.trainable = nn.Parameter(torch.zeros(2), requires_grad=True)
@@ -710,13 +691,8 @@ class TestPinnedModuleInstance:
             module=module,
             params=store.params,
             buffers=store.buffers,
-            cpu_params_by_pinned_id={
-                id(frozen): frozen.make_cpu_param(),
-                id(trainable): trainable.make_cpu_param(),
-            },
         )
-        instance.restore_pinned()
-        pinned_frozen = module.frozen
+        instance.install_pinned()
         pinned_trainable = module.trainable
         pinned_trainable_data_ptr = module.trainable.data_ptr()
         target = instance.allocate_target(
@@ -726,9 +702,14 @@ class TestPinnedModuleInstance:
         )
         instance.load_to_target(target)
 
-        instance.restore_pinned()
+        instance.install_pinned()
 
-        assert module.frozen is pinned_frozen
+        # Frozen params are restored by registry replacement with a fresh
+        # materialized wrapper (built on demand, no cache), so identity is not
+        # preserved — but they stay frozen.
+        assert module.frozen.requires_grad is False
+        # Trainable params preserve the user's Parameter wrapper and restore
+        # only ``.data`` to the pinned bytes.
         assert module.trainable is pinned_trainable
         assert target.param_targets["trainable"].param.data_ptr() != (
             pinned_trainable_data_ptr
@@ -741,22 +722,23 @@ class TestPinnedModuleInstance:
         prototype.register_buffer("running", torch.randn(2))
         store = PinnedModuleStore.from_module(prototype)
 
-        first = store.bind(prototype)
+        store.bind(prototype)
 
         second_module = nn.Module()
         second_module.weight = nn.Parameter(torch.randn(2, 2), requires_grad=False)
         second_module.register_buffer("running", torch.randn(2))
-        second = store.bind(second_module)
+        store.bind(second_module)
 
         pinned = store.params["weight"]
-        first_cpu = first.cpu_params_by_pinned_id[id(pinned)]
-        second_cpu = second.cpu_params_by_pinned_id[id(pinned)]
+        # Each bind materializes its own CPU wrapper (deduped per pinned
+        # within a bind), installed onto the bound module. The instance no
+        # longer caches them, so read the installed wrappers off the modules.
+        first_cpu = prototype.weight
+        second_cpu = second_module.weight
 
         assert first_cpu is not second_cpu
         assert first_cpu.data_ptr() == pinned.make_cpu_param().data_ptr()
         assert second_cpu.data_ptr() == pinned.make_cpu_param().data_ptr()
-        assert prototype.weight is first_cpu
-        assert second_module.weight is second_cpu
         assert prototype.running is store.buffers["running"].tensor
         assert second_module.running is store.buffers["running"].tensor
 
@@ -784,14 +766,17 @@ class TestPinnedModuleInstance:
         target_shared.weight.requires_grad_(False)
         target.left = target_shared
         target.right = target_shared
-        instance = store.bind(target)
+        store.bind(target)
 
         pinned = store.params["left.weight"]
-        cpu_param = instance.cpu_params_by_pinned_id[id(pinned)]
+        # Tied names share one materialized CPU wrapper, installed under both
+        # leaves. Read it off the module (the instance no longer caches it).
+        cpu_param = target.left.weight
 
         assert store.params["left.weight"] is store.params["right.weight"]
         assert target.left.weight is cpu_param
         assert target.right.weight is cpu_param
+        assert cpu_param.data_ptr() == pinned.make_cpu_param().data_ptr()
 
     def test_trainable_restore_preserves_parameter_wrapper(self) -> None:
         prototype = nn.Module()
@@ -802,11 +787,14 @@ class TestPinnedModuleInstance:
         target.weight = nn.Parameter(torch.randn(2, 2), requires_grad=True)
         target_param = target.weight
 
-        instance = store.bind(target)
-        cpu_param = instance.cpu_params_by_pinned_id[id(store.params["weight"])]
+        store.bind(target)
 
+        # Trainable restore preserves the user's Parameter wrapper and swaps
+        # only ``.data`` to the materialized wrapper aliasing the pinned bytes.
         assert target.weight is target_param
-        assert target.weight.data_ptr() == cpu_param.data_ptr()
+        assert target.weight.data_ptr() == (
+            store.params["weight"].make_cpu_param().data_ptr()
+        )
 
     def test_preserves_target_buffer_persistence(self) -> None:
         prototype = nn.Module()
@@ -827,11 +815,11 @@ class TestPinnedModuleInstance:
         module.register_buffer("table", source)
 
         store = PinnedModuleStore.from_module(module)
-        instance = store.bind(module)
+        store.bind(module)
 
         assert not source.is_contiguous()
         assert store.buffers["table"].tensor.is_contiguous()
-        assert instance.module.table is store.buffers["table"].tensor
+        assert module.table is store.buffers["table"].tensor
 
     def test_rejects_missing_param_name(self) -> None:
         prototype = nn.Module()
@@ -983,7 +971,7 @@ class TestPinnedModuleInstance:
         model = nn.Linear(4, 3, bias=True)
         model.bias.requires_grad = False  # frozen
         instance = PinnedModuleStore.from_module(model).bind(model)
-        instance.restore_pinned()  # trainable .data on pinned CPU
+        # ``bind`` installs trainable .data on pinned CPU.
 
         # No grad yet -> no-op, no crash on the None case.
         instance.move_trainable_grads_to(torch.device("cuda"))

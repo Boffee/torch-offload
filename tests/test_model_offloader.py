@@ -738,7 +738,7 @@ class TestCyclicPrefetch:
             recorded, _ = self._record_prefetches(streamer)
             x = torch.randn(2, 8, device="cuda")
             for idx in (3, 2, 1, 0):
-                streamer._blocks[idx](x)
+                streamer.blocks[idx](x)
             torch.cuda.synchronize()
 
         # Per-hook (cyclic, num_prefetch_blocks=1):
@@ -2097,10 +2097,11 @@ class TestStreamedNameSelection:
                     "blocks.1.scale",
                 }
             )
-            instance, local_name = strategy._streamed_components[0]._resolve_buffer_name(
-                "blocks.0.scale"
-            )
-            assert instance.module is model.blocks[0]
+            streamer = strategy._streamed_components[0]
+            _instance, local_name = streamer._resolve_buffer_name("blocks.0.scale")
+            # The instance is module-agnostic now; block 0's scheduling module
+            # (== its from_module source) is model.blocks[0].
+            assert streamer.blocks[0] is model.blocks[0]
             assert local_name == "scale"
         finally:
             strategy.deactivate()
