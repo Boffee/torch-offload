@@ -1591,8 +1591,17 @@ class StreamedComponent:
                 wrap_threshold=wrap_threshold,
             )
 
-        for idx, instance in enumerate(self._block_instances):
-            h = instance.module.register_forward_pre_hook(
+        # One pre-hook per DISTINCT trigger module. A module aliased across
+        # blocks (a weight-shared layer appearing multiple times in the block
+        # list) gets a single hook keyed to its last block index; installing one
+        # hook per alias would fire them all on a single shared forward and churn
+        # the GPU pool (load then immediately evict each aliased block in turn).
+        last_idx_by_module: dict[int, int] = {
+            id(instance.module): idx
+            for idx, instance in enumerate(self._block_instances)
+        }
+        for idx in last_idx_by_module.values():
+            h = self._block_instances[idx].module.register_forward_pre_hook(
                 functools.partial(_pre_hook, idx=idx)
             )
             self._hooks.append(h)
