@@ -538,10 +538,8 @@ class StreamedComponentStore:
     """Reusable pinned backing storage for a streamed block group.
 
     Built via :meth:`from_module`: the streamed tensor source IS the
-    model's block list, and ``blocks_path`` resolves on the model to both
-    the streamed source modules and the schedule (the trigger modules whose
-    forwards drive streaming). The schedule is kept as a distinct seam from
-    the source even though they coincide today.
+    model's block list, resolved by ``blocks_path``. Each block's forward-pre
+    hook triggers the load of its own streamed instance.
     """
 
     _block_stores: tuple[PinnedModuleStore, ...]
@@ -633,22 +631,19 @@ class StreamedComponentStore:
     ) -> StreamedComponent:
         """Bind this store's per-block backing bytes to ``model``.
 
-        The resolved blocks are both the streamed source and the schedule:
-        each instance owns and is installed onto its model block, and loads
-        repoint the instance's own module onto the filled target.
+        Each instance owns and is installed onto its model block; loads repoint
+        the instance's own module onto the filled target, and that block's
+        forward triggers its streaming.
         """
-        schedule = self.resolve_blocks(model)
-        if len(schedule) != len(self._block_stores):
+        blocks = self.resolve_blocks(model)
+        if len(blocks) != len(self._block_stores):
             raise ValueError(
                 "StreamedComponentStore.bind() block count mismatch: "
-                f"store has {len(self._block_stores)}, got {len(schedule)}."
+                f"store has {len(self._block_stores)}, got {len(blocks)}."
             )
-        # Source == schedule: each instance owns and is installed onto its
-        # model block. Loads repoint the instance's own module onto the
-        # filled target; the schedule defaults to the instance modules.
         instances = [
             store.bind(block)
-            for store, block in zip(self._block_stores, schedule, strict=True)
+            for store, block in zip(self._block_stores, blocks, strict=True)
         ]
         return StreamedComponent(
             instances,
@@ -764,7 +759,6 @@ class StreamedComponent:
         self,
         block_instances: Sequence[PinnedModuleInstance],
         *,
-        schedule: Sequence[nn.Module] | None = None,
         num_resident_blocks: int,
         num_prefetch_blocks: int = 2,
         cyclic: bool = False,
@@ -775,24 +769,9 @@ class StreamedComponent:
             num_prefetch_blocks=num_prefetch_blocks,
         )
         self._block_instances = list(block_instances)
-        # Schedule == source today: ``_schedule`` is the ordered list of
-        # modules whose forward-pre hooks trigger streaming of block index i.
-        # It is kept as a distinct seam from the streamed-tensor source — the
-        # source modules ARE the schedule (the default below), so loads
-        # install onto each instance's own module, but a future phase may
-        # schedule on modules other than the source by passing an explicit
-        # ``schedule``. Either way ``len(schedule) == len(instances)``.
-        self._schedule = (
-            list(schedule)
-            if schedule is not None
-            else [inst.module for inst in self._block_instances]
-        )
-        if len(self._schedule) != len(self._block_instances):
-            raise ValueError(
-                "StreamedComponent schedule length "
-                f"({len(self._schedule)}) must match the number of streamed "
-                f"block instances ({len(self._block_instances)})."
-            )
+        # Each block triggers its own streaming: forwarding
+        # ``block_instances[i].module`` loads ``block_instances[i]``. The
+        # trigger block IS the streamed source module (see :attr:`blocks`).
         # Per-block layout signature: blocks with equal signatures share
         # pooled GPU targets, so a block list may mix quant formats.
         self._block_signatures = [
@@ -845,12 +824,12 @@ class StreamedComponent:
 
     @property
     def blocks(self) -> tuple[nn.Module, ...]:
-        """Scheduling modules whose forwards drive this component's streaming.
+        """The streamed block modules, in order.
 
-        These are the streamed-source modules themselves; the schedule is
-        kept as a distinct seam from the source even though they coincide.
+        ``blocks[i]``'s forward triggers the load of streamed instance ``i``
+        (each block triggers its own streaming).
         """
-        return tuple(self._schedule)
+        return tuple(inst.module for inst in self._block_instances)
 
     @property
     def streamed_param_names_by_block(self) -> list[list[str]]:
@@ -1577,20 +1556,15 @@ class StreamedComponent:
         tracker.peak_gpu_blocks = max(tracker.peak_gpu_blocks, total)
 
     def _register_hooks(self, num_resident: int) -> None:
-        # Hooks fire on the SCHEDULE modules (``_schedule``): forwarding
-        # schedule module i triggers a load of streamed block instance i.
-        # Source == schedule today, but the schedule is kept as a distinct
-        # seam so a future phase can schedule on modules other than the source.
-        idx_map: dict[int, int] = {
-            id(block): idx for idx, block in enumerate(self._schedule)
-        }
+        # Each block's forward-pre hook triggers the load of its own streamed
+        # instance: forwarding ``block_instances[i].module`` loads instance i.
         num_prefetch_blocks = self._num_prefetch_blocks  # capture as local — no `self` ref in closure
         max_on_gpu = num_resident + num_prefetch_blocks
         cyclic = self._cyclic
         num_blocks = len(self._block_instances)
         wrap_threshold = num_blocks // 2  # |Δidx| > this counts as wraparound
         # weakref breaks the cycle: block → hook → closure → streamer
-        # → _schedule → block. Without it, dropping the binding without
+        # → block_instances → block. Without it, dropping the binding without
         # first calling deactivate() would keep everything alive until
         # Python's cycle collector runs (not refcount-based GC). The
         # weak ref lets refcount immediately free the binding when the
@@ -1617,9 +1591,10 @@ class StreamedComponent:
                 wrap_threshold=wrap_threshold,
             )
 
-        for block in self._schedule:
-            idx = idx_map[id(block)]
-            h = block.register_forward_pre_hook(functools.partial(_pre_hook, idx=idx))
+        for idx, instance in enumerate(self._block_instances):
+            h = instance.module.register_forward_pre_hook(
+                functools.partial(_pre_hook, idx=idx)
+            )
             self._hooks.append(h)
 
 
