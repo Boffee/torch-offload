@@ -1789,6 +1789,21 @@ class TestBlockLayoutCompatibility:
         )
         assert len(set(self._signatures(component))) == 2
 
+    @CUDA
+    def test_aliased_block_module_installs_single_hook(self) -> None:
+        # A module aliased across blocks (a weight-shared layer appearing
+        # multiple times in the block list) must get ONE forward-pre hook, not
+        # one per alias — else a single shared forward would load then evict
+        # each aliased block in turn, churning the GPU pool.
+        shared = nn.Linear(4, 4, bias=False)
+        shared.weight.requires_grad_(False)
+        component = _make_streamed_component(
+            blocks=[shared, shared],
+            num_resident_blocks=1,
+        )
+        with component.use("cuda"):
+            assert len(shared._forward_pre_hooks) == 1
+
     def test_buffer_shape_mismatch_is_supported(self) -> None:
         class Block(nn.Module):
             def __init__(self, buffer_size: int):
