@@ -86,8 +86,9 @@ class TestModelStrategyConformance:
             component.deactivate()
 
     def test_component_constructor_is_not_public_factory(self) -> None:
+        model = _make_simple_model()
         with pytest.raises(TypeError, match="PinnedComponentStore.from_module"):
-            PinnedComponent(cast(Any, _make_simple_model()))
+            PinnedComponent(cast(Any, model))
 
     def test_offloader_constructor_requires_bound_components(self) -> None:
         with pytest.raises(TypeError, match="pinned_component"):
@@ -389,10 +390,13 @@ class TestLifecycle:
         m = _make_simple_model()
         pw = _make_model_offloader(m)
         try:
-            pinned_params = list(m.parameters())
+            # CPU activate restores frozen params to fresh wrappers over the
+            # same pinned storage (the materialized CPU wrapper is built on
+            # demand, not cached), so compare stable pinned-storage pointers.
+            pinned_ptrs = [p.data_ptr() for p in m.parameters()]
             with pw.use("cpu") as model:
                 assert model is m
-                assert list(m.parameters()) == pinned_params
+                assert [p.data_ptr() for p in m.parameters()] == pinned_ptrs
                 for p in m.parameters():
                     assert p.is_pinned()
             for p in m.parameters():
@@ -564,8 +568,11 @@ class TestTiedWeightDedup:
             # object, preserving tying at the strongest level.
             assert m.embed._parameters["weight"] is m.head._parameters["weight"]
             pinned = pw._instance.params["embed.weight"]
-            cpu_param = pw._instance.cpu_params_by_pinned_id[id(pinned)]
-            assert m.embed.weight is cpu_param
+            # The materialized CPU wrapper is installed onto the module (the
+            # instance no longer caches it); both tied leaves share it.
+            cpu_param = m.embed.weight
+            assert m.head.weight is cpu_param
+            assert cpu_param.data_ptr() == pinned.make_cpu_param().data_ptr()
         finally:
             pw.deactivate()
 

@@ -37,6 +37,7 @@ from typing import Any
 import torch
 from torch import nn
 
+from .pinned_param import PinnedParam
 from .tensor_adapter_registry import param_representation, select_adapter
 from .tensor_adapters import (
     DenseAddmmTensorAdapter,
@@ -63,15 +64,64 @@ class LoRAFactor:
     """A LoRA's pinned factor pair for one target weight.
 
     ``a`` is the ``(rank, in_dim)`` down-projection and ``b`` the
-    ``(out_dim, rank)`` up-projection. Strength is *not* part of the pair —
-    it is extrinsic and supplied when the LoRA is bound to a target (see
-    :meth:`scaled` / :class:`ScaledLoRAFactor`). Per-pair shape validity is
-    checked at construction; the match against a concrete target shape is
-    checked separately, where the target is known.
+    ``(out_dim, rank)`` up-projection, each held as a :class:`PinnedParam`
+    so the offload stack can stream them to GPU through the same target
+    pool the model's weights use. Strength is *not* part of the pair — it is
+    extrinsic and supplied when the LoRA is bound to a target. Per-pair shape
+    validity is checked before pinning (in :func:`_pair_and_pin`); the match
+    against a concrete target shape is checked separately, where the target
+    is known.
+
+    The merge / current-routed paths consume *tensors*, so :meth:`scaled`
+    materializes a device-ready :class:`ScaledLoRAFactor` over zero-copy
+    views of the pinned host bytes; factor streaming instead consumes the
+    :class:`PinnedParam`\\ s directly.
+    """
+
+    a: PinnedParam
+    b: PinnedParam
+    rank: int
+    in_dim: int
+    out_dim: int
+
+    @property
+    def produced_shape(self) -> tuple[int, int]:
+        """Shape of ``b @ a`` — the base-weight shape this factor targets."""
+        return (self.out_dim, self.in_dim)
+
+    @property
+    def cache_bytes(self) -> int:
+        """Pinned host bytes held by this factor pair."""
+        return self.a.cache_bytes + self.b.cache_bytes
+
+    def scaled(self, strength: float) -> ScaledLoRAFactor:
+        """Materialize a device-ready compute factor bound to ``strength``.
+
+        Returns a :class:`ScaledLoRAFactor` over the pinned CPU tensors
+        (zero-copy views of this factor's pinned host bytes). Callers move it
+        to the target device / dtype at the apply site, so the pinned source
+        keeps ``non_blocking`` host-to-device copies asynchronous.
+        """
+        return ScaledLoRAFactor(
+            self.a.make_cpu_param().data,
+            self.b.make_cpu_param().data,
+            strength,
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class ScaledLoRAFactor:
+    """A factor pair as plain tensors bound to an application ``strength``.
+
+    The compute-side carrier eaten by :func:`_routed_residual` and
+    :class:`LoRATransform`. Construct it directly from device/CPU tensors, or
+    via :meth:`LoRAFactor.scaled` from a LoRA's pinned storage. The
+    contribution to the base weight is ``strength * (b @ a)``.
     """
 
     a: torch.Tensor
     b: torch.Tensor
+    strength: float
 
     def __post_init__(self) -> None:
         if self.a.ndim != 2 or self.b.ndim != 2 or self.a.shape[0] != self.b.shape[1]:
@@ -95,21 +145,6 @@ class LoRAFactor:
     def produced_shape(self) -> tuple[int, int]:
         """Shape of ``b @ a`` — the base-weight shape this factor targets."""
         return (self.b.shape[0], self.a.shape[1])
-
-    def scaled(self, strength: float) -> ScaledLoRAFactor:
-        """Bind this factor pair to an application ``strength``."""
-        return ScaledLoRAFactor(self.a, self.b, strength)
-
-
-@dataclass(slots=True, frozen=True)
-class ScaledLoRAFactor(LoRAFactor):
-    """A :class:`LoRAFactor` bound to the ``strength`` it is applied at.
-
-    The contribution to the base weight is ``strength * (b @ a)``; strength
-    is fixed when the LoRA is bound to a target (e.g. via ``set_loras``).
-    """
-
-    strength: float
 
 
 def default_key_transform(key: str) -> str:
@@ -154,7 +189,7 @@ class LoRA:
 
     @property
     def cache_bytes(self) -> int:
-        return sum(factor.a.nbytes + factor.b.nbytes for factor in self._factors.values())
+        return sum(factor.cache_bytes for factor in self._factors.values())
 
     @property
     def value(self) -> LoRA:
@@ -439,8 +474,11 @@ def _pair_and_pin(
                 f"Duplicate LoRA target {target_key!r}: key_transform mapped multiple source keys to the same target."
             )
         factors[target_key] = LoRAFactor(
-            a.contiguous().pin_memory(),
-            b.contiguous().pin_memory(),
+            a=PinnedParam(nn.Parameter(a, requires_grad=False)),
+            b=PinnedParam(nn.Parameter(b, requires_grad=False)),
+            rank=a.shape[0],
+            in_dim=a.shape[1],
+            out_dim=b.shape[0],
         )
 
     return factors

@@ -123,8 +123,8 @@ class PinnedModuleStore:
             buffers=_pin_buffers(buffers),
         )
         _validate_trainable_param_data_swaps(store.params)
-        _restore_params(module, store.params, _make_cpu_params(store.params))
-        _restore_buffers(module, store.buffers)
+        _install_pinned_params(module, store.params)
+        _install_pinned_buffers(module, store.buffers)
         return store
 
     @property
@@ -143,44 +143,42 @@ class PinnedModuleStore:
             if pinned.requires_grad
         )
 
-    def allocate_target(
-        self,
-        device: torch.device,
-        *,
-        param_names: Iterable[str] | None = None,
-        buffer_names: Iterable[str] | None = None,
-    ) -> PinnedModuleTarget:
-        """Allocate active storage for selected store entries on ``device``."""
-        _validate_cuda_device(device)
-        params = _select_known_names(self.params, param_names)
-        buffers = _select_known_names(self.buffers, buffer_names)
-        return PinnedModuleTarget(
-            param_targets=_allocate_param_targets(params, device),
-            buffer_targets=_allocate_buffer_targets(buffers, device),
-        )
-
     def bind(self, module: nn.Module) -> PinnedModuleInstance:
-        """Validate ``module`` and bind this store's backing bytes to it."""
-        _validate_store_names(self)
-        _validate_module_matches_store(self, module)
+        """Validate ``module`` and bind this store's backing bytes to it.
+
+        The sole instance factory: layout-checks ``module`` against this
+        store, constructs a :class:`PinnedModuleInstance` that owns
+        ``module`` and shares this store's pinned host bytes, then installs
+        those pinned bytes onto ``module`` via
+        :meth:`PinnedModuleInstance.install_pinned`.
+        """
+        _validate_module_matches(self.params, self.buffers, module)
         instance = PinnedModuleInstance(
             module=module,
             params=self.params,
             buffers=self.buffers,
-            cpu_params_by_pinned_id=_make_cpu_params(self.params),
         )
-        instance.restore_pinned()
+        instance.install_pinned()
         return instance
 
 
 @dataclass(slots=True)
 class PinnedModuleInstance:
-    """One concrete module bound to pinned parameter and buffer backings."""
+    """One concrete module bound to pinned parameter and buffer backings.
+
+    Owns the :class:`nn.Module` whose managed params and buffers are
+    backed by this instance's pinned host bytes, plus the copy machinery
+    to stream them to (and trainable bytes back from) a GPU
+    :class:`PinnedModuleTarget`. :meth:`load_to_target` copies into a
+    target and installs that active storage onto :attr:`module`;
+    :meth:`install_pinned` installs the pinned host bytes onto
+    :attr:`module`. The pure-copy method :meth:`copy_trainables_from_target`
+    touches no module at all.
+    """
 
     module: nn.Module
     params: Mapping[str, PinnedParam]
     buffers: Mapping[str, PinnedBuffer]
-    cpu_params_by_pinned_id: dict[int, nn.Parameter]
     _post_copy_hooks: dict[int, PostCopyHook] = field(
         default_factory=dict,
         init=False,
@@ -199,13 +197,16 @@ class PinnedModuleInstance:
             if pinned.requires_grad
         )
 
-    def restore_pinned(self) -> None:
-        _restore_params(
-            self.module,
-            self.params,
-            self.cpu_params_by_pinned_id,
-        )
-        _restore_buffers(self.module, self.buffers)
+    def install_pinned(self) -> None:
+        """Install the pinned host bytes onto :attr:`module`'s attributes.
+
+        Pure pinned-CPU repoint: materializes the pinned CPU wrappers on
+        demand (deduped by ``id(pinned)`` so tied names share one wrapper)
+        and installs them onto :attr:`module`, leaving its managed state on
+        the pinned host bytes. Mutates :attr:`module` in place.
+        """
+        _install_pinned_params(self.module, self.params)
+        _install_pinned_buffers(self.module, self.buffers)
 
     def allocate_target(
         self,
@@ -254,8 +255,11 @@ class PinnedModuleInstance:
     ) -> None:
         """Copy selected pinned bytes into ``target`` and install them.
 
-        Copying and hooks complete before any module mutation, so a copy
-        failure does not leave the instance partially active.
+        Copies the selected pinned params and buffers into ``target``,
+        runs any registered post-copy hooks, then repoints :attr:`module`'s
+        managed attributes at the filled target storage. Copying and hooks
+        complete before any module mutation, so a copy failure does not
+        leave :attr:`module` partially active.
         """
         _validate_target_names_known(self.params, self.buffers, target)
         params = _items_for_names(self.params, target.param_targets)
@@ -280,7 +284,6 @@ class PinnedModuleInstance:
 
         _set_params(
             self.module,
-            params,
             {
                 name: param_target.param
                 for name, param_target in target.param_targets.items()
@@ -420,23 +423,25 @@ def _items_for_names(
     return {name: value for name, value in items.items() if name in included}
 
 
-def _validate_module_matches_store(
-    store: PinnedModuleStore, module: nn.Module,
+def _validate_module_matches(
+    pinned_params: Mapping[str, PinnedParam],
+    pinned_buffers: Mapping[str, PinnedBuffer],
+    module: nn.Module,
 ) -> None:
     """Validate that ``module`` is a structurally compatible bind target.
 
     Compares bind layouts, not full target layouts: binding replaces every
-    managed tensor with store-backed storage, so placeholder fields the
-    bind overwrites (dtype, for plain tensors) are not required to match —
-    a config-built meta skeleton binds against a store pinned from
+    managed tensor with the pinned backing storage, so placeholder fields
+    the bind overwrites (dtype, for plain tensors) are not required to
+    match — a config-built meta skeleton binds against bytes pinned from
     natively loaded weights.
     """
     params = _named_parameters(module)
     buffers = _named_buffers(module)
 
-    _validate_names_present(store, params, buffers)
+    _validate_names_present(pinned_params, pinned_buffers, params, buffers)
 
-    for name, pinned in store.params.items():
+    for name, pinned in pinned_params.items():
         param = params[name]
         if param.requires_grad != pinned.requires_grad:
             raise ValueError(
@@ -450,7 +455,7 @@ def _validate_module_matches_store(
                 f"{pinned.bind_layout!r}, module has {layout!r}."
             )
 
-    for name, pinned in store.buffers.items():
+    for name, pinned in pinned_buffers.items():
         layout = PinnedBuffer.bind_layout_for(buffers[name])
         if layout != PinnedBuffer.bind_layout_for(pinned.tensor):
             raise ValueError(
@@ -528,22 +533,14 @@ def _validate_trainable_param_data_swaps(
             ) from exc
 
 
-def _validate_store_names(store: PinnedModuleStore) -> None:
-    overlap = sorted(set(store.params) & set(store.buffers))
-    if overlap:
-        raise ValueError(
-            "PinnedModuleStore cannot bind names as both params and buffers: "
-            f"{_format_names(overlap)}."
-        )
-
-
 def _validate_names_present(
-    store: PinnedModuleStore,
+    pinned_params: Mapping[str, PinnedParam],
+    pinned_buffers: Mapping[str, PinnedBuffer],
     params: Mapping[str, nn.Parameter],
     buffers: Mapping[str, torch.Tensor],
 ) -> None:
-    missing_params = sorted(set(store.params) - set(params))
-    missing_buffers = sorted(set(store.buffers) - set(buffers))
+    missing_params = sorted(set(pinned_params) - set(params))
+    missing_buffers = sorted(set(pinned_buffers) - set(buffers))
     if not missing_params and not missing_buffers:
         return
 
@@ -677,36 +674,44 @@ def _run_post_copy_hooks(
             hook(targets[name].param)
 
 
-def _restore_params(
+def _install_pinned_params(
     module: nn.Module,
     params: Mapping[str, PinnedParam],
-    cpu_params_by_pinned_id: Mapping[int, nn.Parameter],
 ) -> None:
-    _set_params(
-        module,
-        params,
-        {
-            name: cpu_params_by_pinned_id[id(pinned)]
-            for name, pinned in params.items()
-        },
-    )
+    # Build the materialized CPU params on demand, deduped by ``id(pinned)``
+    # so tied names share one wrapper (preserving tied-weight behavior).
+    # ``make_cpu_param`` is cheap/zero-copy for every adapter (a plain
+    # wrapper / metadata reconstruction aliasing the pinned tensors), so
+    # per-install construction is fine.
+    materialized: dict[str, nn.Parameter] = {}
+    by_pinned: dict[int, nn.Parameter] = {}
+    for name, pinned in params.items():
+        cpu_param = by_pinned.get(id(pinned))
+        if cpu_param is None:
+            cpu_param = pinned.make_cpu_param()
+            by_pinned[id(pinned)] = cpu_param
+        materialized[name] = cpu_param
+    _set_params(module, materialized)
 
 
 def _set_params(
     module: nn.Module,
-    params: Mapping[str, PinnedParam],
     materialized_params: Mapping[str, nn.Parameter],
 ) -> None:
-    for name, pinned in params.items():
-        materialized = materialized_params[name]
+    # Both materialized sources carry the correct ``requires_grad`` (GPU
+    # param via ``make_gpu_param``, CPU wrapper via ``make_cpu_param``), so
+    # the swap-vs-replace decision reads off the materialized param itself.
+    for name, materialized in materialized_params.items():
         parent, leaf = resolve_parent_leaf(module, name)
-        if pinned.requires_grad:
+        if materialized.requires_grad:
+            # Trainable: keep the user's wrapper, swap only ``.data``.
             _get_param(parent, leaf).data = materialized.data
         else:
+            # Frozen: replace the registry entry outright.
             _set_param(parent, leaf, materialized)
 
 
-def _restore_buffers(
+def _install_pinned_buffers(
     module: nn.Module,
     buffers: Mapping[str, PinnedBuffer],
 ) -> None:
@@ -724,12 +729,6 @@ def _set_buffers(
         parent, leaf = resolve_parent_leaf(module, name)
         persistent = leaf not in parent._non_persistent_buffers_set
         parent.register_buffer(leaf, tensor, persistent=persistent)
-
-
-def _make_cpu_params(
-    params: Mapping[str, PinnedParam],
-) -> dict[int, nn.Parameter]:
-    return {id(pinned): pinned.make_cpu_param() for pinned in _unique_values(params)}
 
 
 def _named_parameters(module: nn.Module) -> dict[str, nn.Parameter]:
@@ -762,18 +761,6 @@ def _set_param(parent: nn.Module, leaf: str, param: nn.Parameter) -> None:
     if leaf not in parent._parameters:
         raise RuntimeError(f"Parameter {leaf!r} is unexpectedly missing.")
     parent._parameters[leaf] = param
-
-
-def _unique_values(
-    items: Mapping[str, PinnedParam],
-) -> Iterator[PinnedParam]:
-    seen: set[int] = set()
-    for value in items.values():
-        key = id(value)
-        if key in seen:
-            continue
-        seen.add(key)
-        yield value
 
 
 def _unique_cache_bytes(

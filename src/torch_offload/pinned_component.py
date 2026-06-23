@@ -160,7 +160,6 @@ class PinnedComponent:
                 "PinnedComponent requires a PinnedModuleInstance; "
                 "use PinnedComponentStore.from_module(model).bind(model)."
             )
-        self._model: nn.Module | None = instance.module
         self._instance = instance
         self._param_names = frozenset(instance.params)
         self._buffer_names = frozenset(instance.buffers)
@@ -221,7 +220,6 @@ class PinnedComponent:
         tensors back to pinned-CPU) followed by dropping the component
         reference.
         """
-        assert self._model is not None
         if self._active_device is not None:
             raise RuntimeError(
                 "PinnedComponent.activate() called while already active "
@@ -230,7 +228,7 @@ class PinnedComponent:
             )
         active_device = self._resolve_device(device)
         if active_device.type == "cpu":
-            self._instance.restore_pinned()
+            self._instance.install_pinned()
         elif active_device.type == "cuda":
             # One active-device Parameter per unique pinned parameter.
             # Tied names all receive the same Parameter object so the
@@ -269,7 +267,7 @@ class PinnedComponent:
         ``optimizer.step()`` works the same for pinned and streamed
         trainables."""
         try:
-            self._instance.restore_pinned()
+            self._instance.install_pinned()
             self._instance.move_trainable_grads_to(torch.device("cpu"))
         finally:
             self._active_target = None
