@@ -2129,11 +2129,13 @@ class TestStreamedNameSelection:
                 "transformer_blocks.1.weight",
                 lambda _param: None,
             )
-            key = streamer.post_copy_hook_key("transformer_blocks.1.weight")
-            assert key in streamer._block_instances[1]._post_copy_hooks
+            # The hook lands on the block instance owning the named param,
+            # and nowhere else.
+            assert streamer._block_instances[1]._post_copy_hooks
+            assert not streamer._block_instances[0]._post_copy_hooks
 
             handle.remove()
-            assert key not in streamer._block_instances[1]._post_copy_hooks
+            assert not streamer._block_instances[1]._post_copy_hooks
         finally:
             streamer.deactivate()
 

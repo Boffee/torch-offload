@@ -224,7 +224,6 @@ class ModelOffloader:
         self._model = model
         self._active_device: torch.device | None = None
         self._composite = composite
-        _validate_components(composite)
         self._lora_hook_handles: list[_RemovableHook] = []
         # Configured LoRA request. set_loras() only records caller intent;
         # activate(device) groups targets and validates the requested
@@ -400,10 +399,6 @@ class ModelOffloader:
     ) -> _RemovableHook:
         """Register a hook after the owning component copies ``param_name``."""
         return self._register_post_copy_hook(param_name, hook)
-
-    def post_copy_hook_key(self, param_name: str) -> int:
-        """Stable hook/dedup key for a managed parameter name."""
-        return self._composite.post_copy_hook_key(param_name)
 
     def _clear_active_lora_hooks(self) -> None:
         while self._lora_hook_handles:
@@ -635,11 +630,6 @@ def _validate_store_components(
     component_stores: Sequence[PinnedComponentStore | StreamedComponentStore],
 ) -> None:
     if not component_stores:
-        raise ValueError(_NO_COMPONENTS_MSG)
-
-
-def _validate_components(components: CompositeComponent) -> None:
-    if not components.components:
         raise ValueError(_NO_COMPONENTS_MSG)
 
 

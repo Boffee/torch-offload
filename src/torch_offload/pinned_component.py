@@ -193,10 +193,6 @@ class PinnedComponent:
         """
         return self._instance.register_post_copy_hook(name, hook)
 
-    def post_copy_hook_key(self, name: str) -> int:
-        """Stable hook/dedup key for a managed parameter name."""
-        return self._instance.post_copy_hook_key(name)
-
     def activate(self, device: torch.device | str | None = None) -> None:
         """Activate the managed tensors on ``device``.
 

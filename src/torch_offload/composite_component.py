@@ -11,10 +11,9 @@ itself composable.
 
 The pinned-vs-streamed distinction lives in whoever *builds* the component
 list (the store), not here — the composite orchestrates every component
-identically. The one consumer that must distinguish them
-(:class:`~torch_offload.model_offloader.ModelOffloader`'s checkpointing guard,
-which only concerns streamed trainable blocks) filters :attr:`components` by
-type.
+identically through the :class:`~torch_offload.protocols.OffloadComponent`
+protocol, never branching on concrete type. No production consumer
+distinguishes the members at runtime.
 """
 
 from __future__ import annotations
@@ -22,16 +21,13 @@ from __future__ import annotations
 import contextlib
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
 
-from .pinned_component import PinnedComponent, PinnedComponentStore
 from .pinned_module import PostCopyHook, PostCopyHookHandle
-from .streamed_component import StreamedComponent, StreamedComponentStore
-
-_OffloadComponent = PinnedComponent | StreamedComponent
-_OffloadComponentStore = PinnedComponentStore | StreamedComponentStore
+from .protocols import OffloadComponent, OffloadComponentStore
 
 
 class CompositeComponent:
@@ -42,12 +38,12 @@ class CompositeComponent:
     whether a component is pinned or streamed.
     """
 
-    def __init__(self, components: Sequence[_OffloadComponent]) -> None:
+    def __init__(self, components: Sequence[OffloadComponent]) -> None:
         self._components = list(components)
         self._teardown_stack: contextlib.ExitStack | None = None
 
     @property
-    def components(self) -> tuple[_OffloadComponent, ...]:
+    def components(self) -> tuple[OffloadComponent, ...]:
         """The composed components, in activation order."""
         return tuple(self._components)
 
@@ -67,7 +63,7 @@ class CompositeComponent:
             names |= component.buffer_names
         return frozenset(names)
 
-    def component_for_param_name(self, param_name: str) -> _OffloadComponent:
+    def component_for_param_name(self, param_name: str) -> OffloadComponent:
         """The component that manages ``param_name``."""
         for component in self._components:
             if param_name in component.param_names:
@@ -77,17 +73,11 @@ class CompositeComponent:
         )
 
     def register_post_copy_hook(
-        self, param_name: str, hook: PostCopyHook,
+        self, name: str, hook: PostCopyHook,
     ) -> PostCopyHookHandle:
-        """Register a post-copy hook on the component owning ``param_name``."""
-        return self.component_for_param_name(param_name).register_post_copy_hook(
-            param_name, hook,
-        )
-
-    def post_copy_hook_key(self, param_name: str) -> int:
-        """Stable hook/dedup key for ``param_name``'s owning component."""
-        return self.component_for_param_name(param_name).post_copy_hook_key(
-            param_name,
+        """Register a post-copy hook on the component owning ``name``."""
+        return self.component_for_param_name(name).register_post_copy_hook(
+            name, hook,
         )
 
     def activate(self, device: torch.device | str | None = None) -> None:
@@ -132,7 +122,7 @@ class CompositeComponentStore:
     each to a model and wraps the results in a :class:`CompositeComponent`.
     """
 
-    component_stores: tuple[_OffloadComponentStore, ...]
+    component_stores: tuple[OffloadComponentStore, ...]
 
     def __post_init__(self) -> None:
         if not self.component_stores:
@@ -153,6 +143,20 @@ class CompositeComponentStore:
         return CompositeComponent(
             [store.bind(model) for store in self.component_stores]
         )
+
+
+if TYPE_CHECKING:
+    # Statically enforce that the composite and its store satisfy the offload
+    # protocols: a CompositeComponent is itself an OffloadComponent (so
+    # composites nest), and CompositeComponentStore is an OffloadComponentStore.
+    # A signature drift that breaks conformance (e.g. a renamed parameter)
+    # becomes a type error here rather than a silent latent inconsistency.
+    def _assert_protocol_conformance(
+        component: CompositeComponent,
+        store: CompositeComponentStore,
+    ) -> None:
+        _component: OffloadComponent = component
+        _store: OffloadComponentStore = store
 
 
 __all__ = ["CompositeComponent", "CompositeComponentStore"]

@@ -259,18 +259,11 @@ def _has_post_copy_hook(strategy: ModelOffloader, target_key: str) -> bool:
         return False
     component = strategy._composite.component_for_param_name(param_name)
     if isinstance(component, PinnedComponent):
-        return (
-            component.post_copy_hook_key(param_name)
-            in component._instance._post_copy_hooks
-        )
+        instance = component._instance
+        return instance.post_copy_hook_key(param_name) in instance._post_copy_hooks
     if isinstance(component, StreamedComponent):
-        key = component.post_copy_hook_key(param_name)
-        return (
-            any(
-                key in instance._post_copy_hooks
-                for instance in component._block_instances
-            )
-        )
+        instance, local = component._resolve_param_name(param_name)
+        return instance.post_copy_hook_key(local) in instance._post_copy_hooks
     return False
 
 
