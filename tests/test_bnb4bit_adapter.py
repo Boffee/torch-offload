@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from typing import Any
 
 import pytest
@@ -21,8 +20,8 @@ CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def _make_model_offloader(
     model: nn.Module,
     *,
-    blocks_attr: str | Sequence[str] | None = None,
-    num_resident_blocks: int | None = None,
+    blocks_attr: list[str] = [],
+    num_resident_blocks: int = 1,
     num_prefetch_blocks: int = 2,
     cyclic: bool = False,
     stream_trainable_weights: bool = False,
@@ -425,7 +424,7 @@ class TestBnb4bitAdapter:
         model = M().to("cuda")
         offloader = _make_model_offloader(
             model,
-            blocks_attr="blocks",
+            blocks_attr=["blocks"],
             num_resident_blocks=1,
             num_prefetch_blocks=0,
         )
@@ -492,7 +491,7 @@ class TestBnb4bitAdapter:
         reference = model(x)  # 4-bit forward does not migrate state
 
         offloader = _make_model_offloader(
-            model, blocks_attr="blocks",
+            model, blocks_attr=["blocks"],
             num_resident_blocks=1, num_prefetch_blocks=0,
         )
         try:

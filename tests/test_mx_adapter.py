@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 
 import pytest
 import torch
@@ -44,8 +43,8 @@ ELEM_DTYPES = [
 def _make_model_offloader(
     model: nn.Module,
     *,
-    blocks_attr: str | Sequence[str] | None = None,
-    num_resident_blocks: int | None = None,
+    blocks_attr: list[str] = [],
+    num_resident_blocks: int = 1,
     num_prefetch_blocks: int = 2,
     cyclic: bool = False,
     stream_trainable_weights: bool = False,
@@ -507,7 +506,7 @@ class TestMxAdapter:
             )
         offloader = _make_model_offloader(
             model,
-            blocks_attr="blocks",
+            blocks_attr=["blocks"],
             num_resident_blocks=1,
             num_prefetch_blocks=0,
         )
@@ -585,7 +584,7 @@ class TestMxAdapter:
 
         offloader = _make_model_offloader(
             model,
-            blocks_attr="blocks",
+            blocks_attr=["blocks"],
             num_resident_blocks=1,
             num_prefetch_blocks=0,
         )

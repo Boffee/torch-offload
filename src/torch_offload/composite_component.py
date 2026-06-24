@@ -9,11 +9,11 @@ component. It satisfies
 :class:`~torch_offload.protocols.ModelStrategyComponent`, so a composite is
 itself composable.
 
-The pinned-vs-streamed distinction lives in whoever *builds* the component
-list (the store), not here — the composite orchestrates every component
-identically through the :class:`~torch_offload.protocols.OffloadComponent`
-protocol, never branching on concrete type. No production consumer
-distinguishes the members at runtime.
+The pinned-vs-streamed distinction lives in the builder
+(:meth:`CompositeComponentStore.from_module`), not in the orchestration:
+:class:`CompositeComponent` drives every component identically through the
+:class:`~torch_offload.protocols.OffloadComponent` protocol, never branching
+on concrete type.
 """
 
 from __future__ import annotations
@@ -21,13 +21,15 @@ from __future__ import annotations
 import contextlib
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
 
+from .module_names import buffer_names, parameter_names
+from .pinned_component import PinnedComponentStore
 from .pinned_module import PostCopyHook, PostCopyHookHandle
 from .protocols import OffloadComponent, OffloadComponentStore
+from .streamed_component import StreamedComponentStore
 
 
 class CompositeComponent:
@@ -130,6 +132,63 @@ class CompositeComponentStore:
                 "CompositeComponentStore requires at least one component store."
             )
 
+    @classmethod
+    def from_module(
+        cls,
+        model: nn.Module,
+        *,
+        blocks_attr: list[str] = [],  # noqa: B006  (read-only; never mutated)
+        num_resident_blocks: int = 1,
+        num_prefetch_blocks: int = 2,
+        cyclic: bool = False,
+        stream_trainable_weights: bool = False,
+    ) -> CompositeComponentStore:
+        """Decompose ``model`` into a pinned remainder + streamed block groups.
+
+        Each ``blocks_attr`` path becomes one
+        :class:`~torch_offload.StreamedComponentStore`; everything those groups
+        do not claim becomes a single
+        :class:`~torch_offload.PinnedComponentStore`, placed first so it
+        activates before the streamed groups. With no ``blocks_attr`` (the
+        default), nothing streams — the whole model is one pinned component.
+        """
+        # One streamed component per block path.
+        streamed_stores = tuple(
+            StreamedComponentStore.from_module(
+                model,
+                blocks_path=blocks_path,
+                num_resident_blocks=num_resident_blocks,
+                num_prefetch_blocks=num_prefetch_blocks,
+                cyclic=cyclic,
+                stream_trainable_weights=stream_trainable_weights,
+            )
+            for blocks_path in blocks_attr
+        )
+
+        # The pinned component manages whatever the streamed groups did not claim.
+        streamed_params = {n for s in streamed_stores for n in s.param_names}
+        streamed_buffers = {n for s in streamed_stores for n in s.buffer_names}
+        pinned_params = parameter_names(model) - streamed_params
+        pinned_buffers = buffer_names(model) - streamed_buffers
+
+        # Pinned first (preserves activation order), then the streamed groups.
+        stores: list[PinnedComponentStore | StreamedComponentStore] = []
+        if pinned_params or pinned_buffers:
+            stores.append(
+                PinnedComponentStore.from_module(
+                    model,
+                    include_param_names=pinned_params,
+                    include_buffer_names=pinned_buffers,
+                )
+            )
+        stores.extend(streamed_stores)
+        if not stores:
+            raise ValueError(
+                "Offloading requires at least one parameter, registered "
+                "buffer, or streamed block to manage."
+            )
+        return cls(tuple(stores))
+
     @property
     def cache_bytes(self) -> int:
         return sum(store.cache_bytes for store in self.component_stores)
@@ -143,20 +202,6 @@ class CompositeComponentStore:
         return CompositeComponent(
             [store.bind(model) for store in self.component_stores]
         )
-
-
-if TYPE_CHECKING:
-    # Statically enforce that the composite and its store satisfy the offload
-    # protocols: a CompositeComponent is itself an OffloadComponent (so
-    # composites nest), and CompositeComponentStore is an OffloadComponentStore.
-    # A signature drift that breaks conformance (e.g. a renamed parameter)
-    # becomes a type error here rather than a silent latent inconsistency.
-    def _assert_protocol_conformance(
-        component: CompositeComponent,
-        store: CompositeComponentStore,
-    ) -> None:
-        _component: OffloadComponent = component
-        _store: OffloadComponentStore = store
 
 
 __all__ = ["CompositeComponent", "CompositeComponentStore"]

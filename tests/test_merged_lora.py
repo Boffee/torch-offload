@@ -56,8 +56,8 @@ def _factor_tensors(factor: LoRAFactor) -> tuple[torch.Tensor, torch.Tensor]:
 def _make_model_offloader(
     model: nn.Module,
     *,
-    blocks_attr: str | Sequence[str] | None = None,
-    num_resident_blocks: int | None = None,
+    blocks_attr: list[str] = [],
+    num_resident_blocks: int = 1,
     num_prefetch_blocks: int = 2,
     cyclic: bool = False,
     stream_trainable_weights: bool = False,
@@ -243,7 +243,7 @@ def _make_strategy(
         num_resident_blocks = len(model.transformer_blocks) - 1
     return _make_model_offloader(
         model,
-        blocks_attr="transformer_blocks",
+        blocks_attr=["transformer_blocks"],
         num_resident_blocks=num_resident_blocks,
     )
 
@@ -1337,7 +1337,7 @@ class TestRoutedMode:
 
         s = _make_model_offloader(
             model,
-            blocks_attr="transformer_blocks", num_resident_blocks=1,
+            blocks_attr=["transformer_blocks"], num_resident_blocks=1,
         )
         # Build a LoRA targeting attn.weight (LinearLike, not nn.Linear).
         lora = _make_lora(num_blocks=2, dim=16, seed=3)
@@ -1395,7 +1395,7 @@ class TestRoutedMode:
 
         s = _make_model_offloader(
             model,
-            blocks_attr="transformer_blocks", num_resident_blocks=1,
+            blocks_attr=["transformer_blocks"], num_resident_blocks=1,
         )
         lora = _make_lora(num_blocks=2, dim=16, seed=99)
         _set_loras(s, [(lora, 1.0)], mode="routed")
@@ -1431,7 +1431,7 @@ class TestRoutedMode:
 
         s = _make_model_offloader(
             model,
-            blocks_attr="transformer_blocks", num_resident_blocks=1,
+            blocks_attr=["transformer_blocks"], num_resident_blocks=1,
         )
         # Build a LoRA that targets either alias of the tied weight.
         sd = {
@@ -1490,7 +1490,7 @@ class TestRoutedMode:
         loras = [(_make_lora(num_blocks=2, dim=16, seed=55), 0.5)]
         s = _make_model_offloader(
             m,
-            blocks_attr="transformer_blocks", num_resident_blocks=1,
+            blocks_attr=["transformer_blocks"], num_resident_blocks=1,
         )
         _set_loras(s, loras, mode="routed")
         s.activate("cuda")

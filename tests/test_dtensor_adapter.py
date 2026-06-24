@@ -214,7 +214,7 @@ class TestDTensorAdapter:
             [Block(_dtensor_weight(tp_mesh)[0]), Block(_dtensor_weight(tp_mesh)[0])]
         )
         store = ModelOffloaderStore.from_module(
-            net, blocks_attr="blocks", num_resident_blocks=2, num_prefetch_blocks=0
+            net, blocks_attr=["blocks"], num_resident_blocks=2, num_prefetch_blocks=0
         )
         pw = store.bind(net)
         try:

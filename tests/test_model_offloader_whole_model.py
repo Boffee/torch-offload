@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from typing import Any, cast
 
 import pytest
@@ -25,8 +24,8 @@ CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def _make_model_offloader(
     model: nn.Module,
     *,
-    blocks_attr: str | Sequence[str] | None = None,
-    num_resident_blocks: int | None = None,
+    blocks_attr: list[str] = [],
+    num_resident_blocks: int = 1,
     num_prefetch_blocks: int = 2,
     cyclic: bool = False,
     stream_trainable_weights: bool = False,

@@ -161,8 +161,8 @@ class ModelSpec(ResourceSpec[M]):
         estimated_cache_bytes: int,
         factory: Callable[[], M],
         skeleton_factory: Callable[[], M] | None = None,
-        blocks_attr: str | Sequence[str] | None = None,
-        num_resident_blocks: int | None = None,
+        blocks_attr: list[str] = [],  # noqa: B006  (read-only; never mutated)
+        num_resident_blocks: int = 1,
         num_prefetch_blocks: int = 2,
         cyclic: bool = False,
         stream_trainable_weights: bool = False,

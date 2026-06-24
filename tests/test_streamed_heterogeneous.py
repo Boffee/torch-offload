@@ -78,7 +78,7 @@ def test_heterogeneous_block_list_builds_and_partitions_signatures() -> None:
     # differs from block 0 ...") right here.
     store = ModelOffloaderStore.from_module(
         model,
-        blocks_attr="blocks",
+        blocks_attr=["blocks"],
         num_resident_blocks=1,
         num_prefetch_blocks=2,
     )
@@ -97,7 +97,7 @@ def test_signature_distinguishes_each_dtype() -> None:
     model = _frozen_model(16, [torch.float32, torch.float16, torch.bfloat16])
     offloader = ModelOffloaderStore.from_module(
         model,
-        blocks_attr="blocks",
+        blocks_attr=["blocks"],
         num_resident_blocks=1,
         num_prefetch_blocks=1,
     ).bind(model)
@@ -123,7 +123,7 @@ def test_cuda_streams_mixed_dtype_blocks_matches_reference() -> None:
 
     offloader = ModelOffloaderStore.from_module(
         model,
-        blocks_attr="blocks",
+        blocks_attr=["blocks"],
         num_resident_blocks=1,
         num_prefetch_blocks=2,
     ).bind(model)
@@ -148,7 +148,7 @@ def test_cuda_morphing_pool_reuses_targets_across_iterations() -> None:
     num_resident, num_prefetch = 1, 2
     offloader = ModelOffloaderStore.from_module(
         model,
-        blocks_attr="blocks",
+        blocks_attr=["blocks"],
         num_resident_blocks=num_resident,
         num_prefetch_blocks=num_prefetch,
     ).bind(model)
@@ -221,7 +221,7 @@ def test_cuda_streams_mixed_quant_and_plain_blocks() -> None:
 
     offloader = ModelOffloaderStore.from_module(
         model,
-        blocks_attr="blocks",
+        blocks_attr=["blocks"],
         num_resident_blocks=1,
         num_prefetch_blocks=2,
     ).bind(model)

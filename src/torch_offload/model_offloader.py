@@ -19,13 +19,9 @@ from ._devices import canonical_device
 from .composite_component import CompositeComponent, CompositeComponentStore
 from .lora import LoRA, LoRARouteHandle, LoRATransform, ScaledLoRAFactor
 from .module_names import (
-    buffer_names,
     canonical_param_name,
-    parameter_names,
     resolve_parent_leaf,
 )
-from .pinned_component import PinnedComponentStore
-from .streamed_component import StreamedComponentStore
 from .tensor_adapter_registry import param_representation, select_adapter
 
 logger = logging.getLogger(__name__)
@@ -56,43 +52,23 @@ class ModelOffloaderStore:
         cls,
         model: nn.Module,
         *,
-        blocks_attr: str | Sequence[str] | None = None,
-        num_resident_blocks: int | None = None,
+        blocks_attr: list[str] = [],  # noqa: B006  (read-only; never mutated)
+        num_resident_blocks: int = 1,
         num_prefetch_blocks: int = 2,
         cyclic: bool = False,
         stream_trainable_weights: bool = False,
     ) -> ModelOffloaderStore:
-        blocks_paths = _normalize_blocks_paths(blocks_attr)
-        _validate_store_config(
-            blocks_paths=blocks_paths,
-            num_resident_blocks=num_resident_blocks,
-        )
-        (
-            streamed_component_stores,
-            streamed_param_names,
-            streamed_buffer_names,
-        ) = _build_streamed_component_stores(
+        composite_store = CompositeComponentStore.from_module(
             model,
-            blocks_paths=blocks_paths,
+            blocks_attr=blocks_attr,
             num_resident_blocks=num_resident_blocks,
             num_prefetch_blocks=num_prefetch_blocks,
             cyclic=cyclic,
             stream_trainable_weights=stream_trainable_weights,
         )
-        pinned_component_store = _build_pinned_component_store(
-            model,
-            streamed_param_names=streamed_param_names,
-            streamed_buffer_names=streamed_buffer_names,
-        )
-        # Pinned first (preserves activation order), then the streamed groups.
-        component_stores: list[PinnedComponentStore | StreamedComponentStore] = []
-        if pinned_component_store is not None:
-            component_stores.append(pinned_component_store)
-        component_stores.extend(streamed_component_stores)
-        _validate_store_components(component_stores)
         return cls(
             model=model,
-            composite_store=CompositeComponentStore(tuple(component_stores)),
+            composite_store=composite_store,
             stream_trainable_weights=stream_trainable_weights,
         )
 
@@ -152,12 +128,11 @@ class ModelOffloader:
     construction accepts already-bound components for low-level
     composition; it does not build stores or pin model state itself.
 
-    When ``blocks_attr`` or ``num_resident_blocks`` is omitted
-    (``num_resident_blocks=None`` disables streaming), CUDA activation
-    bulk-copies every managed parameter and buffer to CUDA. When both
-    are set, CUDA activation streams the selected block groups plus
-    component-level movement for non-streamed state. CPU activation is
-    pass-through over the pinned host-backed module state.
+    When ``blocks_attr`` is omitted, CUDA activation bulk-copies every
+    managed parameter and buffer to CUDA. When it is set, CUDA activation
+    streams the selected block groups plus component-level movement for
+    non-streamed state. CPU activation is pass-through over the pinned
+    host-backed module state.
 
     Composes :class:`PinnedComponent` (non-streamed params and buffers)
     and one or more :class:`StreamedComponent`\\ s internally. LoRA requests
@@ -544,92 +519,3 @@ class ModelOffloader:
             yield self.model
         finally:
             self.deactivate()
-
-# ---------------------------------------------------------------------------
-# Module-private helpers
-# ---------------------------------------------------------------------------
-
-
-def _normalize_blocks_paths(blocks_attr: str | Sequence[str] | None) -> list[str]:
-    if blocks_attr is None:
-        return []
-    blocks_paths = [blocks_attr] if isinstance(blocks_attr, str) else list(blocks_attr)
-    if not blocks_paths:
-        raise ValueError("blocks_attr must contain at least one path")
-    return blocks_paths
-
-
-def _validate_store_config(
-    *,
-    blocks_paths: Sequence[str],
-    num_resident_blocks: int | None,
-) -> None:
-    if not blocks_paths and num_resident_blocks is not None:
-        raise ValueError("num_resident_blocks requires blocks_attr")
-
-
-def _build_streamed_component_stores(
-    model: nn.Module,
-    *,
-    blocks_paths: Sequence[str],
-    num_resident_blocks: int | None,
-    num_prefetch_blocks: int,
-    cyclic: bool,
-    stream_trainable_weights: bool,
-) -> tuple[tuple[StreamedComponentStore, ...], set[str], set[str]]:
-    # num_resident_blocks=None disables streaming even when
-    # blocks_attr is set — the blocks are then managed by the
-    # whole-model pinned component like any other module state.
-    if not blocks_paths or num_resident_blocks is None:
-        return (), set(), set()
-
-    streamed_component_stores: list[StreamedComponentStore] = []
-    streamed_param_names: set[str] = set()
-    streamed_buffer_names: set[str] = set()
-
-    for blocks_path in blocks_paths:
-        store = StreamedComponentStore.from_module(
-            model,
-            blocks_path=blocks_path,
-            num_resident_blocks=num_resident_blocks,
-            num_prefetch_blocks=num_prefetch_blocks,
-            cyclic=cyclic,
-            stream_trainable_weights=stream_trainable_weights,
-        )
-        streamed_param_names.update(store.param_names)
-        streamed_buffer_names.update(store.buffer_names)
-        streamed_component_stores.append(store)
-
-    return tuple(streamed_component_stores), streamed_param_names, streamed_buffer_names
-
-
-def _build_pinned_component_store(
-    model: nn.Module,
-    *,
-    streamed_param_names: set[str],
-    streamed_buffer_names: set[str],
-) -> PinnedComponentStore | None:
-    pinned_param_names = parameter_names(model) - streamed_param_names
-    pinned_buffer_names = buffer_names(model) - streamed_buffer_names
-    if not pinned_param_names and not pinned_buffer_names:
-        return None
-    return PinnedComponentStore.from_module(
-        model,
-        include_param_names=pinned_param_names,
-        include_buffer_names=pinned_buffer_names,
-    )
-
-
-_NO_COMPONENTS_MSG = (
-    "ModelOffloader requires at least one parameter, registered "
-    "buffer, or streamed block to manage."
-)
-
-
-def _validate_store_components(
-    component_stores: Sequence[PinnedComponentStore | StreamedComponentStore],
-) -> None:
-    if not component_stores:
-        raise ValueError(_NO_COMPONENTS_MSG)
-
-
