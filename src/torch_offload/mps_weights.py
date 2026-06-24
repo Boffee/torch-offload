@@ -60,7 +60,10 @@ class MpsWeights:
     def bind(self) -> MpsWeights:
         return self
 
-    def activate(self, device: torch.device | str | None = None) -> None:
+    def activate(
+        self, device: torch.device | str | None = None, **kwargs: object,
+    ) -> None:
+        del kwargs  # MPS materialization takes no streaming policy
         if device is None:
             raise ValueError(
                 "MpsWeights.activate() requires device='mps'; pass "

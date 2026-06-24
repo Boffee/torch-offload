@@ -96,7 +96,8 @@ class FakeBinding:
     def value(self) -> nn.Module:
         return self.module
 
-    def activate(self, device: torch.device | str | None = None) -> None:
+    def activate(self, device: torch.device | str | None = None, **kwargs: object) -> None:
+        del kwargs
         self.events.append("activate")
         self.activate_devices.append(torch.device(device) if device is not None else None)
         if self._activate_raises is not None:

@@ -69,10 +69,30 @@ from .pinned_module import (
     PostCopyHookHandle,
 )
 from .pinned_param import PinnedParam
+from .stream_config import DEFAULT_STREAM_CONFIG, StreamConfig
 
 logger = logging.getLogger(__name__)
 
 _LoadedTrainableBlock = tuple[PinnedModuleInstance, PinnedModuleTarget]
+
+
+def _stream_config_from_kwargs(kwargs: dict[str, object]) -> StreamConfig:
+    """Extract the optional ``stream_config`` activation kwarg.
+
+    :meth:`StreamedComponent.activate` accepts ``**kwargs`` to satisfy the
+    open :class:`~torch_offload.protocols.ModelStrategyComponent` lifecycle
+    contract; the streamer is the one component that consumes a
+    ``stream_config``. Absent (or ``None``) falls back to the default policy.
+    """
+    stream_config = kwargs.get("stream_config")
+    if stream_config is None:
+        return DEFAULT_STREAM_CONFIG
+    if not isinstance(stream_config, StreamConfig):
+        raise TypeError(
+            "stream_config must be a StreamConfig; got "
+            f"{type(stream_config).__name__}."
+        )
+    return stream_config
 
 
 def _release_cuda_cache_on_drop(is_cuda: bool) -> None:
@@ -414,24 +434,6 @@ def _streamed_log_label(name: str | None, block_count: int) -> str:
     return f"StreamedComponent[{name}]"
 
 
-def _validate_stream_config(
-    *,
-    num_resident_blocks: int,
-    num_prefetch_blocks: int,
-) -> None:
-    # num_resident_blocks > num_blocks is allowed and clamps at
-    # activation, so one config stays valid across models of
-    # different depths.
-    if num_resident_blocks < 1:
-        raise ValueError(
-            f"num_resident_blocks ({num_resident_blocks}) must be >= 1"
-        )
-    if num_prefetch_blocks < 0:
-        raise ValueError(
-            f"num_prefetch_blocks ({num_prefetch_blocks}) must be >= 0"
-        )
-
-
 def _resolve_blocks(module: nn.Module, blocks_path: str) -> list[nn.Module]:
     obj = walk_attr_path(module, blocks_path)
     if not isinstance(obj, nn.ModuleList):
@@ -544,9 +546,6 @@ class StreamedComponentStore:
 
     _block_stores: tuple[PinnedModuleStore, ...]
     blocks_path: str
-    num_resident_blocks: int
-    num_prefetch_blocks: int = 2
-    cyclic: bool = False
 
     @classmethod
     def from_module(
@@ -554,17 +553,10 @@ class StreamedComponentStore:
         model: nn.Module,
         *,
         blocks_path: str,
-        num_resident_blocks: int,
-        num_prefetch_blocks: int = 2,
-        cyclic: bool = False,
         stream_trainable_weights: bool = False,
     ) -> StreamedComponentStore:
         """Resolve ``blocks_path`` on ``model`` and pin its streamed blocks."""
         blocks = _resolve_blocks(model, blocks_path)
-        _validate_stream_config(
-            num_resident_blocks=num_resident_blocks,
-            num_prefetch_blocks=num_prefetch_blocks,
-        )
         stream_param_names = _streamed_param_names_for_blocks(
             blocks,
             stream_trainables=stream_trainable_weights,
@@ -578,9 +570,6 @@ class StreamedComponentStore:
         return cls(
             _block_stores=tuple(block_stores),
             blocks_path=blocks_path,
-            num_resident_blocks=num_resident_blocks,
-            num_prefetch_blocks=num_prefetch_blocks,
-            cyclic=cyclic,
         )
 
     @property
@@ -647,9 +636,6 @@ class StreamedComponentStore:
         ]
         return StreamedComponent(
             instances,
-            num_resident_blocks=self.num_resident_blocks,
-            num_prefetch_blocks=self.num_prefetch_blocks,
-            cyclic=self.cyclic,
             name=self.blocks_path,
         )
 
@@ -684,9 +670,12 @@ class StreamedComponent:
     pins (so ``cache_bytes`` is final at construction time, ready
     for :class:`~torch_offload.model_cache.ModelCache` admission), and
     ``activate`` brings to CUDA or marks CPU active, ``deactivate`` returns state to
-    pinned CPU and removes hooks. There is no ``close()``; pinned
-    memory in module state is freed when the caller drops the
-    binding and model references.
+    pinned CPU and removes hooks. The residency/prefetch policy
+    (``num_resident_blocks``, ``num_prefetch_blocks``, ``cyclic``) is supplied
+    per activation via :class:`~torch_offload.stream_config.StreamConfig` passed
+    to :meth:`activate` — a runtime concern, not part of the pinned backing.
+    There is no ``close()``; pinned memory in module state is freed when the
+    caller drops the binding and model references.
 
     **Calling deactivate() before dropping the binding is preferred**
     — it removes the forward hooks (cleaner model state) and reverts
@@ -705,45 +694,6 @@ class StreamedComponent:
     ----------
     block_instances:
         The concrete bound block instances.
-    num_resident_blocks:
-        Maximum number of streamed blocks resident on GPU at a time.
-        Must be ``>= 1``; values above the block count clamp to it at
-        activation. ``1`` is right for almost all workloads: eviction
-        is LRU, so a sequential scan reloads every block each pass
-        regardless of residency — extra resident slots cost GPU
-        memory without reducing transfer volume. (Unlike kohya-style
-        ``blocks_to_swap``, residency here is a pool cap, not a
-        permanently-resident prefix.) The exception is checkpointed
-        training, whose backward recompute reverses direction and
-        finds the last ``num_resident_blocks`` blocks still resident.
-        Spare VRAM is usually better spent on ``num_prefetch_blocks``.
-    num_prefetch_blocks:
-        How many blocks ahead to prefetch on a background thread. At most
-        ``num_resident_blocks + num_prefetch_blocks`` blocks are
-        GPU-resident at once; for a homogeneous block list the GPU target
-        pool holds exactly that many targets. A heterogeneously quantized
-        list keeps one reusable target per distinct block-layout
-        signature, so its pool can grow to that bound per distinct layout
-        (closer to the homogeneous bound when formats run contiguously).
-    cyclic:
-        Default ``False``. When ``True``, treat the block list as a
-        cyclic sequence: large index jumps (``|Δidx| > num_blocks/2``)
-        are interpreted as iteration wraparound rather than direction
-        reversal, and prefetch indices wrap modulo ``num_blocks``.
-        Suitable for inference loops that iterate the model repeatedly
-        (diffusion denoising, multi-step decoders) — the prefetcher
-        keeps streaming the next iteration's leading blocks instead
-        of misfiring at iteration boundaries. Leave ``False`` for
-        single-shot or genuinely non-cyclic traversals.
-
-        The wraparound heuristic assumes monotonic intra-iteration
-        traversal (each iteration walks blocks in order, forward or
-        reverse, possibly skipping by one or two). Non-monotonic
-        forward jumps larger than ``num_blocks/2`` within a single
-        iteration would be misclassified as wraparound. The flag is
-        captured at :meth:`activate` time; flipping ``self._cyclic``
-        on a live streamer has no effect until the next
-        deactivate/activate cycle.
     name:
         Optional model path for the streamed block list. When set,
         :attr:`param_names` and name-based post-copy hook registration
@@ -759,15 +709,8 @@ class StreamedComponent:
         self,
         block_instances: Sequence[PinnedModuleInstance],
         *,
-        num_resident_blocks: int,
-        num_prefetch_blocks: int = 2,
-        cyclic: bool = False,
         name: str | None = None,
     ) -> None:
-        _validate_stream_config(
-            num_resident_blocks=num_resident_blocks,
-            num_prefetch_blocks=num_prefetch_blocks,
-        )
         self._block_instances = list(block_instances)
         # Each block triggers its own streaming: forwarding
         # ``block_instances[i].module`` loads ``block_instances[i]``. The
@@ -779,9 +722,6 @@ class StreamedComponent:
             for instance in self._block_instances
         ]
         self._active_device: torch.device | None = None
-        self._num_resident_blocks = num_resident_blocks
-        self._num_prefetch_blocks = num_prefetch_blocks
-        self._cyclic = cyclic
         self._log_label = _streamed_log_label(name, len(self._block_instances))
         self._param_name_to_block_param = _build_param_name_index(
             self._block_instances,
@@ -944,7 +884,9 @@ class StreamedComponent:
     # Lifecycle
     # ------------------------------------------------------------------
 
-    def activate(self, device: torch.device | str | None = None) -> None:
+    def activate(
+        self, device: torch.device | str | None = None, **kwargs: object,
+    ) -> None:
         """Activate the block list on ``device``.
 
         CUDA activation uses the streaming path: GPU target pool, CUDA
@@ -981,15 +923,19 @@ class StreamedComponent:
                 "StreamedComponent.activate() supports CUDA or CPU; "
                 f"got {active_device}."
             )
-        self._activate_cuda_resolved(active_device)
+        self._activate_cuda_resolved(
+            active_device, _stream_config_from_kwargs(kwargs),
+        )
 
     def _activate_cpu_resolved(self) -> None:
         self._active_device = torch.device("cpu")
 
-    def _activate_cuda_resolved(self, active_device: torch.device) -> None:
+    def _activate_cuda_resolved(
+        self, active_device: torch.device, stream_config: StreamConfig,
+    ) -> None:
         num_blocks = len(self._block_instances)
-        num_resident = min(self._num_resident_blocks, num_blocks)
-        num_gpu_targets = num_resident + self._num_prefetch_blocks
+        num_resident = min(stream_config.num_resident_blocks, num_blocks)
+        num_gpu_targets = num_resident + stream_config.num_prefetch_blocks
 
         self._active_device = active_device
         self._tracker = _BlockTracker()
@@ -1006,12 +952,14 @@ class StreamedComponent:
             self._load_block(block_idx)
             self._tracker.mark_on_gpu(block_idx)
 
-        self._register_hooks(num_resident)
+        self._register_hooks(
+            num_resident, stream_config.num_prefetch_blocks, stream_config.cyclic,
+        )
         self.reset_peak()
 
         logger.info(
             f"{self._log_label} active: {num_resident}/{num_blocks} resident "
-            f"on GPU, prefetch={self._num_prefetch_blocks}, "
+            f"on GPU, prefetch={stream_config.num_prefetch_blocks}, "
             f"max_gpu_resident={num_gpu_targets}"
         )
 
@@ -1030,9 +978,11 @@ class StreamedComponent:
             raise prefetch_exc
 
     @contextlib.contextmanager
-    def use(self, device: torch.device | str) -> Iterator[None]:
+    def use(
+        self, device: torch.device | str, **kwargs: object,
+    ) -> Iterator[None]:
         """Activate on ``device`` for the duration of the context."""
-        self.activate(device)
+        self.activate(device, **kwargs)
         try:
             yield
         finally:
@@ -1550,12 +1500,14 @@ class StreamedComponent:
         total = len(tracker._on_gpu) + len(pending)
         tracker.peak_gpu_blocks = max(tracker.peak_gpu_blocks, total)
 
-    def _register_hooks(self, num_resident: int) -> None:
+    def _register_hooks(
+        self, num_resident: int, num_prefetch_blocks: int, cyclic: bool,
+    ) -> None:
         # Each block's forward-pre hook triggers the load of its own streamed
         # instance: forwarding ``block_instances[i].module`` loads instance i.
-        num_prefetch_blocks = self._num_prefetch_blocks  # capture as local — no `self` ref in closure
+        # num_prefetch_blocks / cyclic come from activate's StreamConfig, so the
+        # hook closures capture no streaming-policy ``self`` state.
         max_on_gpu = num_resident + num_prefetch_blocks
-        cyclic = self._cyclic
         num_blocks = len(self._block_instances)
         wrap_threshold = num_blocks // 2  # |Δidx| > this counts as wraparound
         # weakref breaks the cycle: block → hook → closure → streamer

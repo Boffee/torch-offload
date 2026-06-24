@@ -13,6 +13,7 @@ from torch_offload import (
     ModelOffloader,
     ModelOffloaderStore,
     ScaledLoRAFactor,
+    StreamConfig,
     merge_lora,
 )
 from torch_offload._torchao_mx import is_supported_mx_elem_dtype
@@ -44,17 +45,11 @@ def _make_model_offloader(
     model: nn.Module,
     *,
     blocks_attr: list[str] = [],
-    num_resident_blocks: int = 1,
-    num_prefetch_blocks: int = 2,
-    cyclic: bool = False,
     stream_trainable_weights: bool = False,
 ) -> ModelOffloader:
     store = ModelOffloaderStore.from_module(
         model,
         blocks_attr=blocks_attr,
-        num_resident_blocks=num_resident_blocks,
-        num_prefetch_blocks=num_prefetch_blocks,
-        cyclic=cyclic,
         stream_trainable_weights=stream_trainable_weights,
     )
     return store.bind(model)
@@ -507,8 +502,6 @@ class TestMxAdapter:
         offloader = _make_model_offloader(
             model,
             blocks_attr=["blocks"],
-            num_resident_blocks=1,
-            num_prefetch_blocks=0,
         )
         lora = LoRA(
             state_dict={
@@ -520,7 +513,12 @@ class TestMxAdapter:
 
         try:
             x = torch.randn(128, 128, dtype=torch.bfloat16, device="cuda")
-            with offloader.use("cuda") as active:
+            with offloader.use(
+                "cuda",
+                stream_config=StreamConfig(
+                    num_resident_blocks=1, num_prefetch_blocks=0
+                ),
+            ) as active:
                 y = active(x)
                 torch.cuda.synchronize()
             assert y.shape == (128, 128)
@@ -585,14 +583,17 @@ class TestMxAdapter:
         offloader = _make_model_offloader(
             model,
             blocks_attr=["blocks"],
-            num_resident_blocks=1,
-            num_prefetch_blocks=0,
         )
         offloader.set_loras([lora], strengths=[0.5], mode="merge")
 
         try:
             x = torch.randn(8, 64, dtype=torch.bfloat16, device="cuda")
-            with offloader.use("cuda") as active:
+            with offloader.use(
+                "cuda",
+                stream_config=StreamConfig(
+                    num_resident_blocks=1, num_prefetch_blocks=0
+                ),
+            ) as active:
                 merged = active.blocks[0].weight.data
                 assert isinstance(merged, mx_cls)
                 torch.testing.assert_close(

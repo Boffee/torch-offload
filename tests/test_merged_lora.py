@@ -28,6 +28,7 @@ from torch_offload import (
     PinnedComponent,
     LoRASpec,
     ScaledLoRAFactor,
+    StreamConfig,
     StreamedComponent,
     merge_lora,
 )
@@ -57,17 +58,11 @@ def _make_model_offloader(
     model: nn.Module,
     *,
     blocks_attr: list[str] = [],
-    num_resident_blocks: int = 1,
-    num_prefetch_blocks: int = 2,
-    cyclic: bool = False,
     stream_trainable_weights: bool = False,
 ) -> ModelOffloader:
     store = ModelOffloaderStore.from_module(
         model,
         blocks_attr=blocks_attr,
-        num_resident_blocks=num_resident_blocks,
-        num_prefetch_blocks=num_prefetch_blocks,
-        cyclic=cyclic,
         stream_trainable_weights=stream_trainable_weights,
     )
     return store.bind(model)
@@ -231,21 +226,26 @@ def _expected_routed_output(
     return F.linear(h, model.head.weight.to(h.device))
 
 
-def _make_strategy(
-    model: nn.Module, num_resident_blocks: int | None = None,
-) -> ModelOffloader:
-    """Shorthand for constructing the strategy with sensible defaults.
+def _make_strategy(model: nn.Module) -> ModelOffloader:
+    """Shorthand for constructing the strategy.
 
-    Defaults to all-but-one blocks resident (the old
-    ``blocks_to_swap=1`` shape) so streaming is engaged regardless
-    of the model's depth."""
+    The block-streaming residency policy is now supplied at activation;
+    pair this with :func:`_strategy_stream_config` on the matching
+    ``activate``/``use`` call.
+    """
+    return _make_model_offloader(model, blocks_attr=["transformer_blocks"])
+
+
+def _strategy_stream_config(
+    model: nn.Module, num_resident_blocks: int | None = None,
+) -> StreamConfig:
+    """Residency policy matching :func:`_make_strategy`'s old defaults.
+
+    Defaults to all-but-one blocks resident (the old ``blocks_to_swap=1``
+    shape) so streaming is engaged regardless of the model's depth."""
     if num_resident_blocks is None:
         num_resident_blocks = len(model.transformer_blocks) - 1
-    return _make_model_offloader(
-        model,
-        blocks_attr=["transformer_blocks"],
-        num_resident_blocks=num_resident_blocks,
-    )
+    return StreamConfig(num_resident_blocks=num_resident_blocks)
 
 
 def _has_post_copy_hook(strategy: ModelOffloader, target_key: str) -> bool:
@@ -529,14 +529,14 @@ class TestSetLorasValidation:
         s = _make_strategy(m)
         _set_loras(s, [(_make_lora(4, 16), 1.0)], mode="merge")
         with pytest.raises(ValueError, match="merge mode requires CUDA"):
-            s.activate("cpu")
+            s.activate("cpu", stream_config=_strategy_stream_config(m))
 
     @CUDA
     def test_set_loras_raises_while_active(self) -> None:
         m = _make_bf16_model()
         s = _make_strategy(m)
         _set_loras(s, [(_make_lora(4, 16), 1.0)])
-        s.activate("cuda")
+        s.activate("cuda", stream_config=_strategy_stream_config(m))
         try:
             with pytest.raises(RuntimeError, match="inactive"):
                 _set_loras(s, [])
@@ -619,7 +619,7 @@ class TestSetLorasValidation:
         _set_loras(s, loras, mode="routed")
 
         x = torch.randn(2, 16)
-        s.activate("cpu")
+        s.activate("cpu", stream_config=_strategy_stream_config(m))
         try:
             actual = m(x)
             expected = _expected_routed_output(m, x, loras)
@@ -643,7 +643,7 @@ class TestLifecycle:
         s = _make_strategy(m)
         _set_loras(s, [(_make_lora(4, 16), 1.0)])
         try:
-            s.activate("cuda")
+            s.activate("cuda", stream_config=_strategy_stream_config(m))
             assert m.embed.weight.is_cuda
             assert m.head.weight.is_cuda
         finally:
@@ -654,7 +654,7 @@ class TestLifecycle:
         m = _make_bf16_model()
         s = _make_strategy(m)
         _set_loras(s, [(_make_lora(4, 16), 1.0)])
-        s.activate("cuda")
+        s.activate("cuda", stream_config=_strategy_stream_config(m))
         s.deactivate()
         assert m.embed.weight.is_pinned()
         assert m.head.weight.is_pinned()
@@ -664,10 +664,10 @@ class TestLifecycle:
         m = _make_bf16_model()
         s = _make_strategy(m)
         _set_loras(s, [(_make_lora(4, 16, seed=1), 1.0)])
-        s.activate("cuda")
+        s.activate("cuda", stream_config=_strategy_stream_config(m))
         s.deactivate()
         _set_loras(s, [(_make_lora(4, 16, seed=2), 1.0)])
-        s.activate("cuda")
+        s.activate("cuda", stream_config=_strategy_stream_config(m))
         s.deactivate()
         assert m.embed.weight.is_pinned()
 
@@ -687,11 +687,11 @@ class TestLifecycle:
         )
         s = _make_strategy(m)
         _set_loras(s, [(LoRA(state_dict=sd), 1.0)], mode="merge")
-        s.activate("cuda")
+        s.activate("cuda", stream_config=_strategy_stream_config(m))
         s.deactivate()
 
         _set_loras(s, [])
-        s.activate("cuda")
+        s.activate("cuda", stream_config=_strategy_stream_config(m))
         try:
             torch.cuda.synchronize()
             torch.testing.assert_close(
@@ -714,7 +714,7 @@ class TestLifecycle:
         m = _make_bf16_model()
         captured = m.transformer_blocks[0].attn.weight.detach().clone()
         s = _make_strategy(m)
-        s.activate("cuda")
+        s.activate("cuda", stream_config=_strategy_stream_config(m))
         try:
             x = torch.randn(2, 16, dtype=torch.bfloat16, device="cuda")
             for blk in m.transformer_blocks:
@@ -748,7 +748,7 @@ class TestMergeCorrectness:
         ]
         s = _make_strategy(m)
         _set_loras(s, loras)
-        s.activate("cuda")
+        s.activate("cuda", stream_config=_strategy_stream_config(m))
         try:
             x = torch.randn(2, 16, dtype=torch.bfloat16, device="cuda")
             for blk in m.transformer_blocks:
@@ -784,7 +784,7 @@ class TestMergeCorrectness:
         lora = _make_lora(4, 16, seed=42, prefix="diffusion_model.")
         s = _make_strategy(m)
         _set_loras(s, [(lora, 0.7)])
-        s.activate("cuda")
+        s.activate("cuda", stream_config=_strategy_stream_config(m))
         try:
             x = torch.randn(2, 16, dtype=torch.bfloat16, device="cuda")
             for blk in m.transformer_blocks:
@@ -817,7 +817,7 @@ class TestMergeCorrectness:
         lora = LoRA(state_dict=sd)
         s = _make_strategy(m)
         _set_loras(s, [(lora, 0.5)])
-        s.activate("cuda")
+        s.activate("cuda", stream_config=_strategy_stream_config(m))
         try:
             factor = lora.targets["embed.weight"]
             a, b = _factor_tensors(factor)
@@ -870,7 +870,7 @@ class TestMergeCorrectness:
         lora = _make_lora(num_blocks=4, dim=16, seed=42)
         s = _make_strategy(m)
         _set_loras(s, [(lora, 0.7)])
-        s.activate("cuda")
+        s.activate("cuda", stream_config=_strategy_stream_config(m))
         try:
             x = torch.randn(2, 16, dtype=torch.bfloat16, device="cuda")
             m(x)
@@ -1001,9 +1001,12 @@ class TestLoRATransform:
             .to(torch.int8)
         )
 
-        s = _make_strategy(m, num_resident_blocks=1)
+        s = _make_strategy(m)
         _set_loras(s, [(lora, 0.5)], mode="merge")
-        s.activate("cuda")
+        s.activate(
+            "cuda",
+            stream_config=_strategy_stream_config(m, num_resident_blocks=1),
+        )
         try:
             merged_qt = m.embed.weight.data
             assert isinstance(merged_qt, WeightQBytesTensor)
@@ -1047,9 +1050,12 @@ class TestLoRATransform:
             expected_dense / scales[0].to(torch.float32)
         ).round().clamp(-128, 127).to(torch.int8)
 
-        s = _make_strategy(m, num_resident_blocks=1)
+        s = _make_strategy(m)
         _set_loras(s, [(lora, 0.5)], mode="merge")
-        s.activate("cuda")
+        s.activate(
+            "cuda",
+            stream_config=_strategy_stream_config(m, num_resident_blocks=1),
+        )
         try:
             streamer = streamed_components(s)[0]
             streamer._load_block(0)
@@ -1216,7 +1222,7 @@ class TestRoutedMode:
 
         s = _make_strategy(m)
         _set_loras(s, loras, mode="routed")
-        s.activate("cuda")
+        s.activate("cuda", stream_config=_strategy_stream_config(m))
         try:
             x = torch.randn(2, 16, dtype=torch.bfloat16, device="cuda")
             actual = m(x)
@@ -1245,7 +1251,7 @@ class TestRoutedMode:
         m = _make_bf16_model(num_blocks=3, dim=16)
         s = _make_strategy(m)
         _set_loras(s, [(_make_lora(3, 16, seed=7), 1.0)], mode="routed")
-        s.activate("cuda")
+        s.activate("cuda", stream_config=_strategy_stream_config(m))
         x = torch.randn(2, 16, dtype=torch.bfloat16, device="cuda")
         with_lora = m(x).detach().clone()
         torch.cuda.synchronize()
@@ -1254,7 +1260,7 @@ class TestRoutedMode:
         # Re-activate without LoRAs; output should differ from with_lora
         # (the hooks should be gone).
         _set_loras(s, [], mode="routed")
-        s.activate("cuda")
+        s.activate("cuda", stream_config=_strategy_stream_config(m))
         try:
             base_only = m(x)
             torch.cuda.synchronize()
@@ -1279,7 +1285,7 @@ class TestRoutedMode:
 
         s = _make_strategy(m)
         _set_loras(s, loras, mode="routed")
-        s.activate("cuda")
+        s.activate("cuda", stream_config=_strategy_stream_config(m))
         try:
             x = torch.randn(2, 16, dtype=torch.bfloat16, device="cuda")
             actual = m(x)
@@ -1337,7 +1343,7 @@ class TestRoutedMode:
 
         s = _make_model_offloader(
             model,
-            blocks_attr=["transformer_blocks"], num_resident_blocks=1,
+            blocks_attr=["transformer_blocks"],
         )
         # Build a LoRA targeting attn.weight (LinearLike, not nn.Linear).
         lora = _make_lora(num_blocks=2, dim=16, seed=3)
@@ -1395,7 +1401,7 @@ class TestRoutedMode:
 
         s = _make_model_offloader(
             model,
-            blocks_attr=["transformer_blocks"], num_resident_blocks=1,
+            blocks_attr=["transformer_blocks"],
         )
         lora = _make_lora(num_blocks=2, dim=16, seed=99)
         _set_loras(s, [(lora, 1.0)], mode="routed")
@@ -1411,7 +1417,7 @@ class TestRoutedMode:
 
         s = _make_strategy(m)
         _set_loras(s, loras, mode="routed")
-        s.activate("cuda")
+        s.activate("cuda", stream_config=_strategy_stream_config(m))
         try:
             x = torch.randn(2, 16, dtype=torch.bfloat16, device="cuda")
             actual = m(x)
@@ -1431,7 +1437,7 @@ class TestRoutedMode:
 
         s = _make_model_offloader(
             model,
-            blocks_attr=["transformer_blocks"], num_resident_blocks=1,
+            blocks_attr=["transformer_blocks"],
         )
         # Build a LoRA that targets either alias of the tied weight.
         sd = {
@@ -1490,7 +1496,7 @@ class TestRoutedMode:
         loras = [(_make_lora(num_blocks=2, dim=16, seed=55), 0.5)]
         s = _make_model_offloader(
             m,
-            blocks_attr=["transformer_blocks"], num_resident_blocks=1,
+            blocks_attr=["transformer_blocks"],
         )
         _set_loras(s, loras, mode="routed")
         s.activate("cuda")
@@ -1576,7 +1582,7 @@ class TestDeactivateCleanupInvariants:
             raise RuntimeError("streamer cleanup failed")
 
         monkeypatch.setattr(streamed_components(s)[0], "deactivate", streamer_boom)
-        s.activate("cuda")
+        s.activate("cuda", stream_config=_strategy_stream_config(m))
 
         with pytest.raises(RuntimeError):
             s.deactivate()

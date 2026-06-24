@@ -25,17 +25,11 @@ def _make_model_offloader(
     model: nn.Module,
     *,
     blocks_attr: list[str] = [],
-    num_resident_blocks: int = 1,
-    num_prefetch_blocks: int = 2,
-    cyclic: bool = False,
     stream_trainable_weights: bool = False,
 ) -> ModelOffloader:
     store = ModelOffloaderStore.from_module(
         model,
         blocks_attr=blocks_attr,
-        num_resident_blocks=num_resident_blocks,
-        num_prefetch_blocks=num_prefetch_blocks,
-        cyclic=cyclic,
         stream_trainable_weights=stream_trainable_weights,
     )
     return store.bind(model)

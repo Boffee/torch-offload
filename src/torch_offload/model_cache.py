@@ -66,6 +66,7 @@ from ._devices import canonical_device
 from .lora import KeyTransformT, LoRA, default_key_transform
 from .model_offloader import LoraMode, ModelOffloader, ModelOffloaderStore
 from .protocols import ResourceBinding, ResourceStore
+from .stream_config import StreamConfig
 
 logger = logging.getLogger(__name__)
 
@@ -162,9 +163,6 @@ class ModelSpec(ResourceSpec[M]):
         factory: Callable[[], M],
         skeleton_factory: Callable[[], M] | None = None,
         blocks_attr: list[str] = [],  # noqa: B006  (read-only; never mutated)
-        num_resident_blocks: int = 1,
-        num_prefetch_blocks: int = 2,
-        cyclic: bool = False,
         stream_trainable_weights: bool = False,
     ) -> None:
         def store_factory() -> ResourceStore:
@@ -172,9 +170,6 @@ class ModelSpec(ResourceSpec[M]):
             return ModelOffloaderStore.from_module(
                 model,
                 blocks_attr=blocks_attr,
-                num_resident_blocks=num_resident_blocks,
-                num_prefetch_blocks=num_prefetch_blocks,
-                cyclic=cyclic,
                 stream_trainable_weights=stream_trainable_weights,
             )
 
@@ -251,7 +246,9 @@ class _ObjectStore(Generic[T]):
     def value(self) -> T:
         return self._value
 
-    def activate(self, device: torch.device | str | None = None) -> None:
+    def activate(
+        self, device: torch.device | str | None = None, **kwargs: object,
+    ) -> None:
         pass
 
     def deactivate(self) -> None:
@@ -605,6 +602,9 @@ class ModelCache:
         model: str | ResourceSpec[T],
         *,
         device: torch.device | str | None = None,
+        num_resident_blocks: int = 1,
+        num_prefetch_blocks: int = 2,
+        cyclic: bool = False,
         loras: Sequence[LoRARef] | None = None,
         lora_strengths: Sequence[float] | None = None,
         lora_mode: LoraMode = "merge",
@@ -646,7 +646,16 @@ class ModelCache:
                 strengths=lora_strengths,
                 mode=lora_mode,
             )
-            self._activate_binding(entry, binding, device=device)
+            self._activate_binding(
+                entry,
+                binding,
+                device=device,
+                stream_config=StreamConfig(
+                    num_resident_blocks=num_resident_blocks,
+                    num_prefetch_blocks=num_prefetch_blocks,
+                    cyclic=cyclic,
+                ),
+            )
             for lora_entry, lora_binding in zip(
                 lora_entries, lora_bindings, strict=True,
             ):
@@ -781,11 +790,12 @@ class ModelCache:
         binding: ResourceBinding[Any],
         *,
         device: torch.device | str | None = None,
+        stream_config: StreamConfig | None = None,
     ) -> None:
         """Activate and publish a binding after all inactive binding
         configuration has been applied."""
         active_device = self._normalize_device(device)
-        binding.activate(active_device)
+        binding.activate(active_device, stream_config=stream_config)
         entry.bindings.append(binding)
         self._eviction.mark_active(entry.spec.key)
 

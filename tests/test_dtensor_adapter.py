@@ -16,7 +16,7 @@ import pytest
 import torch
 from torch import nn
 
-from torch_offload import ModelOffloaderStore
+from torch_offload import ModelOffloaderStore, StreamConfig
 from torch_offload.dtensor_adapter import DTensorAdapter
 from torch_offload.pinned_param import PinnedParam
 from torch_offload.tensor_adapters import (
@@ -213,16 +213,17 @@ class TestDTensorAdapter:
         net = Net(
             [Block(_dtensor_weight(tp_mesh)[0]), Block(_dtensor_weight(tp_mesh)[0])]
         )
-        store = ModelOffloaderStore.from_module(
-            net, blocks_attr=["blocks"], num_resident_blocks=2, num_prefetch_blocks=0
-        )
+        store = ModelOffloaderStore.from_module(net, blocks_attr=["blocks"])
         pw = store.bind(net)
         try:
             # resting: a DTensor on a CPU mesh (local on the host)
             resting = net.blocks[0].weight.data
             assert _is_dtensor(resting)
             assert resting.device_mesh.device_type == "cpu"
-            with pw.use("cuda"):
+            with pw.use(
+                "cuda",
+                stream_config=StreamConfig(num_resident_blocks=2, num_prefetch_blocks=0),
+            ):
                 for blk in net.blocks:
                     assert _is_dtensor(blk.weight.data)
                     assert blk.weight.data.device_mesh.device_type == "cuda"

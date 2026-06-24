@@ -82,12 +82,16 @@ class CompositeComponent:
             name, hook,
         )
 
-    def activate(self, device: torch.device | str | None = None) -> None:
+    def activate(
+        self, device: torch.device | str | None = None, **kwargs: object,
+    ) -> None:
         """Activate every component, in order, on ``device``.
 
         Self-cleaning on failure: if a component's ``activate`` raises, the
         already-activated components are deactivated before the exception
-        propagates.
+        propagates. Extra keyword arguments (e.g. a streamed member's
+        ``stream_config``) are forwarded to every component; members that
+        don't use them ignore them.
         """
         if self._teardown_stack is not None:
             raise RuntimeError(
@@ -97,7 +101,7 @@ class CompositeComponent:
         with contextlib.ExitStack() as stack:
             for component in self._components:
                 stack.callback(component.deactivate)
-                component.activate(device)
+                component.activate(device, **kwargs)
             self._teardown_stack = stack.pop_all()
 
     def deactivate(self) -> None:
@@ -143,9 +147,6 @@ class CompositeComponentStore:
         model: nn.Module,
         *,
         blocks_attr: list[str] = [],  # noqa: B006  (read-only; never mutated)
-        num_resident_blocks: int = 1,
-        num_prefetch_blocks: int = 2,
-        cyclic: bool = False,
         stream_trainable_weights: bool = False,
     ) -> CompositeComponentStore:
         """Decompose ``model`` into a pinned remainder + streamed block groups.
@@ -162,9 +163,6 @@ class CompositeComponentStore:
             StreamedComponentStore.from_module(
                 model,
                 blocks_path=blocks_path,
-                num_resident_blocks=num_resident_blocks,
-                num_prefetch_blocks=num_prefetch_blocks,
-                cyclic=cyclic,
                 stream_trainable_weights=stream_trainable_weights,
             )
             for blocks_path in blocks_attr

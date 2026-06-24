@@ -136,6 +136,7 @@ from .protocols import (
     ResourceBinding,
     ResourceStore,
 )
+from .stream_config import StreamConfig
 from .streamed_component import StreamedComponent, StreamedComponentStore
 
 __all__ = [
@@ -170,6 +171,7 @@ __all__ = [
     "ResourceSpec",
     "ResourceStore",
     "ScaledLoRAFactor",
+    "StreamConfig",
     "StreamedComponent",
     "StreamedComponentStore",
     "merge_lora",

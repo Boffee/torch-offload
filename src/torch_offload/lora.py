@@ -198,8 +198,10 @@ class LoRA:
     def bind(self) -> LoRA:
         return self
 
-    def activate(self, device: torch.device | str | None = None) -> None:
-        del device
+    def activate(
+        self, device: torch.device | str | None = None, **kwargs: object,
+    ) -> None:
+        del device, kwargs
 
     def deactivate(self) -> None:
         pass
