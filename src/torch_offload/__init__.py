@@ -131,6 +131,8 @@ from .pinned_component import PinnedComponent, PinnedComponentStore
 from .protocols import (
     ModelStrategy,
     ModelStrategyComponent,
+    OffloadComponent,
+    OffloadComponentStore,
     ResourceBinding,
     ResourceStore,
 )
@@ -160,6 +162,8 @@ __all__ = [
     "ModelTooLargeError",
     "MpsWeights",
     "ObjectSpec",
+    "OffloadComponent",
+    "OffloadComponentStore",
     "PinnedComponent",
     "PinnedComponentStore",
     "ResourceBinding",

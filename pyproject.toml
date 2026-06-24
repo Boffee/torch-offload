@@ -78,6 +78,7 @@ ignore = [
     # importorskip(), and assertion-oriented context-manager structure.
     "ANN",
     "ARG",
+    "B006",
     "B007",
     "ERA001",
     "F841",

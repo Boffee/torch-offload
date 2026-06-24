@@ -7,7 +7,6 @@ per-weight LoRA application in both modes.
 from __future__ import annotations
 
 import contextlib
-import logging
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import Literal, Protocol
@@ -16,19 +15,13 @@ import torch
 from torch import nn
 
 from ._devices import canonical_device
+from .composite_component import CompositeComponent, CompositeComponentStore
 from .lora import LoRA, LoRARouteHandle, LoRATransform, ScaledLoRAFactor
 from .module_names import (
-    buffer_names,
     canonical_param_name,
-    parameter_names,
     resolve_parent_leaf,
 )
-from .pinned_component import PinnedComponent, PinnedComponentStore
-from .protocols import ModelStrategyComponent
-from .streamed_component import StreamedComponent, StreamedComponentStore
 from .tensor_adapter_registry import param_representation, select_adapter
-
-logger = logging.getLogger(__name__)
 
 LoraMode = Literal["merge", "routed"]
 _LoraParamMap = dict[str, list[ScaledLoRAFactor]]
@@ -48,97 +41,40 @@ class ModelOffloaderStore:
     """
 
     model: nn.Module = field(repr=False, compare=False)
-    pinned_component_store: PinnedComponentStore | None
-    streamed_component_stores: tuple[StreamedComponentStore, ...]
-    stream_trainable_weights: bool
+    composite_store: CompositeComponentStore
 
     @classmethod
     def from_module(
         cls,
         model: nn.Module,
         *,
-        blocks_attr: str | Sequence[str] | None = None,
-        num_resident_blocks: int | None = None,
+        blocks_attr: list[str] = [],  # noqa: B006  (read-only; never mutated)
+        num_resident_blocks: int = 1,
         num_prefetch_blocks: int = 2,
         cyclic: bool = False,
         stream_trainable_weights: bool = False,
     ) -> ModelOffloaderStore:
-        blocks_paths = _normalize_blocks_paths(blocks_attr)
-        _validate_store_config(
-            blocks_paths=blocks_paths,
-            num_resident_blocks=num_resident_blocks,
-        )
-        (
-            streamed_component_stores,
-            streamed_param_names,
-            streamed_buffer_names,
-        ) = _build_streamed_component_stores(
+        composite_store = CompositeComponentStore.from_module(
             model,
-            blocks_paths=blocks_paths,
+            blocks_attr=blocks_attr,
             num_resident_blocks=num_resident_blocks,
             num_prefetch_blocks=num_prefetch_blocks,
             cyclic=cyclic,
             stream_trainable_weights=stream_trainable_weights,
         )
-        pinned_component_store = _build_pinned_component_store(
-            model,
-            streamed_param_names=streamed_param_names,
-            streamed_buffer_names=streamed_buffer_names,
-        )
-        return cls(
-            model=model,
-            pinned_component_store=pinned_component_store,
-            streamed_component_stores=streamed_component_stores,
-            stream_trainable_weights=stream_trainable_weights,
-        )
+        return cls(model=model, composite_store=composite_store)
 
     @property
     def cache_bytes(self) -> int:
-        pinned_bytes = (
-            0
-            if self.pinned_component_store is None
-            else self.pinned_component_store.cache_bytes
-        )
-        streamed_bytes = sum(
-            store.cache_bytes for store in self.streamed_component_stores
-        )
-        return pinned_bytes + streamed_bytes
+        return self.composite_store.cache_bytes
 
     @property
     def has_trainables(self) -> bool:
-        pinned_has_trainables = (
-            self.pinned_component_store is not None
-            and self.pinned_component_store.has_trainables
-        )
-        return pinned_has_trainables or any(
-            store.has_trainables for store in self.streamed_component_stores
-        )
+        return self.composite_store.has_trainables
 
-    def bind(
-        self,
-        model: nn.Module,
-        *,
-        skip_checkpointing_check: bool = False,
-        is_block_checkpointed: Callable[[nn.Module], bool] | None = None,
-    ) -> ModelOffloader:
+    def bind(self, model: nn.Module) -> ModelOffloader:
         """Bind this store's backing bytes to ``model``."""
-        streamed_components = [
-            store.bind(model)
-            for store in self.streamed_component_stores
-        ]
-        pinned_component = (
-            None
-            if self.pinned_component_store is None
-            else self.pinned_component_store.bind(model)
-        )
-        return ModelOffloader(
-            model,
-            pinned_component=pinned_component,
-            streamed_components=streamed_components,
-            stream_trainable_weights=self.stream_trainable_weights,
-            skip_checkpointing_check=skip_checkpointing_check,
-            is_block_checkpointed=is_block_checkpointed,
-        )
+        return ModelOffloader(model, composite=self.composite_store.bind(model))
 
 
 __all__ = [
@@ -184,12 +120,11 @@ class ModelOffloader:
     construction accepts already-bound components for low-level
     composition; it does not build stores or pin model state itself.
 
-    When ``blocks_attr`` or ``num_resident_blocks`` is omitted
-    (``num_resident_blocks=None`` disables streaming), CUDA activation
-    bulk-copies every managed parameter and buffer to CUDA. When both
-    are set, CUDA activation streams the selected block groups plus
-    component-level movement for non-streamed state. CPU activation is
-    pass-through over the pinned host-backed module state.
+    When ``blocks_attr`` is omitted, CUDA activation bulk-copies every
+    managed parameter and buffer to CUDA. When it is set, CUDA activation
+    streams the selected block groups plus component-level movement for
+    non-streamed state. CPU activation is pass-through over the pinned
+    host-backed module state.
 
     Composes :class:`PinnedComponent` (non-streamed params and buffers)
     and one or more :class:`StreamedComponent`\\ s internally. LoRA requests
@@ -218,14 +153,9 @@ class ModelOffloader:
     PyTorch re-runs the block's forward with grad enabled, building
     a fresh autograd graph whose saved references only live within
     that one block's recompute-then-backward window. Target reuse
-    outside that window is then safe.
-
-    For **frozen-only** streamed blocks (training touches only
-    out-of-block trainables), CUDA :meth:`activate` emits a one-time
-    warning if no HuggingFace ``gradient_checkpointing`` flag is
-    detected — the failure mode without checkpointing is a loud
-    ``RuntimeError`` from autograd's saved-tensor check, so a warning
-    suffices.
+    outside that window is then safe. Ensuring each streamed block that
+    participates in training is checkpointed is the caller's
+    responsibility — there is no auto-detection or guard.
 
     By default, trainable params are not streamed through the block
     residency pool. They are managed by :class:`PinnedComponent`, stay
@@ -237,20 +167,6 @@ class ModelOffloader:
     Configure ``stream_trainable_weights=True`` on
     :meth:`ModelOffloaderStore.from_module` to stream in-block trainable
     parameter data through the CUDA block target pool. In that mode,
-    CUDA :meth:`activate` *raises* during training if no
-    ``gradient_checkpointing`` flag is detected. The failure mode here
-    is **silent gradient corruption** rather than a loud error — the
-    ``.data`` swap path used for trainable streaming bypasses autograd's
-    version-counter check, so we hard-guard the precondition. Pass
-    ``skip_checkpointing_check=True`` to :meth:`ModelOffloaderStore.bind`
-    to suppress the check if you wrap blocks manually via
-    ``torch.utils.checkpoint.checkpoint`` at call sites (the
-    wrapping is invisible from the module tree, so detection has
-    false negatives). Callers passing this flag take responsibility
-    for ensuring every streamed block that participates in training
-    is wrapped.
-
-    With ``stream_trainable_weights=True`` on CUDA,
     :meth:`optimizer_step` is the optimizer boundary: it materializes
     streamed trainable ``.data`` on GPU while an arbitrary PyTorch
     optimizer updates it, then copies the updated data back to pinned
@@ -260,63 +176,22 @@ class ModelOffloader:
     Parameters
     ----------
     model:
-        The concrete model bound to the supplied components.
-    pinned_component:
-        Optional bound component for non-streamed parameter and buffer
-        state.
-    streamed_components:
-        Bound streamed block-list components.
-    stream_trainable_weights:
-        Whether the streamed components include trainable parameter data.
-    skip_checkpointing_check:
-        Default ``False``. Suppresses the activate-time checkpointing
-        guard/warning entirely. Pass ``True`` only if you wrap each
-        streamed block that participates in training manually via
-        ``torch.utils.checkpoint.checkpoint`` at call sites — that
-        style is invisible from the module tree, so the auto-detect
-        sees no flag and would raise. By passing ``True`` you take
-        responsibility for ensuring every streamed block that
-        participates in training is checkpointed; otherwise trainable
-        streaming may silently corrupt gradients.
-    is_block_checkpointed:
-        Optional per-block predicate, called once per streamed block
-        at :meth:`activate` to decide whether the block runs under
-        activation checkpointing. Default detection reads the
-        HuggingFace ``gradient_checkpointing`` boolean attribute on
-        the block module. Pass a custom callable to support
-        non-HF frameworks (DeepSpeed, custom training loops, etc.) —
-        the predicate sees the block module and should return
-        ``True`` iff that block runs under activation checkpointing.
-        Ignored when ``skip_checkpointing_check=True``.
+        The concrete model bound to the supplied composite.
+    composite:
+        Bound :class:`CompositeComponent` owning the model's pinned
+        and streamed offload components.
     """
 
     def __init__(
         self,
         model: nn.Module,
         *,
-        pinned_component: PinnedComponent | None,
-        streamed_components: Sequence[StreamedComponent] = (),
-        stream_trainable_weights: bool,
-        skip_checkpointing_check: bool,
-        is_block_checkpointed: Callable[[nn.Module], bool] | None,
+        composite: CompositeComponent,
     ) -> None:
         self._model = model
         self._active_device: torch.device | None = None
-        self._pinned_component = pinned_component
-        self._streamed_components = list(streamed_components)
-        _validate_components(pinned_component, self._streamed_components)
-        if pinned_component is not None:
-            self._instance = pinned_component._instance
-        self._teardown_stack: contextlib.ExitStack | None = None
+        self._composite = composite
         self._lora_hook_handles: list[_RemovableHook] = []
-        self._warned_about_checkpointing: bool = False
-        self._stream_trainable_weights: bool = stream_trainable_weights
-        self._skip_checkpointing_check: bool = skip_checkpointing_check
-        self._is_block_checkpointed: Callable[[nn.Module], bool] = (
-            is_block_checkpointed
-            if is_block_checkpointed is not None
-            else _hf_block_has_checkpointing_flag
-        )
         # Configured LoRA request. set_loras() only records caller intent;
         # activate(device) groups targets and validates the requested
         # application path once the runtime context is known.
@@ -374,7 +249,7 @@ class ModelOffloader:
         ``strengths`` defaults to ``1.0`` for each LoRA. Pass an empty
         LoRA sequence to clear all LoRAs (base-only forward).
         """
-        if self._teardown_stack is not None:
+        if self._active_device is not None:
             raise RuntimeError(
                 "ModelOffloader.set_loras() requires the binding "
                 "to be inactive. Call deactivate() first."
@@ -482,8 +357,7 @@ class ModelOffloader:
         param_name: str,
         hook: Callable[[nn.Parameter], None],
     ) -> _RemovableHook:
-        component = self._component_for_param_name(param_name)
-        return component.register_post_copy_hook(param_name, hook)
+        return self._composite.register_post_copy_hook(param_name, hook)
 
     def register_post_copy_hook(
         self,
@@ -492,25 +366,6 @@ class ModelOffloader:
     ) -> _RemovableHook:
         """Register a hook after the owning component copies ``param_name``."""
         return self._register_post_copy_hook(param_name, hook)
-
-    def post_copy_hook_key(self, param_name: str) -> int:
-        """Stable hook/dedup key for a managed parameter name."""
-        component = self._component_for_param_name(param_name)
-        return component.post_copy_hook_key(param_name)
-
-    def _component_for_param_name(
-        self,
-        param_name: str,
-    ) -> PinnedComponent | StreamedComponent:
-        if (
-            self._pinned_component is not None
-            and param_name in self._pinned_component.param_names
-        ):
-            return self._pinned_component
-        for streamed_component in self._streamed_components:
-            if param_name in streamed_component.param_names:
-                return streamed_component
-        raise KeyError(f"param name {param_name!r} is not managed by this ModelOffloader")
 
     def _clear_active_lora_hooks(self) -> None:
         while self._lora_hook_handles:
@@ -539,22 +394,12 @@ class ModelOffloader:
     @property
     def param_names(self) -> frozenset[str]:
         """Parameter names managed by this offloader."""
-        names: set[str] = set()
-        if self._pinned_component is not None:
-            names.update(self._pinned_component.param_names)
-        for streamed_component in self._streamed_components:
-            names.update(streamed_component.param_names)
-        return frozenset(names)
+        return self._composite.param_names
 
     @property
     def buffer_names(self) -> frozenset[str]:
         """Buffer names managed by this offloader."""
-        names: set[str] = set()
-        if self._pinned_component is not None:
-            names.update(self._pinned_component.buffer_names)
-        for streamed_component in self._streamed_components:
-            names.update(streamed_component.buffer_names)
-        return frozenset(names)
+        return self._composite.buffer_names
 
     def _resolve_device(self, device: torch.device | str | None) -> torch.device:
         if device is not None:
@@ -578,37 +423,28 @@ class ModelOffloader:
                 "ModelOffloader.activate() supports CUDA or CPU; "
                 f"got {active_device}."
         )
-        if active_device.type == "cuda":
-            self._enforce_checkpointing_for_trainable_streaming()
-            self._warn_if_training_without_checkpointing()
         self._active_device = active_device
         try:
-            with contextlib.ExitStack() as stack:
-                targets = (
-                    self._group_lora_factors_by_param_name(self._loras)
-                    if self._loras
-                    else None
-                )
-                if targets is not None:
-                    self._register_lora_hooks(active_device, targets)
-
-                for component in self._iter_components():
-                    stack.callback(component.deactivate)
-                    component.activate(active_device)
-
-                self._teardown_stack = stack.pop_all()
+            # Register LoRA hooks (incl. merge post-copy hooks installed on the
+            # components) BEFORE activating, so they fire during component loads.
+            targets = (
+                self._group_lora_factors_by_param_name(self._loras)
+                if self._loras
+                else None
+            )
+            if targets is not None:
+                self._register_lora_hooks(active_device, targets)
+            # The composite self-cleans its components if activation fails midway.
+            self._composite.activate(active_device)
         except BaseException:
             self._clear_loras()
             self._active_device = None
             raise
 
     def deactivate(self) -> None:
-        stack = self._teardown_stack
-        self._teardown_stack = None
         try:
             self._clear_active_lora_hooks()
-            if stack is not None:
-                stack.close()
+            self._composite.deactivate()
         finally:
             self._clear_loras()
             self._active_device = None
@@ -653,12 +489,7 @@ class ModelOffloader:
             optimizer.step()        # runs on CPU; states stay on host
             optimizer.zero_grad()
         """
-        with contextlib.ExitStack() as stack:
-            if self._pinned_component is not None:
-                stack.enter_context(self._pinned_component.optimizer_step())
-            for streamed_component in self._streamed_components:
-                if streamed_component.has_trainables:
-                    stack.enter_context(streamed_component.optimizer_step())
+        with self._composite.optimizer_step():
             yield
 
     @contextlib.contextmanager
@@ -680,261 +511,3 @@ class ModelOffloader:
             yield self.model
         finally:
             self.deactivate()
-
-    # ----------------------------------------------------------- Internals
-
-    def _iter_components(self) -> Iterator[ModelStrategyComponent]:
-        if self._pinned_component is not None:
-            yield self._pinned_component
-        yield from self._streamed_components
-
-    @property
-    def _has_streamed_blocks(self) -> bool:
-        return any(
-            _component_streams_tensor_state(component)
-            for component in self._streamed_components
-        )
-
-    def _iter_streamed_block_groups(
-        self,
-    ) -> Iterator[tuple[StreamedComponent, tuple[nn.Module, ...]]]:
-        for streamed_component in self._streamed_components:
-            if _component_streams_tensor_state(streamed_component):
-                yield streamed_component, streamed_component.blocks
-
-    def _enforce_checkpointing_for_trainable_streaming(self) -> None:
-        """Hard-guard: refuse to activate if a streamed_component manages
-        trainable params and the configured checkpointing predicate
-        returns ``False`` for any block in that streamed_component.
-
-        Trainable streaming uses ``.data`` swap on the user's
-        ``Parameter`` (preserves identity for autograd / optimizer
-        state). Without checkpointing, autograd's version-counter
-        check is **bypassed** — ``Tensor.set_`` (which
-        ``param.data = ...`` invokes) repoints storage without
-        bumping anything autograd sees. Result: silent gradient
-        corruption rather than a loud error. Frozen streaming has
-        the same precondition but a loud failure mode (saved-tensor
-        version check raises), so it's a warning; trainable
-        streaming is silent, so it's a hard error.
-
-        Detection layers:
-
-        - ``skip_checkpointing_check=True`` short-circuits — caller
-          takes responsibility (typically used with manual call-site
-          ``torch.utils.checkpoint.checkpoint`` wrapping, which is
-          invisible from the module tree).
-        - ``is_block_checkpointed: Callable[[nn.Module], bool]`` is
-          the configurable per-block predicate. Default checks the
-          HuggingFace per-block flag; non-HF frameworks (DeepSpeed,
-          custom training loops) plug in their own detection.
-
-        We deliberately do NOT walk module ancestors looking for the
-        flag. Some HF model versions set ``gradient_checkpointing``
-        on the root ``PreTrainedModel`` rather than each block; an
-        ancestor walk would silence the guard for those — but a
-        root-level flag does not prove that each block actually
-        runs under checkpointing, so accepting it would re-introduce
-        the silent-corruption failure mode. Users on those model
-        families should either pass an ``is_block_checkpointed``
-        predicate that knows the framework's conventions, or
-        ``skip_checkpointing_check=True`` after manually verifying.
-        """
-        if not self._has_streamed_blocks:
-            return
-        if self._skip_checkpointing_check:
-            return
-        if not self._stream_trainable_weights:
-            return
-        if not self._model.training:
-            return
-
-        for streamed_component, blocks in self._iter_streamed_block_groups():
-            if not streamed_component.has_trainables:
-                continue
-            for block in blocks:
-                if not self._is_block_checkpointed(block):
-                    raise RuntimeError(
-                        "ModelOffloader: in-block trainable params "
-                        "detected but the configured checkpointing "
-                        "predicate (`is_block_checkpointed`) reports "
-                        "False for at least one streamed block. "
-                        "Trainable streaming uses .data swap, which "
-                        "bypasses autograd's version-counter check "
-                        "and silently corrupts gradients without "
-                        "checkpointing — so this is a hard error, "
-                        "not a warning.\n\n"
-                        "Fix: call model.gradient_checkpointing_enable() "
-                        "before binding or activating the ModelOffloader "
-                        "(HF models, "
-                        "default detection); pass an "
-                        "is_block_checkpointed predicate matching your "
-                        "framework's conventions; or, if you wrap each "
-                        "streamed block manually via "
-                        "torch.utils.checkpoint.checkpoint at call "
-                        "sites, pass skip_checkpointing_check=True to "
-                        "suppress this guard (call-site wrapping is "
-                        "invisible from the module tree)."
-                    )
-
-    def _warn_if_training_without_checkpointing(self) -> None:
-        """Emit a one-time warning when training-shaped use is detected
-        without configured checkpointing detection on streamed
-        blocks.
-
-        The default predicate only catches the HF flag
-        (``module.gradient_checkpointing = True``, set by
-        ``model.gradient_checkpointing_enable()``). Manual
-        :func:`torch.utils.checkpoint.checkpoint` wrapping at call sites
-        is invisible from the module tree, so callers using that style
-        should pass ``skip_checkpointing_check=True``.
-        """
-        if not self._has_streamed_blocks:
-            return
-        if self._warned_about_checkpointing:
-            return
-        if self._skip_checkpointing_check:
-            return
-        if not self._model.training:
-            return
-        # Tighten the false-positive case for inference users who left
-        # the model in train mode: only warn when at least one trainable
-        # param actually exists.
-        if not any(p.requires_grad for p in self._model.parameters()):
-            return
-
-        any_with = False
-        any_without = False
-        for _streamed_component, blocks in self._iter_streamed_block_groups():
-            for block in blocks:
-                if self._is_block_checkpointed(block):
-                    any_with = True
-                else:
-                    any_without = True
-
-        if any_with and any_without:
-            logger.warning(
-                "ModelOffloader: streamed blocks have inconsistent "
-                "gradient_checkpointing flags. Backward through any "
-                "non-checkpointed streamed block will raise on the first "
-                "target reuse — call model.gradient_checkpointing_enable() "
-                "to enable on every block."
-            )
-            self._warned_about_checkpointing = True
-        elif not any_with:
-            logger.warning(
-                "ModelOffloader: model.training=True with trainable "
-                "params, but no gradient_checkpointing flag is set on "
-                "the streamed blocks. Training through streamed blocks "
-                "requires checkpointing each block "
-                "(model.gradient_checkpointing_enable() for HF models, "
-                "or torch.utils.checkpoint.checkpoint() at call sites). "
-                "Without it, loss.backward() will raise an in-place "
-                "modification error from autograd's saved-tensor check. "
-                "If you are wrapping blocks manually at call sites, "
-                "ignore this warning (the wrap is invisible from the "
-                "module tree)."
-            )
-            self._warned_about_checkpointing = True
-
-# ---------------------------------------------------------------------------
-# Module-private helpers
-# ---------------------------------------------------------------------------
-
-
-def _normalize_blocks_paths(blocks_attr: str | Sequence[str] | None) -> list[str]:
-    if blocks_attr is None:
-        return []
-    blocks_paths = [blocks_attr] if isinstance(blocks_attr, str) else list(blocks_attr)
-    if not blocks_paths:
-        raise ValueError("blocks_attr must contain at least one path")
-    return blocks_paths
-
-
-def _validate_store_config(
-    *,
-    blocks_paths: Sequence[str],
-    num_resident_blocks: int | None,
-) -> None:
-    if not blocks_paths and num_resident_blocks is not None:
-        raise ValueError("num_resident_blocks requires blocks_attr")
-
-
-def _build_streamed_component_stores(
-    model: nn.Module,
-    *,
-    blocks_paths: Sequence[str],
-    num_resident_blocks: int | None,
-    num_prefetch_blocks: int,
-    cyclic: bool,
-    stream_trainable_weights: bool,
-) -> tuple[tuple[StreamedComponentStore, ...], set[str], set[str]]:
-    # num_resident_blocks=None disables streaming even when
-    # blocks_attr is set — the blocks are then managed by the
-    # whole-model pinned component like any other module state.
-    if not blocks_paths or num_resident_blocks is None:
-        return (), set(), set()
-
-    streamed_component_stores: list[StreamedComponentStore] = []
-    streamed_param_names: set[str] = set()
-    streamed_buffer_names: set[str] = set()
-
-    for blocks_path in blocks_paths:
-        store = StreamedComponentStore.from_module(
-            model,
-            blocks_path=blocks_path,
-            num_resident_blocks=num_resident_blocks,
-            num_prefetch_blocks=num_prefetch_blocks,
-            cyclic=cyclic,
-            stream_trainable_weights=stream_trainable_weights,
-        )
-        streamed_param_names.update(store.param_names)
-        streamed_buffer_names.update(store.buffer_names)
-        streamed_component_stores.append(store)
-
-    return tuple(streamed_component_stores), streamed_param_names, streamed_buffer_names
-
-
-def _build_pinned_component_store(
-    model: nn.Module,
-    *,
-    streamed_param_names: set[str],
-    streamed_buffer_names: set[str],
-) -> PinnedComponentStore | None:
-    pinned_param_names = parameter_names(model) - streamed_param_names
-    pinned_buffer_names = buffer_names(model) - streamed_buffer_names
-    if not pinned_param_names and not pinned_buffer_names:
-        return None
-    return PinnedComponentStore.from_module(
-        model,
-        include_param_names=pinned_param_names,
-        include_buffer_names=pinned_buffer_names,
-    )
-
-
-def _validate_components(
-    pinned_component: PinnedComponent | None,
-    streamed_components: Sequence[StreamedComponent],
-) -> None:
-    if pinned_component is None and not streamed_components:
-        raise ValueError(
-            "ModelOffloader requires at least one parameter, registered "
-            "buffer, or streamed block to manage."
-        )
-
-
-def _component_streams_tensor_state(component: StreamedComponent) -> bool:
-    return bool(component.param_names) or any(component.streamed_buffer_names_by_block)
-
-
-def _hf_block_has_checkpointing_flag(block: nn.Module) -> bool:
-    """Default ``is_block_checkpointed`` predicate.
-
-    Checks the HuggingFace per-block ``gradient_checkpointing``
-    boolean attribute set by older ``model.gradient_checkpointing_enable()``
-    implementations (and still used by many HF model families). Does
-    NOT walk ancestors; conservative on purpose — see
-    :meth:`ModelOffloader._enforce_checkpointing_for_trainable_streaming`
-    for why.
-    """
-    return bool(getattr(block, "gradient_checkpointing", False))

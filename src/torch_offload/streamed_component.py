@@ -875,11 +875,6 @@ class StreamedComponent:
         instance, name = self._resolve_param_name(name)
         return instance.register_post_copy_hook(name, hook)
 
-    def post_copy_hook_key(self, name: str) -> int:
-        """Stable hook/dedup key for a streamed parameter."""
-        instance, name = self._resolve_param_name(name)
-        return instance.post_copy_hook_key(name)
-
     def _resolve_param_name(
         self,
         name: str,

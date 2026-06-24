@@ -9,8 +9,7 @@ over the host-backed pinned state.
 
 from __future__ import annotations
 
-import logging
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from concurrent.futures import Future
 
 import pytest
@@ -26,6 +25,9 @@ from torch_offload import (
     StreamedComponent,
     StreamedComponentStore,
 )
+from torch_offload.composite_component import CompositeComponent
+
+from tests.conftest import pinned_component, streamed_components
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -33,13 +35,11 @@ CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def _make_model_offloader(
     model: nn.Module,
     *,
-    blocks_attr: str | Sequence[str] | None = None,
-    num_resident_blocks: int | None = None,
+    blocks_attr: list[str] = [],
+    num_resident_blocks: int = 1,
     num_prefetch_blocks: int = 2,
     cyclic: bool = False,
     stream_trainable_weights: bool = False,
-    skip_checkpointing_check: bool = False,
-    is_block_checkpointed: Callable[[nn.Module], bool] | None = None,
 ) -> ModelOffloader:
     store = ModelOffloaderStore.from_module(
         model,
@@ -49,11 +49,7 @@ def _make_model_offloader(
         cyclic=cyclic,
         stream_trainable_weights=stream_trainable_weights,
     )
-    return store.bind(
-        model,
-        skip_checkpointing_check=skip_checkpointing_check,
-        is_block_checkpointed=is_block_checkpointed,
-    )
+    return store.bind(model)
 
 
 def _make_streamed_component(
@@ -169,7 +165,7 @@ class TestModelStrategyConformance:
         m = _make_block_model()
         strategy = _make_model_offloader(
             m,
-            blocks_attr="transformer_blocks", num_resident_blocks=2,
+            blocks_attr=["transformer_blocks"], num_resident_blocks=2,
         )
         try:
             assert isinstance(strategy, ModelStrategy)
@@ -180,7 +176,7 @@ class TestModelStrategyConformance:
         m = _make_block_model()
         strategy = _make_model_offloader(
             m,
-            blocks_attr="transformer_blocks", num_resident_blocks=2,
+            blocks_attr=["transformer_blocks"], num_resident_blocks=2,
         )
         try:
             assert callable(strategy.activate)
@@ -199,7 +195,7 @@ class TestConstructorPins:
         m = _make_block_model()
         store = ModelOffloaderStore.from_module(
             m,
-            blocks_attr="transformer_blocks", num_resident_blocks=2,
+            blocks_attr=["transformer_blocks"], num_resident_blocks=2,
         )
         strategy = store.bind(m)
         try:
@@ -224,7 +220,7 @@ class TestLifecycle:
         m = _make_block_model()
         strategy = _make_model_offloader(
             m,
-            blocks_attr="transformer_blocks", num_resident_blocks=2,
+            blocks_attr=["transformer_blocks"], num_resident_blocks=2,
         )
         try:
             assert strategy.active_device is None
@@ -239,7 +235,7 @@ class TestLifecycle:
         m = _make_block_model()
         strategy = _make_model_offloader(
             m,
-            blocks_attr="transformer_blocks", num_resident_blocks=2,
+            blocks_attr=["transformer_blocks"], num_resident_blocks=2,
         )
         try:
             strategy.activate("cuda")
@@ -253,12 +249,12 @@ class TestLifecycle:
         expected = torch.device("cuda", torch.cuda.current_device())
         strategy = _make_model_offloader(
             m,
-            blocks_attr="transformer_blocks", num_resident_blocks=2,
+            blocks_attr=["transformer_blocks"], num_resident_blocks=2,
         )
         try:
             strategy.activate("cuda")
             assert strategy._active_device == expected
-            assert strategy._streamed_components[0]._active_device == expected
+            assert streamed_components(strategy)[0]._active_device == expected
         finally:
             strategy.deactivate()
 
@@ -274,7 +270,7 @@ class TestLifecycle:
 
         strategy = _make_model_offloader(
             m_off,
-            blocks_attr="transformer_blocks", num_resident_blocks=2,
+            blocks_attr=["transformer_blocks"], num_resident_blocks=2,
         )
         try:
             pinned_block_params = [
@@ -284,9 +280,9 @@ class TestLifecycle:
                 assert strategy._active_device == torch.device("cpu")
                 assert all(
                     s._active_device == torch.device("cpu")
-                    for s in strategy._streamed_components
+                    for s in streamed_components(strategy)
                 )
-                assert all(s._executor is None for s in strategy._streamed_components)
+                assert all(s._executor is None for s in streamed_components(strategy))
                 assert all(
                     block.weight is pinned
                     for block, pinned in zip(
@@ -310,7 +306,7 @@ class TestLifecycle:
         m = _make_block_model()
         target = torch.device("cuda")
         strategy = _make_model_offloader(
-            m, blocks_attr="transformer_blocks", num_resident_blocks=2,
+            m, blocks_attr=["transformer_blocks"], num_resident_blocks=2,
         )
         try:
             strategy.activate("cuda")
@@ -324,7 +320,7 @@ class TestLifecycle:
         m = _make_block_model()
         target = torch.device("cuda")
         strategy = _make_model_offloader(
-            m, blocks_attr="transformer_blocks", num_resident_blocks=2,
+            m, blocks_attr=["transformer_blocks"], num_resident_blocks=2,
         )
         try:
             strategy.activate("cuda")
@@ -341,7 +337,7 @@ class TestLifecycle:
         m = _make_block_model()
         target = torch.device("cuda")
         strategy = _make_model_offloader(
-            m, blocks_attr="transformer_blocks", num_resident_blocks=2,
+            m, blocks_attr=["transformer_blocks"], num_resident_blocks=2,
         )
         try:
             strategy.activate("cuda")
@@ -355,7 +351,7 @@ class TestLifecycle:
         m = _make_block_model()
         strategy = _make_model_offloader(
             m,
-            blocks_attr="transformer_blocks", num_resident_blocks=2,
+            blocks_attr=["transformer_blocks"], num_resident_blocks=2,
         )
         try:
             strategy.deactivate()  # no error, never activated
@@ -369,7 +365,7 @@ class TestLifecycle:
         m = _make_block_model()
         strategy = _make_model_offloader(
             m,
-            blocks_attr="transformer_blocks", num_resident_blocks=2,
+            blocks_attr=["transformer_blocks"], num_resident_blocks=2,
         )
         try:
             strategy.activate("cpu")
@@ -378,9 +374,9 @@ class TestLifecycle:
                 del device
                 raise AssertionError("component activation should not run")
 
-            assert strategy._pinned_component is not None
+            assert pinned_component(strategy) is not None
             monkeypatch.setattr(
-                strategy._pinned_component,
+                pinned_component(strategy),
                 "activate",
                 fail_activate,
             )
@@ -502,7 +498,7 @@ class TestCleanup:
         m = _make_block_model()
         strategy = _make_model_offloader(
             m,
-            blocks_attr="transformer_blocks", num_resident_blocks=2,
+            blocks_attr=["transformer_blocks"], num_resident_blocks=2,
         )
         strategy.activate("cuda")
         strategy.deactivate()
@@ -515,7 +511,7 @@ class TestCleanup:
         m = _make_block_model()
         strategy = _make_model_offloader(
             m,
-            blocks_attr="transformer_blocks", num_resident_blocks=2,
+            blocks_attr=["transformer_blocks"], num_resident_blocks=2,
         )
         strategy.deactivate()
         strategy.deactivate()  # no error
@@ -525,12 +521,12 @@ class TestCleanup:
         m = _make_block_model()
         strategy = _make_model_offloader(
             m,
-            blocks_attr="transformer_blocks", num_resident_blocks=2,
+            blocks_attr=["transformer_blocks"], num_resident_blocks=2,
         )
         strategy.activate("cuda")
-        assert strategy._teardown_stack is not None
+        assert strategy._composite._teardown_stack is not None
         strategy.deactivate()
-        assert strategy._teardown_stack is None
+        assert strategy._composite._teardown_stack is None
 
     @CUDA
     def test_drop_strategy_without_deactivate_does_not_cycle(self) -> None:
@@ -548,10 +544,10 @@ class TestCleanup:
         m = _make_block_model()
         strategy = _make_model_offloader(
             m,
-            blocks_attr="transformer_blocks", num_resident_blocks=2,
+            blocks_attr=["transformer_blocks"], num_resident_blocks=2,
         )
         strategy.activate("cuda")  # installs hooks; no deactivate
-        streamer = strategy._streamed_components[0]
+        streamer = streamed_components(strategy)[0]
         streamer_ref = weakref.ref(streamer)
 
         # Disable cycle collector BEFORE dropping refs to prove the
@@ -574,7 +570,7 @@ class TestCleanup:
         m = _make_block_model(num_blocks=4, width=8)
         strategy = _make_model_offloader(
             m,
-            blocks_attr="transformer_blocks", num_resident_blocks=2,
+            blocks_attr=["transformer_blocks"], num_resident_blocks=2,
         )
         strategy.activate("cuda")
         # Drop without deactivate.
@@ -609,7 +605,7 @@ class TestHookLifecycle:
         m = _make_block_model()
         strategy = _make_model_offloader(
             m,
-            blocks_attr="transformer_blocks", num_resident_blocks=2,
+            blocks_attr=["transformer_blocks"], num_resident_blocks=2,
         )
         try:
             strategy.activate("cuda")
@@ -626,7 +622,7 @@ class TestHookLifecycle:
         m = _make_block_model()
         strategy = _make_model_offloader(
             m,
-            blocks_attr="transformer_blocks", num_resident_blocks=2,
+            blocks_attr=["transformer_blocks"], num_resident_blocks=2,
         )
         strategy.activate("cuda")
         blocks = list(m.transformer_blocks)
@@ -669,10 +665,10 @@ class TestCyclicPrefetch:
         m = _make_block_model(num_blocks=4, width=8)
         strategy = _make_model_offloader(
             m,
-            blocks_attr="transformer_blocks", num_resident_blocks=3,
+            blocks_attr=["transformer_blocks"], num_resident_blocks=3,
             num_prefetch_blocks=2, cyclic=True,
         )
-        streamer: StreamedComponent = strategy._streamed_components[0]
+        streamer: StreamedComponent = streamed_components(strategy)[0]
 
         with strategy.use("cuda"):
             recorded, _ = self._record_prefetches(streamer)
@@ -701,10 +697,10 @@ class TestCyclicPrefetch:
         m = _make_block_model(num_blocks=4, width=8)
         strategy = _make_model_offloader(
             m,
-            blocks_attr="transformer_blocks", num_resident_blocks=3,
+            blocks_attr=["transformer_blocks"], num_resident_blocks=3,
             num_prefetch_blocks=2, cyclic=False,
         )
-        streamer: StreamedComponent = strategy._streamed_components[0]
+        streamer: StreamedComponent = streamed_components(strategy)[0]
 
         with strategy.use("cuda"):
             recorded, _ = self._record_prefetches(streamer)
@@ -729,10 +725,10 @@ class TestCyclicPrefetch:
         m = _make_block_model(num_blocks=4, width=8)
         strategy = _make_model_offloader(
             m,
-            blocks_attr="transformer_blocks", num_resident_blocks=3,
+            blocks_attr=["transformer_blocks"], num_resident_blocks=3,
             num_prefetch_blocks=1, cyclic=True,
         )
-        streamer: StreamedComponent = strategy._streamed_components[0]
+        streamer: StreamedComponent = streamed_components(strategy)[0]
 
         with strategy.use("cuda"):
             recorded, _ = self._record_prefetches(streamer)
@@ -765,7 +761,7 @@ class TestCyclicPrefetch:
         m_off = _make_block_model(num_blocks=4, width=8)
         strategy = _make_model_offloader(
             m_off,
-            blocks_attr="transformer_blocks", num_resident_blocks=3,
+            blocks_attr=["transformer_blocks"], num_resident_blocks=3,
             num_prefetch_blocks=2, cyclic=True,
         )
         try:
@@ -788,10 +784,10 @@ class TestCyclicPrefetch:
         m = _make_block_model(num_blocks=3, width=8)
         strategy = _make_model_offloader(
             m,
-            blocks_attr="transformer_blocks", num_resident_blocks=2,
+            blocks_attr=["transformer_blocks"], num_resident_blocks=2,
             num_prefetch_blocks=1, cyclic=True,
         )
-        streamer: StreamedComponent = strategy._streamed_components[0]
+        streamer: StreamedComponent = streamed_components(strategy)[0]
 
         with strategy.use("cuda"):
             recorded, _ = self._record_prefetches(streamer)
@@ -827,7 +823,7 @@ class TestForwardCorrectness:
         m_off = _make_block_model(num_blocks=4, width=8)
         strategy = _make_model_offloader(
             m_off,
-            blocks_attr="transformer_blocks", num_resident_blocks=2,
+            blocks_attr=["transformer_blocks"], num_resident_blocks=2,
         )
         try:
             strategy.activate("cuda")
@@ -844,7 +840,7 @@ class TestForwardCorrectness:
         m = _make_block_model(num_blocks=4, width=8)
         strategy = _make_model_offloader(
             m,
-            blocks_attr="transformer_blocks", num_resident_blocks=2,
+            blocks_attr=["transformer_blocks"], num_resident_blocks=2,
         )
         try:
             x = torch.randn(2, 8, device="cuda")
@@ -877,7 +873,7 @@ class TestValidation:
         m = _make_block_model(num_blocks=4)
         strategy = _make_model_offloader(
             m,
-            blocks_attr="transformer_blocks", num_resident_blocks=8,
+            blocks_attr=["transformer_blocks"], num_resident_blocks=8,
         )
         try:
             with strategy.use("cuda"):
@@ -890,48 +886,32 @@ class TestValidation:
         with pytest.raises(ValueError, match="num_resident_blocks"):
             _make_model_offloader(
                 m,
-                blocks_attr="transformer_blocks", num_resident_blocks=0,
+                blocks_attr=["transformer_blocks"], num_resident_blocks=0,
             )
-
-    def test_none_num_resident_blocks_disables_streaming(self) -> None:
-        m = _make_block_model(num_blocks=4)
-        strategy = _make_model_offloader(
-            m,
-            blocks_attr="transformer_blocks", num_resident_blocks=None,
-        )
-        try:
-            assert not strategy._streamed_components
-        finally:
-            strategy.deactivate()
-
-    def test_num_resident_blocks_without_blocks_attr_raises(self) -> None:
-        m = _make_block_model(num_blocks=4)
-        with pytest.raises(ValueError, match="requires blocks_attr"):
-            _make_model_offloader(m, num_resident_blocks=2)
 
     def test_num_prefetch_blocks_must_be_non_negative(self) -> None:
         m = _make_block_model(num_blocks=4)
         with pytest.raises(ValueError, match="num_prefetch_blocks"):
             _make_model_offloader(
                 m,
-                blocks_attr="transformer_blocks", num_resident_blocks=2,
+                blocks_attr=["transformer_blocks"], num_resident_blocks=2,
                 num_prefetch_blocks=-1,
             )
 
-    def test_empty_blocks_attr_raises(self) -> None:
+    def test_empty_blocks_attr_disables_streaming(self) -> None:
         m = _make_block_model(num_blocks=4)
-        with pytest.raises(ValueError, match="at least one path"):
-            _make_model_offloader(
-                m,
-                blocks_attr=[], num_resident_blocks=2,
-            )
+        strategy = _make_model_offloader(m, blocks_attr=[])
+        try:
+            assert not streamed_components(strategy)
+        finally:
+            strategy.deactivate()
 
     def test_blocks_attr_resolving_to_non_modulelist_raises(self) -> None:
         m = _make_block_model(num_blocks=4)
         with pytest.raises(TypeError, match="nn.ModuleList"):
             _make_model_offloader(
                 m,
-                blocks_attr="embed",  # an nn.Linear, not a ModuleList
+                blocks_attr=["embed"],  # an nn.Linear, not a ModuleList
                 num_resident_blocks=2,
             )
 
@@ -958,7 +938,7 @@ class TestModelCacheIntegration:
             key="xformer",
             estimated_cache_bytes=1024,
             factory=factory,
-            blocks_attr="transformer_blocks",
+            blocks_attr=["transformer_blocks"],
             num_resident_blocks=2,
         )
 
@@ -992,7 +972,7 @@ class TestModelCacheIntegration:
             key="xformer",
             estimated_cache_bytes=1024,
             factory=lambda: _make_block_model(num_blocks=4, width=8),
-            blocks_attr="transformer_blocks",
+            blocks_attr=["transformer_blocks"],
             num_resident_blocks=2,
         )
 
@@ -1027,7 +1007,7 @@ class TestModelCacheIntegration:
             estimated_cache_bytes=1024,
             factory=factory,
             skeleton_factory=skeleton_factory,
-            blocks_attr="transformer_blocks",
+            blocks_attr=["transformer_blocks"],
             num_resident_blocks=2,
         )
 
@@ -1136,9 +1116,9 @@ class TestActivateFailureCleanup:
         m = _make_block_model()
         strategy = _make_model_offloader(
             m,
-            blocks_attr="transformer_blocks", num_resident_blocks=2,
+            blocks_attr=["transformer_blocks"], num_resident_blocks=2,
         )
-        streamer = strategy._streamed_components[0]
+        streamer = streamed_components(strategy)[0]
         original_register_hooks = streamer._register_hooks
 
         def broken_register_hooks(*args, **kwargs):
@@ -1150,7 +1130,7 @@ class TestActivateFailureCleanup:
         with pytest.raises(RuntimeError, match="simulated activate failure"):
             strategy.activate("cuda")
 
-        assert strategy._teardown_stack is None
+        assert strategy._composite._teardown_stack is None
 
     def test_failing_components_own_deactivate_runs(self) -> None:
         # Regression: previously the composite registered each
@@ -1182,14 +1162,15 @@ class TestActivateFailureCleanup:
         m = _make_block_model()
         strat = _make_model_offloader(
             m,
-            blocks_attr="transformer_blocks", num_resident_blocks=2,
+            blocks_attr=["transformer_blocks"], num_resident_blocks=2,
         )
-        strat._pinned_component = None
-        strat._streamed_components = [
-            _Recorder("A"),
-            _Recorder("B"),
-            _Recorder("C", raise_on_activate=True),
-        ]
+        strat._composite = CompositeComponent(
+            [
+                _Recorder("A"),
+                _Recorder("B"),
+                _Recorder("C", raise_on_activate=True),
+            ]
+        )
 
         with pytest.raises(RuntimeError, match="C activate failed"):
             strat.activate("cpu")
@@ -1221,10 +1202,10 @@ class TestPrefetchFailureOnDeactivate:
         m = _make_block_model()
         strategy = _make_model_offloader(
             m,
-            blocks_attr="transformer_blocks", num_resident_blocks=2,
+            blocks_attr=["transformer_blocks"], num_resident_blocks=2,
         )
         strategy.activate("cuda")
-        streamer = strategy._streamed_components[0]
+        streamer = streamed_components(strategy)[0]
         # Inject a pre-failed Future so deactivate's drain loop hits it.
         bad_future: Future[None] = Future()
         bad_future.set_exception(RuntimeError("simulated prefetch failure"))
@@ -1256,7 +1237,7 @@ class TestConstructedStateIsInactive:
         m = _make_block_model(num_blocks=4, width=8)
         target = torch.device("cuda")
         strategy = _make_model_offloader(
-            m, blocks_attr="transformer_blocks", num_resident_blocks=2,
+            m, blocks_attr=["transformer_blocks"], num_resident_blocks=2,
         )
         try:
             for p in m.parameters():
@@ -1281,12 +1262,12 @@ class TestConstructedStateIsInactive:
             p.requires_grad = False
         store = ModelOffloaderStore.from_module(
             m,
-            blocks_attr="transformer_blocks", num_resident_blocks=2,
+            blocks_attr=["transformer_blocks"], num_resident_blocks=2,
         )
         strategy = store.bind(m)
         try:
             # No PinnedComponent component, just StreamedComponent.
-            assert strategy._pinned_component is None
+            assert pinned_component(strategy) is None
             assert store.cache_bytes > 0  # block bytes only
         finally:
             strategy.deactivate()
@@ -1318,7 +1299,7 @@ class TestBufferOnlyNonBlock:
             p.requires_grad = False
         target = torch.device("cuda")
         strategy = _make_model_offloader(
-            m, blocks_attr="transformer_blocks", num_resident_blocks=2,
+            m, blocks_attr=["transformer_blocks"], num_resident_blocks=2,
         )
         try:
             assert m.rope.table.is_pinned()
@@ -1353,7 +1334,7 @@ class TestSharedStorageLocalBehavior:
 
         strat = _make_model_offloader(
             m,
-            blocks_attr="transformer_blocks", num_resident_blocks=1,
+            blocks_attr=["transformer_blocks"], num_resident_blocks=1,
         )
         strat.deactivate()
 
@@ -1381,7 +1362,7 @@ class TestSharedStorageLocalBehavior:
             p.requires_grad = False
         strategy = _make_model_offloader(
             m,
-            blocks_attr="transformer_blocks", num_resident_blocks=1,
+            blocks_attr=["transformer_blocks"], num_resident_blocks=1,
         )
         try:
             for block in m.transformer_blocks:
@@ -1412,7 +1393,7 @@ class TestSharedStorageLocalBehavior:
             p.requires_grad = False
         strategy = _make_model_offloader(
             m,
-            blocks_attr="transformer_blocks", num_resident_blocks=1,
+            blocks_attr=["transformer_blocks"], num_resident_blocks=1,
         )
         try:
             for block in m.transformer_blocks:
@@ -1442,7 +1423,7 @@ class TestSharedStorageLocalBehavior:
             p.requires_grad = False
         strategy = _make_model_offloader(
             m,
-            blocks_attr="transformer_blocks", num_resident_blocks=1,
+            blocks_attr=["transformer_blocks"], num_resident_blocks=1,
         )
         try:
             for block in m.transformer_blocks:
@@ -1472,11 +1453,11 @@ class TestSharedStorageLocalBehavior:
             p.requires_grad = False
         strategy = _make_model_offloader(
             m,
-            blocks_attr="transformer_blocks", num_resident_blocks=2,
+            blocks_attr=["transformer_blocks"], num_resident_blocks=2,
         )
         try:
             assert m.embed.weight is m.head.weight
-            non_block = strategy._pinned_component
+            non_block = pinned_component(strategy)
             assert non_block is not None
             assert non_block.param_names == {"embed.weight", "head.weight"}
             assert (
@@ -1512,7 +1493,7 @@ class TestDirectParentStateHandled:
             p.requires_grad = False
         strategy = _make_model_offloader(
             m,
-            blocks_attr="transformer_blocks", num_resident_blocks=2,
+            blocks_attr=["transformer_blocks"], num_resident_blocks=2,
         )
         try:
             assert m.scale_shift.is_pinned()
@@ -1534,7 +1515,7 @@ class TestDirectParentStateHandled:
             p.requires_grad = False
         strategy = _make_model_offloader(
             m,
-            blocks_attr="encoder.blocks", num_resident_blocks=2,
+            blocks_attr=["encoder.blocks"], num_resident_blocks=2,
         )
         try:
             assert m.root_param.is_pinned()
@@ -1555,7 +1536,7 @@ class TestDirectParentStateHandled:
             p.requires_grad = False
         strategy = _make_model_offloader(
             m,
-            blocks_attr="transformer_blocks", num_resident_blocks=2,
+            blocks_attr=["transformer_blocks"], num_resident_blocks=2,
         )
         try:
             assert m.table.is_pinned()
@@ -1614,7 +1595,7 @@ class TestBlockBuffersPinned:
             p.requires_grad = False
         strategy = _make_model_offloader(
             m,
-            blocks_attr="transformer_blocks", num_resident_blocks=2,
+            blocks_attr=["transformer_blocks"], num_resident_blocks=2,
         )
         try:
             for block in m.transformer_blocks:
@@ -1646,7 +1627,7 @@ class TestBlockBuffersPinned:
         m = M()
         strategy = _make_model_offloader(
             m,
-            blocks_attr="transformer_blocks",
+            blocks_attr=["transformer_blocks"],
             num_resident_blocks=1,
         )
         try:
@@ -1661,7 +1642,7 @@ class TestBlockBuffersPinned:
         m = self._make_tied_buffer_model(device="cuda")
         strategy = _make_model_offloader(
             m,
-            blocks_attr="transformer_blocks",
+            blocks_attr=["transformer_blocks"],
             num_resident_blocks=1,
         )
         try:
@@ -1929,7 +1910,6 @@ class TestBlockLayoutCompatibility:
             )
 
 
-
 # ---------------------------------------------------------------------------
 # Multi-component cleanup ordering (ExitStack semantics)
 # ---------------------------------------------------------------------------
@@ -1947,7 +1927,7 @@ class TestMultiComponentCleanup:
         m = _make_block_model()
         strategy = _make_model_offloader(
             m,
-            blocks_attr="transformer_blocks", num_resident_blocks=2,
+            blocks_attr=["transformer_blocks"], num_resident_blocks=2,
         )
         original_deactivate = PinnedComponent.deactivate
 
@@ -1966,8 +1946,8 @@ class TestMultiComponentCleanup:
             # PinnedComponent restored registry entries before raising, and streamers
             # were already unwound in LIFO order.
             assert m.embed.weight.is_pinned()  # type: ignore[union-attr]
-            assert not strategy._streamed_components[0]._hooks
-            assert strategy._teardown_stack is None
+            assert not streamed_components(strategy)[0]._hooks
+            assert strategy._composite._teardown_stack is None
         finally:
             strategy.deactivate()
 
@@ -2045,7 +2025,7 @@ class TestStreamedNameSelection:
 
         store = ModelOffloaderStore.from_module(
             prototype,
-            blocks_attr="transformer_blocks",
+            blocks_attr=["transformer_blocks"],
             num_resident_blocks=2,
         )
         strategy = store.bind(target)
@@ -2088,7 +2068,7 @@ class TestStreamedNameSelection:
         model = BufferModel()
         strategy = _make_model_offloader(
             model,
-            blocks_attr="blocks",
+            blocks_attr=["blocks"],
             num_resident_blocks=1,
         )
         try:
@@ -2106,13 +2086,13 @@ class TestStreamedNameSelection:
                     "blocks.1.scale",
                 }
             )
-            assert strategy._streamed_components[0].buffer_names == frozenset(
+            assert streamed_components(strategy)[0].buffer_names == frozenset(
                 {
                     "blocks.0.scale",
                     "blocks.1.scale",
                 }
             )
-            streamer = strategy._streamed_components[0]
+            streamer = streamed_components(strategy)[0]
             _instance, local_name = streamer._resolve_buffer_name("blocks.0.scale")
             # The instance is module-agnostic now; block 0's scheduling module
             # (== its from_module source) is model.blocks[0].
@@ -2133,11 +2113,13 @@ class TestStreamedNameSelection:
                 "transformer_blocks.1.weight",
                 lambda _param: None,
             )
-            key = streamer.post_copy_hook_key("transformer_blocks.1.weight")
-            assert key in streamer._block_instances[1]._post_copy_hooks
+            # The hook lands on the block instance owning the named param,
+            # and nowhere else.
+            assert streamer._block_instances[1]._post_copy_hooks
+            assert not streamer._block_instances[0]._post_copy_hooks
 
             handle.remove()
-            assert key not in streamer._block_instances[1]._post_copy_hooks
+            assert not streamer._block_instances[1]._post_copy_hooks
         finally:
             streamer.deactivate()
 
@@ -2163,12 +2145,12 @@ class TestStreamedNameSelection:
         m = _make_block_model()
         strategy = _make_model_offloader(
             m,
-            blocks_attr="transformer_blocks",
+            blocks_attr=["transformer_blocks"],
             num_resident_blocks=2,
         )
         try:
-            streamer = strategy._streamed_components[0]
-            non_block = strategy._pinned_component
+            streamer = streamed_components(strategy)[0]
+            non_block = pinned_component(strategy)
             assert non_block is not None
 
             assert streamer.streamed_param_names_by_block == [["weight"]] * len(
@@ -2235,7 +2217,7 @@ class TestMixedGradTieDetection:
         with pytest.raises(ValueError, match="mixed requires_grad"):
             _make_model_offloader(
                 m,
-                blocks_attr="transformer_blocks", num_resident_blocks=1,
+                blocks_attr=["transformer_blocks"], num_resident_blocks=1,
             )
 
     def test_all_trainable_distinct_parameter_tie_constructs(self) -> None:
@@ -2262,7 +2244,7 @@ class TestMixedGradTieDetection:
             p.requires_grad = False
         strategy = _make_model_offloader(
             m,
-            blocks_attr="transformer_blocks", num_resident_blocks=1,
+            blocks_attr=["transformer_blocks"], num_resident_blocks=1,
         )
         strategy.deactivate()
 
@@ -2296,7 +2278,7 @@ class TestMixedGradTieDetection:
         optimizer = torch.optim.SGD([a, b], lr=0.1)
         strategy = _make_model_offloader(
             m,
-            blocks_attr="transformer_blocks", num_resident_blocks=1,
+            blocks_attr=["transformer_blocks"], num_resident_blocks=1,
         )
         try:
             assert m.alias_a.weight is a
@@ -2349,7 +2331,7 @@ class TestMixedGradTieDetection:
         m = M()
         strategy = _make_model_offloader(
             m,
-            blocks_attr="transformer_blocks", num_resident_blocks=1,
+            blocks_attr=["transformer_blocks"], num_resident_blocks=1,
         )
         assert m.transformer_blocks[0]._parameters["a"] is shared
         assert m.transformer_blocks[1]._parameters["a"] is shared
@@ -2387,7 +2369,7 @@ class TestMixedGradTieDetection:
 
         strategy = _make_model_offloader(
             m,
-            blocks_attr="transformer_blocks", num_resident_blocks=1,
+            blocks_attr=["transformer_blocks"], num_resident_blocks=1,
             stream_trainable_weights=True,
         )
 
@@ -2415,7 +2397,7 @@ class TestMixedGradTieDetection:
         m = M()
         strategy = _make_model_offloader(
             m,
-            blocks_attr="transformer_blocks",
+            blocks_attr=["transformer_blocks"],
             num_resident_blocks=1,
             stream_trainable_weights=True,
         )
@@ -2464,11 +2446,11 @@ class TestLoRAInBlockRouting:
         m = M([self._make_lora_block() for _ in range(2)])
         strat = _make_model_offloader(
             m,
-            blocks_attr="transformer_blocks", num_resident_blocks=1,
+            blocks_attr=["transformer_blocks"], num_resident_blocks=1,
             stream_trainable_weights=True,
         )
         try:
-            streamers = strat._streamed_components
+            streamers = streamed_components(strat)
             assert len(streamers) == 1
             streamer = streamers[0]
             assert streamer.streamed_param_names_by_block == [
@@ -2489,17 +2471,17 @@ class TestLoRAInBlockRouting:
         m = M([self._make_lora_block() for _ in range(2)])
         strat = _make_model_offloader(
             m,
-            blocks_attr="transformer_blocks", num_resident_blocks=1,
+            blocks_attr=["transformer_blocks"], num_resident_blocks=1,
         )
         try:
-            streamers = strat._streamed_components
+            streamers = streamed_components(strat)
             assert len(streamers) == 1
             streamer = streamers[0]
             assert streamer.streamed_param_names_by_block == [
                 ["base.weight"],
                 ["base.weight"],
             ]
-            pinned = strat._pinned_component
+            pinned = pinned_component(strat)
             assert pinned is not None
             assert pinned.param_names == {
                 "transformer_blocks.0.lora_a.weight",
@@ -2533,10 +2515,10 @@ class TestLoRAInBlockRouting:
 
         strat = _make_model_offloader(
             m,
-            blocks_attr="transformer_blocks", num_resident_blocks=1,
+            blocks_attr=["transformer_blocks"], num_resident_blocks=1,
         )
         try:
-            pinned = strat._pinned_component
+            pinned = pinned_component(strat)
             assert pinned is not None
             # PinnedComponent manages every non-streamed parameter, including
             # trainable_bias.
@@ -2572,11 +2554,7 @@ class TestLoRAInBlockRouting:
 #
 # These tests pin Phase 1's contract: forward+backward through a
 # streamed model produces baseline-matching grads under checkpointing,
-# raises a loud, recognisable error without it, and the activate-time
-# warning fires exactly when training-shape use is detected without
-# HF-style ``gradient_checkpointing`` flags.
-
-_OFFLOADER_LOGGER = "torch_offload.model_offloader"
+# and raises a loud, recognisable error without it.
 
 
 class TestTrainingWithCheckpointing:
@@ -2607,7 +2585,7 @@ class TestTrainingWithCheckpointing:
         # reuse is what the checkpointing contract has to survive.
         offloader = _make_model_offloader(
             m_streamed,
-            blocks_attr="transformer_blocks",
+            blocks_attr=["transformer_blocks"],
             num_resident_blocks=2, num_prefetch_blocks=0,
             stream_trainable_weights=True,
         )
@@ -2674,7 +2652,7 @@ class TestTrainingWithCheckpointing:
         m = M(8, 3)
         offloader = _make_model_offloader(
             m,
-            blocks_attr="transformer_blocks",
+            blocks_attr=["transformer_blocks"],
             num_resident_blocks=1,
             num_prefetch_blocks=0,
             stream_trainable_weights=True,
@@ -2725,7 +2703,7 @@ class TestTrainingWithCheckpointing:
         m = _make_trainable_block_model(num_blocks=4, width=8)
         offloader = _make_model_offloader(
             m,
-            blocks_attr="transformer_blocks",
+            blocks_attr=["transformer_blocks"],
             num_resident_blocks=2, num_prefetch_blocks=0,
         )
         try:
@@ -2751,164 +2729,8 @@ def _make_offloader_for_warning_test(model: nn.Module) -> ModelOffloader:
     """
     return _make_model_offloader(
         model,
-        blocks_attr="transformer_blocks", num_resident_blocks=2,
+        blocks_attr=["transformer_blocks"], num_resident_blocks=2,
     )
-
-
-class TestTrainingWarning:
-    """The activate-time warning is heuristic: it fires when
-    ``model.training=True`` and at least one trainable param exists
-    but no HuggingFace ``gradient_checkpointing`` flag is detected
-    on the streamed blocks. Manual call-site checkpointing isn't
-    visible from the module tree, so users wrapping that way will
-    see a false-positive warning the first time they activate."""
-
-    def test_fires_in_train_mode_with_trainables_and_no_flag(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        m = _make_trainable_block_model(num_blocks=4)
-        offloader = _make_offloader_for_warning_test(m)
-        with caplog.at_level(logging.WARNING, logger=_OFFLOADER_LOGGER):
-            offloader._warn_if_training_without_checkpointing()
-        warnings = [
-            r for r in caplog.records
-            if "no gradient_checkpointing flag" in r.message
-        ]
-        assert len(warnings) == 1, (
-            f"expected one missing-checkpointing warning, got "
-            f"{[r.message for r in caplog.records]}"
-        )
-
-    def test_silent_when_not_in_train_mode(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        m = _make_trainable_block_model(num_blocks=4)
-        m.train(False)
-        offloader = _make_offloader_for_warning_test(m)
-        with caplog.at_level(logging.WARNING, logger=_OFFLOADER_LOGGER):
-            offloader._warn_if_training_without_checkpointing()
-        assert not any(
-            "gradient_checkpointing" in r.message for r in caplog.records
-        )
-
-    def test_silent_when_no_trainable_params(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        # Inference user with model.training=True but nothing to train.
-        # Heuristic should suppress the warning.
-        m = _make_block_model(num_blocks=4)  # all frozen
-        assert m.training, "fixture invariant: default modules are in train mode"
-        offloader = _make_offloader_for_warning_test(m)
-        with caplog.at_level(logging.WARNING, logger=_OFFLOADER_LOGGER):
-            offloader._warn_if_training_without_checkpointing()
-        assert not any(
-            "gradient_checkpointing" in r.message for r in caplog.records
-        )
-
-    def test_silent_when_default_mode_streams_no_block_state(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        class AllTrainableBlocks(nn.Module):
-            def __init__(self) -> None:
-                super().__init__()
-                self.transformer_blocks = nn.ModuleList(
-                    nn.Linear(4, 4, bias=False) for _ in range(2)
-                )
-
-        m = AllTrainableBlocks()
-        offloader = _make_model_offloader(
-            m,
-            blocks_attr="transformer_blocks",
-            num_resident_blocks=1,
-        )
-        try:
-            assert not offloader._has_streamed_blocks
-            assert offloader._streamed_components[0].param_names == frozenset()
-            assert offloader._streamed_components[0].streamed_buffer_names_by_block == [
-                [],
-                [],
-            ]
-
-            with caplog.at_level(logging.WARNING, logger=_OFFLOADER_LOGGER):
-                offloader._warn_if_training_without_checkpointing()
-
-            assert not any(
-                "gradient_checkpointing" in r.message for r in caplog.records
-            )
-        finally:
-            offloader.deactivate()
-
-    def test_silent_when_hf_flag_set_on_all_blocks(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        m = _make_trainable_block_model(num_blocks=4)
-        for block in m.transformer_blocks:
-            block.gradient_checkpointing = True
-        offloader = _make_offloader_for_warning_test(m)
-        with caplog.at_level(logging.WARNING, logger=_OFFLOADER_LOGGER):
-            offloader._warn_if_training_without_checkpointing()
-        assert not any(
-            "gradient_checkpointing" in r.message for r in caplog.records
-        )
-
-    def test_silent_when_custom_predicate_accepts_blocks(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        m = _make_trainable_block_model(num_blocks=4)
-        offloader = _make_model_offloader(
-            m,
-            blocks_attr="transformer_blocks", num_resident_blocks=2,
-            is_block_checkpointed=lambda block: True,
-        )
-        with caplog.at_level(logging.WARNING, logger=_OFFLOADER_LOGGER):
-            offloader._warn_if_training_without_checkpointing()
-        assert not any(
-            "gradient_checkpointing" in r.message for r in caplog.records
-        )
-
-    def test_skip_checkpointing_check_suppresses_warning(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        m = _make_trainable_block_model(num_blocks=4)
-        offloader = _make_model_offloader(
-            m,
-            blocks_attr="transformer_blocks", num_resident_blocks=2,
-            skip_checkpointing_check=True,
-        )
-        with caplog.at_level(logging.WARNING, logger=_OFFLOADER_LOGGER):
-            offloader._warn_if_training_without_checkpointing()
-        assert not any(
-            "gradient_checkpointing" in r.message for r in caplog.records
-        )
-
-    def test_inconsistent_flags_emit_dedicated_warning(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        m = _make_trainable_block_model(num_blocks=4)
-        m.transformer_blocks[0].gradient_checkpointing = True
-        # blocks 1..3 left unflagged
-        offloader = _make_offloader_for_warning_test(m)
-        with caplog.at_level(logging.WARNING, logger=_OFFLOADER_LOGGER):
-            offloader._warn_if_training_without_checkpointing()
-        assert any(
-            "inconsistent gradient_checkpointing" in r.message
-            for r in caplog.records
-        ), [r.message for r in caplog.records]
-
-    def test_fires_only_once_across_repeated_invocations(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        m = _make_trainable_block_model(num_blocks=4)
-        offloader = _make_offloader_for_warning_test(m)
-        with caplog.at_level(logging.WARNING, logger=_OFFLOADER_LOGGER):
-            offloader._warn_if_training_without_checkpointing()
-            offloader._warn_if_training_without_checkpointing()
-            offloader._warn_if_training_without_checkpointing()
-        n = sum(
-            1 for r in caplog.records
-            if "gradient_checkpointing" in r.message
-        )
-        assert n == 1, f"expected one warning across 3 invocations, got {n}"
 
 
 # ---------------------------------------------------------------------------
@@ -2958,115 +2780,13 @@ def _make_lora_in_block_model(
     return M()
 
 
-class TestInBlockTrainableCheckpointingGuard:
-    """``_enforce_checkpointing_for_trainable_streaming`` is a hard
-    guard that prevents silent gradient corruption when in-block
-    trainables are streamed without activation checkpointing. The
-    guard is heuristic (HF-style ``gradient_checkpointing`` flag), so
-    ``skip_checkpointing_check=True`` provides an escape hatch for
-    call-site checkpointing.
-    """
-
-    def test_raises_without_checkpointing_flag(self) -> None:
-        m = _make_lora_in_block_model(num_blocks=2)
-        offloader = _make_model_offloader(
-            m,
-            blocks_attr="transformer_blocks", num_resident_blocks=1,
-            stream_trainable_weights=True,
-        )
-        with pytest.raises(RuntimeError, match="gradient_checkpointing"):
-            offloader._enforce_checkpointing_for_trainable_streaming()
-
-    def test_passes_with_flag_on_every_block(self) -> None:
-        m = _make_lora_in_block_model(num_blocks=2)
-        for block in m.transformer_blocks:
-            block.gradient_checkpointing = True
-        offloader = _make_model_offloader(
-            m,
-            blocks_attr="transformer_blocks", num_resident_blocks=1,
-            stream_trainable_weights=True,
-        )
-        offloader._enforce_checkpointing_for_trainable_streaming()  # no raise
-
-    def test_raises_with_flag_on_only_some_blocks(self) -> None:
-        m = _make_lora_in_block_model(num_blocks=4)
-        m.transformer_blocks[0].gradient_checkpointing = True
-        m.transformer_blocks[1].gradient_checkpointing = True
-        # blocks 2, 3 unflagged
-        offloader = _make_model_offloader(
-            m,
-            blocks_attr="transformer_blocks", num_resident_blocks=1,
-            stream_trainable_weights=True,
-        )
-        with pytest.raises(RuntimeError, match="gradient_checkpointing"):
-            offloader._enforce_checkpointing_for_trainable_streaming()
-
-    def test_skip_checkpointing_check_suppresses_guard(self) -> None:
-        m = _make_lora_in_block_model(num_blocks=2)
-        offloader = _make_model_offloader(
-            m,
-            blocks_attr="transformer_blocks", num_resident_blocks=1,
-            skip_checkpointing_check=True,
-            stream_trainable_weights=True,
-        )
-        offloader._enforce_checkpointing_for_trainable_streaming()  # no raise
-
-    def test_eval_mode_suppresses_guard(self) -> None:
-        # Streamed trainable weights are safe for inference/eval activation:
-        # the silent-corruption risk requires grad-enabled training through
-        # streamed blocks.
-        m = _make_lora_in_block_model(num_blocks=2)
-        m.eval()
-        offloader = _make_model_offloader(
-            m,
-            blocks_attr="transformer_blocks", num_resident_blocks=1,
-            stream_trainable_weights=True,
-        )
-        offloader._enforce_checkpointing_for_trainable_streaming()  # no raise
-
-    def test_silent_for_frozen_only_streamed_blocks(self) -> None:
-        # Frozen-only blocks → no in-block trainables → no hard guard.
-        # The frozen failure mode is autograd's loud version-counter
-        # error, so a soft warning suffices (covered by
-        # ``TestTrainingWarning``).
-        m = _make_trainable_block_model(num_blocks=2)
-        offloader = _make_model_offloader(
-            m,
-            blocks_attr="transformer_blocks", num_resident_blocks=1,
-        )
-        offloader._enforce_checkpointing_for_trainable_streaming()  # no raise
-
-    def test_uncheckpointed_frozen_group_does_not_hard_fail(self) -> None:
-        # Only streamers that actually manage trainable params need the
-        # hard guard. Frozen-only groups still get the soft warning path
-        # because their failure mode is autograd's loud version check.
-        class FrozenBlock(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.proj = nn.Linear(8, 8, bias=False)
-                self.proj.weight.requires_grad = False
-
-        m = _make_lora_in_block_model(num_blocks=2)
-        m.frozen_blocks = nn.ModuleList(FrozenBlock() for _ in range(2))
-        for block in m.transformer_blocks:
-            block.gradient_checkpointing = True
-
-        offloader = _make_model_offloader(
-            m,
-            blocks_attr=["transformer_blocks", "frozen_blocks"],
-            num_resident_blocks=1,
-            stream_trainable_weights=True,
-        )
-        offloader._enforce_checkpointing_for_trainable_streaming()  # no raise
-
-
 class TestStreamedComponentActivateTwice:
     @CUDA
     def test_double_activate_raises(self) -> None:
         m = _make_block_model(num_blocks=4)
         offloader = _make_model_offloader(
             m,
-            blocks_attr="transformer_blocks", num_resident_blocks=3,
+            blocks_attr=["transformer_blocks"], num_resident_blocks=3,
         )
         try:
             offloader.activate("cuda")
@@ -3074,7 +2794,7 @@ class TestStreamedComponentActivateTwice:
             # composer's activate handles its own teardown ExitStack,
             # but the streamer itself must hard-guard against
             # double-install of forward-pre hooks.
-            streamer = offloader._streamed_components[0]
+            streamer = streamed_components(offloader)[0]
             with pytest.raises(RuntimeError, match="already.*active"):
                 streamer.activate("cuda")
         finally:
@@ -3124,7 +2844,7 @@ class TestInBlockTrainableStreamingEndToEnd:
 
         offloader = _make_model_offloader(
             m_streamed,
-            blocks_attr="transformer_blocks",
+            blocks_attr=["transformer_blocks"],
             num_resident_blocks=2, num_prefetch_blocks=0,
             stream_trainable_weights=True,
         )
@@ -3185,7 +2905,7 @@ class TestInBlockTrainableStreamingEndToEnd:
 
         offloader = _make_model_offloader(
             m_offloaded,
-            blocks_attr="transformer_blocks",
+            blocks_attr=["transformer_blocks"],
             num_resident_blocks=2, num_prefetch_blocks=0,
         )
         try:
@@ -3245,7 +2965,7 @@ class TestInBlockTrainableStreamingEndToEnd:
 
         offloader = _make_model_offloader(
             m_streamed,
-            blocks_attr="transformer_blocks",
+            blocks_attr=["transformer_blocks"],
             num_resident_blocks=2, num_prefetch_blocks=0,
             stream_trainable_weights=True,
         )
@@ -3289,7 +3009,7 @@ class TestInBlockTrainableStreamingEndToEnd:
 
         offloader = _make_model_offloader(
             m,
-            blocks_attr="transformer_blocks",
+            blocks_attr=["transformer_blocks"],
             num_resident_blocks=1, num_prefetch_blocks=0,
             stream_trainable_weights=True,
         )
@@ -3357,7 +3077,7 @@ class TestInBlockTrainableStreamingEndToEnd:
 
         offloader = _make_model_offloader(
             m,
-            blocks_attr="transformer_blocks",
+            blocks_attr=["transformer_blocks"],
             num_resident_blocks=1,
             stream_trainable_weights=True,
         )
@@ -3396,62 +3116,6 @@ class TestInBlockTrainableStreamingEndToEnd:
             offloader.deactivate()
 
 
-class TestPluggableCheckpointingDetection:
-    """``is_block_checkpointed`` callable lets callers wire framework-
-    specific detection without resorting to ``skip_checkpointing_check=True``
-    (which silences the guard entirely). The default predicate stays
-    HF-per-block-flag — conservative on purpose."""
-
-    def test_custom_predicate_accepted(self) -> None:
-        # A custom predicate returning True for every block lets the
-        # guard pass even without per-block flags set.
-        m = _make_lora_in_block_model(num_blocks=2)
-        offloader = _make_model_offloader(
-            m,
-            blocks_attr="transformer_blocks", num_resident_blocks=1,
-            is_block_checkpointed=lambda block: True,
-            stream_trainable_weights=True,
-        )
-        offloader._enforce_checkpointing_for_trainable_streaming()  # no raise
-
-    def test_custom_predicate_can_reject(self) -> None:
-        # Predicate returning False on the second block triggers the
-        # hard guard with the standard message.
-        m = _make_lora_in_block_model(num_blocks=2)
-        seen: list[nn.Module] = []
-
-        def predicate(block: nn.Module) -> bool:
-            seen.append(block)
-            return len(seen) == 1  # True for first, False for second
-
-        offloader = _make_model_offloader(
-            m,
-            blocks_attr="transformer_blocks", num_resident_blocks=1,
-            is_block_checkpointed=predicate,
-            stream_trainable_weights=True,
-        )
-        with pytest.raises(RuntimeError, match="is_block_checkpointed"):
-            offloader._enforce_checkpointing_for_trainable_streaming()
-
-    def test_skip_checkpointing_check_overrides_predicate(self) -> None:
-        # skip_checkpointing_check=True short-circuits before the predicate
-        # is even consulted. Use a sentinel predicate that would raise
-        # if called to verify it isn't.
-        m = _make_lora_in_block_model(num_blocks=2)
-
-        def fail_predicate(block: nn.Module) -> bool:
-            raise AssertionError("should not be called")
-
-        offloader = _make_model_offloader(
-            m,
-            blocks_attr="transformer_blocks", num_resident_blocks=1,
-            skip_checkpointing_check=True,
-            is_block_checkpointed=fail_predicate,
-            stream_trainable_weights=True,
-        )
-        offloader._enforce_checkpointing_for_trainable_streaming()  # no raise
-
-
 # ---------------------------------------------------------------------------
 # Streamer-level invariants from C1 + C2 (drain-and-evict + transactional gather)
 # ---------------------------------------------------------------------------
@@ -3475,7 +3139,7 @@ class TestRevisedDataOnlyDesign:
 
         offloader = _make_model_offloader(
             m,
-            blocks_attr="transformer_blocks",
+            blocks_attr=["transformer_blocks"],
             num_resident_blocks=1, num_prefetch_blocks=0,
             stream_trainable_weights=True,
         )
@@ -3538,7 +3202,7 @@ class TestRevisedDataOnlyDesign:
 
         offloader = _make_model_offloader(
             m_streamed,
-            blocks_attr="transformer_blocks",
+            blocks_attr=["transformer_blocks"],
             num_resident_blocks=1, num_prefetch_blocks=0,
             stream_trainable_weights=True,
         )
@@ -3583,7 +3247,7 @@ class TestRevisedDataOnlyDesign:
 
         offloader = _make_model_offloader(
             m,
-            blocks_attr="transformer_blocks",
+            blocks_attr=["transformer_blocks"],
             num_resident_blocks=1, num_prefetch_blocks=0,
             stream_trainable_weights=True,
         )
@@ -3621,7 +3285,7 @@ class TestRevisedDataOnlyDesign:
 
         offloader = _make_model_offloader(
             m,
-            blocks_attr="transformer_blocks",
+            blocks_attr=["transformer_blocks"],
             num_resident_blocks=1, num_prefetch_blocks=0,
             stream_trainable_weights=True,
         )
@@ -3687,7 +3351,7 @@ class TestRevisedDataOnlyDesign:
 
         offloader = _make_model_offloader(
             m_streamed,
-            blocks_attr="transformer_blocks",
+            blocks_attr=["transformer_blocks"],
             num_resident_blocks=3, num_prefetch_blocks=2,
             stream_trainable_weights=True,
         )
@@ -3748,7 +3412,7 @@ class TestRevisedDataOnlyDesign:
 
         offloader = _make_model_offloader(
             m_streamed,
-            blocks_attr="transformer_blocks",
+            blocks_attr=["transformer_blocks"],
             num_resident_blocks=2, num_prefetch_blocks=0,
             stream_trainable_weights=True,
         )

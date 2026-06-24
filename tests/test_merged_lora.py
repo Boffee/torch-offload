@@ -10,7 +10,7 @@ CUDA-only tests gate on availability.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 
 import pytest
 import torch
@@ -38,6 +38,8 @@ from torch_offload.pinned_module import PinnedModuleInstance
 from torch_offload.pinned_param import PinnedParam
 from torch_offload.protocols import ResourceBinding, ResourceStore
 
+from tests.conftest import streamed_components
+
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
@@ -54,13 +56,11 @@ def _factor_tensors(factor: LoRAFactor) -> tuple[torch.Tensor, torch.Tensor]:
 def _make_model_offloader(
     model: nn.Module,
     *,
-    blocks_attr: str | Sequence[str] | None = None,
-    num_resident_blocks: int | None = None,
+    blocks_attr: list[str] = [],
+    num_resident_blocks: int = 1,
     num_prefetch_blocks: int = 2,
     cyclic: bool = False,
     stream_trainable_weights: bool = False,
-    skip_checkpointing_check: bool = False,
-    is_block_checkpointed: Callable[[nn.Module], bool] | None = None,
 ) -> ModelOffloader:
     store = ModelOffloaderStore.from_module(
         model,
@@ -70,11 +70,7 @@ def _make_model_offloader(
         cyclic=cyclic,
         stream_trainable_weights=stream_trainable_weights,
     )
-    return store.bind(
-        model,
-        skip_checkpointing_check=skip_checkpointing_check,
-        is_block_checkpointed=is_block_checkpointed,
-    )
+    return store.bind(model)
 
 
 def _make_bf16_model(num_blocks: int = 4, dim: int = 16) -> nn.Module:
@@ -247,7 +243,7 @@ def _make_strategy(
         num_resident_blocks = len(model.transformer_blocks) - 1
     return _make_model_offloader(
         model,
-        blocks_attr="transformer_blocks",
+        blocks_attr=["transformer_blocks"],
         num_resident_blocks=num_resident_blocks,
     )
 
@@ -261,20 +257,13 @@ def _has_post_copy_hook(strategy: ModelOffloader, target_key: str) -> bool:
     param_name = canonical_param_names.get(target_key)
     if param_name is None:
         return False
-    component = strategy._component_for_param_name(param_name)
+    component = strategy._composite.component_for_param_name(param_name)
     if isinstance(component, PinnedComponent):
-        return (
-            component.post_copy_hook_key(param_name)
-            in component._instance._post_copy_hooks
-        )
+        instance = component._instance
+        return instance.post_copy_hook_key(param_name) in instance._post_copy_hooks
     if isinstance(component, StreamedComponent):
-        key = component.post_copy_hook_key(param_name)
-        return (
-            any(
-                key in instance._post_copy_hooks
-                for instance in component._block_instances
-            )
-        )
+        instance, local = component._resolve_param_name(param_name)
+        return instance.post_copy_hook_key(local) in instance._post_copy_hooks
     return False
 
 
@@ -1062,7 +1051,7 @@ class TestLoRATransform:
         _set_loras(s, [(lora, 0.5)], mode="merge")
         s.activate("cuda")
         try:
-            streamer = s._streamed_components[0]
+            streamer = streamed_components(s)[0]
             streamer._load_block(0)
             merged_qt = m.transformer_blocks[0].attn.weight.data
             assert isinstance(merged_qt, WeightQBytesTensor)
@@ -1348,7 +1337,7 @@ class TestRoutedMode:
 
         s = _make_model_offloader(
             model,
-            blocks_attr="transformer_blocks", num_resident_blocks=1,
+            blocks_attr=["transformer_blocks"], num_resident_blocks=1,
         )
         # Build a LoRA targeting attn.weight (LinearLike, not nn.Linear).
         lora = _make_lora(num_blocks=2, dim=16, seed=3)
@@ -1406,7 +1395,7 @@ class TestRoutedMode:
 
         s = _make_model_offloader(
             model,
-            blocks_attr="transformer_blocks", num_resident_blocks=1,
+            blocks_attr=["transformer_blocks"], num_resident_blocks=1,
         )
         lora = _make_lora(num_blocks=2, dim=16, seed=99)
         _set_loras(s, [(lora, 1.0)], mode="routed")
@@ -1442,7 +1431,7 @@ class TestRoutedMode:
 
         s = _make_model_offloader(
             model,
-            blocks_attr="transformer_blocks", num_resident_blocks=1,
+            blocks_attr=["transformer_blocks"], num_resident_blocks=1,
         )
         # Build a LoRA that targets either alias of the tied weight.
         sd = {
@@ -1501,7 +1490,7 @@ class TestRoutedMode:
         loras = [(_make_lora(num_blocks=2, dim=16, seed=55), 0.5)]
         s = _make_model_offloader(
             m,
-            blocks_attr="transformer_blocks", num_resident_blocks=1,
+            blocks_attr=["transformer_blocks"], num_resident_blocks=1,
         )
         _set_loras(s, loras, mode="routed")
         s.activate("cuda")
@@ -1586,7 +1575,7 @@ class TestDeactivateCleanupInvariants:
         def streamer_boom() -> None:
             raise RuntimeError("streamer cleanup failed")
 
-        monkeypatch.setattr(s._streamed_components[0], "deactivate", streamer_boom)
+        monkeypatch.setattr(streamed_components(s)[0], "deactivate", streamer_boom)
         s.activate("cuda")
 
         with pytest.raises(RuntimeError):

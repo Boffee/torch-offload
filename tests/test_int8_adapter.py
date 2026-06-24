@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
 
 import pytest
 import torch
@@ -27,13 +26,11 @@ CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def _make_model_offloader(
     model: nn.Module,
     *,
-    blocks_attr: str | Sequence[str] | None = None,
-    num_resident_blocks: int | None = None,
+    blocks_attr: list[str] = [],
+    num_resident_blocks: int = 1,
     num_prefetch_blocks: int = 2,
     cyclic: bool = False,
     stream_trainable_weights: bool = False,
-    skip_checkpointing_check: bool = False,
-    is_block_checkpointed: Callable[[nn.Module], bool] | None = None,
 ) -> ModelOffloader:
     store = ModelOffloaderStore.from_module(
         model,
@@ -43,11 +40,7 @@ def _make_model_offloader(
         cyclic=cyclic,
         stream_trainable_weights=stream_trainable_weights,
     )
-    return store.bind(
-        model,
-        skip_checkpointing_check=skip_checkpointing_check,
-        is_block_checkpointed=is_block_checkpointed,
-    )
+    return store.bind(model)
 
 
 def _int8_config(*, dynamic_activation: bool) -> object:
@@ -422,7 +415,7 @@ class TestInt8Adapter:
             )
         offloader = _make_model_offloader(
             model,
-            blocks_attr="blocks",
+            blocks_attr=["blocks"],
             num_resident_blocks=1,
             num_prefetch_blocks=0,
         )
@@ -491,7 +484,7 @@ class TestInt8Adapter:
 
         offloader = _make_model_offloader(
             model,
-            blocks_attr="blocks",
+            blocks_attr=["blocks"],
             num_resident_blocks=1,
             num_prefetch_blocks=0,
         )

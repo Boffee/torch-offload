@@ -38,3 +38,24 @@ def pytest_runtest_call(item: pytest.Item) -> Generator[None, None, None]:
         outcome.force_exception(
             pytest.skip.Exception(f"needs a CUDA GPU: {exc}", _use_item_location=True)
         )
+
+
+def streamed_components(offloader: object) -> list:
+    """A ModelOffloader's streamed components (test-introspection helper)."""
+    from torch_offload import StreamedComponent
+
+    return [
+        component
+        for component in offloader._composite.components  # type: ignore[attr-defined]
+        if isinstance(component, StreamedComponent)
+    ]
+
+
+def pinned_component(offloader: object):
+    """A ModelOffloader's pinned component, or None (test-introspection helper)."""
+    from torch_offload import PinnedComponent
+
+    for component in offloader._composite.components:  # type: ignore[attr-defined]
+        if isinstance(component, PinnedComponent):
+            return component
+    return None

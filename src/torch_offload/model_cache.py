@@ -154,20 +154,18 @@ class ModelSpec(ResourceSpec[M]):
     stays stable, and concurrent bindings are still rejected.
     """
 
-    def __init__(  # noqa: PLR0913
+    def __init__(
         self,
         *,
         key: str,
         estimated_cache_bytes: int,
         factory: Callable[[], M],
         skeleton_factory: Callable[[], M] | None = None,
-        blocks_attr: str | Sequence[str] | None = None,
-        num_resident_blocks: int | None = None,
+        blocks_attr: list[str] = [],  # noqa: B006  (read-only; never mutated)
+        num_resident_blocks: int = 1,
         num_prefetch_blocks: int = 2,
         cyclic: bool = False,
         stream_trainable_weights: bool = False,
-        skip_checkpointing_check: bool = False,
-        is_block_checkpointed: Callable[[nn.Module], bool] | None = None,
     ) -> None:
         def store_factory() -> ResourceStore:
             model = factory()
@@ -188,11 +186,7 @@ class ModelSpec(ResourceSpec[M]):
                 model = cast(M, offloader_store.model)
             else:
                 model = skeleton_factory()
-            binding = offloader_store.bind(
-                model,
-                skip_checkpointing_check=skip_checkpointing_check,
-                is_block_checkpointed=is_block_checkpointed,
-            )
+            binding = offloader_store.bind(model)
             # ModelOffloader.value is typed nn.Module but yields the
             # bound module, which is an M.
             return cast(ResourceBinding[M], binding)
