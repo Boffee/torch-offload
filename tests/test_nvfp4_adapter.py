@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 
 import pytest
 import torch
@@ -32,8 +32,6 @@ def _make_model_offloader(
     num_prefetch_blocks: int = 2,
     cyclic: bool = False,
     stream_trainable_weights: bool = False,
-    skip_checkpointing_check: bool = False,
-    is_block_checkpointed: Callable[[nn.Module], bool] | None = None,
 ) -> ModelOffloader:
     store = ModelOffloaderStore.from_module(
         model,
@@ -43,11 +41,7 @@ def _make_model_offloader(
         cyclic=cyclic,
         stream_trainable_weights=stream_trainable_weights,
     )
-    return store.bind(
-        model,
-        skip_checkpointing_check=skip_checkpointing_check,
-        is_block_checkpointed=is_block_checkpointed,
-    )
+    return store.bind(model)
 
 
 def _nvfp4_modules():

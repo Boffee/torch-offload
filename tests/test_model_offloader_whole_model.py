@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-import logging
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from typing import Any, cast
 
 import pytest
@@ -18,8 +17,9 @@ from torch_offload import (
     PinnedComponentStore,
 )
 
+from tests.conftest import pinned_component
+
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-_OFFLOADER_LOGGER = "torch_offload.model_offloader"
 
 
 def _make_model_offloader(
@@ -30,8 +30,6 @@ def _make_model_offloader(
     num_prefetch_blocks: int = 2,
     cyclic: bool = False,
     stream_trainable_weights: bool = False,
-    skip_checkpointing_check: bool = False,
-    is_block_checkpointed: Callable[[nn.Module], bool] | None = None,
 ) -> ModelOffloader:
     store = ModelOffloaderStore.from_module(
         model,
@@ -41,11 +39,7 @@ def _make_model_offloader(
         cyclic=cyclic,
         stream_trainable_weights=stream_trainable_weights,
     )
-    return store.bind(
-        model,
-        skip_checkpointing_check=skip_checkpointing_check,
-        is_block_checkpointed=is_block_checkpointed,
-    )
+    return store.bind(model)
 
 
 def _make_simple_model() -> nn.Module:
@@ -57,11 +51,11 @@ def _make_simple_model() -> nn.Module:
 
 
 def _unique_pinned_param_count(pw: ModelOffloader) -> int:
-    return len({id(pinned) for pinned in pw._instance.params.values()})
+    return len({id(pinned) for pinned in pinned_component(pw)._instance.params.values()})
 
 
 def _unique_pinned_buffer_count(pw: ModelOffloader) -> int:
-    return len({id(pinned) for pinned in pw._instance.buffers.values()})
+    return len({id(pinned) for pinned in pinned_component(pw)._instance.buffers.values()})
 
 
 # ---------------------------------------------------------------------------
@@ -90,8 +84,8 @@ class TestModelStrategyConformance:
         with pytest.raises(TypeError, match="PinnedComponentStore.from_module"):
             PinnedComponent(cast(Any, model))
 
-    def test_offloader_constructor_requires_bound_components(self) -> None:
-        with pytest.raises(TypeError, match="components"):
+    def test_offloader_constructor_requires_bound_composite(self) -> None:
+        with pytest.raises(TypeError, match="composite"):
             cast(Any, ModelOffloader)(_make_simple_model())
 
     def test_has_lifecycle_methods(self) -> None:
@@ -197,23 +191,6 @@ class TestTrainableParams:
             assert m.weight is param
             assert m.weight.is_pinned()
             assert not torch.equal(m.weight.detach(), before)
-        finally:
-            pw.deactivate()
-
-    def test_whole_model_mode_does_not_warn_about_streamed_checkpointing(
-        self, caplog: pytest.LogCaptureFixture,
-    ) -> None:
-        m = nn.Linear(4, 2, bias=False)
-        assert m.training
-
-        pw = _make_model_offloader(m)
-        try:
-            with caplog.at_level(logging.WARNING, logger=_OFFLOADER_LOGGER):
-                pw._warn_if_training_without_checkpointing()
-            assert not any(
-                "gradient_checkpointing" in record.message
-                for record in caplog.records
-            )
         finally:
             pw.deactivate()
 
@@ -567,7 +544,7 @@ class TestTiedWeightDedup:
             # After construction, both names reference the same Parameter
             # object, preserving tying at the strongest level.
             assert m.embed._parameters["weight"] is m.head._parameters["weight"]
-            pinned = pw._instance.params["embed.weight"]
+            pinned = pinned_component(pw)._instance.params["embed.weight"]
             # The materialized CPU wrapper is installed onto the module (the
             # instance no longer caches it); both tied leaves share it.
             cpu_param = m.embed.weight
@@ -702,7 +679,7 @@ class TestSharedSubmoduleAlias:
             # One pinned buffer backing covers both alias paths.
             assert _unique_pinned_buffer_count(pw) == 1
             assert pw.buffer_names == {"a.buf", "b.buf"}
-            pinned_buffer = pw._instance.buffers["a.buf"]
+            pinned_buffer = pinned_component(pw)._instance.buffers["a.buf"]
             assert pinned_buffer.tensor.is_pinned()
             # Both module entries reference the SAME pinned tensor.
             assert m.a.buf is pinned_buffer.tensor
@@ -725,7 +702,7 @@ class TestSharedSubmoduleAlias:
         pw = _make_model_offloader(m)
         try:
             assert _unique_pinned_buffer_count(pw) == 1
-            pinned_buffer = pw._instance.buffers["a.buf"]
+            pinned_buffer = pinned_component(pw)._instance.buffers["a.buf"]
             assert m.a.buf is pinned_buffer.tensor
             assert m.b.buf is pinned_buffer.tensor
         finally:
@@ -751,7 +728,7 @@ class TestSharedSubmoduleAlias:
         pw = _make_model_offloader(m)
         try:
             assert _unique_pinned_buffer_count(pw) == 1
-            pinned_buffer = pw._instance.buffers["a.buf"]
+            pinned_buffer = pinned_component(pw)._instance.buffers["a.buf"]
             assert m.a.buf is pinned_buffer.tensor
             assert m.b.buf is pinned_buffer.tensor
             assert m.a.buf.is_pinned()

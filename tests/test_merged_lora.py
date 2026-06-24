@@ -10,7 +10,7 @@ CUDA-only tests gate on availability.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 
 import pytest
 import torch
@@ -38,6 +38,8 @@ from torch_offload.pinned_module import PinnedModuleInstance
 from torch_offload.pinned_param import PinnedParam
 from torch_offload.protocols import ResourceBinding, ResourceStore
 
+from tests.conftest import streamed_components
+
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
@@ -59,8 +61,6 @@ def _make_model_offloader(
     num_prefetch_blocks: int = 2,
     cyclic: bool = False,
     stream_trainable_weights: bool = False,
-    skip_checkpointing_check: bool = False,
-    is_block_checkpointed: Callable[[nn.Module], bool] | None = None,
 ) -> ModelOffloader:
     store = ModelOffloaderStore.from_module(
         model,
@@ -70,11 +70,7 @@ def _make_model_offloader(
         cyclic=cyclic,
         stream_trainable_weights=stream_trainable_weights,
     )
-    return store.bind(
-        model,
-        skip_checkpointing_check=skip_checkpointing_check,
-        is_block_checkpointed=is_block_checkpointed,
-    )
+    return store.bind(model)
 
 
 def _make_bf16_model(num_blocks: int = 4, dim: int = 16) -> nn.Module:
@@ -261,7 +257,7 @@ def _has_post_copy_hook(strategy: ModelOffloader, target_key: str) -> bool:
     param_name = canonical_param_names.get(target_key)
     if param_name is None:
         return False
-    component = strategy._component_for_param_name(param_name)
+    component = strategy._composite.component_for_param_name(param_name)
     if isinstance(component, PinnedComponent):
         return (
             component.post_copy_hook_key(param_name)
@@ -1062,7 +1058,7 @@ class TestLoRATransform:
         _set_loras(s, [(lora, 0.5)], mode="merge")
         s.activate("cuda")
         try:
-            streamer = s._streamed_components[0]
+            streamer = streamed_components(s)[0]
             streamer._load_block(0)
             merged_qt = m.transformer_blocks[0].attn.weight.data
             assert isinstance(merged_qt, WeightQBytesTensor)
@@ -1586,7 +1582,7 @@ class TestDeactivateCleanupInvariants:
         def streamer_boom() -> None:
             raise RuntimeError("streamer cleanup failed")
 
-        monkeypatch.setattr(s._streamed_components[0], "deactivate", streamer_boom)
+        monkeypatch.setattr(streamed_components(s)[0], "deactivate", streamer_boom)
         s.activate("cuda")
 
         with pytest.raises(RuntimeError):

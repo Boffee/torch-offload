@@ -216,7 +216,7 @@ class TestDTensorAdapter:
         store = ModelOffloaderStore.from_module(
             net, blocks_attr="blocks", num_resident_blocks=2, num_prefetch_blocks=0
         )
-        pw = store.bind(net, skip_checkpointing_check=True)
+        pw = store.bind(net)
         try:
             # resting: a DTensor on a CPU mesh (local on the host)
             resting = net.blocks[0].weight.data

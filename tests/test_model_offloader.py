@@ -9,8 +9,7 @@ over the host-backed pinned state.
 
 from __future__ import annotations
 
-import logging
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from concurrent.futures import Future
 
 import pytest
@@ -28,6 +27,8 @@ from torch_offload import (
 )
 from torch_offload.composite_component import CompositeComponent
 
+from tests.conftest import pinned_component, streamed_components
+
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
@@ -39,8 +40,6 @@ def _make_model_offloader(
     num_prefetch_blocks: int = 2,
     cyclic: bool = False,
     stream_trainable_weights: bool = False,
-    skip_checkpointing_check: bool = False,
-    is_block_checkpointed: Callable[[nn.Module], bool] | None = None,
 ) -> ModelOffloader:
     store = ModelOffloaderStore.from_module(
         model,
@@ -50,11 +49,7 @@ def _make_model_offloader(
         cyclic=cyclic,
         stream_trainable_weights=stream_trainable_weights,
     )
-    return store.bind(
-        model,
-        skip_checkpointing_check=skip_checkpointing_check,
-        is_block_checkpointed=is_block_checkpointed,
-    )
+    return store.bind(model)
 
 
 def _make_streamed_component(
@@ -259,7 +254,7 @@ class TestLifecycle:
         try:
             strategy.activate("cuda")
             assert strategy._active_device == expected
-            assert strategy._streamed_components[0]._active_device == expected
+            assert streamed_components(strategy)[0]._active_device == expected
         finally:
             strategy.deactivate()
 
@@ -285,9 +280,9 @@ class TestLifecycle:
                 assert strategy._active_device == torch.device("cpu")
                 assert all(
                     s._active_device == torch.device("cpu")
-                    for s in strategy._streamed_components
+                    for s in streamed_components(strategy)
                 )
-                assert all(s._executor is None for s in strategy._streamed_components)
+                assert all(s._executor is None for s in streamed_components(strategy))
                 assert all(
                     block.weight is pinned
                     for block, pinned in zip(
@@ -379,9 +374,9 @@ class TestLifecycle:
                 del device
                 raise AssertionError("component activation should not run")
 
-            assert strategy._pinned_component is not None
+            assert pinned_component(strategy) is not None
             monkeypatch.setattr(
-                strategy._pinned_component,
+                pinned_component(strategy),
                 "activate",
                 fail_activate,
             )
@@ -529,9 +524,9 @@ class TestCleanup:
             blocks_attr="transformer_blocks", num_resident_blocks=2,
         )
         strategy.activate("cuda")
-        assert strategy._components._teardown_stack is not None
+        assert strategy._composite._teardown_stack is not None
         strategy.deactivate()
-        assert strategy._components._teardown_stack is None
+        assert strategy._composite._teardown_stack is None
 
     @CUDA
     def test_drop_strategy_without_deactivate_does_not_cycle(self) -> None:
@@ -552,7 +547,7 @@ class TestCleanup:
             blocks_attr="transformer_blocks", num_resident_blocks=2,
         )
         strategy.activate("cuda")  # installs hooks; no deactivate
-        streamer = strategy._streamed_components[0]
+        streamer = streamed_components(strategy)[0]
         streamer_ref = weakref.ref(streamer)
 
         # Disable cycle collector BEFORE dropping refs to prove the
@@ -673,7 +668,7 @@ class TestCyclicPrefetch:
             blocks_attr="transformer_blocks", num_resident_blocks=3,
             num_prefetch_blocks=2, cyclic=True,
         )
-        streamer: StreamedComponent = strategy._streamed_components[0]
+        streamer: StreamedComponent = streamed_components(strategy)[0]
 
         with strategy.use("cuda"):
             recorded, _ = self._record_prefetches(streamer)
@@ -705,7 +700,7 @@ class TestCyclicPrefetch:
             blocks_attr="transformer_blocks", num_resident_blocks=3,
             num_prefetch_blocks=2, cyclic=False,
         )
-        streamer: StreamedComponent = strategy._streamed_components[0]
+        streamer: StreamedComponent = streamed_components(strategy)[0]
 
         with strategy.use("cuda"):
             recorded, _ = self._record_prefetches(streamer)
@@ -733,7 +728,7 @@ class TestCyclicPrefetch:
             blocks_attr="transformer_blocks", num_resident_blocks=3,
             num_prefetch_blocks=1, cyclic=True,
         )
-        streamer: StreamedComponent = strategy._streamed_components[0]
+        streamer: StreamedComponent = streamed_components(strategy)[0]
 
         with strategy.use("cuda"):
             recorded, _ = self._record_prefetches(streamer)
@@ -792,7 +787,7 @@ class TestCyclicPrefetch:
             blocks_attr="transformer_blocks", num_resident_blocks=2,
             num_prefetch_blocks=1, cyclic=True,
         )
-        streamer: StreamedComponent = strategy._streamed_components[0]
+        streamer: StreamedComponent = streamed_components(strategy)[0]
 
         with strategy.use("cuda"):
             recorded, _ = self._record_prefetches(streamer)
@@ -901,7 +896,7 @@ class TestValidation:
             blocks_attr="transformer_blocks", num_resident_blocks=None,
         )
         try:
-            assert not strategy._streamed_components
+            assert not streamed_components(strategy)
         finally:
             strategy.deactivate()
 
@@ -1139,7 +1134,7 @@ class TestActivateFailureCleanup:
             m,
             blocks_attr="transformer_blocks", num_resident_blocks=2,
         )
-        streamer = strategy._streamed_components[0]
+        streamer = streamed_components(strategy)[0]
         original_register_hooks = streamer._register_hooks
 
         def broken_register_hooks(*args, **kwargs):
@@ -1151,7 +1146,7 @@ class TestActivateFailureCleanup:
         with pytest.raises(RuntimeError, match="simulated activate failure"):
             strategy.activate("cuda")
 
-        assert strategy._components._teardown_stack is None
+        assert strategy._composite._teardown_stack is None
 
     def test_failing_components_own_deactivate_runs(self) -> None:
         # Regression: previously the composite registered each
@@ -1185,7 +1180,7 @@ class TestActivateFailureCleanup:
             m,
             blocks_attr="transformer_blocks", num_resident_blocks=2,
         )
-        strat._components = CompositeComponent(
+        strat._composite = CompositeComponent(
             [
                 _Recorder("A"),
                 _Recorder("B"),
@@ -1226,7 +1221,7 @@ class TestPrefetchFailureOnDeactivate:
             blocks_attr="transformer_blocks", num_resident_blocks=2,
         )
         strategy.activate("cuda")
-        streamer = strategy._streamed_components[0]
+        streamer = streamed_components(strategy)[0]
         # Inject a pre-failed Future so deactivate's drain loop hits it.
         bad_future: Future[None] = Future()
         bad_future.set_exception(RuntimeError("simulated prefetch failure"))
@@ -1288,7 +1283,7 @@ class TestConstructedStateIsInactive:
         strategy = store.bind(m)
         try:
             # No PinnedComponent component, just StreamedComponent.
-            assert strategy._pinned_component is None
+            assert pinned_component(strategy) is None
             assert store.cache_bytes > 0  # block bytes only
         finally:
             strategy.deactivate()
@@ -1478,7 +1473,7 @@ class TestSharedStorageLocalBehavior:
         )
         try:
             assert m.embed.weight is m.head.weight
-            non_block = strategy._pinned_component
+            non_block = pinned_component(strategy)
             assert non_block is not None
             assert non_block.param_names == {"embed.weight", "head.weight"}
             assert (
@@ -1931,7 +1926,6 @@ class TestBlockLayoutCompatibility:
             )
 
 
-
 # ---------------------------------------------------------------------------
 # Multi-component cleanup ordering (ExitStack semantics)
 # ---------------------------------------------------------------------------
@@ -1968,8 +1962,8 @@ class TestMultiComponentCleanup:
             # PinnedComponent restored registry entries before raising, and streamers
             # were already unwound in LIFO order.
             assert m.embed.weight.is_pinned()  # type: ignore[union-attr]
-            assert not strategy._streamed_components[0]._hooks
-            assert strategy._components._teardown_stack is None
+            assert not streamed_components(strategy)[0]._hooks
+            assert strategy._composite._teardown_stack is None
         finally:
             strategy.deactivate()
 
@@ -2108,13 +2102,13 @@ class TestStreamedNameSelection:
                     "blocks.1.scale",
                 }
             )
-            assert strategy._streamed_components[0].buffer_names == frozenset(
+            assert streamed_components(strategy)[0].buffer_names == frozenset(
                 {
                     "blocks.0.scale",
                     "blocks.1.scale",
                 }
             )
-            streamer = strategy._streamed_components[0]
+            streamer = streamed_components(strategy)[0]
             _instance, local_name = streamer._resolve_buffer_name("blocks.0.scale")
             # The instance is module-agnostic now; block 0's scheduling module
             # (== its from_module source) is model.blocks[0].
@@ -2169,8 +2163,8 @@ class TestStreamedNameSelection:
             num_resident_blocks=2,
         )
         try:
-            streamer = strategy._streamed_components[0]
-            non_block = strategy._pinned_component
+            streamer = streamed_components(strategy)[0]
+            non_block = pinned_component(strategy)
             assert non_block is not None
 
             assert streamer.streamed_param_names_by_block == [["weight"]] * len(
@@ -2470,7 +2464,7 @@ class TestLoRAInBlockRouting:
             stream_trainable_weights=True,
         )
         try:
-            streamers = strat._streamed_components
+            streamers = streamed_components(strat)
             assert len(streamers) == 1
             streamer = streamers[0]
             assert streamer.streamed_param_names_by_block == [
@@ -2494,14 +2488,14 @@ class TestLoRAInBlockRouting:
             blocks_attr="transformer_blocks", num_resident_blocks=1,
         )
         try:
-            streamers = strat._streamed_components
+            streamers = streamed_components(strat)
             assert len(streamers) == 1
             streamer = streamers[0]
             assert streamer.streamed_param_names_by_block == [
                 ["base.weight"],
                 ["base.weight"],
             ]
-            pinned = strat._pinned_component
+            pinned = pinned_component(strat)
             assert pinned is not None
             assert pinned.param_names == {
                 "transformer_blocks.0.lora_a.weight",
@@ -2538,7 +2532,7 @@ class TestLoRAInBlockRouting:
             blocks_attr="transformer_blocks", num_resident_blocks=1,
         )
         try:
-            pinned = strat._pinned_component
+            pinned = pinned_component(strat)
             assert pinned is not None
             # PinnedComponent manages every non-streamed parameter, including
             # trainable_bias.
@@ -2574,11 +2568,7 @@ class TestLoRAInBlockRouting:
 #
 # These tests pin Phase 1's contract: forward+backward through a
 # streamed model produces baseline-matching grads under checkpointing,
-# raises a loud, recognisable error without it, and the activate-time
-# warning fires exactly when training-shape use is detected without
-# HF-style ``gradient_checkpointing`` flags.
-
-_OFFLOADER_LOGGER = "torch_offload.model_offloader"
+# and raises a loud, recognisable error without it.
 
 
 class TestTrainingWithCheckpointing:
@@ -2757,162 +2747,6 @@ def _make_offloader_for_warning_test(model: nn.Module) -> ModelOffloader:
     )
 
 
-class TestTrainingWarning:
-    """The activate-time warning is heuristic: it fires when
-    ``model.training=True`` and at least one trainable param exists
-    but no HuggingFace ``gradient_checkpointing`` flag is detected
-    on the streamed blocks. Manual call-site checkpointing isn't
-    visible from the module tree, so users wrapping that way will
-    see a false-positive warning the first time they activate."""
-
-    def test_fires_in_train_mode_with_trainables_and_no_flag(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        m = _make_trainable_block_model(num_blocks=4)
-        offloader = _make_offloader_for_warning_test(m)
-        with caplog.at_level(logging.WARNING, logger=_OFFLOADER_LOGGER):
-            offloader._warn_if_training_without_checkpointing()
-        warnings = [
-            r for r in caplog.records
-            if "no gradient_checkpointing flag" in r.message
-        ]
-        assert len(warnings) == 1, (
-            f"expected one missing-checkpointing warning, got "
-            f"{[r.message for r in caplog.records]}"
-        )
-
-    def test_silent_when_not_in_train_mode(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        m = _make_trainable_block_model(num_blocks=4)
-        m.train(False)
-        offloader = _make_offloader_for_warning_test(m)
-        with caplog.at_level(logging.WARNING, logger=_OFFLOADER_LOGGER):
-            offloader._warn_if_training_without_checkpointing()
-        assert not any(
-            "gradient_checkpointing" in r.message for r in caplog.records
-        )
-
-    def test_silent_when_no_trainable_params(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        # Inference user with model.training=True but nothing to train.
-        # Heuristic should suppress the warning.
-        m = _make_block_model(num_blocks=4)  # all frozen
-        assert m.training, "fixture invariant: default modules are in train mode"
-        offloader = _make_offloader_for_warning_test(m)
-        with caplog.at_level(logging.WARNING, logger=_OFFLOADER_LOGGER):
-            offloader._warn_if_training_without_checkpointing()
-        assert not any(
-            "gradient_checkpointing" in r.message for r in caplog.records
-        )
-
-    def test_silent_when_default_mode_streams_no_block_state(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        class AllTrainableBlocks(nn.Module):
-            def __init__(self) -> None:
-                super().__init__()
-                self.transformer_blocks = nn.ModuleList(
-                    nn.Linear(4, 4, bias=False) for _ in range(2)
-                )
-
-        m = AllTrainableBlocks()
-        offloader = _make_model_offloader(
-            m,
-            blocks_attr="transformer_blocks",
-            num_resident_blocks=1,
-        )
-        try:
-            assert not offloader._has_streamed_blocks
-            assert offloader._streamed_components[0].param_names == frozenset()
-            assert offloader._streamed_components[0].streamed_buffer_names_by_block == [
-                [],
-                [],
-            ]
-
-            with caplog.at_level(logging.WARNING, logger=_OFFLOADER_LOGGER):
-                offloader._warn_if_training_without_checkpointing()
-
-            assert not any(
-                "gradient_checkpointing" in r.message for r in caplog.records
-            )
-        finally:
-            offloader.deactivate()
-
-    def test_silent_when_hf_flag_set_on_all_blocks(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        m = _make_trainable_block_model(num_blocks=4)
-        for block in m.transformer_blocks:
-            block.gradient_checkpointing = True
-        offloader = _make_offloader_for_warning_test(m)
-        with caplog.at_level(logging.WARNING, logger=_OFFLOADER_LOGGER):
-            offloader._warn_if_training_without_checkpointing()
-        assert not any(
-            "gradient_checkpointing" in r.message for r in caplog.records
-        )
-
-    def test_silent_when_custom_predicate_accepts_blocks(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        m = _make_trainable_block_model(num_blocks=4)
-        offloader = _make_model_offloader(
-            m,
-            blocks_attr="transformer_blocks", num_resident_blocks=2,
-            is_block_checkpointed=lambda block: True,
-        )
-        with caplog.at_level(logging.WARNING, logger=_OFFLOADER_LOGGER):
-            offloader._warn_if_training_without_checkpointing()
-        assert not any(
-            "gradient_checkpointing" in r.message for r in caplog.records
-        )
-
-    def test_skip_checkpointing_check_suppresses_warning(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        m = _make_trainable_block_model(num_blocks=4)
-        offloader = _make_model_offloader(
-            m,
-            blocks_attr="transformer_blocks", num_resident_blocks=2,
-            skip_checkpointing_check=True,
-        )
-        with caplog.at_level(logging.WARNING, logger=_OFFLOADER_LOGGER):
-            offloader._warn_if_training_without_checkpointing()
-        assert not any(
-            "gradient_checkpointing" in r.message for r in caplog.records
-        )
-
-    def test_inconsistent_flags_emit_dedicated_warning(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        m = _make_trainable_block_model(num_blocks=4)
-        m.transformer_blocks[0].gradient_checkpointing = True
-        # blocks 1..3 left unflagged
-        offloader = _make_offloader_for_warning_test(m)
-        with caplog.at_level(logging.WARNING, logger=_OFFLOADER_LOGGER):
-            offloader._warn_if_training_without_checkpointing()
-        assert any(
-            "inconsistent gradient_checkpointing" in r.message
-            for r in caplog.records
-        ), [r.message for r in caplog.records]
-
-    def test_fires_only_once_across_repeated_invocations(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        m = _make_trainable_block_model(num_blocks=4)
-        offloader = _make_offloader_for_warning_test(m)
-        with caplog.at_level(logging.WARNING, logger=_OFFLOADER_LOGGER):
-            offloader._warn_if_training_without_checkpointing()
-            offloader._warn_if_training_without_checkpointing()
-            offloader._warn_if_training_without_checkpointing()
-        n = sum(
-            1 for r in caplog.records
-            if "gradient_checkpointing" in r.message
-        )
-        assert n == 1, f"expected one warning across 3 invocations, got {n}"
-
-
 # ---------------------------------------------------------------------------
 # In-block trainable streaming (.data-only design)
 # ---------------------------------------------------------------------------
@@ -2960,108 +2794,6 @@ def _make_lora_in_block_model(
     return M()
 
 
-class TestInBlockTrainableCheckpointingGuard:
-    """``_enforce_checkpointing_for_trainable_streaming`` is a hard
-    guard that prevents silent gradient corruption when in-block
-    trainables are streamed without activation checkpointing. The
-    guard is heuristic (HF-style ``gradient_checkpointing`` flag), so
-    ``skip_checkpointing_check=True`` provides an escape hatch for
-    call-site checkpointing.
-    """
-
-    def test_raises_without_checkpointing_flag(self) -> None:
-        m = _make_lora_in_block_model(num_blocks=2)
-        offloader = _make_model_offloader(
-            m,
-            blocks_attr="transformer_blocks", num_resident_blocks=1,
-            stream_trainable_weights=True,
-        )
-        with pytest.raises(RuntimeError, match="gradient_checkpointing"):
-            offloader._enforce_checkpointing_for_trainable_streaming()
-
-    def test_passes_with_flag_on_every_block(self) -> None:
-        m = _make_lora_in_block_model(num_blocks=2)
-        for block in m.transformer_blocks:
-            block.gradient_checkpointing = True
-        offloader = _make_model_offloader(
-            m,
-            blocks_attr="transformer_blocks", num_resident_blocks=1,
-            stream_trainable_weights=True,
-        )
-        offloader._enforce_checkpointing_for_trainable_streaming()  # no raise
-
-    def test_raises_with_flag_on_only_some_blocks(self) -> None:
-        m = _make_lora_in_block_model(num_blocks=4)
-        m.transformer_blocks[0].gradient_checkpointing = True
-        m.transformer_blocks[1].gradient_checkpointing = True
-        # blocks 2, 3 unflagged
-        offloader = _make_model_offloader(
-            m,
-            blocks_attr="transformer_blocks", num_resident_blocks=1,
-            stream_trainable_weights=True,
-        )
-        with pytest.raises(RuntimeError, match="gradient_checkpointing"):
-            offloader._enforce_checkpointing_for_trainable_streaming()
-
-    def test_skip_checkpointing_check_suppresses_guard(self) -> None:
-        m = _make_lora_in_block_model(num_blocks=2)
-        offloader = _make_model_offloader(
-            m,
-            blocks_attr="transformer_blocks", num_resident_blocks=1,
-            skip_checkpointing_check=True,
-            stream_trainable_weights=True,
-        )
-        offloader._enforce_checkpointing_for_trainable_streaming()  # no raise
-
-    def test_eval_mode_suppresses_guard(self) -> None:
-        # Streamed trainable weights are safe for inference/eval activation:
-        # the silent-corruption risk requires grad-enabled training through
-        # streamed blocks.
-        m = _make_lora_in_block_model(num_blocks=2)
-        m.eval()
-        offloader = _make_model_offloader(
-            m,
-            blocks_attr="transformer_blocks", num_resident_blocks=1,
-            stream_trainable_weights=True,
-        )
-        offloader._enforce_checkpointing_for_trainable_streaming()  # no raise
-
-    def test_silent_for_frozen_only_streamed_blocks(self) -> None:
-        # Frozen-only blocks → no in-block trainables → no hard guard.
-        # The frozen failure mode is autograd's loud version-counter
-        # error, so a soft warning suffices (covered by
-        # ``TestTrainingWarning``).
-        m = _make_trainable_block_model(num_blocks=2)
-        offloader = _make_model_offloader(
-            m,
-            blocks_attr="transformer_blocks", num_resident_blocks=1,
-        )
-        offloader._enforce_checkpointing_for_trainable_streaming()  # no raise
-
-    def test_uncheckpointed_frozen_group_does_not_hard_fail(self) -> None:
-        # Only streamers that actually manage trainable params need the
-        # hard guard. Frozen-only groups still get the soft warning path
-        # because their failure mode is autograd's loud version check.
-        class FrozenBlock(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.proj = nn.Linear(8, 8, bias=False)
-                self.proj.weight.requires_grad = False
-
-        m = _make_lora_in_block_model(num_blocks=2)
-        m.frozen_blocks = nn.ModuleList(FrozenBlock() for _ in range(2))
-        for block in m.transformer_blocks:
-            block.gradient_checkpointing = True
-
-        offloader = _make_model_offloader(
-            m,
-            blocks_attr=["transformer_blocks", "frozen_blocks"],
-            num_resident_blocks=1,
-            stream_trainable_weights=True,
-        )
-        offloader._enforce_checkpointing_for_trainable_streaming()  # no raise
-
-
 class TestStreamedComponentActivateTwice:
     @CUDA
     def test_double_activate_raises(self) -> None:
@@ -3076,7 +2808,7 @@ class TestStreamedComponentActivateTwice:
             # composer's activate handles its own teardown ExitStack,
             # but the streamer itself must hard-guard against
             # double-install of forward-pre hooks.
-            streamer = offloader._streamed_components[0]
+            streamer = streamed_components(offloader)[0]
             with pytest.raises(RuntimeError, match="already.*active"):
                 streamer.activate("cuda")
         finally:
@@ -3396,62 +3128,6 @@ class TestInBlockTrainableStreamingEndToEnd:
                 assert p.is_pinned()
         finally:
             offloader.deactivate()
-
-
-class TestPluggableCheckpointingDetection:
-    """``is_block_checkpointed`` callable lets callers wire framework-
-    specific detection without resorting to ``skip_checkpointing_check=True``
-    (which silences the guard entirely). The default predicate stays
-    HF-per-block-flag — conservative on purpose."""
-
-    def test_custom_predicate_accepted(self) -> None:
-        # A custom predicate returning True for every block lets the
-        # guard pass even without per-block flags set.
-        m = _make_lora_in_block_model(num_blocks=2)
-        offloader = _make_model_offloader(
-            m,
-            blocks_attr="transformer_blocks", num_resident_blocks=1,
-            is_block_checkpointed=lambda block: True,
-            stream_trainable_weights=True,
-        )
-        offloader._enforce_checkpointing_for_trainable_streaming()  # no raise
-
-    def test_custom_predicate_can_reject(self) -> None:
-        # Predicate returning False on the second block triggers the
-        # hard guard with the standard message.
-        m = _make_lora_in_block_model(num_blocks=2)
-        seen: list[nn.Module] = []
-
-        def predicate(block: nn.Module) -> bool:
-            seen.append(block)
-            return len(seen) == 1  # True for first, False for second
-
-        offloader = _make_model_offloader(
-            m,
-            blocks_attr="transformer_blocks", num_resident_blocks=1,
-            is_block_checkpointed=predicate,
-            stream_trainable_weights=True,
-        )
-        with pytest.raises(RuntimeError, match="is_block_checkpointed"):
-            offloader._enforce_checkpointing_for_trainable_streaming()
-
-    def test_skip_checkpointing_check_overrides_predicate(self) -> None:
-        # skip_checkpointing_check=True short-circuits before the predicate
-        # is even consulted. Use a sentinel predicate that would raise
-        # if called to verify it isn't.
-        m = _make_lora_in_block_model(num_blocks=2)
-
-        def fail_predicate(block: nn.Module) -> bool:
-            raise AssertionError("should not be called")
-
-        offloader = _make_model_offloader(
-            m,
-            blocks_attr="transformer_blocks", num_resident_blocks=1,
-            skip_checkpointing_check=True,
-            is_block_checkpointed=fail_predicate,
-            stream_trainable_weights=True,
-        )
-        offloader._enforce_checkpointing_for_trainable_streaming()  # no raise
 
 
 # ---------------------------------------------------------------------------

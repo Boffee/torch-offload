@@ -46,6 +46,16 @@ def streamed_components(offloader: object) -> list:
 
     return [
         component
-        for component in offloader._components.components  # type: ignore[attr-defined]
+        for component in offloader._composite.components  # type: ignore[attr-defined]
         if isinstance(component, StreamedComponent)
     ]
+
+
+def pinned_component(offloader: object):
+    """A ModelOffloader's pinned component, or None (test-introspection helper)."""
+    from torch_offload import PinnedComponent
+
+    for component in offloader._composite.components:  # type: ignore[attr-defined]
+        if isinstance(component, PinnedComponent):
+            return component
+    return None
