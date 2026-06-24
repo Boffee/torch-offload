@@ -26,6 +26,7 @@ from torch_offload import (
     StreamedComponent,
     StreamedComponentStore,
 )
+from torch_offload.composite_component import CompositeComponent
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -528,9 +529,9 @@ class TestCleanup:
             blocks_attr="transformer_blocks", num_resident_blocks=2,
         )
         strategy.activate("cuda")
-        assert strategy._teardown_stack is not None
+        assert strategy._components._teardown_stack is not None
         strategy.deactivate()
-        assert strategy._teardown_stack is None
+        assert strategy._components._teardown_stack is None
 
     @CUDA
     def test_drop_strategy_without_deactivate_does_not_cycle(self) -> None:
@@ -1150,7 +1151,7 @@ class TestActivateFailureCleanup:
         with pytest.raises(RuntimeError, match="simulated activate failure"):
             strategy.activate("cuda")
 
-        assert strategy._teardown_stack is None
+        assert strategy._components._teardown_stack is None
 
     def test_failing_components_own_deactivate_runs(self) -> None:
         # Regression: previously the composite registered each
@@ -1184,12 +1185,13 @@ class TestActivateFailureCleanup:
             m,
             blocks_attr="transformer_blocks", num_resident_blocks=2,
         )
-        strat._pinned_component = None
-        strat._streamed_components = [
-            _Recorder("A"),
-            _Recorder("B"),
-            _Recorder("C", raise_on_activate=True),
-        ]
+        strat._components = CompositeComponent(
+            [
+                _Recorder("A"),
+                _Recorder("B"),
+                _Recorder("C", raise_on_activate=True),
+            ]
+        )
 
         with pytest.raises(RuntimeError, match="C activate failed"):
             strat.activate("cpu")
@@ -1967,7 +1969,7 @@ class TestMultiComponentCleanup:
             # were already unwound in LIFO order.
             assert m.embed.weight.is_pinned()  # type: ignore[union-attr]
             assert not strategy._streamed_components[0]._hooks
-            assert strategy._teardown_stack is None
+            assert strategy._components._teardown_stack is None
         finally:
             strategy.deactivate()
 

@@ -91,7 +91,7 @@ class TestModelStrategyConformance:
             PinnedComponent(cast(Any, model))
 
     def test_offloader_constructor_requires_bound_components(self) -> None:
-        with pytest.raises(TypeError, match="pinned_component"):
+        with pytest.raises(TypeError, match="components"):
             cast(Any, ModelOffloader)(_make_simple_model())
 
     def test_has_lifecycle_methods(self) -> None:

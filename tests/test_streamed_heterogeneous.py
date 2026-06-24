@@ -8,6 +8,8 @@ check rejected any block that differed — the case these tests cover.
 
 from __future__ import annotations
 
+from tests.conftest import streamed_components
+
 from collections.abc import Sequence
 
 import pytest
@@ -55,7 +57,7 @@ def _frozen_model(dim: int, dtypes: Sequence[torch.dtype]) -> _Model:
 
 
 def _streamed_component(offloader: object):
-    components = offloader._streamed_components  # type: ignore[attr-defined]
+    components = streamed_components(offloader)  # type: ignore[attr-defined]
     assert len(components) == 1
     return components[0]
 

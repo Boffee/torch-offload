@@ -16,6 +16,7 @@ import torch
 from torch import nn
 
 from ._devices import canonical_device
+from .composite_component import CompositeComponent, CompositeComponentStore
 from .lora import LoRA, LoRARouteHandle, LoRATransform, ScaledLoRAFactor
 from .module_names import (
     buffer_names,
@@ -24,7 +25,7 @@ from .module_names import (
     resolve_parent_leaf,
 )
 from .pinned_component import PinnedComponent, PinnedComponentStore
-from .protocols import ModelStrategyComponent
+from .pinned_module import PinnedModuleInstance
 from .streamed_component import StreamedComponent, StreamedComponentStore
 from .tensor_adapter_registry import param_representation, select_adapter
 
@@ -48,8 +49,7 @@ class ModelOffloaderStore:
     """
 
     model: nn.Module = field(repr=False, compare=False)
-    pinned_component_store: PinnedComponentStore | None
-    streamed_component_stores: tuple[StreamedComponentStore, ...]
+    composite_store: CompositeComponentStore
     stream_trainable_weights: bool
 
     @classmethod
@@ -85,34 +85,25 @@ class ModelOffloaderStore:
             streamed_param_names=streamed_param_names,
             streamed_buffer_names=streamed_buffer_names,
         )
+        # Pinned first (preserves activation order), then the streamed groups.
+        component_stores: list[PinnedComponentStore | StreamedComponentStore] = []
+        if pinned_component_store is not None:
+            component_stores.append(pinned_component_store)
+        component_stores.extend(streamed_component_stores)
+        _validate_store_components(component_stores)
         return cls(
             model=model,
-            pinned_component_store=pinned_component_store,
-            streamed_component_stores=streamed_component_stores,
+            composite_store=CompositeComponentStore(tuple(component_stores)),
             stream_trainable_weights=stream_trainable_weights,
         )
 
     @property
     def cache_bytes(self) -> int:
-        pinned_bytes = (
-            0
-            if self.pinned_component_store is None
-            else self.pinned_component_store.cache_bytes
-        )
-        streamed_bytes = sum(
-            store.cache_bytes for store in self.streamed_component_stores
-        )
-        return pinned_bytes + streamed_bytes
+        return self.composite_store.cache_bytes
 
     @property
     def has_trainables(self) -> bool:
-        pinned_has_trainables = (
-            self.pinned_component_store is not None
-            and self.pinned_component_store.has_trainables
-        )
-        return pinned_has_trainables or any(
-            store.has_trainables for store in self.streamed_component_stores
-        )
+        return self.composite_store.has_trainables
 
     def bind(
         self,
@@ -122,19 +113,9 @@ class ModelOffloaderStore:
         is_block_checkpointed: Callable[[nn.Module], bool] | None = None,
     ) -> ModelOffloader:
         """Bind this store's backing bytes to ``model``."""
-        streamed_components = [
-            store.bind(model)
-            for store in self.streamed_component_stores
-        ]
-        pinned_component = (
-            None
-            if self.pinned_component_store is None
-            else self.pinned_component_store.bind(model)
-        )
         return ModelOffloader(
             model,
-            pinned_component=pinned_component,
-            streamed_components=streamed_components,
+            components=self.composite_store.bind(model),
             stream_trainable_weights=self.stream_trainable_weights,
             skip_checkpointing_check=skip_checkpointing_check,
             is_block_checkpointed=is_block_checkpointed,
@@ -294,20 +275,15 @@ class ModelOffloader:
         self,
         model: nn.Module,
         *,
-        pinned_component: PinnedComponent | None,
-        streamed_components: Sequence[StreamedComponent] = (),
+        components: CompositeComponent,
         stream_trainable_weights: bool,
         skip_checkpointing_check: bool,
         is_block_checkpointed: Callable[[nn.Module], bool] | None,
     ) -> None:
         self._model = model
         self._active_device: torch.device | None = None
-        self._pinned_component = pinned_component
-        self._streamed_components = list(streamed_components)
-        _validate_components(pinned_component, self._streamed_components)
-        if pinned_component is not None:
-            self._instance = pinned_component._instance
-        self._teardown_stack: contextlib.ExitStack | None = None
+        self._components = components
+        _validate_components(components)
         self._lora_hook_handles: list[_RemovableHook] = []
         self._warned_about_checkpointing: bool = False
         self._stream_trainable_weights: bool = stream_trainable_weights
@@ -374,7 +350,7 @@ class ModelOffloader:
         ``strengths`` defaults to ``1.0`` for each LoRA. Pass an empty
         LoRA sequence to clear all LoRAs (base-only forward).
         """
-        if self._teardown_stack is not None:
+        if self._active_device is not None:
             raise RuntimeError(
                 "ModelOffloader.set_loras() requires the binding "
                 "to be inactive. Call deactivate() first."
@@ -482,8 +458,7 @@ class ModelOffloader:
         param_name: str,
         hook: Callable[[nn.Parameter], None],
     ) -> _RemovableHook:
-        component = self._component_for_param_name(param_name)
-        return component.register_post_copy_hook(param_name, hook)
+        return self._components.register_post_copy_hook(param_name, hook)
 
     def register_post_copy_hook(
         self,
@@ -495,22 +470,7 @@ class ModelOffloader:
 
     def post_copy_hook_key(self, param_name: str) -> int:
         """Stable hook/dedup key for a managed parameter name."""
-        component = self._component_for_param_name(param_name)
-        return component.post_copy_hook_key(param_name)
-
-    def _component_for_param_name(
-        self,
-        param_name: str,
-    ) -> PinnedComponent | StreamedComponent:
-        if (
-            self._pinned_component is not None
-            and param_name in self._pinned_component.param_names
-        ):
-            return self._pinned_component
-        for streamed_component in self._streamed_components:
-            if param_name in streamed_component.param_names:
-                return streamed_component
-        raise KeyError(f"param name {param_name!r} is not managed by this ModelOffloader")
+        return self._components.post_copy_hook_key(param_name)
 
     def _clear_active_lora_hooks(self) -> None:
         while self._lora_hook_handles:
@@ -539,22 +499,12 @@ class ModelOffloader:
     @property
     def param_names(self) -> frozenset[str]:
         """Parameter names managed by this offloader."""
-        names: set[str] = set()
-        if self._pinned_component is not None:
-            names.update(self._pinned_component.param_names)
-        for streamed_component in self._streamed_components:
-            names.update(streamed_component.param_names)
-        return frozenset(names)
+        return self._components.param_names
 
     @property
     def buffer_names(self) -> frozenset[str]:
         """Buffer names managed by this offloader."""
-        names: set[str] = set()
-        if self._pinned_component is not None:
-            names.update(self._pinned_component.buffer_names)
-        for streamed_component in self._streamed_components:
-            names.update(streamed_component.buffer_names)
-        return frozenset(names)
+        return self._components.buffer_names
 
     def _resolve_device(self, device: torch.device | str | None) -> torch.device:
         if device is not None:
@@ -583,32 +533,26 @@ class ModelOffloader:
             self._warn_if_training_without_checkpointing()
         self._active_device = active_device
         try:
-            with contextlib.ExitStack() as stack:
-                targets = (
-                    self._group_lora_factors_by_param_name(self._loras)
-                    if self._loras
-                    else None
-                )
-                if targets is not None:
-                    self._register_lora_hooks(active_device, targets)
-
-                for component in self._iter_components():
-                    stack.callback(component.deactivate)
-                    component.activate(active_device)
-
-                self._teardown_stack = stack.pop_all()
+            # Register LoRA hooks (incl. merge post-copy hooks installed on the
+            # components) BEFORE activating, so they fire during component loads.
+            targets = (
+                self._group_lora_factors_by_param_name(self._loras)
+                if self._loras
+                else None
+            )
+            if targets is not None:
+                self._register_lora_hooks(active_device, targets)
+            # The composite self-cleans its components if activation fails midway.
+            self._components.activate(active_device)
         except BaseException:
             self._clear_loras()
             self._active_device = None
             raise
 
     def deactivate(self) -> None:
-        stack = self._teardown_stack
-        self._teardown_stack = None
         try:
             self._clear_active_lora_hooks()
-            if stack is not None:
-                stack.close()
+            self._components.deactivate()
         finally:
             self._clear_loras()
             self._active_device = None
@@ -653,12 +597,7 @@ class ModelOffloader:
             optimizer.step()        # runs on CPU; states stay on host
             optimizer.zero_grad()
         """
-        with contextlib.ExitStack() as stack:
-            if self._pinned_component is not None:
-                stack.enter_context(self._pinned_component.optimizer_step())
-            for streamed_component in self._streamed_components:
-                if streamed_component.has_trainables:
-                    stack.enter_context(streamed_component.optimizer_step())
+        with self._components.optimizer_step():
             yield
 
     @contextlib.contextmanager
@@ -683,10 +622,34 @@ class ModelOffloader:
 
     # ----------------------------------------------------------- Internals
 
-    def _iter_components(self) -> Iterator[ModelStrategyComponent]:
-        if self._pinned_component is not None:
-            yield self._pinned_component
-        yield from self._streamed_components
+    # Derived read-only views over the composite. Production lifecycle goes
+    # through ``self._components``; these project the typed pieces that the
+    # checkpointing policy (streamed only) and introspection need.
+
+    @property
+    def _streamed_components(self) -> list[StreamedComponent]:
+        return [
+            component
+            for component in self._components.components
+            if isinstance(component, StreamedComponent)
+        ]
+
+    @property
+    def _pinned_component(self) -> PinnedComponent | None:
+        for component in self._components.components:
+            if isinstance(component, PinnedComponent):
+                return component
+        return None
+
+    @property
+    def _instance(self) -> PinnedModuleInstance | None:
+        pinned = self._pinned_component
+        return None if pinned is None else pinned._instance
+
+    def _component_for_param_name(
+        self, param_name: str,
+    ) -> PinnedComponent | StreamedComponent:
+        return self._components.component_for_param_name(param_name)
 
     @property
     def _has_streamed_blocks(self) -> bool:
@@ -912,15 +875,22 @@ def _build_pinned_component_store(
     )
 
 
-def _validate_components(
-    pinned_component: PinnedComponent | None,
-    streamed_components: Sequence[StreamedComponent],
+_NO_COMPONENTS_MSG = (
+    "ModelOffloader requires at least one parameter, registered "
+    "buffer, or streamed block to manage."
+)
+
+
+def _validate_store_components(
+    component_stores: Sequence[PinnedComponentStore | StreamedComponentStore],
 ) -> None:
-    if pinned_component is None and not streamed_components:
-        raise ValueError(
-            "ModelOffloader requires at least one parameter, registered "
-            "buffer, or streamed block to manage."
-        )
+    if not component_stores:
+        raise ValueError(_NO_COMPONENTS_MSG)
+
+
+def _validate_components(components: CompositeComponent) -> None:
+    if not components.components:
+        raise ValueError(_NO_COMPONENTS_MSG)
 
 
 def _component_streams_tensor_state(component: StreamedComponent) -> bool:
