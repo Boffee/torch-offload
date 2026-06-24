@@ -7,7 +7,6 @@ per-weight LoRA application in both modes.
 from __future__ import annotations
 
 import contextlib
-import logging
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import Literal, Protocol
@@ -23,8 +22,6 @@ from .module_names import (
     resolve_parent_leaf,
 )
 from .tensor_adapter_registry import param_representation, select_adapter
-
-logger = logging.getLogger(__name__)
 
 LoraMode = Literal["merge", "routed"]
 _LoraParamMap = dict[str, list[ScaledLoRAFactor]]
@@ -45,7 +42,6 @@ class ModelOffloaderStore:
 
     model: nn.Module = field(repr=False, compare=False)
     composite_store: CompositeComponentStore
-    stream_trainable_weights: bool
 
     @classmethod
     def from_module(
@@ -66,11 +62,7 @@ class ModelOffloaderStore:
             cyclic=cyclic,
             stream_trainable_weights=stream_trainable_weights,
         )
-        return cls(
-            model=model,
-            composite_store=composite_store,
-            stream_trainable_weights=stream_trainable_weights,
-        )
+        return cls(model=model, composite_store=composite_store)
 
     @property
     def cache_bytes(self) -> int:

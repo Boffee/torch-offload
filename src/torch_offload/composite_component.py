@@ -89,6 +89,11 @@ class CompositeComponent:
         already-activated components are deactivated before the exception
         propagates.
         """
+        if self._teardown_stack is not None:
+            raise RuntimeError(
+                "CompositeComponent.activate() called while already active; "
+                "deactivate() first."
+            )
         with contextlib.ExitStack() as stack:
             for component in self._components:
                 stack.callback(component.deactivate)
