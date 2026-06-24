@@ -62,7 +62,7 @@ This library gives you:
 | Situation | Use |
 |---|---|
 | Most application code, especially multiple models or repeated calls | Register model factories with **`ModelCache`** via **`ModelSpec`** |
-| Model too big for a CUDA GPU even when active | Use **`ModelSpec(..., blocks_attr=..., num_resident_blocks=...)`** so the cache creates streamed bindings |
+| Model too big for a CUDA GPU even when active | Register **`ModelSpec(..., blocks_attr=...)`** and stream via **`cache.use(..., num_resident_blocks=...)`** |
 | LoRA adapters reused across calls | Register/apply **`LoRASpec`** through **`ModelCache.use(..., loras=[...])`** |
 | Low-level/manual lifecycle for one model | Use **`ModelOffloaderStore.from_module(model).bind(model)`** directly |
 | Component or resource development | Use the lower-level store/binding protocols and component stores directly |
@@ -142,32 +142,42 @@ and a CUDA-stream-based async prefetcher.
 
 ```python
 import torch
-from torch_offload import ModelOffloaderStore
+from torch_offload import ModelOffloaderStore, StreamConfig
 
 # Store construction pins everything; cache_bytes is final immediately.
+# blocks_attr selects what streams; the residency policy is supplied per
+# activation via StreamConfig, not at construction.
 store = ModelOffloaderStore.from_module(
     model,
-    blocks_attr="transformer_blocks",  # path to the nn.ModuleList
-    num_resident_blocks=1,             # blocks kept on GPU; rest stream in
-    num_prefetch_blocks=2,             # GPU pool = resident + prefetch
+    blocks_attr=["transformer_blocks"],  # path(s) to the nn.ModuleList
 )
 offload = store.bind(model)
 device = torch.device("cuda")
 
-with offload.use(device) as gpu_model:
+with offload.use(
+    device,
+    stream_config=StreamConfig(
+        num_resident_blocks=1,   # blocks kept on GPU; rest stream in
+        num_prefetch_blocks=2,   # GPU pool = resident + prefetch
+    ),
+) as gpu_model:
     output = gpu_model(input_tensor)
 
 del offload, store, model  # drop refs to free pinned host memory
 ```
 
-`num_resident_blocks=1` is right for almost all workloads: eviction is
-LRU, so a sequential pass through the blocks reloads every block each
-iteration regardless of residency — extra resident slots cost GPU
-memory without reducing transfer volume. Spend spare VRAM on
-`num_prefetch_blocks` instead. Values above the block count clamp to
-it, so one config works across models of different depths.
-`num_resident_blocks=None` (the default) disables streaming entirely:
-activation bulk-copies everything to the GPU.
+The residency policy lives on `StreamConfig`, supplied per activation
+(`offload.use(device, stream_config=...)` / `activate(...)`, or
+`cache.use(..., num_resident_blocks=...)`) — it governs GPU residency, a
+runtime concern, and is not part of the pinned backing. `num_resident_blocks=1`
+(the default) is right for almost all workloads: eviction is LRU, so a
+sequential pass through the blocks reloads every block each iteration
+regardless of residency — extra resident slots cost GPU memory without
+reducing transfer volume. Spend spare VRAM on `num_prefetch_blocks` instead.
+Values above the block count clamp to it, so one config works across models
+of different depths. Streaming itself is selected by `blocks_attr`; with no
+`blocks_attr` (the default) nothing streams — the whole model is one
+bulk-pinned component that activation copies to the GPU.
 
 `ModelOffloader` only streams on CUDA. Activating the binding on
 `cpu` is a pass-through over the already-installed pinned CPU storage:
@@ -189,8 +199,7 @@ streaming in-block trainable weights:
 ```python
 store = ModelOffloaderStore.from_module(
     model,
-    blocks_attr="transformer_blocks",
-    num_resident_blocks=1,
+    blocks_attr=["transformer_blocks"],
     stream_trainable_weights=True,
 )
 offload = store.bind(model)
@@ -232,8 +241,7 @@ from safetensors.torch import load_file
 
 store = ModelOffloaderStore.from_module(
     model,
-    blocks_attr="transformer_blocks",
-    num_resident_blocks=1,
+    blocks_attr=["transformer_blocks"],
     # Default: stream_trainable_weights=False
 )
 offload = store.bind(model)
@@ -304,10 +312,10 @@ directly:
 store = ModelOffloaderStore.from_module(
     model,
     blocks_attr=["transformer_blocks", "single_transformer_blocks"],
-    num_resident_blocks=1,         # shared by both groups
-    num_prefetch_blocks=2,
 )
 offload = store.bind(model)
+# One StreamConfig at activation is shared by all groups, e.g.:
+#   offload.use(device, stream_config=StreamConfig(num_resident_blocks=1))
 ```
 
 ### Training streamed blocks
@@ -345,8 +353,7 @@ from torch_offload import ModelOffloaderStore
 
 store = ModelOffloaderStore.from_module(
     model,
-    blocks_attr="transformer_blocks",
-    num_resident_blocks=1,
+    blocks_attr=["transformer_blocks"],
 )
 offload = store.bind(model)
 device = torch.device("cuda")
@@ -363,15 +370,13 @@ with offload.use(device) as gpu_model:
         optimizer.zero_grad()
 ```
 
-`ModelOffloader.activate()` emits a one-time warning if
-`model.training=True` with trainable params present and no
-HuggingFace `gradient_checkpointing` flag is detected on the streamed
-blocks. With `stream_trainable_weights=True`, the same missing check is
-a hard error because trainable weight streaming can silently corrupt
-gradients without checkpointing. Manual `checkpoint(...)` wrapping at
-call sites is invisible from the module tree; pass
-`skip_checkpointing_check=True` only after verifying every streamed
-training block is checkpointed.
+Checkpointing every streamed training block is the caller's
+responsibility — `ModelOffloader` does not auto-detect or warn about its
+absence. It matters most with `stream_trainable_weights=True`, where the
+`.data` swap bypasses autograd's version-counter check, so missing
+checkpointing can silently corrupt gradients. Verify every streamed
+training block is checkpointed (HF `gradient_checkpointing_enable()` or
+manual `torch.utils.checkpoint.checkpoint` wrapping).
 
 Wrap CUDA optimizer updates so managed trainable weights are synced back
 to pinned CPU storage. With `stream_trainable_weights=True`, this also
@@ -416,8 +421,7 @@ cache.register(ModelSpec(
     key="diffusion_model",
     estimated_cache_bytes=24 * 1024**3,
     factory=build_diffusion_model,
-    blocks_attr="transformer_blocks",
-    num_resident_blocks=1,
+    blocks_attr=["transformer_blocks"],
 ))
 
 # First use builds the store; subsequent uses reuse it. The default
@@ -428,7 +432,7 @@ cache.register(ModelSpec(
 with cache.use("text_encoder", device=device) as enc:
     embeddings = enc.encode(prompt)
 
-with cache.use("diffusion_model", device=device) as t:
+with cache.use("diffusion_model", device=device, num_resident_blocks=1) as t:
     latent = t(...)
 
 # When budget pressure forces eviction, the eviction policy chooses
@@ -531,9 +535,11 @@ ModelCache
 
 `ResourceStore` is the cache admission contract: it reports
 `cache_bytes` for reusable backing storage. `ResourceBinding` is the
-per-use lifecycle contract: `value`, `activate(device=None)`, and
-`deactivate()`. `ModelStrategy` specializes `ResourceBinding` for
-`nn.Module` values and adds `model`.
+per-use lifecycle contract: `value`, `activate(device=None, **kwargs)`,
+and `deactivate()` — `activate` accepts resource-specific activation
+policy as keyword arguments (a streamed binding's `stream_config`),
+which non-streaming resources ignore. `ModelStrategy` specializes
+`ResourceBinding` for `nn.Module` values and adds `model`.
 
 `ModelCache` caches stores and creates bindings for `use()` calls.
 Whether a second concurrent same-key binding is allowed is decided by
@@ -551,7 +557,7 @@ class MyBinding:
     def model(self) -> nn.Module: ...
     @property
     def value(self) -> nn.Module: ...
-    def activate(self, device=None) -> None: ...
+    def activate(self, device=None, **kwargs) -> None: ...
     def deactivate(self) -> None: ...
 
 class MyStore:

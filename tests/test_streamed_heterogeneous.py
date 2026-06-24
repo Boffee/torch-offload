@@ -16,7 +16,7 @@ import pytest
 import torch
 from torch import nn
 
-from torch_offload import ModelOffloaderStore
+from torch_offload import ModelOffloaderStore, StreamConfig
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -79,8 +79,6 @@ def test_heterogeneous_block_list_builds_and_partitions_signatures() -> None:
     store = ModelOffloaderStore.from_module(
         model,
         blocks_attr=["blocks"],
-        num_resident_blocks=1,
-        num_prefetch_blocks=2,
     )
     offloader = store.bind(model)
 
@@ -98,8 +96,6 @@ def test_signature_distinguishes_each_dtype() -> None:
     offloader = ModelOffloaderStore.from_module(
         model,
         blocks_attr=["blocks"],
-        num_resident_blocks=1,
-        num_prefetch_blocks=1,
     ).bind(model)
     signatures = _streamed_component(offloader)._block_signatures
     assert len(set(signatures)) == 3
@@ -124,11 +120,12 @@ def test_cuda_streams_mixed_dtype_blocks_matches_reference() -> None:
     offloader = ModelOffloaderStore.from_module(
         model,
         blocks_attr=["blocks"],
-        num_resident_blocks=1,
-        num_prefetch_blocks=2,
     ).bind(model)
 
-    with torch.no_grad(), offloader.use("cuda") as bound:
+    with torch.no_grad(), offloader.use(
+        "cuda",
+        stream_config=StreamConfig(num_resident_blocks=1, num_prefetch_blocks=2),
+    ) as bound:
         streamed = bound(x.cuda()).cpu()
 
     # Tolerant: ref and streamed share dtypes, so the only delta is
@@ -149,12 +146,16 @@ def test_cuda_morphing_pool_reuses_targets_across_iterations() -> None:
     offloader = ModelOffloaderStore.from_module(
         model,
         blocks_attr=["blocks"],
-        num_resident_blocks=num_resident,
-        num_prefetch_blocks=num_prefetch,
     ).bind(model)
 
     component = _streamed_component(offloader)
-    with torch.no_grad(), offloader.use("cuda") as bound:
+    with torch.no_grad(), offloader.use(
+        "cuda",
+        stream_config=StreamConfig(
+            num_resident_blocks=num_resident,
+            num_prefetch_blocks=num_prefetch,
+        ),
+    ) as bound:
         bound(x.cuda())
         bound(x.cuda())
         # Concurrency is block-count bounded, independent of how many
@@ -222,12 +223,13 @@ def test_cuda_streams_mixed_quant_and_plain_blocks() -> None:
     offloader = ModelOffloaderStore.from_module(
         model,
         blocks_attr=["blocks"],
-        num_resident_blocks=1,
-        num_prefetch_blocks=2,
     ).bind(model)
     assert len(set(_streamed_component(offloader)._block_signatures)) == 2
 
-    with torch.no_grad(), offloader.use("cuda") as bound:
+    with torch.no_grad(), offloader.use(
+        "cuda",
+        stream_config=StreamConfig(num_resident_blocks=1, num_prefetch_blocks=2),
+    ) as bound:
         streamed = bound(x.cuda()).cpu()
 
     torch.testing.assert_close(streamed, reference, atol=5e-2, rtol=5e-2)

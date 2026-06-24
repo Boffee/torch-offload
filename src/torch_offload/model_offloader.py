@@ -49,17 +49,11 @@ class ModelOffloaderStore:
         model: nn.Module,
         *,
         blocks_attr: list[str] = [],  # noqa: B006  (read-only; never mutated)
-        num_resident_blocks: int = 1,
-        num_prefetch_blocks: int = 2,
-        cyclic: bool = False,
         stream_trainable_weights: bool = False,
     ) -> ModelOffloaderStore:
         composite_store = CompositeComponentStore.from_module(
             model,
             blocks_attr=blocks_attr,
-            num_resident_blocks=num_resident_blocks,
-            num_prefetch_blocks=num_prefetch_blocks,
-            cyclic=cyclic,
             stream_trainable_weights=stream_trainable_weights,
         )
         return cls(model=model, composite_store=composite_store)
@@ -410,7 +404,9 @@ class ModelOffloader:
             "ModelCache.use(..., device=...)"
         )
 
-    def activate(self, device: torch.device | str | None = None) -> None:
+    def activate(
+        self, device: torch.device | str | None = None, **kwargs: object,
+    ) -> None:
         if self._active_device is not None:
             raise RuntimeError(
                 "ModelOffloader.activate() called while already active "
@@ -435,7 +431,7 @@ class ModelOffloader:
             if targets is not None:
                 self._register_lora_hooks(active_device, targets)
             # The composite self-cleans its components if activation fails midway.
-            self._composite.activate(active_device)
+            self._composite.activate(active_device, **kwargs)
         except BaseException:
             self._clear_loras()
             self._active_device = None
@@ -504,9 +500,11 @@ class ModelOffloader:
             yield
 
     @contextlib.contextmanager
-    def use(self, device: torch.device | str) -> Iterator[nn.Module]:
+    def use(
+        self, device: torch.device | str, **kwargs: object,
+    ) -> Iterator[nn.Module]:
         """Activate on ``device`` for the duration of the context."""
-        self.activate(device)
+        self.activate(device, **kwargs)
         try:
             yield self.model
         finally:

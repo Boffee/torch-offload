@@ -13,7 +13,13 @@ import pytest
 import torch
 from torch import nn
 
-from torch_offload import LoRA, ModelOffloader, ModelOffloaderStore, merge_lora
+from torch_offload import (
+    LoRA,
+    ModelOffloader,
+    ModelOffloaderStore,
+    StreamConfig,
+    merge_lora,
+)
 from torch_offload.int4_tile_adapter import Int4TilePackedAdapter
 from torch_offload.pinned_param import PinnedParam
 from torch_offload.streamed_component import _param_target_layout
@@ -29,17 +35,11 @@ def _make_model_offloader(
     model: nn.Module,
     *,
     blocks_attr: list[str] = [],
-    num_resident_blocks: int = 1,
-    num_prefetch_blocks: int = 2,
-    cyclic: bool = False,
     stream_trainable_weights: bool = False,
 ) -> ModelOffloader:
     store = ModelOffloaderStore.from_module(
         model,
         blocks_attr=blocks_attr,
-        num_resident_blocks=num_resident_blocks,
-        num_prefetch_blocks=num_prefetch_blocks,
-        cyclic=cyclic,
         stream_trainable_weights=stream_trainable_weights,
     )
     return store.bind(model)
@@ -237,8 +237,6 @@ class TestInt4TilePackedAdapter:
         offloader = _make_model_offloader(
             model,
             blocks_attr=["blocks"],
-            num_resident_blocks=1,
-            num_prefetch_blocks=0,
         )
         lora = LoRA(
             state_dict={
@@ -250,7 +248,12 @@ class TestInt4TilePackedAdapter:
 
         try:
             x = torch.randn(64, 256, dtype=torch.bfloat16, device="cuda")
-            with offloader.use("cuda") as active:
+            with offloader.use(
+                "cuda",
+                stream_config=StreamConfig(
+                    num_resident_blocks=1, num_prefetch_blocks=0
+                ),
+            ) as active:
                 y = active(x)
                 torch.cuda.synchronize()
             assert y.shape == (64, 256)

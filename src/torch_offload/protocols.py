@@ -95,7 +95,9 @@ class ModelStrategyComponent(Protocol):
     component in order; return values are ignored.
     """
 
-    def activate(self, device: torch.device | str | None = None) -> None:
+    def activate(
+        self, device: torch.device | str | None = None, **kwargs: object,
+    ) -> None:
         """Make this piece's contribution ready for compute.
 
         Implementations may move weights to GPU, allocate a target pool,
@@ -104,7 +106,9 @@ class ModelStrategyComponent(Protocol):
         :meth:`deactivate` before activating again. ``device`` lets a
         top-level cache pass through the caller's acquire-time device;
         resources that require an explicit device should raise when it
-        is omitted.
+        is omitted. Extra keyword arguments carry resource-specific
+        activation policy (e.g. a streamed component's ``stream_config``);
+        resources that don't use them ignore them.
         """
         ...
 
@@ -198,7 +202,9 @@ class ResourceBinding(Protocol[T_co]):
         """The bound payload yielded by :meth:`ModelCache.use`."""
         ...
 
-    def activate(self, device: torch.device | str | None = None) -> None:
+    def activate(
+        self, device: torch.device | str | None = None, **kwargs: object,
+    ) -> None:
         """Make the binding ready for compute."""
         ...
 

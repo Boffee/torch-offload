@@ -193,7 +193,9 @@ class PinnedComponent:
         """
         return self._instance.register_post_copy_hook(name, hook)
 
-    def activate(self, device: torch.device | str | None = None) -> None:
+    def activate(
+        self, device: torch.device | str | None = None, **kwargs: object,
+    ) -> None:
         """Activate the managed tensors on ``device``.
 
         CUDA activation bulk-DMAs pinned weights to GPU: per-tensor
@@ -216,6 +218,7 @@ class PinnedComponent:
         tensors back to pinned-CPU) followed by dropping the component
         reference.
         """
+        del kwargs  # streaming-only policy; bulk-pinned activation ignores it
         if self._active_device is not None:
             raise RuntimeError(
                 "PinnedComponent.activate() called while already active "

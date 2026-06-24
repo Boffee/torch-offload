@@ -7,7 +7,15 @@ import pytest
 import torch
 from torch import nn
 
-from torch_offload import LoRA, LoRATransform, ModelOffloader, ModelOffloaderStore, ScaledLoRAFactor, merge_lora
+from torch_offload import (
+    LoRA,
+    LoRATransform,
+    ModelOffloader,
+    ModelOffloaderStore,
+    ScaledLoRAFactor,
+    StreamConfig,
+    merge_lora,
+)
 from torch_offload.float8_adapter import Float8Adapter
 from torch_offload.pinned_param import PinnedParam
 from torch_offload.streamed_component import _param_target_layout
@@ -20,17 +28,11 @@ def _make_model_offloader(
     model: nn.Module,
     *,
     blocks_attr: list[str] = [],
-    num_resident_blocks: int = 1,
-    num_prefetch_blocks: int = 2,
-    cyclic: bool = False,
     stream_trainable_weights: bool = False,
 ) -> ModelOffloader:
     store = ModelOffloaderStore.from_module(
         model,
         blocks_attr=blocks_attr,
-        num_resident_blocks=num_resident_blocks,
-        num_prefetch_blocks=num_prefetch_blocks,
-        cyclic=cyclic,
         stream_trainable_weights=stream_trainable_weights,
     )
     return store.bind(model)
@@ -381,14 +383,17 @@ class TestFloat8Adapter:
         offloader = _make_model_offloader(
             model,
             blocks_attr=["blocks"],
-            num_resident_blocks=1,
-            num_prefetch_blocks=0,
         )
         offloader.set_loras([lora], strengths=[0.5], mode="merge")
 
         try:
             x = torch.randn(8, 16, dtype=torch.bfloat16, device="cuda")
-            with offloader.use("cuda") as active:
+            with offloader.use(
+                "cuda",
+                stream_config=StreamConfig(
+                    num_resident_blocks=1, num_prefetch_blocks=0
+                ),
+            ) as active:
                 merged = active.blocks[0].weight.data
                 assert isinstance(merged, float8_tensor_cls)
                 torch.testing.assert_close(
