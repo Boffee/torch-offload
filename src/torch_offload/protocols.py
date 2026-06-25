@@ -7,18 +7,8 @@ These Protocols form the contract:
   Just ``activate(device=...)`` + ``deactivate()``. Components do not
   expose a value because their parent composite owns it.
 
-- :class:`OffloadComponent` -- refines :class:`ModelStrategyComponent`
-  with the aggregation surface a :class:`CompositeComponent` drives on
-  each member (managed names, post-copy hook registration, optimizer
-  step). The composite depends only on this protocol, never on concrete
-  component types.
-
 - :class:`ResourceStore` -- cached backing state. A store owns the
   budgeted cache bytes and can be reused across independent activations.
-
-- :class:`OffloadComponentStore` -- refines :class:`ResourceStore` with
-  the trainable-state flag and the :meth:`bind` factory that yields an
-  :class:`OffloadComponent`.
 
 - :class:`ResourceBinding` -- per-use active binding. A binding exposes
   a typed :attr:`value` accessor plus activate/deactivate lifecycle.
@@ -73,15 +63,10 @@ concern.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Protocol, TypeVar, runtime_checkable
+from typing import Protocol, TypeVar, runtime_checkable
 
 import torch
 from torch import nn
-
-if TYPE_CHECKING:
-    from contextlib import AbstractContextManager
-
-    from .pinned_module import PostCopyHook, PostCopyHookHandle
 
 
 @runtime_checkable
@@ -132,59 +117,6 @@ class ResourceStore(Protocol):
     @property
     def cache_bytes(self) -> int:
         """Bytes charged against the cache budget."""
-        ...
-
-
-@runtime_checkable
-class OffloadComponent(ModelStrategyComponent, Protocol):
-    """A lifecycle component a :class:`CompositeComponent` drives uniformly.
-
-    Refines :class:`ModelStrategyComponent` with the surface a composite
-    aggregates over its members: the managed parameter/buffer names, a
-    post-copy hook registration seam (used by merge-mode LoRA), and an
-    optimizer-step boundary. A composite never branches on whether a member
-    is pinned, streamed, or itself a composite -- it depends only on this
-    protocol, so new component kinds compose without edits to the composite.
-    """
-
-    @property
-    def param_names(self) -> frozenset[str]:
-        """Parameter names this component manages."""
-        ...
-
-    @property
-    def buffer_names(self) -> frozenset[str]:
-        """Buffer names this component manages."""
-        ...
-
-    def register_post_copy_hook(
-        self, name: str, hook: PostCopyHook,
-    ) -> PostCopyHookHandle:
-        """Register a hook fired after ``name`` is copied to its device target."""
-        ...
-
-    def optimizer_step(self) -> AbstractContextManager[None]:
-        """Optimizer-step boundary; a guarded no-op without active trainables."""
-        ...
-
-
-@runtime_checkable
-class OffloadComponentStore(ResourceStore, Protocol):
-    """Reusable backing store that binds to a model, yielding an
-    :class:`OffloadComponent`.
-
-    Refines :class:`ResourceStore` (which owns ``cache_bytes``) with the
-    trainable-state flag the cache uses to gate concurrent bindings, plus the
-    :meth:`bind` factory.
-    """
-
-    @property
-    def has_trainables(self) -> bool:
-        """Whether binding this store manages any trainable parameters."""
-        ...
-
-    def bind(self, model: nn.Module) -> OffloadComponent:
-        """Bind this store's backing state to ``model``."""
         ...
 
 

@@ -1,19 +1,21 @@
 """Composite of offload components, orchestrated as one unit.
 
-A :class:`CompositeComponent` holds an ordered list of offload components
-(:class:`~torch_offload.pinned_component.PinnedComponent` /
-:class:`~torch_offload.streamed_component.StreamedComponent`) and drives them
-together: activate/deactivate as a unit, coordinate the optimizer-step
+A :class:`CompositeComponent` holds a model's offload components — an
+optional pinned remainder
+(:class:`~torch_offload.pinned_component.PinnedComponent`) and zero or more
+streamed block groups
+(:class:`~torch_offload.streamed_component.StreamedComponent`) — and drives
+them together: activate/deactivate as a unit, coordinate the optimizer-step
 boundary, aggregate managed names, and route post-copy hooks to the owning
 component. It satisfies
 :class:`~torch_offload.protocols.ModelStrategyComponent`, so a composite is
 itself composable.
 
-The pinned-vs-streamed distinction lives in the builder
-(:meth:`CompositeComponentStore.from_module`), not in the orchestration:
-:class:`CompositeComponent` drives every component identically through the
-:class:`~torch_offload.protocols.OffloadComponent` protocol, never branching
-on concrete type.
+The pinned remainder and the streamed groups are stored as separate fields
+(the package only ever composes these two kinds), but orchestration is
+uniform: every lifecycle and aggregation operation iterates an ordered member
+list — pinned first, then the streamed groups — and calls the same method on
+each, never branching on concrete type.
 """
 
 from __future__ import annotations
@@ -26,34 +28,58 @@ import torch
 from torch import nn
 
 from .module_names import buffer_names, parameter_names
-from .pinned_component import PinnedComponentStore
+from .pinned_component import PinnedComponent, PinnedComponentStore
 from .pinned_module import PostCopyHook, PostCopyHookHandle
-from .protocols import OffloadComponent, OffloadComponentStore
-from .streamed_component import StreamedComponentStore
+from .streamed_component import StreamedComponent, StreamedComponentStore
 
 
 class CompositeComponent:
-    """An offload component composed of an ordered list of components.
+    """An offload component composed of a pinned remainder and streamed groups.
 
-    Created by binding a :class:`CompositeComponentStore`. Every lifecycle and
-    aggregation operation is type-agnostic — the composite never branches on
-    whether a component is pinned or streamed.
+    Created by binding a :class:`CompositeComponentStore`. The optional pinned
+    component and the streamed block groups are kept as separate fields, but
+    every lifecycle and aggregation method drives them uniformly through an
+    ordered member list (pinned first) — it never branches on whether a member
+    is pinned or streamed.
     """
 
-    def __init__(self, components: Sequence[OffloadComponent]) -> None:
-        self._components = list(components)
+    def __init__(
+        self,
+        *,
+        pinned: PinnedComponent | None,
+        streamed: Sequence[StreamedComponent],
+    ) -> None:
+        self._pinned = pinned
+        self._streamed = tuple(streamed)
         self._teardown_stack: contextlib.ExitStack | None = None
 
     @property
-    def components(self) -> tuple[OffloadComponent, ...]:
-        """The composed components, in activation order."""
-        return tuple(self._components)
+    def pinned(self) -> PinnedComponent | None:
+        """The pinned remainder component, or ``None`` when fully streamed."""
+        return self._pinned
+
+    @property
+    def streamed(self) -> tuple[StreamedComponent, ...]:
+        """The streamed block-group components, in activation order."""
+        return self._streamed
+
+    def _components(self) -> Iterator[PinnedComponent | StreamedComponent]:
+        """Members in activation order: the pinned remainder first (when
+        present), then the streamed groups.
+
+        The single definition of member order, derived from ``_pinned`` /
+        ``_streamed`` on demand and never cached — so there is no second copy
+        that can drift from those two fields.
+        """
+        if self._pinned is not None:
+            yield self._pinned
+        yield from self._streamed
 
     @property
     def param_names(self) -> frozenset[str]:
         """Union of every component's managed parameter names."""
         names: set[str] = set()
-        for component in self._components:
+        for component in self._components():
             names |= component.param_names
         return frozenset(names)
 
@@ -61,13 +87,15 @@ class CompositeComponent:
     def buffer_names(self) -> frozenset[str]:
         """Union of every component's managed buffer names."""
         names: set[str] = set()
-        for component in self._components:
+        for component in self._components():
             names |= component.buffer_names
         return frozenset(names)
 
-    def component_for_param_name(self, param_name: str) -> OffloadComponent:
+    def component_for_param_name(
+        self, param_name: str,
+    ) -> PinnedComponent | StreamedComponent:
         """The component that manages ``param_name``."""
-        for component in self._components:
+        for component in self._components():
             if param_name in component.param_names:
                 return component
         raise KeyError(
@@ -99,7 +127,7 @@ class CompositeComponent:
                 "deactivate() first."
             )
         with contextlib.ExitStack() as stack:
-            for component in self._components:
+            for component in self._components():
                 stack.callback(component.deactivate)
                 component.activate(device, **kwargs)
             self._teardown_stack = stack.pop_all()
@@ -120,7 +148,7 @@ class CompositeComponent:
         no active trainables, so entering all of them is uniform and correct.
         """
         with contextlib.ExitStack() as stack:
-            for component in self._components:
+            for component in self._components():
                 stack.enter_context(component.optimizer_step())
             yield
 
@@ -129,16 +157,19 @@ class CompositeComponent:
 class CompositeComponentStore:
     """Reusable backing stores for a :class:`CompositeComponent`.
 
-    A tuple of component stores (pinned and/or streamed); :meth:`bind` binds
-    each to a model and wraps the results in a :class:`CompositeComponent`.
+    Holds the optional pinned remainder store and the streamed block-group
+    stores separately; :meth:`bind` binds each to a model and wraps the
+    results in a :class:`CompositeComponent`.
     """
 
-    component_stores: tuple[OffloadComponentStore, ...]
+    pinned_store: PinnedComponentStore | None
+    streamed_stores: tuple[StreamedComponentStore, ...]
 
     def __post_init__(self) -> None:
-        if not self.component_stores:
+        if self.pinned_store is None and not self.streamed_stores:
             raise ValueError(
-                "CompositeComponentStore requires at least one component store."
+                "CompositeComponentStore requires a pinned store or at least "
+                "one streamed store."
             )
 
     @classmethod
@@ -154,11 +185,10 @@ class CompositeComponentStore:
         Each ``blocks_attr`` path becomes one
         :class:`~torch_offload.StreamedComponentStore`; everything those groups
         do not claim becomes a single
-        :class:`~torch_offload.PinnedComponentStore`, placed first so it
-        activates before the streamed groups. With no ``blocks_attr`` (the
-        default), nothing streams — the whole model is one pinned component.
+        :class:`~torch_offload.PinnedComponentStore`. With no ``blocks_attr``
+        (the default), nothing streams — the whole model is one pinned store.
         """
-        # One streamed component per block path.
+        # One streamed store per block path.
         streamed_stores = tuple(
             StreamedComponentStore.from_module(
                 model,
@@ -168,42 +198,44 @@ class CompositeComponentStore:
             for blocks_path in blocks_attr
         )
 
-        # The pinned component manages whatever the streamed groups did not claim.
+        # The pinned store manages whatever the streamed groups did not claim.
         streamed_params = {n for s in streamed_stores for n in s.param_names}
         streamed_buffers = {n for s in streamed_stores for n in s.buffer_names}
         pinned_params = parameter_names(model) - streamed_params
         pinned_buffers = buffer_names(model) - streamed_buffers
-
-        # Pinned first (preserves activation order), then the streamed groups.
-        stores: list[PinnedComponentStore | StreamedComponentStore] = []
-        if pinned_params or pinned_buffers:
-            stores.append(
-                PinnedComponentStore.from_module(
-                    model,
-                    include_param_names=pinned_params,
-                    include_buffer_names=pinned_buffers,
-                )
+        pinned_store = (
+            PinnedComponentStore.from_module(
+                model,
+                include_param_names=pinned_params,
+                include_buffer_names=pinned_buffers,
             )
-        stores.extend(streamed_stores)
-        if not stores:
+            if pinned_params or pinned_buffers
+            else None
+        )
+
+        if pinned_store is None and not streamed_stores:
             raise ValueError(
                 "Offloading requires at least one parameter, registered "
                 "buffer, or streamed block to manage."
             )
-        return cls(tuple(stores))
+        return cls(pinned_store=pinned_store, streamed_stores=streamed_stores)
 
     @property
     def cache_bytes(self) -> int:
-        return sum(store.cache_bytes for store in self.component_stores)
+        pinned = self.pinned_store.cache_bytes if self.pinned_store else 0
+        return pinned + sum(s.cache_bytes for s in self.streamed_stores)
 
     @property
     def has_trainables(self) -> bool:
-        return any(store.has_trainables for store in self.component_stores)
+        pinned = bool(self.pinned_store and self.pinned_store.has_trainables)
+        return pinned or any(s.has_trainables for s in self.streamed_stores)
 
     def bind(self, model: nn.Module) -> CompositeComponent:
-        """Bind every component store to ``model``."""
+        """Bind the pinned and streamed stores to ``model``."""
+        pinned = self.pinned_store.bind(model) if self.pinned_store else None
         return CompositeComponent(
-            [store.bind(model) for store in self.component_stores]
+            pinned=pinned,
+            streamed=[s.bind(model) for s in self.streamed_stores],
         )
 
 

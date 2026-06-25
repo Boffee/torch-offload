@@ -1216,11 +1216,12 @@ class TestActivateFailureCleanup:
             blocks_attr=["transformer_blocks"],
         )
         strat._composite = CompositeComponent(
-            [
+            pinned=None,
+            streamed=[
                 _Recorder("A"),
                 _Recorder("B"),
                 _Recorder("C", raise_on_activate=True),
-            ]
+            ],
         )
 
         with pytest.raises(RuntimeError, match="C activate failed"):
