@@ -42,20 +42,9 @@ def pytest_runtest_call(item: pytest.Item) -> Generator[None, None, None]:
 
 def streamed_components(offloader: object) -> list:
     """A ModelOffloader's streamed components (test-introspection helper)."""
-    from torch_offload import StreamedComponent
-
-    return [
-        component
-        for component in offloader._composite.components  # type: ignore[attr-defined]
-        if isinstance(component, StreamedComponent)
-    ]
+    return list(offloader._composite.streamed)  # type: ignore[attr-defined]
 
 
 def pinned_component(offloader: object):
     """A ModelOffloader's pinned component, or None (test-introspection helper)."""
-    from torch_offload import PinnedComponent
-
-    for component in offloader._composite.components:  # type: ignore[attr-defined]
-        if isinstance(component, PinnedComponent):
-            return component
-    return None
+    return offloader._composite.pinned  # type: ignore[attr-defined]
