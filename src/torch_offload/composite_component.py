@@ -230,12 +230,23 @@ class CompositeComponentStore:
         pinned = bool(self.pinned_store and self.pinned_store.has_trainables)
         return pinned or any(s.has_trainables for s in self.streamed_stores)
 
-    def bind(self, model: nn.Module) -> CompositeComponent:
-        """Bind the pinned and streamed stores to ``model``."""
+    def bind(
+        self, model: nn.Module, *, schedule_model: nn.Module | None = None,
+    ) -> CompositeComponent:
+        """Bind the pinned and streamed stores to ``model``.
+
+        ``schedule_model`` is forwarded only to the streamed stores — it
+        redirects their streaming triggers onto a parallel co-scheduled model
+        (see :meth:`~torch_offload.streamed_component.StreamedComponentStore.bind`).
+        The pinned store has no streaming and ignores it.
+        """
         pinned = self.pinned_store.bind(model) if self.pinned_store else None
         return CompositeComponent(
             pinned=pinned,
-            streamed=[s.bind(model) for s in self.streamed_stores],
+            streamed=[
+                s.bind(model, schedule_model=schedule_model)
+                for s in self.streamed_stores
+            ],
         )
 
 

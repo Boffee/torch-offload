@@ -3542,3 +3542,121 @@ class TestRevisedDataOnlyDesign:
             torch.testing.assert_close(
                 streamed_after[name], baseline_t, atol=1e-5, rtol=1e-5,
             )
+
+
+# ---------------------------------------------------------------------------
+# schedule_model: redirect streaming triggers onto a parallel co-scheduled model
+# ---------------------------------------------------------------------------
+
+
+def _record_block_triggers(streamer: StreamedComponent) -> list[int]:
+    """Record the idx of each block-forward trigger without altering behavior."""
+    fired: list[int] = []
+    original = streamer._before_block_forward
+
+    def record(idx: int, **kwargs: object) -> None:
+        fired.append(idx)
+        original(idx, **kwargs)  # type: ignore[arg-type]
+
+    streamer._before_block_forward = record  # type: ignore[method-assign]
+    return fired
+
+
+class TestScheduleModel:
+    def _blocks(self, n: int = 4, width: int = 8) -> list[nn.Module]:
+        blocks = [nn.Linear(width, width, bias=False) for _ in range(n)]
+        for block in blocks:
+            for p in block.parameters():
+                p.requires_grad = False
+        return blocks
+
+    def test_schedule_model_blocks_become_triggers(self) -> None:
+        # Built from the mirror, bound with schedule_model=sched: the
+        # component's trigger sites are the SCHEDULE model's blocks, not the
+        # mirror's own (whose forward never runs in the redesign).
+        mirror_blocks = self._blocks()
+        sched_blocks = self._blocks()
+        mirror = _make_block_list_model(mirror_blocks, "blocks")
+        sched = _make_block_list_model(sched_blocks, "blocks")
+        store = StreamedComponentStore.from_module(
+            mirror, blocks_path="blocks", stream_trainable_weights=False,
+        )
+        streamer = store.bind(mirror, schedule_model=sched)
+
+        assert list(streamer.blocks) == sched_blocks
+        assert all(b not in mirror_blocks for b in streamer.blocks)
+
+    def test_default_triggers_are_own_blocks(self) -> None:
+        # No schedule_model: each block triggers its own streaming (unchanged).
+        mirror_blocks = self._blocks()
+        mirror = _make_block_list_model(mirror_blocks, "blocks")
+        store = StreamedComponentStore.from_module(
+            mirror, blocks_path="blocks", stream_trainable_weights=False,
+        )
+        streamer = store.bind(mirror)
+        assert list(streamer.blocks) == mirror_blocks
+
+    def test_schedule_model_block_count_mismatch_raises(self) -> None:
+        mirror = _make_block_list_model(self._blocks(n=4), "blocks")
+        sched = _make_block_list_model(self._blocks(n=3), "blocks")
+        store = StreamedComponentStore.from_module(
+            mirror, blocks_path="blocks", stream_trainable_weights=False,
+        )
+        with pytest.raises(ValueError, match="schedule_model block count"):
+            store.bind(mirror, schedule_model=sched)
+
+    def test_component_rejects_mismatched_trigger_modules(self) -> None:
+        # Defense-in-depth: the component validates trigger count directly,
+        # independent of the store's earlier check.
+        mirror = _make_block_list_model(self._blocks(n=4), "blocks")
+        store = StreamedComponentStore.from_module(
+            mirror, blocks_path="blocks", stream_trainable_weights=False,
+        )
+        instances = store.bind(mirror)._block_instances
+        with pytest.raises(ValueError, match="one trigger per streamed block"):
+            StreamedComponent(instances, trigger_modules=[nn.Linear(8, 8)])
+
+    def test_offloader_store_threads_schedule_model_to_streamed(self) -> None:
+        # The seam threads through CompositeComponentStore + ModelOffloaderStore:
+        # binding the top-level store with schedule_model lands the triggers on
+        # the schedule model's blocks.
+        mirror_blocks = self._blocks()
+        sched_blocks = self._blocks()
+        mirror = _make_block_list_model(mirror_blocks, "blocks")
+        sched = _make_block_list_model(sched_blocks, "blocks")
+        store = ModelOffloaderStore.from_module(mirror, blocks_attr=["blocks"])
+        offloader = store.bind(mirror, schedule_model=sched)
+        streamer = streamed_components(offloader)[0]
+        assert list(streamer.blocks) == sched_blocks
+
+    @CUDA
+    def test_schedule_model_redirects_streaming_triggers(self) -> None:
+        # End-to-end co-scheduling: hooks land on the schedule model's blocks
+        # (not the mirror's), and forwarding the schedule blocks streams the
+        # mirror's instances in lockstep.
+        mirror_blocks = self._blocks()
+        sched_blocks = self._blocks()
+        mirror = _make_block_list_model(mirror_blocks, "blocks")
+        sched = _make_block_list_model(sched_blocks, "blocks").to("cuda")
+        store = StreamedComponentStore.from_module(
+            mirror, blocks_path="blocks", stream_trainable_weights=False,
+        )
+        streamer = store.bind(mirror, schedule_model=sched)
+
+        with streamer.use(
+            "cuda",
+            stream_config=StreamConfig(
+                num_resident_blocks=1, num_prefetch_blocks=1, cyclic=False,
+            ),
+        ):
+            # Hooks are on the schedule blocks, not the mirror blocks.
+            assert all(not b._forward_pre_hooks for b in mirror_blocks)
+            assert all(len(sb._forward_pre_hooks) == 1 for sb in sched_blocks)
+
+            fired = _record_block_triggers(streamer)
+            x = torch.randn(2, 8, device="cuda")
+            for sb in sched_blocks:
+                sb(x)
+            torch.cuda.synchronize()
+            # Each schedule block's forward fired its mirror instance's load.
+            assert fired == [0, 1, 2, 3]

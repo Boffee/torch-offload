@@ -617,12 +617,23 @@ class StreamedComponentStore:
     def bind(
         self,
         model: nn.Module,
+        *,
+        schedule_model: nn.Module | None = None,
     ) -> StreamedComponent:
         """Bind this store's per-block backing bytes to ``model``.
 
         Each instance owns and is installed onto its model block; loads repoint
         the instance's own module onto the filled target, and that block's
         forward triggers its streaming.
+
+        ``schedule_model`` redirects the streaming triggers onto a parallel
+        external model: its blocks at the same ``blocks_path`` (resolved
+        positionally against ``model``'s) become the forward-pre trigger sites
+        instead of ``model``'s own blocks. Use it to co-schedule this
+        component's loads with another model's forward — e.g. a LoRA factor
+        mirror whose own blocks never run forward, streamed in lockstep with
+        the base model's blocks. The two block lists must be equal length and
+        correspond positionally.
         """
         blocks = self.resolve_blocks(model)
         if len(blocks) != len(self._block_stores):
@@ -634,9 +645,20 @@ class StreamedComponentStore:
             store.bind(block)
             for store, block in zip(self._block_stores, blocks, strict=True)
         ]
+        trigger_modules: list[nn.Module] | None = None
+        if schedule_model is not None:
+            trigger_modules = self.resolve_blocks(schedule_model)
+            if len(trigger_modules) != len(instances):
+                raise ValueError(
+                    "StreamedComponentStore.bind() schedule_model block count "
+                    f"mismatch: bind model has {len(instances)} blocks at "
+                    f"{self.blocks_path!r}, schedule_model has "
+                    f"{len(trigger_modules)}."
+                )
         return StreamedComponent(
             instances,
             name=self.blocks_path,
+            trigger_modules=trigger_modules,
         )
 
 
@@ -710,11 +732,30 @@ class StreamedComponent:
         block_instances: Sequence[PinnedModuleInstance],
         *,
         name: str | None = None,
+        trigger_modules: Sequence[nn.Module] | None = None,
     ) -> None:
         self._block_instances = list(block_instances)
-        # Each block triggers its own streaming: forwarding
-        # ``block_instances[i].module`` loads ``block_instances[i]``. The
-        # trigger block IS the streamed source module (see :attr:`blocks`).
+        # The modules whose forward-pre fires each block's streaming load.
+        # By default a block triggers its OWN streaming: forwarding
+        # ``block_instances[i].module`` loads ``block_instances[i]``, so the
+        # trigger block IS the streamed source module. A caller may instead
+        # redirect triggers onto a parallel external block list (e.g. a
+        # co-scheduled base model whose blocks drive a LoRA factor mirror's
+        # streaming, where the mirror's own blocks never run forward); then
+        # ``trigger_modules[i]`` fires the load of streamed instance ``i``.
+        # The two lists correspond positionally and must be equal length.
+        if trigger_modules is None:
+            self._trigger_modules: list[nn.Module] = [
+                instance.module for instance in self._block_instances
+            ]
+        else:
+            self._trigger_modules = list(trigger_modules)
+            if len(self._trigger_modules) != len(self._block_instances):
+                raise ValueError(
+                    "trigger_modules must have one trigger per streamed block: "
+                    f"got {len(self._trigger_modules)} triggers for "
+                    f"{len(self._block_instances)} blocks."
+                )
         # Per-block layout signature: blocks with equal signatures share
         # pooled GPU targets, so a block list may mix quant formats.
         self._block_signatures = [
@@ -764,12 +805,14 @@ class StreamedComponent:
 
     @property
     def blocks(self) -> tuple[nn.Module, ...]:
-        """The streamed block modules, in order.
+        """The trigger modules whose forward drives streaming, in order.
 
-        ``blocks[i]``'s forward triggers the load of streamed instance ``i``
-        (each block triggers its own streaming).
+        ``blocks[i]``'s forward triggers the load of streamed instance ``i``.
+        By default these are the streamed instances' own modules (each block
+        triggers its own streaming); when triggers are redirected via
+        ``trigger_modules`` they are the external co-scheduled modules.
         """
-        return tuple(inst.module for inst in self._block_instances)
+        return tuple(self._trigger_modules)
 
     @property
     def streamed_param_names_by_block(self) -> list[list[str]]:
@@ -1503,10 +1546,11 @@ class StreamedComponent:
     def _register_hooks(
         self, num_resident: int, num_prefetch_blocks: int, cyclic: bool,
     ) -> None:
-        # Each block's forward-pre hook triggers the load of its own streamed
-        # instance: forwarding ``block_instances[i].module`` loads instance i.
-        # num_prefetch_blocks / cyclic come from activate's StreamConfig, so the
-        # hook closures capture no streaming-policy ``self`` state.
+        # Each trigger module's forward-pre hook fires the load of its streamed
+        # instance: forwarding ``self._trigger_modules[i]`` loads instance i
+        # (by default the trigger IS the streamed block; a redirected trigger
+        # is an external co-scheduled module). num_prefetch_blocks / cyclic come
+        # from activate's StreamConfig, so the closures capture no policy state.
         max_on_gpu = num_resident + num_prefetch_blocks
         num_blocks = len(self._block_instances)
         wrap_threshold = num_blocks // 2  # |Δidx| > this counts as wraparound
@@ -1539,16 +1583,16 @@ class StreamedComponent:
             )
 
         # One pre-hook per DISTINCT trigger module. A module aliased across
-        # blocks (a weight-shared layer appearing multiple times in the block
+        # blocks (a weight-shared layer appearing multiple times in the trigger
         # list) gets a single hook keyed to its last block index; installing one
         # hook per alias would fire them all on a single shared forward and churn
         # the GPU pool (load then immediately evict each aliased block in turn).
         last_idx_by_module: dict[int, int] = {
-            id(instance.module): idx
-            for idx, instance in enumerate(self._block_instances)
+            id(module): idx
+            for idx, module in enumerate(self._trigger_modules)
         }
         for idx in last_idx_by_module.values():
-            h = self._block_instances[idx].module.register_forward_pre_hook(
+            h = self._trigger_modules[idx].register_forward_pre_hook(
                 functools.partial(_pre_hook, idx=idx)
             )
             self._hooks.append(h)
