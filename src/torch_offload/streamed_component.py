@@ -390,32 +390,39 @@ def _pin_block_module_stores(
 def _build_param_name_index(
     instances: Sequence[PinnedModuleInstance],
     prefix: str | None,
+    block_indices: Sequence[int],
 ) -> dict[str, tuple[int, str]]:
+    # The external NAME uses the true block index so a sparse group's params
+    # are addressed at their real path; the stored VALUE keeps the compact
+    # position used to index ``_block_instances`` for the streaming engine.
     index: dict[str, tuple[int, str]] = {}
-    for block_idx, instance in enumerate(instances):
+    for compact_idx, instance in enumerate(instances):
+        true_idx = block_indices[compact_idx]
         for local_name in instance.params:
-            name = _streamed_param_name(prefix, block_idx, local_name)
+            name = _streamed_param_name(prefix, true_idx, local_name)
             if name in index:
                 raise ValueError(
                     f"duplicate streamed parameter name {name!r}"
                 )
-            index[name] = (block_idx, local_name)
+            index[name] = (compact_idx, local_name)
     return index
 
 
 def _build_buffer_name_index(
     instances: Sequence[PinnedModuleInstance],
     prefix: str | None,
+    block_indices: Sequence[int],
 ) -> dict[str, tuple[int, str]]:
     index: dict[str, tuple[int, str]] = {}
-    for block_idx, instance in enumerate(instances):
+    for compact_idx, instance in enumerate(instances):
+        true_idx = block_indices[compact_idx]
         for local_name in instance.buffers:
-            name = _streamed_param_name(prefix, block_idx, local_name)
+            name = _streamed_param_name(prefix, true_idx, local_name)
             if name in index:
                 raise ValueError(
                     f"duplicate streamed buffer name {name!r}"
                 )
-            index[name] = (block_idx, local_name)
+            index[name] = (compact_idx, local_name)
     return index
 
 
@@ -497,6 +504,20 @@ def _block_buffer_names(block: nn.Module) -> set[str]:
     }
 
 
+def _block_is_empty(block: nn.Module) -> bool:
+    """A block with no parameters or buffers at any depth.
+
+    LoRA modules pad unadapted block indices with empty holder modules so
+    adapted factors keep their true block index; these carry nothing to stream
+    and are skipped by :meth:`StreamedComponentStore.from_module`. Real model
+    blocks always carry weights, so this never skips a model block.
+    """
+    return (
+        next(block.parameters(), None) is None
+        and next(block.buffers(), None) is None
+    )
+
+
 # ---------------------------------------------------------------------------
 # LRU tracker
 # ---------------------------------------------------------------------------
@@ -542,10 +563,19 @@ class StreamedComponentStore:
     Built via :meth:`from_module`: the streamed tensor source IS the
     model's block list, resolved by ``blocks_path``. Each block's forward-pre
     hook triggers the load of its own streamed instance.
+
+    ``block_indices`` records which positions of the resolved block list this
+    group actually occupies. :meth:`from_module` skips structurally-empty
+    positions (no parameters or buffers), so a LoRA whose module pads
+    unadapted block indices with empty holders streams only its real blocks
+    while keeping each at its true index — the seam then triggers those blocks
+    on the matching positions of a co-scheduled model. A model's blocks are
+    never empty, so the offloader path keeps the full contiguous range.
     """
 
     _block_stores: tuple[PinnedModuleStore, ...]
     blocks_path: str
+    block_indices: tuple[int, ...]
 
     @classmethod
     def from_module(
@@ -555,8 +585,28 @@ class StreamedComponentStore:
         blocks_path: str,
         stream_trainable_weights: bool = False,
     ) -> StreamedComponentStore:
-        """Resolve ``blocks_path`` on ``model`` and pin its streamed blocks."""
-        blocks = _resolve_blocks(model, blocks_path)
+        """Resolve ``blocks_path`` on ``model`` and pin its streamed blocks.
+
+        Structurally-empty positions (no parameters or buffers) are skipped and
+        dropped from :attr:`block_indices`, so a LoRA that pads unadapted block
+        indices with empty holders streams only its real blocks. The surviving
+        blocks must still agree on selected names (see
+        :func:`_streamed_param_names_for_blocks`); a model's own blocks are
+        never empty, so its full range is kept unchanged.
+        """
+        all_blocks = _resolve_blocks(model, blocks_path)
+        kept = [
+            (idx, block)
+            for idx, block in enumerate(all_blocks)
+            if not _block_is_empty(block)
+        ]
+        if not kept:
+            raise ValueError(
+                f"blocks_attr = {blocks_path!r} has no streamable blocks "
+                "(every block is structurally empty)."
+            )
+        block_indices = tuple(idx for idx, _ in kept)
+        blocks = [block for _, block in kept]
         stream_param_names = _streamed_param_names_for_blocks(
             blocks,
             stream_trainables=stream_trainable_weights,
@@ -570,6 +620,7 @@ class StreamedComponentStore:
         return cls(
             _block_stores=tuple(block_stores),
             blocks_path=blocks_path,
+            block_indices=block_indices,
         )
 
     @property
@@ -584,20 +635,30 @@ class StreamedComponentStore:
 
     @property
     def param_names(self) -> frozenset[str]:
-        """Externally addressable streamed parameter names."""
+        """Externally addressable streamed parameter names.
+
+        Named by TRUE block index (:attr:`block_indices`), not the compact
+        store position — so a sparse group's factors are advertised at their
+        real path (``blocks.2...``) and the pinned-remainder subtraction in
+        :meth:`CompositeComponentStore.from_module` lines up correctly.
+        """
         names = {
-            _streamed_param_name(self.blocks_path, block_idx, local_name)
-            for block_idx, store in enumerate(self._block_stores)
+            _streamed_param_name(self.blocks_path, true_idx, local_name)
+            for true_idx, store in zip(
+                self.block_indices, self._block_stores, strict=True,
+            )
             for local_name in store.params
         }
         return frozenset(names)
 
     @property
     def buffer_names(self) -> frozenset[str]:
-        """Externally addressable streamed buffer names."""
+        """Externally addressable streamed buffer names (true block indices)."""
         names = {
-            _streamed_param_name(self.blocks_path, block_idx, local_name)
-            for block_idx, store in enumerate(self._block_stores)
+            _streamed_param_name(self.blocks_path, true_idx, local_name)
+            for true_idx, store in zip(
+                self.block_indices, self._block_stores, strict=True,
+            )
             for local_name in store.buffers
         }
         return frozenset(names)
@@ -618,8 +679,10 @@ class StreamedComponentStore:
         recover the pinned factor pairs it pinned through this store.
         """
         return {
-            _streamed_param_name(self.blocks_path, block_idx, local_name): pinned
-            for block_idx, store in enumerate(self._block_stores)
+            _streamed_param_name(self.blocks_path, true_idx, local_name): pinned
+            for true_idx, store in zip(
+                self.block_indices, self._block_stores, strict=True,
+            )
             for local_name, pinned in store.params.items()
         }
 
@@ -640,40 +703,64 @@ class StreamedComponentStore:
         forward triggers its streaming.
 
         ``schedule_model`` redirects the streaming triggers onto a parallel
-        external model: its blocks at the same ``blocks_path`` (resolved
-        positionally against ``model``'s) become the forward-pre trigger sites
-        instead of ``model``'s own blocks. Use it to co-schedule this
-        component's loads with another model's forward — e.g. a LoRA factor
-        mirror whose own blocks never run forward, streamed in lockstep with
-        the base model's blocks. The two block lists must be equal length and
-        correspond positionally.
+        external model: its blocks at the same ``blocks_path`` become the
+        forward-pre trigger sites instead of ``model``'s own blocks. Use it to
+        co-schedule this component's loads with another model's forward — e.g.
+        a LoRA whose own blocks never run forward, streamed in lockstep with
+        the base model's blocks.
+
+        Both models are indexed by :attr:`block_indices`, so each must have a
+        block at every occupied position (at least ``block_indices[-1] + 1``
+        blocks). The two roles differ on *unoccupied* blocks: ``model`` owns
+        the streamed bytes, so any non-empty block it has outside
+        ``block_indices`` is rejected (it would be silently unmanaged — never
+        moved or streamed). ``schedule_model`` only supplies triggers, so its
+        extra blocks are fine and simply never fire — a LoRA co-scheduled on a
+        larger base model is the intended case.
         """
-        blocks = self.resolve_blocks(model)
-        if len(blocks) != len(self._block_stores):
+        last = self.block_indices[-1]
+        bind_blocks = self.resolve_blocks(model)
+        if last >= len(bind_blocks):
             raise ValueError(
-                "StreamedComponentStore.bind() block count mismatch: "
-                f"store has {len(self._block_stores)}, got {len(blocks)}."
+                f"StreamedComponentStore.bind() bind model has too few blocks "
+                f"at {self.blocks_path!r}: needs index {last}, found "
+                f"{len(bind_blocks)}."
             )
-        # Preflight the schedule_model count BEFORE binding, so a mismatch
-        # raises without having installed pinned params into the bind model.
+        occupied = set(self.block_indices)
+        unmanaged = [
+            pos
+            for pos, block in enumerate(bind_blocks)
+            if pos not in occupied and not _block_is_empty(block)
+        ]
+        if unmanaged:
+            raise ValueError(
+                f"StreamedComponentStore.bind() bind model has non-empty "
+                f"block(s) {unmanaged} at {self.blocks_path!r} that this store "
+                f"does not occupy (it occupies {list(self.block_indices)}); "
+                "those blocks would never be moved or streamed. Bind a model "
+                "whose only non-empty blocks are the occupied ones."
+            )
+        # Resolve and bounds-check the schedule_model BEFORE binding, so a
+        # too-short model raises without having installed pinned params.
         trigger_modules: list[nn.Module] | None = None
         if schedule_model is not None:
-            trigger_modules = self.resolve_blocks(schedule_model)
-            if len(trigger_modules) != len(self._block_stores):
+            sched_blocks = self.resolve_blocks(schedule_model)
+            if last >= len(sched_blocks):
                 raise ValueError(
-                    "StreamedComponentStore.bind() schedule_model block count "
-                    f"mismatch: bind model has {len(self._block_stores)} blocks "
-                    f"at {self.blocks_path!r}, schedule_model has "
-                    f"{len(trigger_modules)}."
+                    f"StreamedComponentStore.bind() schedule_model has too few "
+                    f"blocks at {self.blocks_path!r}: needs index {last}, found "
+                    f"{len(sched_blocks)}."
                 )
+            trigger_modules = [sched_blocks[idx] for idx in self.block_indices]
         instances = [
-            store.bind(block)
-            for store, block in zip(self._block_stores, blocks, strict=True)
+            store.bind(bind_blocks[idx])
+            for store, idx in zip(self._block_stores, self.block_indices, strict=True)
         ]
         return StreamedComponent(
             instances,
             name=self.blocks_path,
             trigger_modules=trigger_modules,
+            block_indices=self.block_indices,
         )
 
 
@@ -740,6 +827,11 @@ class StreamedComponent:
         block (the ``.data`` swap bypasses autograd's version-counter
         check). The streamer doesn't enforce that precondition itself —
         :class:`ModelOffloader` does.
+    block_indices:
+        True block index for each instance, used to NAME its params/buffers
+        (so a sparse group addresses ``"blocks.2.weight"`` not the compact
+        ``"blocks.1.weight"``). The streaming engine still uses the compact
+        ``0..k-1`` position internally. Defaults to ``0..k-1`` (contiguous).
     """
 
     def __init__(
@@ -748,8 +840,18 @@ class StreamedComponent:
         *,
         name: str | None = None,
         trigger_modules: Sequence[nn.Module] | None = None,
+        block_indices: Sequence[int] | None = None,
     ) -> None:
         self._block_instances = list(block_instances)
+        if block_indices is None:
+            block_indices = range(len(self._block_instances))
+        block_indices = list(block_indices)
+        if len(block_indices) != len(self._block_instances):
+            raise ValueError(
+                "block_indices must have one index per streamed block: "
+                f"got {len(block_indices)} for "
+                f"{len(self._block_instances)} blocks."
+            )
         # The modules whose forward-pre fires each block's streaming load.
         # By default a block triggers its OWN streaming: forwarding
         # ``block_instances[i].module`` loads ``block_instances[i]``, so the
@@ -782,10 +884,12 @@ class StreamedComponent:
         self._param_name_to_block_param = _build_param_name_index(
             self._block_instances,
             name,
+            block_indices,
         )
         self._buffer_name_to_block_buffer = _build_buffer_name_index(
             self._block_instances,
             name,
+            block_indices,
         )
         self._param_names = frozenset(self._param_name_to_block_param)
         self._buffer_names = frozenset(self._buffer_name_to_block_buffer)

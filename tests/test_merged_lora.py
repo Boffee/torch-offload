@@ -1790,16 +1790,30 @@ class TestLoRABlocksAttr:
         assert set(lora.targets) == {"0.weight"}
         assert isinstance(lora._module, nn.ModuleList)  # type: ignore[arg-type]
 
-    def test_sparse_blocks_attr_streaming_unsupported_for_now(self) -> None:
-        # Streaming a sparse block group is not supported yet: the streamed
-        # component requires uniform per-block param names, and the empty
-        # holder block has none. Sparse LoRAs use the default all-pinned store
-        # until empty-block streaming lands (with routed co-scheduling). See #26.
-        with pytest.raises(ValueError, match="same parameter names"):
-            LoRA(
-                state_dict=self._sparse_sd(),
-                blocks_attr=["transformer_blocks"],
-            )
+    def test_sparse_blocks_attr_streaming_skips_empty_holders(self) -> None:
+        # A sparse LoRA streams fine now (#26): the empty holder block at the
+        # gap is skipped, the two adapted blocks pass the uniform-name check,
+        # and their TRUE indices are recorded so the seam can co-schedule them
+        # against the matching base-model blocks.
+        lora = LoRA(
+            state_dict=self._sparse_sd(),
+            blocks_attr=["transformer_blocks"],
+        )
+        (streamed,) = lora._store.streamed_stores
+        assert streamed.block_indices == (0, 2)
+        assert len(streamed._block_stores) == 2
+        # Names use TRUE indices (0, 2), so there is no bogus block-1 target
+        # and no duplicate block-2 target leaking through the pinned remainder.
+        assert streamed.param_names == frozenset({
+            "transformer_blocks.0.attn.lora_A.weight",
+            "transformer_blocks.0.attn.lora_B.weight",
+            "transformer_blocks.2.attn.lora_A.weight",
+            "transformer_blocks.2.attn.lora_B.weight",
+        })
+        assert set(lora.targets) == {
+            "transformer_blocks.0.attn.weight",
+            "transformer_blocks.2.attn.weight",
+        }
 
     def test_non_block_adapter_goes_to_pinned_remainder(self) -> None:
         sd = _make_lora_sd(num_blocks=2, dim=16)
