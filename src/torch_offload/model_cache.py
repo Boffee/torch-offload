@@ -63,7 +63,7 @@ import torch
 from torch import nn
 
 from ._devices import canonical_device
-from .lora import KeyTransformT, LoRA, default_key_transform
+from .lora import LoRA
 from .model_offloader import LoraMode, ModelOffloader, ModelOffloaderStore
 from .protocols import ResourceBinding, ResourceStore
 from .stream_config import StreamConfig
@@ -209,10 +209,9 @@ class LoRASpec(ResourceSpec[LoRA]):
         key: str,
         estimated_cache_bytes: int,
         factory: Callable[[], dict[str, torch.Tensor]],
-        key_transform: KeyTransformT = default_key_transform,
     ) -> None:
         def store_factory() -> ResourceStore:
-            return LoRA(factory(), key_transform=key_transform)
+            return LoRA(factory())
 
         def bind(store: ResourceStore) -> ResourceBinding[LoRA]:
             return cast(LoRA, store).bind()

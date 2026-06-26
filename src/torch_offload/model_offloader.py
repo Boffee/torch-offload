@@ -66,9 +66,21 @@ class ModelOffloaderStore:
     def has_trainables(self) -> bool:
         return self.composite_store.has_trainables
 
-    def bind(self, model: nn.Module) -> ModelOffloader:
-        """Bind this store's backing bytes to ``model``."""
-        return ModelOffloader(model, composite=self.composite_store.bind(model))
+    def bind(
+        self, model: nn.Module, *, schedule_model: nn.Module | None = None,
+    ) -> ModelOffloader:
+        """Bind this store's backing bytes to ``model``.
+
+        ``schedule_model`` co-schedules streamed components' loads with another
+        model's forward; see
+        :meth:`~torch_offload.streamed_component.StreamedComponentStore.bind`.
+        """
+        return ModelOffloader(
+            model,
+            composite=self.composite_store.bind(
+                model, schedule_model=schedule_model,
+            ),
+        )
 
 
 __all__ = [
