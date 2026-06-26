@@ -390,32 +390,39 @@ def _pin_block_module_stores(
 def _build_param_name_index(
     instances: Sequence[PinnedModuleInstance],
     prefix: str | None,
+    block_indices: Sequence[int],
 ) -> dict[str, tuple[int, str]]:
+    # The external NAME uses the true block index so a sparse group's params
+    # are addressed at their real path; the stored VALUE keeps the compact
+    # position used to index ``_block_instances`` for the streaming engine.
     index: dict[str, tuple[int, str]] = {}
-    for block_idx, instance in enumerate(instances):
+    for compact_idx, instance in enumerate(instances):
+        true_idx = block_indices[compact_idx]
         for local_name in instance.params:
-            name = _streamed_param_name(prefix, block_idx, local_name)
+            name = _streamed_param_name(prefix, true_idx, local_name)
             if name in index:
                 raise ValueError(
                     f"duplicate streamed parameter name {name!r}"
                 )
-            index[name] = (block_idx, local_name)
+            index[name] = (compact_idx, local_name)
     return index
 
 
 def _build_buffer_name_index(
     instances: Sequence[PinnedModuleInstance],
     prefix: str | None,
+    block_indices: Sequence[int],
 ) -> dict[str, tuple[int, str]]:
     index: dict[str, tuple[int, str]] = {}
-    for block_idx, instance in enumerate(instances):
+    for compact_idx, instance in enumerate(instances):
+        true_idx = block_indices[compact_idx]
         for local_name in instance.buffers:
-            name = _streamed_param_name(prefix, block_idx, local_name)
+            name = _streamed_param_name(prefix, true_idx, local_name)
             if name in index:
                 raise ValueError(
                     f"duplicate streamed buffer name {name!r}"
                 )
-            index[name] = (block_idx, local_name)
+            index[name] = (compact_idx, local_name)
     return index
 
 
@@ -628,20 +635,30 @@ class StreamedComponentStore:
 
     @property
     def param_names(self) -> frozenset[str]:
-        """Externally addressable streamed parameter names."""
+        """Externally addressable streamed parameter names.
+
+        Named by TRUE block index (:attr:`block_indices`), not the compact
+        store position — so a sparse group's factors are advertised at their
+        real path (``blocks.2...``) and the pinned-remainder subtraction in
+        :meth:`CompositeComponentStore.from_module` lines up correctly.
+        """
         names = {
-            _streamed_param_name(self.blocks_path, block_idx, local_name)
-            for block_idx, store in enumerate(self._block_stores)
+            _streamed_param_name(self.blocks_path, true_idx, local_name)
+            for true_idx, store in zip(
+                self.block_indices, self._block_stores, strict=True,
+            )
             for local_name in store.params
         }
         return frozenset(names)
 
     @property
     def buffer_names(self) -> frozenset[str]:
-        """Externally addressable streamed buffer names."""
+        """Externally addressable streamed buffer names (true block indices)."""
         names = {
-            _streamed_param_name(self.blocks_path, block_idx, local_name)
-            for block_idx, store in enumerate(self._block_stores)
+            _streamed_param_name(self.blocks_path, true_idx, local_name)
+            for true_idx, store in zip(
+                self.block_indices, self._block_stores, strict=True,
+            )
             for local_name in store.buffers
         }
         return frozenset(names)
@@ -662,8 +679,10 @@ class StreamedComponentStore:
         recover the pinned factor pairs it pinned through this store.
         """
         return {
-            _streamed_param_name(self.blocks_path, block_idx, local_name): pinned
-            for block_idx, store in enumerate(self._block_stores)
+            _streamed_param_name(self.blocks_path, true_idx, local_name): pinned
+            for true_idx, store in zip(
+                self.block_indices, self._block_stores, strict=True,
+            )
             for local_name, pinned in store.params.items()
         }
 
@@ -688,11 +707,16 @@ class StreamedComponentStore:
         forward-pre trigger sites instead of ``model``'s own blocks. Use it to
         co-schedule this component's loads with another model's forward — e.g.
         a LoRA whose own blocks never run forward, streamed in lockstep with
-        the base model's blocks. Both ``model`` and ``schedule_model`` are
-        indexed by :attr:`block_indices`, so each must have a block at every
-        occupied position (at least ``block_indices[-1] + 1`` blocks); a LoRA
-        occupying a subset of a larger model's blocks is fine, and the extra
-        blocks simply never trigger.
+        the base model's blocks.
+
+        Both models are indexed by :attr:`block_indices`, so each must have a
+        block at every occupied position (at least ``block_indices[-1] + 1``
+        blocks). The two roles differ on *unoccupied* blocks: ``model`` owns
+        the streamed bytes, so any non-empty block it has outside
+        ``block_indices`` is rejected (it would be silently unmanaged — never
+        moved or streamed). ``schedule_model`` only supplies triggers, so its
+        extra blocks are fine and simply never fire — a LoRA co-scheduled on a
+        larger base model is the intended case.
         """
         last = self.block_indices[-1]
         bind_blocks = self.resolve_blocks(model)
@@ -701,6 +725,20 @@ class StreamedComponentStore:
                 f"StreamedComponentStore.bind() bind model has too few blocks "
                 f"at {self.blocks_path!r}: needs index {last}, found "
                 f"{len(bind_blocks)}."
+            )
+        occupied = set(self.block_indices)
+        unmanaged = [
+            pos
+            for pos, block in enumerate(bind_blocks)
+            if pos not in occupied and not _block_is_empty(block)
+        ]
+        if unmanaged:
+            raise ValueError(
+                f"StreamedComponentStore.bind() bind model has non-empty "
+                f"block(s) {unmanaged} at {self.blocks_path!r} that this store "
+                f"does not occupy (it occupies {list(self.block_indices)}); "
+                "those blocks would never be moved or streamed. Bind a model "
+                "whose only non-empty blocks are the occupied ones."
             )
         # Resolve and bounds-check the schedule_model BEFORE binding, so a
         # too-short model raises without having installed pinned params.
@@ -722,6 +760,7 @@ class StreamedComponentStore:
             instances,
             name=self.blocks_path,
             trigger_modules=trigger_modules,
+            block_indices=self.block_indices,
         )
 
 
@@ -788,6 +827,11 @@ class StreamedComponent:
         block (the ``.data`` swap bypasses autograd's version-counter
         check). The streamer doesn't enforce that precondition itself —
         :class:`ModelOffloader` does.
+    block_indices:
+        True block index for each instance, used to NAME its params/buffers
+        (so a sparse group addresses ``"blocks.2.weight"`` not the compact
+        ``"blocks.1.weight"``). The streaming engine still uses the compact
+        ``0..k-1`` position internally. Defaults to ``0..k-1`` (contiguous).
     """
 
     def __init__(
@@ -796,8 +840,18 @@ class StreamedComponent:
         *,
         name: str | None = None,
         trigger_modules: Sequence[nn.Module] | None = None,
+        block_indices: Sequence[int] | None = None,
     ) -> None:
         self._block_instances = list(block_instances)
+        if block_indices is None:
+            block_indices = range(len(self._block_instances))
+        block_indices = list(block_indices)
+        if len(block_indices) != len(self._block_instances):
+            raise ValueError(
+                "block_indices must have one index per streamed block: "
+                f"got {len(block_indices)} for "
+                f"{len(self._block_instances)} blocks."
+            )
         # The modules whose forward-pre fires each block's streaming load.
         # By default a block triggers its OWN streaming: forwarding
         # ``block_instances[i].module`` loads ``block_instances[i]``, so the
@@ -830,10 +884,12 @@ class StreamedComponent:
         self._param_name_to_block_param = _build_param_name_index(
             self._block_instances,
             name,
+            block_indices,
         )
         self._buffer_name_to_block_buffer = _build_buffer_name_index(
             self._block_instances,
             name,
+            block_indices,
         )
         self._param_names = frozenset(self._param_name_to_block_param)
         self._buffer_names = frozenset(self._buffer_name_to_block_buffer)

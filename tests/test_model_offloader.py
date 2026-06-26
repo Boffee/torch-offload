@@ -3667,6 +3667,32 @@ class TestScheduleModel:
         streamer = store.bind(mirror, schedule_model=sched)
         assert list(streamer.blocks) == [sched_blocks[1], sched_blocks[3]]
 
+    def test_bind_model_with_unmanaged_nonempty_blocks_raises(self) -> None:
+        # A 3-block store bound to a 5-block model: positions 3 and 4 are
+        # non-empty and unoccupied, so they would be silently unmanaged (never
+        # moved or streamed). The bind model — unlike schedule_model — must
+        # reject them.
+        store_model = _make_block_list_model(self._blocks(n=3), "blocks")
+        bind_model = _make_block_list_model(self._blocks(n=5), "blocks")
+        store = StreamedComponentStore.from_module(
+            store_model, blocks_path="blocks", stream_trainable_weights=False,
+        )
+        with pytest.raises(ValueError, match="does not occupy"):
+            store.bind(bind_model)
+
+    def test_bind_model_empty_unoccupied_blocks_allowed(self) -> None:
+        # The mirror of test_subset_triggers... covers the converse: a bind
+        # model whose unoccupied positions are EMPTY holders binds fine. Here
+        # an empty trailing holder past the occupied range is also accepted.
+        real = self._blocks(n=2)
+        mixed: list[nn.Module] = [real[0], real[1], nn.Module()]
+        bind_model = _make_block_list_model(mixed, "blocks")
+        store = StreamedComponentStore.from_module(
+            bind_model, blocks_path="blocks", stream_trainable_weights=False,
+        )
+        assert store.block_indices == (0, 1)
+        store.bind(bind_model)  # empty holder at position 2 is fine
+
     def test_all_empty_blocks_raises(self) -> None:
         mirror = _make_block_list_model(
             [nn.Module(), nn.Module()], "blocks",

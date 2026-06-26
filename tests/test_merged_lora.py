@@ -1802,6 +1802,18 @@ class TestLoRABlocksAttr:
         (streamed,) = lora._store.streamed_stores
         assert streamed.block_indices == (0, 2)
         assert len(streamed._block_stores) == 2
+        # Names use TRUE indices (0, 2), so there is no bogus block-1 target
+        # and no duplicate block-2 target leaking through the pinned remainder.
+        assert streamed.param_names == frozenset({
+            "transformer_blocks.0.attn.lora_A.weight",
+            "transformer_blocks.0.attn.lora_B.weight",
+            "transformer_blocks.2.attn.lora_A.weight",
+            "transformer_blocks.2.attn.lora_B.weight",
+        })
+        assert set(lora.targets) == {
+            "transformer_blocks.0.attn.weight",
+            "transformer_blocks.2.attn.weight",
+        }
 
     def test_non_block_adapter_goes_to_pinned_remainder(self) -> None:
         sd = _make_lora_sd(num_blocks=2, dim=16)
