@@ -1776,6 +1776,20 @@ class TestLoRABlocksAttr:
         # The path the routed apply resolves on the model is reachable.
         assert lora._module.get_submodule("blocks.0.1.attn.lora_A") is not None
 
+    def test_root_level_numeric_paths(self) -> None:
+        # A root-level nn.Sequential / nn.ModuleList model has params like
+        # ``0.weight``, so factor keys start with an index — the root holder
+        # must itself be a ModuleList (regression: a plain-Module root crashed
+        # the path-walk on the first numeric segment).
+        g = torch.Generator().manual_seed(0)
+        sd = {
+            "0.lora_A.weight": torch.randn(4, 16, generator=g),
+            "0.lora_B.weight": torch.randn(16, 4, generator=g),
+        }
+        lora = LoRA(state_dict=sd)
+        assert set(lora.targets) == {"0.weight"}
+        assert isinstance(lora._module, nn.ModuleList)  # type: ignore[arg-type]
+
     def test_sparse_blocks_attr_streaming_unsupported_for_now(self) -> None:
         # Streaming a sparse block group is not supported yet: the streamed
         # component requires uniform per-block param names, and the empty

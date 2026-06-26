@@ -3605,6 +3605,22 @@ class TestScheduleModel:
         with pytest.raises(ValueError, match="schedule_model block count"):
             store.bind(mirror, schedule_model=sched)
 
+    def test_schedule_model_mismatch_preflights_before_binding(self) -> None:
+        # A schedule_model count mismatch must raise BEFORE store.bind installs
+        # pinned params into the (separate) bind model — no partial mutation.
+        mirror = _make_block_list_model(self._blocks(n=4), "blocks")
+        bind_blocks = self._blocks(n=4)
+        bind_model = _make_block_list_model(bind_blocks, "blocks")
+        sched = _make_block_list_model(self._blocks(n=3), "blocks")
+        store = StreamedComponentStore.from_module(
+            mirror, blocks_path="blocks", stream_trainable_weights=False,
+        )
+        before = [b.weight.data_ptr() for b in bind_blocks]
+        with pytest.raises(ValueError, match="schedule_model block count"):
+            store.bind(bind_model, schedule_model=sched)
+        after = [b.weight.data_ptr() for b in bind_blocks]
+        assert before == after  # bind model left untouched
+
     def test_component_rejects_mismatched_trigger_modules(self) -> None:
         # Defense-in-depth: the component validates trigger count directly,
         # independent of the store's earlier check.

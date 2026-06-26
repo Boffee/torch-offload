@@ -443,10 +443,20 @@ def _build_lora_module(state_dict: dict[str, torch.Tensor]) -> nn.Module:
     unadapted); a name segment is an attribute submodule. Well-formedness is
     checked separately by :func:`_validate_lora_state_dict`.
     """
-    root = nn.Module()
-    for key, tensor in state_dict.items():
-        if not key.endswith((".lora_A.weight", ".lora_B.weight")):
-            continue
+    factor_keys = [
+        key for key in state_dict
+        if key.endswith((".lora_A.weight", ".lora_B.weight"))
+    ]
+    # The root holder is itself an nn.ModuleList when paths start with an
+    # index — a root-level nn.Sequential / nn.ModuleList model whose params
+    # are ``0.weight`` etc., so factor keys are ``0.lora_A.weight``.
+    root: nn.Module = (
+        nn.ModuleList()
+        if any(key.split(".", 1)[0].isdigit() for key in factor_keys)
+        else nn.Module()
+    )
+    for key in factor_keys:
+        tensor = state_dict[key]
         *mod_segs, param_name = key.split(".")
         node: nn.Module = root
         for i, seg in enumerate(mod_segs):

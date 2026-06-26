@@ -654,20 +654,22 @@ class StreamedComponentStore:
                 "StreamedComponentStore.bind() block count mismatch: "
                 f"store has {len(self._block_stores)}, got {len(blocks)}."
             )
+        # Preflight the schedule_model count BEFORE binding, so a mismatch
+        # raises without having installed pinned params into the bind model.
+        trigger_modules: list[nn.Module] | None = None
+        if schedule_model is not None:
+            trigger_modules = self.resolve_blocks(schedule_model)
+            if len(trigger_modules) != len(self._block_stores):
+                raise ValueError(
+                    "StreamedComponentStore.bind() schedule_model block count "
+                    f"mismatch: bind model has {len(self._block_stores)} blocks "
+                    f"at {self.blocks_path!r}, schedule_model has "
+                    f"{len(trigger_modules)}."
+                )
         instances = [
             store.bind(block)
             for store, block in zip(self._block_stores, blocks, strict=True)
         ]
-        trigger_modules: list[nn.Module] | None = None
-        if schedule_model is not None:
-            trigger_modules = self.resolve_blocks(schedule_model)
-            if len(trigger_modules) != len(instances):
-                raise ValueError(
-                    "StreamedComponentStore.bind() schedule_model block count "
-                    f"mismatch: bind model has {len(instances)} blocks at "
-                    f"{self.blocks_path!r}, schedule_model has "
-                    f"{len(trigger_modules)}."
-                )
         return StreamedComponent(
             instances,
             name=self.blocks_path,
