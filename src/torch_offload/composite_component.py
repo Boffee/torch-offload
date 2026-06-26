@@ -30,6 +30,7 @@ from torch import nn
 from .module_names import buffer_names, parameter_names
 from .pinned_component import PinnedComponent, PinnedComponentStore
 from .pinned_module import PostCopyHook, PostCopyHookHandle
+from .pinned_param import PinnedParam
 from .streamed_component import StreamedComponent, StreamedComponentStore
 
 
@@ -229,6 +230,15 @@ class CompositeComponentStore:
     def has_trainables(self) -> bool:
         pinned = bool(self.pinned_store and self.pinned_store.has_trainables)
         return pinned or any(s.has_trainables for s in self.streamed_stores)
+
+    def pinned_params(self) -> dict[str, PinnedParam]:
+        """Every pinned param across pinned + streamed members, by full name."""
+        result: dict[str, PinnedParam] = {}
+        if self.pinned_store is not None:
+            result.update(self.pinned_store.pinned_params())
+        for store in self.streamed_stores:
+            result.update(store.pinned_params())
+        return result
 
     def bind(
         self, model: nn.Module, *, schedule_model: nn.Module | None = None,

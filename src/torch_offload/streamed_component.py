@@ -610,6 +610,19 @@ class StreamedComponentStore:
     def has_trainables(self) -> bool:
         return any(store.has_trainables for store in self._block_stores)
 
+    def pinned_params(self) -> dict[str, PinnedParam]:
+        """Externally-named pinned params backing this group, by full name.
+
+        Keys match :attr:`param_names` (``"blocks.3.weight"``-style); values
+        are the shared :class:`PinnedParam` host backings. Lets a composer
+        recover the pinned factor pairs it pinned through this store.
+        """
+        return {
+            _streamed_param_name(self.blocks_path, block_idx, local_name): pinned
+            for block_idx, store in enumerate(self._block_stores)
+            for local_name, pinned in store.params.items()
+        }
+
     def resolve_blocks(self, model: nn.Module) -> list[nn.Module]:
         """Resolve this store's blocks path on ``model``."""
         return _resolve_blocks(model, self.blocks_path)

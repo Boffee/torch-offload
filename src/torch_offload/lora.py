@@ -29,7 +29,7 @@ on deactivate.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from types import TracebackType
 from typing import Any
@@ -37,6 +37,7 @@ from typing import Any
 import torch
 from torch import nn
 
+from .composite_component import CompositeComponentStore
 from .pinned_param import PinnedParam
 from .tensor_adapter_registry import param_representation, select_adapter
 from .tensor_adapters import (
@@ -46,17 +47,12 @@ from .tensor_adapters import (
 )
 
 __all__ = [
-    "KeyTransformT",
     "LoRA",
     "LoRAFactor",
     "LoRARouteHandle",
     "LoRATransform",
     "ScaledLoRAFactor",
-    "default_key_transform",
 ]
-
-
-KeyTransformT = Callable[[str], str] | None
 
 
 @dataclass(slots=True, frozen=True)
@@ -68,9 +64,9 @@ class LoRAFactor:
     so the offload stack can stream them to GPU through the same target
     pool the model's weights use. Strength is *not* part of the pair — it is
     extrinsic and supplied when the LoRA is bound to a target. Per-pair shape
-    validity is checked before pinning (in :func:`_pair_and_pin`); the match
-    against a concrete target shape is checked separately, where the target
-    is known.
+    validity is checked before pinning (in :func:`_validate_factor_pair`); the
+    match against a concrete target shape is checked separately, where the
+    target is known.
 
     The merge / current-routed paths consume *tensors*, so :meth:`scaled`
     materializes a device-ready :class:`ScaledLoRAFactor` over zero-copy
@@ -80,14 +76,6 @@ class LoRAFactor:
 
     a: PinnedParam
     b: PinnedParam
-    rank: int
-    in_dim: int
-    out_dim: int
-
-    @property
-    def produced_shape(self) -> tuple[int, int]:
-        """Shape of ``b @ a`` — the base-weight shape this factor targets."""
-        return (self.out_dim, self.in_dim)
 
     @property
     def cache_bytes(self) -> int:
@@ -147,17 +135,20 @@ class ScaledLoRAFactor:
         return (self.b.shape[0], self.a.shape[1])
 
 
-def default_key_transform(key: str) -> str:
-    """Strip the common ``diffusion_model.`` prefix from ComfyUI LoRA keys."""
-    prefix = "diffusion_model."
-    return key[len(prefix) :] if key.startswith(prefix) else key
-
-
 class LoRA:
-    """A LoRA adapter with pinned factor matrices.
+    """A LoRA adapter whose factors are an ``nn.Module`` pinned via the
+    offload substrate.
 
-    Factors are paired, validated, and pinned to host memory at
-    construction.  The raw ``state_dict`` is not retained.
+    At construction the flat ``state_dict`` is paired, validated, and built
+    into an ``nn.Module`` whose factors sit at their dotted paths (numeric
+    segments become ``nn.ModuleList`` positions, so a block-indexed LoRA lands
+    each factor at its true block index); a
+    :class:`~torch_offload.composite_component.CompositeComponentStore` then
+    pins it — the same path the model itself uses. The store owns the single
+    pinned copy, the raw ``state_dict`` is not retained, and :attr:`targets`
+    is derived from it. Pass ``blocks_attr`` to group factor blocks as a
+    streamed component (for routed co-scheduling with the model); the default
+    pins the whole adapter.
 
     Implements both the :class:`~torch_offload.protocols.ResourceStore`
     and :class:`~torch_offload.protocols.ResourceBinding` shapes so it
@@ -170,26 +161,37 @@ class LoRA:
     Strength is extrinsic — specify it when passing the adapter to
     :meth:`ModelOffloader.set_loras` via the ``strengths`` argument.
 
-    ``key_transform`` is applied to state-dict keys before pairing.
-    Defaults to stripping the ``diffusion_model.`` prefix common in
-    ComfyUI LoRA files.  Pass ``None`` to disable.
+    ``state_dict`` keys must already be model parameter paths (``.lora_A`` /
+    ``.lora_B`` suffixed). Any key remapping — e.g. stripping the
+    ``diffusion_model.`` prefix on ComfyUI adapters — is the caller's
+    responsibility, done in the factory that produces the state dict.
     """
 
     def __init__(
         self,
         state_dict: dict[str, torch.Tensor],
-        key_transform: KeyTransformT = default_key_transform,
+        *,
+        blocks_attr: list[str] = [],  # noqa: B006  (read-only; never mutated)
     ) -> None:
-        self._factors = _pair_and_pin(state_dict, key_transform)
+        _validate_lora_state_dict(state_dict)
+        self._module = _build_lora_module(state_dict)
+        self._store = CompositeComponentStore.from_module(
+            self._module, blocks_attr=blocks_attr,
+        )
 
     @property
     def targets(self) -> dict[str, LoRAFactor]:
-        """Map of target weight name to its pinned :class:`LoRAFactor`."""
-        return self._factors
+        """Map of target weight name to its pinned :class:`LoRAFactor`.
+
+        Derived on demand from the composite store, which owns the single
+        pinned copy of every factor. ``LoRAFactor.scaled()`` still views those
+        pinned host bytes, so merge's ``non_blocking`` H2D stays asynchronous.
+        """
+        return _derive_targets(self._store)
 
     @property
     def cache_bytes(self) -> int:
-        return sum(factor.cache_bytes for factor in self._factors.values())
+        return self._store.cache_bytes
 
     @property
     def value(self) -> LoRA:
@@ -429,19 +431,57 @@ class LoRARouteHandle:
 # ---------------------------------------------------------------------------
 
 
-def _pair_and_pin(
-    state_dict: dict[str, torch.Tensor],
-    key_transform: KeyTransformT,
-) -> dict[str, LoRAFactor]:
-    a_tensors: dict[str, torch.Tensor] = {}
-    b_tensors: dict[str, torch.Tensor] = {}
+def _build_lora_module(state_dict: dict[str, torch.Tensor]) -> nn.Module:
+    """Build an ``nn.Module`` from a LoRA state dict.
+
+    The state-dict keys are already module paths, so each factor tensor is
+    placed directly at its path — no pairing or target synthesis. Only
+    ``.lora_A.weight`` / ``.lora_B.weight`` entries are kept; non-factor
+    entries (e.g. ``.alpha`` scalars) are ignored. A numeric path segment
+    indexes an ``nn.ModuleList`` (extended with empty holder modules to reach
+    the index, so block positions stay true even when some blocks are
+    unadapted); a name segment is an attribute submodule. Well-formedness is
+    checked separately by :func:`_validate_lora_state_dict`.
+    """
+    root = nn.Module()
     for key, tensor in state_dict.items():
-        if key.endswith(".lora_A.weight"):
-            base_key = key[: -len(".lora_A.weight")]
-            a_tensors[base_key] = tensor
-        elif key.endswith(".lora_B.weight"):
-            base_key = key[: -len(".lora_B.weight")]
-            b_tensors[base_key] = tensor
+        if not key.endswith((".lora_A.weight", ".lora_B.weight")):
+            continue
+        *mod_segs, param_name = key.split(".")
+        node: nn.Module = root
+        for i, seg in enumerate(mod_segs):
+            # A holder is an nn.ModuleList exactly when its own child is a
+            # numeric index; this is what lets ModuleLists nest (``0.1.``).
+            child_is_index = i + 1 < len(mod_segs) and mod_segs[i + 1].isdigit()
+            if seg.isdigit():
+                # The parent of a numeric segment was created as a ModuleList
+                # (its own child_is_index was True). A failure here means the
+                # state dict uses one path as both a submodule and a list
+                # index — a malformed adapter we reject rather than mis-build.
+                assert isinstance(node, nn.ModuleList)
+                idx = int(seg)
+                while len(node) <= idx:
+                    node.append(nn.ModuleList() if child_is_index else nn.Module())
+                node = node[idx]
+            else:
+                child = getattr(node, seg, None)
+                if child is None:
+                    child = nn.ModuleList() if child_is_index else nn.Module()
+                    node.add_module(seg, child)
+                node = child
+        node.register_parameter(
+            param_name, nn.Parameter(tensor, requires_grad=False),
+        )
+    return root
+
+
+def _validate_lora_state_dict(state_dict: dict[str, torch.Tensor]) -> None:
+    """Check ``state_dict`` is a well-formed LoRA before it is built.
+
+    Every target needs a paired ``lora_A`` / ``lora_B`` and each factor must be
+    a 2-D floating-point matrix with a matching inner rank.
+    """
+    a_tensors, b_tensors = _split_factor_tensors(state_dict)
 
     a_only = set(a_tensors) - set(b_tensors)
     b_only = set(b_tensors) - set(a_tensors)
@@ -452,35 +492,56 @@ def _pair_and_pin(
             f".lora_A.weight and .lora_B.weight."
         )
 
-    factors: dict[str, LoRAFactor] = {}
     for base_key, a in a_tensors.items():
-        b = b_tensors[base_key]
-        target_key = f"{base_key}.weight"
-        if key_transform is not None:
-            target_key = key_transform(target_key)
+        _validate_factor_pair(f"{base_key}.weight", a, b_tensors[base_key])
 
-        if not a.is_floating_point() or not b.is_floating_point():
-            raise ValueError(
-                f"LoRA factors for {target_key!r}: must be floating-point; got A.dtype={a.dtype}, B.dtype={b.dtype}."
-            )
-        if a.dim() != 2 or b.dim() != 2 or a.shape[0] != b.shape[1]:
-            raise ValueError(
-                f"LoRA factor shape mismatch for {target_key!r}: "
-                f"A.shape={tuple(a.shape)}, B.shape={tuple(b.shape)}. "
-                f"Expected A=(rank, in_dim), B=(out_dim, rank) with "
-                f"A.shape[0] == B.shape[1]."
-            )
 
-        if target_key in factors:
-            raise ValueError(
-                f"Duplicate LoRA target {target_key!r}: key_transform mapped multiple source keys to the same target."
-            )
-        factors[target_key] = LoRAFactor(
-            a=PinnedParam(nn.Parameter(a, requires_grad=False)),
-            b=PinnedParam(nn.Parameter(b, requires_grad=False)),
-            rank=a.shape[0],
-            in_dim=a.shape[1],
-            out_dim=b.shape[0],
+def _split_factor_tensors(
+    state_dict: dict[str, torch.Tensor],
+) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    a_tensors: dict[str, torch.Tensor] = {}
+    b_tensors: dict[str, torch.Tensor] = {}
+    for key, tensor in state_dict.items():
+        if key.endswith(".lora_A.weight"):
+            a_tensors[key[: -len(".lora_A.weight")]] = tensor
+        elif key.endswith(".lora_B.weight"):
+            b_tensors[key[: -len(".lora_B.weight")]] = tensor
+    return a_tensors, b_tensors
+
+
+def _validate_factor_pair(
+    target_key: str, a: torch.Tensor, b: torch.Tensor,
+) -> None:
+    if not a.is_floating_point() or not b.is_floating_point():
+        raise ValueError(
+            f"LoRA factors for {target_key!r}: must be floating-point; "
+            f"got A.dtype={a.dtype}, B.dtype={b.dtype}."
+        )
+    if a.dim() != 2 or b.dim() != 2 or a.shape[0] != b.shape[1]:
+        raise ValueError(
+            f"LoRA factor shape mismatch for {target_key!r}: "
+            f"A.shape={tuple(a.shape)}, B.shape={tuple(b.shape)}. "
+            f"Expected A=(rank, in_dim), B=(out_dim, rank) with "
+            f"A.shape[0] == B.shape[1]."
         )
 
+
+def _derive_targets(store: CompositeComponentStore) -> dict[str, LoRAFactor]:
+    """Recover the ``target -> LoRAFactor`` map from the pinned store.
+
+    The store owns the single pinned copy of every factor; we pair its
+    ``.lora_A`` / ``.lora_B`` pinned params back into :class:`LoRAFactor`s.
+    """
+    pinned = store.pinned_params()
+    a_by_base: dict[str, PinnedParam] = {}
+    b_by_base: dict[str, PinnedParam] = {}
+    for name, param in pinned.items():
+        if name.endswith(".lora_A.weight"):
+            a_by_base[name[: -len(".lora_A.weight")]] = param
+        elif name.endswith(".lora_B.weight"):
+            b_by_base[name[: -len(".lora_B.weight")]] = param
+
+    factors: dict[str, LoRAFactor] = {}
+    for base, a in a_by_base.items():
+        factors[f"{base}.weight"] = LoRAFactor(a=a, b=b_by_base[base])
     return factors

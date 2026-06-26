@@ -32,7 +32,6 @@ from torch_offload import (
     StreamedComponent,
     merge_lora,
 )
-from torch_offload.lora import KeyTransformT
 from torch_offload.model_offloader import LoraMode, _routed_factor_dtype
 from torch_offload.module_names import canonical_param_name
 from torch_offload.pinned_module import PinnedModuleInstance
@@ -156,13 +155,10 @@ def _make_lora_sd(
 def _make_lora(
     num_blocks: int, dim: int, rank: int = 4,
     seed: int = 0, prefix: str = "",
-    key_transform: KeyTransformT = ...,  # type: ignore[assignment]
 ) -> LoRA:
     """Build a LoRA targeting attn.weight across all blocks."""
     sd = _make_lora_sd(num_blocks, dim, rank=rank, seed=seed, prefix=prefix)
-    if key_transform is ...:  # type: ignore[comparison-overlap]
-        return LoRA(state_dict=sd)
-    return LoRA(state_dict=sd, key_transform=key_transform)
+    return LoRA(state_dict=sd)
 
 
 def _set_loras(
@@ -354,12 +350,11 @@ class TestLoRAConstruction:
         expected = 4 * (4 * 16 + 16 * 4) * 4  # 4 blocks * 2 factors * float32
         assert lora.cache_bytes == expected
 
-    def test_default_key_transform_strips_prefix(self) -> None:
+    def test_keys_used_verbatim(self) -> None:
+        # Keys are used as-is — no built-in remapping. A prefixed key stays
+        # prefixed; stripping it (e.g. ComfyUI's ``diffusion_model.``) is the
+        # caller's job in the factory that produces the state dict.
         lora = _make_lora(1, 16, prefix="diffusion_model.")
-        assert "transformer_blocks.0.attn.weight" in lora.targets
-
-    def test_key_transform_none_preserves_prefix(self) -> None:
-        lora = _make_lora(1, 16, prefix="diffusion_model.", key_transform=None)
         assert "diffusion_model.transformer_blocks.0.attn.weight" in lora.targets
         assert "transformer_blocks.0.attn.weight" not in lora.targets
 
@@ -483,26 +478,20 @@ class TestSetLorasValidation:
         assert _has_post_copy_hook(s, "transformer_blocks.0.b.weight")
         assert _has_post_copy_hook(s, "transformer_blocks.0.a.weight")
 
-    def test_key_transform_strips_prefix(self) -> None:
+    def test_exact_keys_match(self) -> None:
+        m = _make_bf16_model()
+        s = _make_strategy(m)
+        lora = _make_lora(4, 16)
+        _set_loras(s, [(lora, 1.0)])
+        _activate_loras_for_test(s)
+        assert _has_post_copy_hook(s, "transformer_blocks.0.attn.weight")
+
+    def test_prefixed_keys_rejected(self) -> None:
+        # Keys are verbatim, so a ``diffusion_model.``-prefixed adapter does not
+        # match the model's params — the caller must strip it before building.
         m = _make_bf16_model()
         s = _make_strategy(m)
         lora = _make_lora(4, 16, prefix="diffusion_model.")
-        _set_loras(s, [(lora, 1.0)])
-        _activate_loras_for_test(s)
-        assert _has_post_copy_hook(s, "transformer_blocks.0.attn.weight")
-
-    def test_key_transform_none_matches_exact_keys(self) -> None:
-        m = _make_bf16_model()
-        s = _make_strategy(m)
-        lora = _make_lora(4, 16, key_transform=None)
-        _set_loras(s, [(lora, 1.0)])
-        _activate_loras_for_test(s)
-        assert _has_post_copy_hook(s, "transformer_blocks.0.attn.weight")
-
-    def test_key_transform_none_rejects_prefixed_keys(self) -> None:
-        m = _make_bf16_model()
-        s = _make_strategy(m)
-        lora = _make_lora(4, 16, prefix="diffusion_model.", key_transform=None)
         _set_loras(s, [(lora, 1.0)])
         with pytest.raises(ValueError, match="LoRA target .* is not managed"):
             _activate_loras_for_test(s)
@@ -515,7 +504,7 @@ class TestSetLorasValidation:
             "transformer_blocks.0.attn.base_layer.lora_A.weight": torch.randn(4, 16),
             "transformer_blocks.0.attn.base_layer.lora_B.weight": torch.randn(16, 4),
         }
-        _set_loras(s, [(LoRA(state_dict=sd, key_transform=None), 1.0)])
+        _set_loras(s, [(LoRA(state_dict=sd), 1.0)])
 
         with pytest.raises(ValueError, match="LoRA target .* is not managed"):
             _activate_loras_for_test(s)
@@ -772,38 +761,6 @@ class TestMergeCorrectness:
             s.deactivate()
 
     @CUDA
-    def test_prefixed_lora_keys_merge_correctly(self) -> None:
-        """LoRAs with ``diffusion_model.`` prefix (ComfyUI format) should
-        merge identically to unprefixed keys via the default key_transform."""
-        m = _make_bf16_model(num_blocks=4, dim=16)
-        captured_base = {
-            i: m.transformer_blocks[i].attn.weight.detach().clone()
-            for i in range(4)
-        }
-
-        lora = _make_lora(4, 16, seed=42, prefix="diffusion_model.")
-        s = _make_strategy(m)
-        _set_loras(s, [(lora, 0.7)])
-        s.activate("cuda", stream_config=_strategy_stream_config(m))
-        try:
-            x = torch.randn(2, 16, dtype=torch.bfloat16, device="cuda")
-            for blk in m.transformer_blocks:
-                x = blk(x)
-            torch.cuda.synchronize()
-            for i in range(4):
-                _ = m.transformer_blocks[i](
-                    torch.randn(2, 16, dtype=torch.bfloat16, device="cuda")
-                )
-                torch.cuda.synchronize()
-                expected = _expected_merged_weight(
-                    captured_base[i].to("cuda"), [(lora, 0.7)], i, "attn.weight",
-                )
-                actual = m.transformer_blocks[i].attn.weight.detach()
-                assert torch.allclose(actual, expected, rtol=0.01, atol=0.01)
-        finally:
-            s.deactivate()
-
-    @CUDA
     def test_non_block_lora_merges_correctly(self) -> None:
         """LoRA targeting embed (non-block) should be merged at activate."""
         m = _make_bf16_model(num_blocks=4, dim=16)
@@ -982,7 +939,7 @@ class TestLoRATransform:
             "embed.lora_A.weight": torch.randn(rank, cols),
             "embed.lora_B.weight": torch.randn(rows, rank),
         }
-        lora = LoRA(state_dict=sd, key_transform=None)
+        lora = LoRA(state_dict=sd)
         factor = lora.targets["embed.weight"]
         a, b = _factor_tensors(factor)
         # Compute the reference on CUDA, matching the device the offloader
@@ -1041,7 +998,7 @@ class TestLoRATransform:
             "transformer_blocks.0.attn.lora_A.weight": torch.randn(rank, cols),
             "transformer_blocks.0.attn.lora_B.weight": torch.randn(rows, rank),
         }
-        lora = LoRA(state_dict=sd, key_transform=None)
+        lora = LoRA(state_dict=sd)
         factor = lora.targets["transformer_blocks.0.attn.weight"]
         a, b = _factor_tensors(factor)
         expected_dense = original_qt.dequantize().to(torch.float32)
@@ -1091,7 +1048,7 @@ class TestPermanentMerge:
             "target.lora_A.weight": torch.randn(rank, cols),
             "target.lora_B.weight": torch.randn(rows, rank),
         }
-        lora = LoRA(state_dict=sd, key_transform=None)
+        lora = LoRA(state_dict=sd)
         factor = lora.targets["target.weight"]
         a, b = _factor_tensors(factor)
 
@@ -1121,7 +1078,7 @@ class TestPermanentMerge:
             "head.lora_A.weight": torch.randn(4, 16),
             "head.lora_B.weight": torch.randn(16, 4),
         }
-        lora = LoRA(state_dict=sd, key_transform=None)
+        lora = LoRA(state_dict=sd)
         factor = lora.targets["head.weight"]
         a, b = _factor_tensors(factor)
 
@@ -1147,7 +1104,7 @@ class TestPermanentMerge:
         }
 
         with pytest.raises(ValueError, match="same tied parameter backing"):
-            merge_lora(m, [(LoRA(state_dict=sd, key_transform=None), 1.0)])
+            merge_lora(m, [(LoRA(state_dict=sd), 1.0)])
 
         torch.testing.assert_close(m.embed.weight, before)
         assert m.head.weight is m.embed.weight
@@ -1172,7 +1129,7 @@ class TestPermanentMerge:
             "target.lora_A.weight": torch.randn(4, 16),
             "target.lora_B.weight": torch.randn(16, 4),
         }
-        lora = LoRA(state_dict=sd, key_transform=None)
+        lora = LoRA(state_dict=sd)
         factor = lora.targets["target.weight"]
         a, b = _factor_tensors(factor)
 
@@ -1444,7 +1401,7 @@ class TestRoutedMode:
             f"{target}.lora_A.weight": torch.randn(4, 16),
             f"{target}.lora_B.weight": torch.randn(16, 4),
         }
-        lora = LoRA(state_dict=sd, key_transform=None)
+        lora = LoRA(state_dict=sd)
         _set_loras(s, [(lora, 1.0)], mode="routed")
         targets = s._group_lora_factors_by_param_name(s._loras)
         s._register_lora_hooks(torch.device("cpu"), targets)
@@ -1733,3 +1690,136 @@ class TestLoRAResource:
 
         assert cache.info("lora:style").active_count == 0
         assert cache.info("not-a-model").active_count == 0
+
+
+# ---------------------------------------------------------------------------
+# LoRA as nn.Module + composite store (blocks_attr)
+# ---------------------------------------------------------------------------
+
+
+class TestLoRABlocksAttr:
+    """LoRA factors live in an nn.Module pinned via a CompositeComponentStore;
+    blocks_attr groups factor blocks into a streamed component."""
+
+    def test_targets_match_all_pinned(self) -> None:
+        # A blocks_attr-built LoRA derives the same targets (keys + factor
+        # bytes + cache_bytes) as the default all-pinned one, so it merges
+        # identically — the transitive guarantee for the merge suite.
+        sd = _make_lora_sd(num_blocks=4, dim=16, seed=7)
+        pinned = LoRA(state_dict=sd)
+        streamed = LoRA(state_dict=sd, blocks_attr=["transformer_blocks"])
+        assert set(pinned.targets) == set(streamed.targets)
+        for key in pinned.targets:
+            pa, pb = _factor_tensors(pinned.targets[key])
+            sa, sb = _factor_tensors(streamed.targets[key])
+            torch.testing.assert_close(pa, sa)
+            torch.testing.assert_close(pb, sb)
+        assert pinned.cache_bytes == streamed.cache_bytes
+
+    def test_scaled_factor_views_pinned_memory(self) -> None:
+        # The derived factor's .scaled() must view pinned host bytes, or
+        # merge's non_blocking H2D silently degrades to a sync stall.
+        sd = _make_lora_sd(num_blocks=2, dim=16)
+        lora = LoRA(state_dict=sd, blocks_attr=["transformer_blocks"])
+        factor = next(iter(lora.targets.values()))
+        scaled = factor.scaled(1.0)
+        assert scaled.a.is_pinned()
+        assert scaled.b.is_pinned()
+
+    def test_blocks_attr_builds_streamed_component(self) -> None:
+        sd = _make_lora_sd(num_blocks=4, dim=16)
+        lora = LoRA(state_dict=sd, blocks_attr=["transformer_blocks"])
+        streamed = lora._store.streamed_stores
+        assert len(streamed) == 1
+        assert streamed[0].blocks_path == "transformer_blocks"
+        # Default (no blocks_attr) keeps everything pinned, no streamed group.
+        assert LoRA(state_dict=sd)._store.streamed_stores == ()
+
+    @staticmethod
+    def _sparse_sd() -> dict[str, torch.Tensor]:
+        # Adapts only blocks 0 and 2 — block 1 is unadapted.
+        g = torch.Generator().manual_seed(0)
+        sd: dict[str, torch.Tensor] = {}
+        for b in (0, 2):
+            base = f"transformer_blocks.{b}.attn"
+            sd[f"{base}.lora_A.weight"] = torch.randn(4, 16, generator=g)
+            sd[f"{base}.lora_B.weight"] = torch.randn(16, 4, generator=g)
+        return sd
+
+    def test_path_walk_indexes_sparse_blocks_with_empty_holders(self) -> None:
+        # Path-walk construction indexes blocks truly: the gap at block 1
+        # becomes an empty holder so blocks 0 and 2 keep their real indices.
+        # No manual padding — it falls out of the dotted paths.
+        lora = LoRA(state_dict=self._sparse_sd())
+        blocks = lora._module.transformer_blocks  # type: ignore[union-attr]
+        assert len(blocks) == 3
+        assert list(blocks[1].parameters()) == []  # empty holder at the gap
+        assert set(lora.targets) == {
+            "transformer_blocks.0.attn.weight",
+            "transformer_blocks.2.attn.weight",
+        }
+
+    def test_nested_module_list_paths(self) -> None:
+        # Consecutive numeric segments build a ModuleList-of-ModuleLists: the
+        # holder type follows whether the *next* segment is an index, so nested
+        # lists (e.g. grouped/MoE blocks at ``0.1``) round-trip correctly.
+        g = torch.Generator().manual_seed(0)
+        sd = {
+            "blocks.0.1.attn.lora_A.weight": torch.randn(4, 16, generator=g),
+            "blocks.0.1.attn.lora_B.weight": torch.randn(16, 4, generator=g),
+        }
+        lora = LoRA(state_dict=sd)
+        assert set(lora.targets) == {"blocks.0.1.attn.weight"}
+        blocks = lora._module.blocks  # type: ignore[union-attr]
+        assert isinstance(blocks, nn.ModuleList)
+        assert isinstance(blocks[0], nn.ModuleList)
+        # The path the routed apply resolves on the model is reachable.
+        assert lora._module.get_submodule("blocks.0.1.attn.lora_A") is not None
+
+    def test_sparse_blocks_attr_streaming_unsupported_for_now(self) -> None:
+        # Streaming a sparse block group is not supported yet: the streamed
+        # component requires uniform per-block param names, and the empty
+        # holder block has none. Sparse LoRAs use the default all-pinned store
+        # until empty-block streaming lands (with routed co-scheduling). See #26.
+        with pytest.raises(ValueError, match="same parameter names"):
+            LoRA(
+                state_dict=self._sparse_sd(),
+                blocks_attr=["transformer_blocks"],
+            )
+
+    def test_non_block_adapter_goes_to_pinned_remainder(self) -> None:
+        sd = _make_lora_sd(num_blocks=2, dim=16)
+        sd["embed.lora_A.weight"] = torch.randn(4, 16)
+        sd["embed.lora_B.weight"] = torch.randn(16, 4)
+        lora = LoRA(state_dict=sd, blocks_attr=["transformer_blocks"])
+        assert lora._store.pinned_store is not None
+        assert "embed.weight" in lora.targets
+        assert "transformer_blocks.0.attn.weight" in lora.targets
+
+    @CUDA
+    def test_blocks_attr_merge_matches_manual_baseline(self) -> None:
+        # End-to-end: a streamed-store-pinned LoRA merges correctly, proving
+        # the derived factors keep pinned-view async H2D semantics.
+        m = _make_bf16_model(num_blocks=4, dim=16)
+        captured = {
+            i: m.transformer_blocks[i].attn.weight.detach().clone()
+            for i in range(4)
+        }
+        sd = _make_lora_sd(num_blocks=4, dim=16, seed=3)
+        lora = LoRA(state_dict=sd, blocks_attr=["transformer_blocks"])
+        s = _make_strategy(m)
+        _set_loras(s, [(lora, 0.5)])
+        s.activate("cuda", stream_config=_strategy_stream_config(m))
+        try:
+            for i in range(4):
+                _ = m.transformer_blocks[i](
+                    torch.randn(2, 16, dtype=torch.bfloat16, device="cuda")
+                )
+                torch.cuda.synchronize()
+                expected = _expected_merged_weight(
+                    captured[i].to("cuda"), [(lora, 0.5)], i, "attn.weight",
+                )
+                actual = m.transformer_blocks[i].attn.weight.detach()
+                assert torch.allclose(actual, expected, rtol=0.01, atol=0.01)
+        finally:
+            s.deactivate()
