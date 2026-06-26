@@ -497,6 +497,20 @@ def _block_buffer_names(block: nn.Module) -> set[str]:
     }
 
 
+def _block_is_empty(block: nn.Module) -> bool:
+    """A block with no parameters or buffers at any depth.
+
+    LoRA modules pad unadapted block indices with empty holder modules so
+    adapted factors keep their true block index; these carry nothing to stream
+    and are skipped by :meth:`StreamedComponentStore.from_module`. Real model
+    blocks always carry weights, so this never skips a model block.
+    """
+    return (
+        next(block.parameters(), None) is None
+        and next(block.buffers(), None) is None
+    )
+
+
 # ---------------------------------------------------------------------------
 # LRU tracker
 # ---------------------------------------------------------------------------
@@ -542,10 +556,19 @@ class StreamedComponentStore:
     Built via :meth:`from_module`: the streamed tensor source IS the
     model's block list, resolved by ``blocks_path``. Each block's forward-pre
     hook triggers the load of its own streamed instance.
+
+    ``block_indices`` records which positions of the resolved block list this
+    group actually occupies. :meth:`from_module` skips structurally-empty
+    positions (no parameters or buffers), so a LoRA whose module pads
+    unadapted block indices with empty holders streams only its real blocks
+    while keeping each at its true index — the seam then triggers those blocks
+    on the matching positions of a co-scheduled model. A model's blocks are
+    never empty, so the offloader path keeps the full contiguous range.
     """
 
     _block_stores: tuple[PinnedModuleStore, ...]
     blocks_path: str
+    block_indices: tuple[int, ...]
 
     @classmethod
     def from_module(
@@ -555,8 +578,28 @@ class StreamedComponentStore:
         blocks_path: str,
         stream_trainable_weights: bool = False,
     ) -> StreamedComponentStore:
-        """Resolve ``blocks_path`` on ``model`` and pin its streamed blocks."""
-        blocks = _resolve_blocks(model, blocks_path)
+        """Resolve ``blocks_path`` on ``model`` and pin its streamed blocks.
+
+        Structurally-empty positions (no parameters or buffers) are skipped and
+        dropped from :attr:`block_indices`, so a LoRA that pads unadapted block
+        indices with empty holders streams only its real blocks. The surviving
+        blocks must still agree on selected names (see
+        :func:`_streamed_param_names_for_blocks`); a model's own blocks are
+        never empty, so its full range is kept unchanged.
+        """
+        all_blocks = _resolve_blocks(model, blocks_path)
+        kept = [
+            (idx, block)
+            for idx, block in enumerate(all_blocks)
+            if not _block_is_empty(block)
+        ]
+        if not kept:
+            raise ValueError(
+                f"blocks_attr = {blocks_path!r} has no streamable blocks "
+                "(every block is structurally empty)."
+            )
+        block_indices = tuple(idx for idx, _ in kept)
+        blocks = [block for _, block in kept]
         stream_param_names = _streamed_param_names_for_blocks(
             blocks,
             stream_trainables=stream_trainable_weights,
@@ -570,6 +613,7 @@ class StreamedComponentStore:
         return cls(
             _block_stores=tuple(block_stores),
             blocks_path=blocks_path,
+            block_indices=block_indices,
         )
 
     @property
@@ -640,35 +684,39 @@ class StreamedComponentStore:
         forward triggers its streaming.
 
         ``schedule_model`` redirects the streaming triggers onto a parallel
-        external model: its blocks at the same ``blocks_path`` (resolved
-        positionally against ``model``'s) become the forward-pre trigger sites
-        instead of ``model``'s own blocks. Use it to co-schedule this
-        component's loads with another model's forward — e.g. a LoRA factor
-        mirror whose own blocks never run forward, streamed in lockstep with
-        the base model's blocks. The two block lists must be equal length and
-        correspond positionally.
+        external model: its blocks at the same ``blocks_path`` become the
+        forward-pre trigger sites instead of ``model``'s own blocks. Use it to
+        co-schedule this component's loads with another model's forward — e.g.
+        a LoRA whose own blocks never run forward, streamed in lockstep with
+        the base model's blocks. Both ``model`` and ``schedule_model`` are
+        indexed by :attr:`block_indices`, so each must have a block at every
+        occupied position (at least ``block_indices[-1] + 1`` blocks); a LoRA
+        occupying a subset of a larger model's blocks is fine, and the extra
+        blocks simply never trigger.
         """
-        blocks = self.resolve_blocks(model)
-        if len(blocks) != len(self._block_stores):
+        last = self.block_indices[-1]
+        bind_blocks = self.resolve_blocks(model)
+        if last >= len(bind_blocks):
             raise ValueError(
-                "StreamedComponentStore.bind() block count mismatch: "
-                f"store has {len(self._block_stores)}, got {len(blocks)}."
+                f"StreamedComponentStore.bind() bind model has too few blocks "
+                f"at {self.blocks_path!r}: needs index {last}, found "
+                f"{len(bind_blocks)}."
             )
-        # Preflight the schedule_model count BEFORE binding, so a mismatch
-        # raises without having installed pinned params into the bind model.
+        # Resolve and bounds-check the schedule_model BEFORE binding, so a
+        # too-short model raises without having installed pinned params.
         trigger_modules: list[nn.Module] | None = None
         if schedule_model is not None:
-            trigger_modules = self.resolve_blocks(schedule_model)
-            if len(trigger_modules) != len(self._block_stores):
+            sched_blocks = self.resolve_blocks(schedule_model)
+            if last >= len(sched_blocks):
                 raise ValueError(
-                    "StreamedComponentStore.bind() schedule_model block count "
-                    f"mismatch: bind model has {len(self._block_stores)} blocks "
-                    f"at {self.blocks_path!r}, schedule_model has "
-                    f"{len(trigger_modules)}."
+                    f"StreamedComponentStore.bind() schedule_model has too few "
+                    f"blocks at {self.blocks_path!r}: needs index {last}, found "
+                    f"{len(sched_blocks)}."
                 )
+            trigger_modules = [sched_blocks[idx] for idx in self.block_indices]
         instances = [
-            store.bind(block)
-            for store, block in zip(self._block_stores, blocks, strict=True)
+            store.bind(bind_blocks[idx])
+            for store, idx in zip(self._block_stores, self.block_indices, strict=True)
         ]
         return StreamedComponent(
             instances,
