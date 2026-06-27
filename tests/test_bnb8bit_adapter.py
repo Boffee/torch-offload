@@ -9,7 +9,7 @@ import torch
 from torch import nn
 
 from torch_offload import (
-    LoRA,
+    LoRAStore,
     ModelOffloader,
     ModelOffloaderStore,
     StreamConfig,
@@ -219,7 +219,7 @@ class TestBnb8bitAdapter:
         # Int8Params is already a Parameter — assign it directly.
         model.lin.weight = _make_int8(rows=64, cols=32)
         original_cb = model.lin.weight.CB.clone()
-        lora = LoRA(
+        lora = LoRAStore.from_state_dict(
             state_dict={
                 "lin.lora_A.weight": torch.randn(4, 32),
                 "lin.lora_B.weight": torch.randn(64, 4),
@@ -243,7 +243,7 @@ class TestBnb8bitAdapter:
         model = M().to("cuda")
         model.lin.weight = _make_int8(rows=64, cols=32, device="cuda")
         original_cb = model.lin.weight.CB.clone()
-        lora = LoRA(
+        lora = LoRAStore.from_state_dict(
             state_dict={
                 "lin.lora_A.weight": torch.randn(4, 32),
                 "lin.lora_B.weight": torch.randn(64, 4),

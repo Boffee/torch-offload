@@ -14,7 +14,7 @@ import torch
 from torch import nn
 
 from torch_offload import (
-    LoRA,
+    LoRAStore,
     ModelOffloader,
     ModelOffloaderStore,
     StreamConfig,
@@ -148,7 +148,7 @@ class TestInt4TilePackedAdapter:
         model = M()
         model.lin.weight.requires_grad = False
         model.lin.weight = nn.Parameter(_make_int4_tile(), requires_grad=False)
-        lora = LoRA(
+        lora = LoRAStore.from_state_dict(
             state_dict={
                 "lin.lora_A.weight": torch.randn(8, 256),
                 "lin.lora_B.weight": torch.randn(256, 8),
@@ -238,7 +238,7 @@ class TestInt4TilePackedAdapter:
             model,
             blocks_attr=["blocks"],
         )
-        lora = LoRA(
+        lora = LoRAStore.from_state_dict(
             state_dict={
                 "blocks.0.lora_A.weight": torch.randn(8, 256),
                 "blocks.0.lora_B.weight": torch.randn(256, 8),

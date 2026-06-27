@@ -23,8 +23,10 @@ These Protocols form the contract:
 Top-level :class:`ResourceBinding` implementations in this package:
 :class:`~torch_offload.ModelOffloader` (whole-model bulk DMA or streamed
 block offload), :class:`~torch_offload.MpsWeights` (whole-model CPU->MPS
-materialization without a second CPU cache), and :class:`~torch_offload.LoRA`
-(pinned LoRA factor storage).
+materialization without a second CPU cache), and
+:class:`~torch_offload.LoRA` (a streamable LoRA factor binding). Its
+:class:`ResourceStore` is :class:`~torch_offload.LoRAStore` (pinned LoRA
+factor storage).
 Future resources (disk-mmap, NVMe-paged, multi-GPU shard) satisfy the
 :class:`ResourceStore` / :class:`ResourceBinding` split.
 

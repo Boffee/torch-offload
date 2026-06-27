@@ -9,7 +9,7 @@ import torch
 from torch import nn
 
 from torch_offload import (
-    LoRA,
+    LoRAStore,
     ModelOffloader,
     ModelOffloaderStore,
     StreamConfig,
@@ -315,7 +315,7 @@ class TestBnb4bitAdapter:
         # copy_into mutates the weight's packed storage in place, so snapshot
         # the original bytes rather than holding a tensor reference.
         original_packed = model.lin.weight.data.data.clone()
-        lora = LoRA(
+        lora = LoRAStore.from_state_dict(
             state_dict={
                 "lin.lora_A.weight": torch.randn(4, 32),
                 "lin.lora_B.weight": torch.randn(64, 4),
@@ -426,7 +426,7 @@ class TestBnb4bitAdapter:
             model,
             blocks_attr=["blocks"],
         )
-        lora = LoRA(
+        lora = LoRAStore.from_state_dict(
             state_dict={
                 "blocks.0.lora_A.weight": torch.randn(4, 128),
                 "blocks.0.lora_B.weight": torch.randn(128, 4),

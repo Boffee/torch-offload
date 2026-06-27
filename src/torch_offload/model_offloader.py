@@ -16,7 +16,7 @@ from torch import nn
 
 from ._devices import canonical_device
 from .composite_component import CompositeComponent, CompositeComponentStore
-from .lora import LoRA, LoRARouteHandle, LoRATransform, ScaledLoRAFactor
+from .lora import LoRARouteHandle, LoRAStore, LoRATransform, ScaledLoRAFactor
 from .module_names import (
     canonical_param_name,
     resolve_parent_leaf,
@@ -201,14 +201,14 @@ class ModelOffloader:
         # Configured LoRA request. set_loras() only records caller intent;
         # activate(device) groups targets and validates the requested
         # application path once the runtime context is known.
-        self._loras: list[tuple[LoRA, float]] = []
+        self._loras: list[tuple[LoRAStore, float]] = []
         self._lora_mode: LoraMode = "merge"
 
     # ------------------------------------------------------------------ API
 
     def set_loras(
         self,
-        loras: Sequence[LoRA],
+        loras: Sequence[LoRAStore],
         *,
         strengths: Sequence[float] | None = None,
         mode: LoraMode = "merge",
@@ -274,15 +274,15 @@ class ModelOffloader:
                 )
             strength_list = [float(strength) for strength in strengths]
         for lora in lora_list:
-            if not isinstance(lora, LoRA):
+            if not isinstance(lora, LoRAStore):
                 raise TypeError(
-                    "ModelOffloader.set_loras() expects LoRA instances"
+                    "ModelOffloader.set_loras() expects LoRAStore instances"
                 )
         self._loras = list(zip(lora_list, strength_list, strict=True))
         self._lora_mode = mode if lora_list else "merge"
 
     def _group_lora_factors_by_param_name(
-        self, loras: Sequence[tuple[LoRA, float]],
+        self, loras: Sequence[tuple[LoRAStore, float]],
     ) -> _LoraParamMap:
         per_param: _LoraParamMap = {}
         param_names = self.param_names
