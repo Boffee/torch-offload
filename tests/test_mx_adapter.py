@@ -8,7 +8,7 @@ import torch
 from torch import nn
 
 from torch_offload import (
-    LoRA,
+    LoRAStore,
     LoRATransform,
     ModelOffloader,
     ModelOffloaderStore,
@@ -398,7 +398,7 @@ class TestMxAdapter:
         # copy_into mutates the weight's storage in place, so snapshot the
         # original packed bytes rather than holding a tensor ref.
         original_qdata = model.lin.weight.data.qdata.view(torch.uint8).clone()
-        lora = LoRA(
+        lora = LoRAStore.from_state_dict(
             state_dict={
                 "lin.lora_A.weight": torch.randn(4, 64),
                 "lin.lora_B.weight": torch.randn(16, 4),
@@ -503,7 +503,7 @@ class TestMxAdapter:
             model,
             blocks_attr=["blocks"],
         )
-        lora = LoRA(
+        lora = LoRAStore.from_state_dict(
             state_dict={
                 "blocks.0.lora_A.weight": torch.randn(4, 128),
                 "blocks.0.lora_B.weight": torch.randn(128, 4),
@@ -563,7 +563,7 @@ class TestMxAdapter:
         rank = 4
         a = torch.randn(rank, 64)
         b = torch.randn(64, rank)
-        lora = LoRA(
+        lora = LoRAStore.from_state_dict(
             state_dict={
                 "blocks.0.lora_A.weight": a,
                 "blocks.0.lora_B.weight": b,

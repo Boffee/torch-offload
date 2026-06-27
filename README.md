@@ -17,7 +17,7 @@ to be lifted into its own package when a second consumer appears.
 | `model_offloader.py` | `ModelOffloaderStore`, `ModelOffloader` — lower-level store/binding for whole-model bulk pinned-CPU↔GPU or streamed block offload |
 | `pinned_component.py` | `PinnedComponentStore`, `PinnedComponent` — lower-level reusable pinned backing storage plus lifecycle-only pinned component used by `ModelOffloader` |
 | `streamed_component.py` | `StreamedComponentStore`, `StreamedComponent` — lower-level streamed backing storage plus per-block-list streaming component |
-| `lora.py` | `LoRA`, `LoRATransform`, `LoRARouteHandle` — pinned factor storage + merge / routed-hook application |
+| `lora.py` | `LoRAStore`, `LoRA`, `LoRATransform`, `LoRARouteHandle` — pinned factor storage + streamable binding + merge / routed-hook application |
 | `merge.py` | `merge_lora()` — permanent in-place LoRA merge into base weights (alternative to `set_loras`) |
 | `pinned_param.py` | `PinnedParam` — per-parameter pinning primitive (handles plain tensors, quanto, GGUF, bitsandbytes, DTensor, and TorchAO scaled-FP8 / INT8 / MX (MXFP8, MXFP4) / NVFP4 / INT4 tile-packed via adapters; see [Quantized weight support](#quantized-weight-support)) |
 | `pinned_module.py` | Internal name-keyed pinned module storage plus concrete module bindings |
@@ -236,7 +236,7 @@ or validated when the merge hook applies.
 
 ```python
 import torch
-from torch_offload import ModelOffloaderStore, LoRA
+from torch_offload import ModelOffloaderStore, LoRAStore
 from safetensors.torch import load_file
 
 store = ModelOffloaderStore.from_module(
@@ -248,8 +248,8 @@ offload = store.bind(model)
 device = torch.device("cuda")
 
 # Request LoRAs for the next activation (must be called while deactivated)
-lora_a = LoRA(state_dict=load_file("lora_a.safetensors"))
-lora_b = LoRA(state_dict=load_file("lora_b.safetensors"))
+lora_a = LoRAStore.from_state_dict(state_dict=load_file("lora_a.safetensors"))
+lora_b = LoRAStore.from_state_dict(state_dict=load_file("lora_b.safetensors"))
 offload.set_loras([lora_a, lora_b], strengths=[0.8, 0.5])
 
 with offload.use(device) as gpu_model:
@@ -283,9 +283,9 @@ For a one-shot **permanent** merge — bake the LoRA into the model
 weights and discard the LoRA — use `merge_lora`:
 
 ```python
-from torch_offload import merge_lora, LoRA
+from torch_offload import merge_lora, LoRAStore
 
-merge_lora(model, [(LoRA(state_dict=load_file("lora.safetensors")), 0.8)])
+merge_lora(model, [(LoRAStore.from_state_dict(state_dict=load_file("lora.safetensors")), 0.8)])
 ```
 
 This uses an in-place `addmm_` for plain fp/bf bases and
@@ -510,7 +510,7 @@ ModelSpec / LoRASpec / ResourceSpec
         |                            |
         |                            +-- PinnedParam(s)
         |
-        +-- builds/admit --> LoRA (store + binding)
+        +-- builds/admit --> LoRAStore (pinned factors; inert cache binding)
         |
         +-- builds/admit --> custom ResourceStore
         |
@@ -526,7 +526,7 @@ ModelCache
           |      |
           |      +-- PinnedComponent
           |      +-- StreamedComponent(s)
-          |      +-- optional LoRA binding via set_loras before activation
+          |      +-- optional LoRAStore application via set_loras before activation
           |      |
           |      +-- activate/deactivate --> nn.Module binding value
           |

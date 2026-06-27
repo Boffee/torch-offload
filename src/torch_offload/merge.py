@@ -20,7 +20,7 @@ from typing import Any
 
 from torch import nn
 
-from .lora import LoRA, LoRATransform
+from .lora import LoRAStore, LoRATransform
 from .module_names import canonical_param_name
 from .tensor_adapter_registry import param_tensor_id
 
@@ -44,7 +44,7 @@ class _MergeOp:
 
 def merge_lora(
     model: nn.Module,
-    loras: Sequence[tuple[LoRA, float]],
+    loras: Sequence[tuple[LoRAStore, float]],
 ) -> int:
     """Merge one or more LoRAs into model parameters in-place.
 

@@ -1,10 +1,12 @@
 """LoRA types and per-weight merge / routed transforms.
 
-:class:`LoRA` pairs, validates, and pins factor matrices from a flat
+:class:`LoRAStore` pairs, validates, and pins factor matrices from a flat
 safetensors state dict at construction.  The raw state dict is not
-retained — this object owns the only copy of the pinned factors.
+retained — the store owns the only copy of the pinned factors, and
+:meth:`LoRAStore.bind` produces a streamable :class:`LoRA` binding.
 
-Two application paths share the same :class:`LoRA` data container:
+Two application paths read the store's pinned factors via
+:attr:`LoRAStore.targets`:
 
 - :class:`LoRATransform` (merge mode) — applied to the GPU parameter
   after DMA; integrates with block streaming. Uses dense in-place
@@ -30,14 +32,14 @@ on deactivate.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
-from types import TracebackType
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
 from torch import nn
 
-from .composite_component import CompositeComponentStore
+from ._devices import canonical_device
+from .composite_component import CompositeComponent, CompositeComponentStore
 from .pinned_param import PinnedParam
 from .tensor_adapter_registry import param_representation, select_adapter
 from .tensor_adapters import (
@@ -50,6 +52,7 @@ __all__ = [
     "LoRA",
     "LoRAFactor",
     "LoRARouteHandle",
+    "LoRAStore",
     "LoRATransform",
     "ScaledLoRAFactor",
 ]
@@ -135,30 +138,29 @@ class ScaledLoRAFactor:
         return (self.b.shape[0], self.a.shape[1])
 
 
-class LoRA:
-    """A LoRA adapter whose factors are an ``nn.Module`` pinned via the
-    offload substrate.
+@dataclass(frozen=True, slots=True)
+class LoRAStore:
+    """Reusable pinned backing storage for a LoRA adapter.
 
-    At construction the flat ``state_dict`` is paired, validated, and built
-    into an ``nn.Module`` whose factors sit at their dotted paths (numeric
-    segments become ``nn.ModuleList`` positions, so a block-indexed LoRA lands
-    each factor at its true block index); a
+    Build once from a flat ``state_dict``: the factors are paired, validated,
+    and built into an ``nn.Module`` whose factors sit at their dotted paths
+    (numeric segments become ``nn.ModuleList`` positions, so a block-indexed
+    LoRA lands each factor at its true block index); a
     :class:`~torch_offload.composite_component.CompositeComponentStore` then
     pins it — the same path the model itself uses. The store owns the single
     pinned copy, the raw ``state_dict`` is not retained, and :attr:`targets`
-    is derived from it. Pass ``blocks_attr`` to group factor blocks as a
-    streamed component (for routed co-scheduling with the model); the default
-    pins the whole adapter.
+    is derived from it. Pass ``blocks_attr`` to group factor blocks as
+    streamed components (for routed co-scheduling with the model); the
+    default pins the whole adapter.
 
-    Implements both the :class:`~torch_offload.protocols.ResourceStore`
-    and :class:`~torch_offload.protocols.ResourceBinding` shapes so it
-    can be registered in :class:`~torch_offload.ModelCache` for budget
-    tracking and policy-driven eviction. ``bind()`` returns ``self``;
-    ``activate``/``deactivate`` are no-ops because factors stay on
-    pinned CPU and are copied to GPU per-parameter by
-    :class:`LoRATransform` during the merge-mode post-copy hook.
+    Satisfies :class:`~torch_offload.protocols.ResourceStore`, so it can be
+    registered in :class:`~torch_offload.ModelCache` for budget tracking and
+    policy-driven eviction. The merge and current-routed application paths
+    read the pinned factors through :attr:`targets` and never bind;
+    :meth:`bind` produces a streamable :class:`LoRA` binding for a future
+    routed path that reads GPU-resident factors.
 
-    Strength is extrinsic — specify it when passing the adapter to
+    Strength is extrinsic — specify it when passing the store to
     :meth:`ModelOffloader.set_loras` via the ``strengths`` argument.
 
     ``state_dict`` keys must already be model parameter paths (``.lora_A`` /
@@ -167,58 +169,116 @@ class LoRA:
     responsibility, done in the factory that produces the state dict.
     """
 
-    def __init__(
-        self,
+    module: nn.Module = field(repr=False, compare=False)
+    composite_store: CompositeComponentStore
+
+    @classmethod
+    def from_state_dict(
+        cls,
         state_dict: dict[str, torch.Tensor],
         *,
         blocks_attr: list[str] = [],  # noqa: B006  (read-only; never mutated)
-    ) -> None:
+    ) -> LoRAStore:
+        """Pair, validate, build, and pin ``state_dict`` into a store."""
         _validate_lora_state_dict(state_dict)
-        self._module = _build_lora_module(state_dict)
-        self._store = CompositeComponentStore.from_module(
-            self._module, blocks_attr=blocks_attr,
+        module = _build_lora_module(state_dict)
+        composite_store = CompositeComponentStore.from_module(
+            module, blocks_attr=blocks_attr,
         )
+        return cls(module=module, composite_store=composite_store)
 
     @property
     def targets(self) -> dict[str, LoRAFactor]:
         """Map of target weight name to its pinned :class:`LoRAFactor`.
 
         Derived on demand from the composite store, which owns the single
-        pinned copy of every factor. ``LoRAFactor.scaled()`` still views those
-        pinned host bytes, so merge's ``non_blocking`` H2D stays asynchronous.
+        pinned copy of every factor — including the streamed block groups,
+        whose pinned host masters are returned alongside the pinned remainder.
+        ``LoRAFactor.scaled()`` still views those pinned host bytes, so merge's
+        ``non_blocking`` H2D stays asynchronous.
         """
-        return _derive_targets(self._store)
+        return _derive_targets(self.composite_store)
 
     @property
     def cache_bytes(self) -> int:
-        return self._store.cache_bytes
+        return self.composite_store.cache_bytes
+
+    def bind(self, *, schedule_model: nn.Module | None = None) -> LoRA:
+        """Bind the pinned factors into a streamable :class:`LoRA`.
+
+        Binds to the adapter's own module. ``schedule_model`` co-schedules the
+        streamed factor blocks with another model's forward (the base model),
+        so factor block *i* streams when base-model block *i* runs; see
+        :meth:`~torch_offload.streamed_component.StreamedComponentStore.bind`.
+        """
+        return LoRA(
+            composite=self.composite_store.bind(
+                self.module, schedule_model=schedule_model,
+            ),
+        )
+
+
+class LoRA:
+    """A LoRA adapter bound for streaming through the offload substrate.
+
+    Created by :meth:`LoRAStore.bind` (usually with ``schedule_model=<base
+    model>`` so its factor blocks co-stream with the model's blocks). Wraps
+    the bound :class:`~torch_offload.composite_component.CompositeComponent`;
+    its lifecycle drives factor streaming exactly as
+    :class:`~torch_offload.ModelOffloader` does for a model —
+    :meth:`activate` moves the pinned remainder to CUDA and arms per-block
+    streaming, :meth:`deactivate` tears it down.
+
+    A pure activate/deactivate lifecycle — it owns no module handle. The
+    merge and current-routed application paths do **not** use this binding;
+    they read the *pinned* factors via :attr:`LoRAStore.targets`. This binding
+    exists so a future routed path can read GPU-resident factors off the
+    activated :attr:`LoRAStore.module` (e.g. via ``get_submodule``).
+    """
+
+    def __init__(self, *, composite: CompositeComponent) -> None:
+        self._composite = composite
+        self._active_device: torch.device | None = None
 
     @property
-    def value(self) -> LoRA:
-        return self
-
-    def bind(self) -> LoRA:
-        return self
+    def active_device(self) -> torch.device | None:
+        """Currently active device, or ``None`` when inactive."""
+        return self._active_device
 
     def activate(
         self, device: torch.device | str | None = None, **kwargs: object,
     ) -> None:
-        del device, kwargs
+        if self._active_device is not None:
+            raise RuntimeError(
+                "LoRA.activate() called while already active on "
+                f"{self._active_device}. Deactivate first."
+            )
+        active_device = self._resolve_device(device)
+        self._active_device = active_device
+        try:
+            self._composite.activate(active_device, **kwargs)
+        except BaseException:
+            self._active_device = None
+            raise
 
     def deactivate(self) -> None:
-        pass
+        try:
+            self._composite.deactivate()
+        finally:
+            self._active_device = None
 
-    def __enter__(self) -> LoRA:
-        self.activate()
-        return self.value
-
-    def __exit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        tb: TracebackType | None,
-    ) -> None:
-        self.deactivate()
+    @staticmethod
+    def _resolve_device(device: torch.device | str | None) -> torch.device:
+        if device is None:
+            raise ValueError(
+                "LoRA.activate() requires a device; pass activate(device)."
+            )
+        resolved = canonical_device(device)
+        if resolved.type not in ("cpu", "cuda"):
+            raise ValueError(
+                f"LoRA.activate() supports CUDA or CPU; got {resolved}."
+            )
+        return resolved
 
 
 class LoRATransform:

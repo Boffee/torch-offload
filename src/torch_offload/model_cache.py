@@ -12,7 +12,7 @@ Design highlights
 - **Resource-agnostic.** The cache only talks to
   :class:`ResourceStore` for cached backing bytes and
   :class:`ResourceBinding` for per-use activation. Pluggable: today
-  :class:`ModelOffloader`, :class:`MpsWeights`, and :class:`LoRA`;
+  :class:`ModelOffloader`, :class:`MpsWeights`, and :class:`LoRAStore`;
   future resources (disk-mmap, NVMe-paged, multi-GPU shard) just satisfy
   the protocol pair.
 - **Active bindings.** Multiple keys can be active simultaneously
@@ -63,7 +63,7 @@ import torch
 from torch import nn
 
 from ._devices import canonical_device
-from .lora import LoRA
+from .lora import LoRAStore
 from .model_offloader import LoraMode, ModelOffloader, ModelOffloaderStore
 from .protocols import ResourceBinding, ResourceStore
 from .stream_config import StreamConfig
@@ -200,8 +200,15 @@ class ModelSpec(ResourceSpec[M]):
         )
 
 
-class LoRASpec(ResourceSpec[LoRA]):
-    """LoRA-specific cache spec built from a state-dict factory."""
+class LoRASpec(ResourceSpec[LoRAStore]):
+    """LoRA-specific cache spec built from a state-dict factory.
+
+    The cached resource is a :class:`~torch_offload.LoRAStore` (pinned
+    factors). The cache does not stream LoRAs independently — streaming is
+    owned by the :class:`ModelOffloader` the LoRA is applied to — so the
+    per-use binding is inert and simply yields the store; ``use()`` and
+    :meth:`ModelOffloader.set_loras` consume it through :attr:`value`.
+    """
 
     def __init__(
         self,
@@ -211,10 +218,11 @@ class LoRASpec(ResourceSpec[LoRA]):
         factory: Callable[[], dict[str, torch.Tensor]],
     ) -> None:
         def store_factory() -> ResourceStore:
-            return LoRA(factory())
+            return LoRAStore.from_state_dict(factory())
 
-        def bind(store: ResourceStore) -> ResourceBinding[LoRA]:
-            return cast(LoRA, store).bind()
+        def bind(store: ResourceStore) -> ResourceBinding[LoRAStore]:
+            lora_store = cast(LoRAStore, store)
+            return _ObjectStore(lora_store, lora_store.cache_bytes)
 
         super().__init__(
             key=key,
