@@ -110,7 +110,7 @@ class TestPinnedComponentStoreBind:
         try:
             assert component.param_names == frozenset()
             assert component.buffer_names == frozenset()
-            component.activate("cpu")
+            component.activate(torch.device("cpu"))
         finally:
             component.deactivate()
 
@@ -138,8 +138,8 @@ class TestPinnedComponentStoreBind:
             assert prototype.weight is not second_model.weight
             assert prototype.running is second_model.running
 
-            first.activate("cpu")
-            second.activate("cpu")
+            first.activate(torch.device("cpu"))
+            second.activate(torch.device("cpu"))
         finally:
             first.deactivate()
             second.deactivate()

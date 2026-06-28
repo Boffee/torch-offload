@@ -1891,21 +1891,28 @@ class TestLoRAStreamingBinding:
     def test_cpu_activation_round_trips(self) -> None:
         binding = _make_lora(num_blocks=4, dim=16).bind()
         assert binding.active_device is None
-        binding.activate("cpu")
+        binding.activate(torch.device("cpu"))
         assert binding.active_device == torch.device("cpu")
         binding.deactivate()
         assert binding.active_device is None
 
-    def test_activate_requires_device_and_rejects_double_activate(self) -> None:
+    def test_rejects_double_activate(self) -> None:
         binding = _make_lora(num_blocks=2, dim=8).bind()
-        with pytest.raises(ValueError, match="requires a device"):
-            binding.activate(None)
-        binding.activate("cpu")
+        binding.activate(torch.device("cpu"))
         try:
             with pytest.raises(RuntimeError, match="already active"):
-                binding.activate("cpu")
+                binding.activate(torch.device("cpu"))
         finally:
             binding.deactivate()
+
+    def test_activate_rejects_unsupported_device(self) -> None:
+        # Device-type validation is delegated to the offload components, which
+        # support CUDA/CPU only — MPS (and anything else) is rejected there
+        # (no MPS backend needed: rejection is by device.type before any move).
+        binding = _make_lora(num_blocks=2, dim=8).bind()
+        with pytest.raises(ValueError, match="supports CUDA or CPU"):
+            binding.activate(torch.device("mps"))
+        assert binding.active_device is None
 
     def test_deactivate_clears_active_device_even_if_teardown_raises(
         self,
@@ -1914,7 +1921,7 @@ class TestLoRAStreamingBinding:
         # teardown raises — otherwise the next activate() hits the
         # already-active guard and the binding is unusable.
         binding = _make_lora(num_blocks=2, dim=8).bind()
-        binding.activate("cpu")
+        binding.activate(torch.device("cpu"))
 
         def boom() -> None:
             raise RuntimeError("teardown failed")
@@ -1945,7 +1952,7 @@ class TestLoRAStreamingBinding:
 
         binding = store.bind(schedule_model=model)
         binding.activate(
-            "cuda",
+            torch.device("cuda"),
             stream_config=StreamConfig(
                 num_resident_blocks=1, num_prefetch_blocks=1,
             ),

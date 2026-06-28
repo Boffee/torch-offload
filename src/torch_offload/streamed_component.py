@@ -1029,13 +1029,6 @@ class StreamedComponent:
             )
         return instance, name
 
-    def _resolve_device(self, device: torch.device | str | None) -> torch.device:
-        if device is not None:
-            return canonical_device(device)
-        raise ValueError(
-            "StreamedComponent.activate() requires a device"
-        )
-
     def _require_active_device(self) -> torch.device:
         device = self._active_device
         if device is None:
@@ -1046,9 +1039,7 @@ class StreamedComponent:
     # Lifecycle
     # ------------------------------------------------------------------
 
-    def activate(
-        self, device: torch.device | str | None = None, **kwargs: object,
-    ) -> None:
+    def activate(self, device: torch.device, **kwargs: object) -> None:
         """Activate the block list on ``device``.
 
         CUDA activation uses the streaming path: GPU target pool, CUDA
@@ -1076,7 +1067,7 @@ class StreamedComponent:
                 "active. Deactivate first, or check for a leaked "
                 "context manager."
             )
-        active_device = self._resolve_device(device)
+        active_device = canonical_device(device)
         if active_device.type == "cpu":
             self._activate_cpu_resolved()
             return
@@ -1144,7 +1135,7 @@ class StreamedComponent:
         self, device: torch.device | str, **kwargs: object,
     ) -> Iterator[None]:
         """Activate on ``device`` for the duration of the context."""
-        self.activate(device, **kwargs)
+        self.activate(canonical_device(device), **kwargs)
         try:
             yield
         finally:
