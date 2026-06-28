@@ -5,20 +5,22 @@ safetensors state dict at construction.  The raw state dict is not
 retained — the store owns the only copy of the pinned factors, and
 :meth:`LoRAStore.bind` produces a streamable :class:`LoRA` binding.
 
-Two application paths read the store's pinned factors via
-:attr:`LoRAStore.targets`:
+Two application paths apply the store's factors:
 
 - :class:`LoRATransform` (merge mode) — applied to the GPU parameter
   after DMA; integrates with block streaming. Uses dense in-place
   ``addmm_`` when available, otherwise an adapter-provided
   dequantize/requantize plus ``copy_into`` path.
-- :class:`LoRARouteHandle` (routed mode) — installs a forward hook on
-  the layer that adds ``alpha * (x @ A.T @ B.T)`` to the layer's output;
-  base weight is not touched in place. Restricted to ``nn.Linear``
-  parents (other layer types raise) and tied weights are rejected.
-  Compatible with quantized bases whose adapter can report the logical
-  compute dtype, or that expose ``module.compute_dtype``. Formats whose
-  logical shape does not match their packed storage shape still need a
+- routed mode (:func:`install_routed_residual_hook`) — a forward-POST hook
+  on the layer adds ``strength * (x @ A.T) @ B.T`` to the layer's output,
+  reading the LoRA's GPU-resident factors (streamed co-scheduled with the
+  base model via the :class:`LoRA` binding) off their holder modules; the
+  base weight is not touched in place. Restricted to ``nn.Linear`` parents
+  (other layer types raise); shared weight storage is allowed (the hook
+  targets the matched module, not the weight bytes). The factor is cast to
+  the layer's output dtype in the hook, so quantized bases work as long as
+  the matched module exposes the logical ``nn.Linear`` weight shape. Formats
+  whose logical shape does not match their packed storage shape still need a
   richer per-format LoRA layer.
 
 :class:`~torch_offload.ModelOffloader` is the consumer-facing API; its
@@ -37,6 +39,7 @@ from typing import Any
 
 import torch
 from torch import nn
+from torch.utils.hooks import RemovableHandle
 
 from ._devices import canonical_device
 from .composite_component import CompositeComponent, CompositeComponentStore
@@ -51,7 +54,6 @@ from .tensor_adapters import (
 __all__ = [
     "LoRA",
     "LoRAFactor",
-    "LoRARouteHandle",
     "LoRAStore",
     "LoRATransform",
     "ScaledLoRAFactor",
@@ -71,10 +73,10 @@ class LoRAFactor:
     match against a concrete target shape is checked separately, where the
     target is known.
 
-    The merge / current-routed paths consume *tensors*, so :meth:`scaled`
-    materializes a device-ready :class:`ScaledLoRAFactor` over zero-copy
-    views of the pinned host bytes; factor streaming instead consumes the
-    :class:`PinnedParam`\\ s directly.
+    The merge path consumes *tensors*, so :meth:`scaled` materializes a
+    device-ready :class:`ScaledLoRAFactor` over zero-copy views of the pinned
+    host bytes; routed mode instead streams the :class:`PinnedParam`\\ s
+    directly and reads each GPU-resident factor off its holder module.
     """
 
     a: PinnedParam
@@ -104,10 +106,10 @@ class LoRAFactor:
 class ScaledLoRAFactor:
     """A factor pair as plain tensors bound to an application ``strength``.
 
-    The compute-side carrier eaten by :func:`_routed_residual` and
-    :class:`LoRATransform`. Construct it directly from device/CPU tensors, or
-    via :meth:`LoRAFactor.scaled` from a LoRA's pinned storage. The
-    contribution to the base weight is ``strength * (b @ a)``.
+    The compute-side carrier eaten by :class:`LoRATransform` (merge mode).
+    Construct it directly from device/CPU tensors, or via
+    :meth:`LoRAFactor.scaled` from a LoRA's pinned storage. The contribution
+    to the base weight is ``strength * (b @ a)``.
     """
 
     a: torch.Tensor
@@ -155,10 +157,9 @@ class LoRAStore:
 
     Satisfies :class:`~torch_offload.protocols.ResourceStore`, so it can be
     registered in :class:`~torch_offload.ModelCache` for budget tracking and
-    policy-driven eviction. The merge and current-routed application paths
-    read the pinned factors through :attr:`targets` and never bind;
-    :meth:`bind` produces a streamable :class:`LoRA` binding for a future
-    routed path that reads GPU-resident factors.
+    policy-driven eviction. Merge mode reads the pinned factors through
+    :attr:`targets` and never binds; routed mode calls :meth:`bind` to stream
+    the factors GPU-resident, co-scheduled with the base model.
 
     Strength is extrinsic — specify it when passing the store to
     :meth:`ModelOffloader.set_loras` via the ``strengths`` argument.
@@ -178,14 +179,43 @@ class LoRAStore:
         state_dict: dict[str, torch.Tensor],
         *,
         blocks_attr: list[str] = [],  # noqa: B006  (read-only; never mutated)
+        dtype: torch.dtype | None = None,
     ) -> LoRAStore:
-        """Pair, validate, build, and pin ``state_dict`` into a store."""
+        """Pair, validate, build, and pin ``state_dict`` into a store.
+
+        ``dtype`` casts every factor at build time. For routed mode, pass the
+        base model's compute dtype: the factors then stream and reside at that
+        width and the forward hook's per-call cast is a no-op. Left as ``None``
+        the factors keep their stored dtype (fp32 safetensors stay fp32 —
+        resident at full width and re-cast on every forward). Merge mode casts
+        at apply time regardless, so ``dtype`` only affects residency there.
+        """
+        if dtype is not None and not dtype.is_floating_point:
+            raise ValueError(
+                f"LoRAStore dtype must be floating-point, got {dtype}."
+            )
         _validate_lora_state_dict(state_dict)
-        module = _build_lora_module(state_dict)
+        module = _build_lora_module(state_dict, dtype=dtype)
         composite_store = CompositeComponentStore.from_module(
             module, blocks_attr=blocks_attr,
         )
         return cls(module=module, composite_store=composite_store)
+
+    def factor_holders(self, target_key: str) -> tuple[nn.Module, nn.Module]:
+        """Resolve a target weight key to its ``(lora_A, lora_B)`` holder modules.
+
+        Inverts the target convention (``<base>.weight`` is derived from the
+        factor paths ``<base>.lora_A.weight`` / ``<base>.lora_B.weight``): the
+        holders live at ``<base>.lora_A`` / ``<base>.lora_B`` on :attr:`module`.
+        Routed mode reads their ``.weight`` fresh each forward — streaming swaps
+        the Parameter on load/evict while the holder module identity is stable,
+        so callers must hold the *module*, never the weight tensor.
+        """
+        base = target_key.removesuffix(".weight")
+        return (
+            self.module.get_submodule(f"{base}.lora_A"),
+            self.module.get_submodule(f"{base}.lora_B"),
+        )
 
     @property
     def targets(self) -> dict[str, LoRAFactor]:
@@ -229,11 +259,12 @@ class LoRA:
     :meth:`activate` moves the pinned remainder to CUDA and arms per-block
     streaming, :meth:`deactivate` tears it down.
 
-    A pure activate/deactivate lifecycle — it owns no module handle. The
-    merge and current-routed application paths do **not** use this binding;
-    they read the *pinned* factors via :attr:`LoRAStore.targets`. This binding
-    exists so a future routed path can read GPU-resident factors off the
-    activated :attr:`LoRAStore.module` (e.g. via ``get_submodule``).
+    A pure activate/deactivate lifecycle — it owns no module handle. Merge mode
+    does **not** use this binding; it reads the *pinned* factors via
+    :attr:`LoRAStore.targets`. Routed mode
+    (:meth:`~torch_offload.ModelOffloader._register_routed_lora_hooks`) drives
+    this binding so its forward hooks can read GPU-resident factors off the
+    activated :attr:`LoRAStore.module` (via :meth:`LoRAStore.factor_holders`).
     """
 
     def __init__(self, *, composite: CompositeComponent) -> None:
@@ -386,92 +417,50 @@ def _dequant_requant_adapter(
 
 def _routed_residual(
     x: torch.Tensor,
-    factors: Sequence[ScaledLoRAFactor],
+    a: torch.Tensor,
+    b: torch.Tensor,
+    strength: float,
 ) -> torch.Tensor:
-    """Routed LoRA contribution ``Σ_i strength_i · (x @ A_i.T) @ B_i.T``.
+    """One routed LoRA pair's contribution: ``strength · (x @ A.T) @ B.T``.
 
-    Each adapter pair is applied independently and summed — no fusion.
-    Strength scales the intermediate ``M·r`` projection (cheaper than
-    scaling the ``M·out`` result, and keeps it extrinsic to the stored
-    factors rather than baked into a buffer). The overwhelmingly common
-    single-adapter case is one scaled pair of GEMMs.
+    Strength scales the intermediate ``M·r`` projection (cheaper than scaling
+    the ``M·out`` result, and keeps it extrinsic to the stored factors rather
+    than baked into a buffer).
     """
-    total: torch.Tensor | None = None
-    for factor in factors:
-        part = ((x @ factor.a.T) * factor.strength) @ factor.b.T
-        total = part if total is None else total + part
-    if total is None:
-        raise ValueError("Routed LoRA residual requires at least one factor.")
-    return total
+    return ((x @ a.T) * strength) @ b.T
 
 
-class LoRARouteHandle:
-    """Live forward-hook for one routed LoRA target.
+def install_routed_residual_hook(
+    parent: nn.Module,
+    lora_a: nn.Module,
+    lora_b: nn.Module,
+    strength: float,
+) -> RemovableHandle:
+    """Install a forward-POST hook on ``parent`` adding one LoRA's residual.
 
-    Owns GPU copies of the LoRA factors plus the registered hook on
-    the parent module. Forward path becomes::
+    ``lora_a`` / ``lora_b`` are the LoRA module's factor *holder* submodules.
+    The hook reads their GPU-resident ``.weight`` **fresh on every forward**:
+    streaming swaps the ``.weight`` Parameter on each load/evict, so the holder
+    modules (stable identity) are captured, not their tensors. The factor is
+    cast to the layer's output dtype in the hook, so the residual matches
+    whatever the (possibly quantized) base layer produced.
 
-        y = base(x) + sum_i strength_i * (x @ A_i.T) @ B_i.T
-
-    Each adapter's ``(A, B)`` pair is applied independently and summed
-    (see :func:`_routed_residual`); strength is applied at the
-    intermediate ``M·r`` projection, never baked into a stored buffer.
-    The overwhelmingly common single-adapter case is one scaled pair of
-    GEMMs; multiple adapters against one weight (rare) do N small GEMMs.
-    Keeping the pairs separate makes each factor a plain tensor the mover
-    handles directly and keeps the path DTensor-friendly — no fused
-    buffer that would discard tensor-parallel placement.
-
-    The factors are copied pinned-CPU → GPU once at install (``to`` casts
-    dtype during the transfer, so fp32-stored factors land as the layer's
-    bf16/fp16). Construction installs the hook; :meth:`remove` removes it
-    and drops the GPU factor refs so refcount-GC reclaims them.
-
-    Restricted to ``nn.Linear``-shaped forwards. The math assumes
-    ``base(x) = x @ W.T (+ bias)``; LoRA applied to Conv2d, Embedding,
-    or other layouts needs different formulas (see PEFT's per-type
-    LoraLayer subclasses).
+    Multiple LoRAs on one ``parent`` stack as independent additive hooks —
+    PyTorch chains them, so multi-LoRA summation falls out for free. Returns
+    the removable handle; routed teardown removes it and deactivates the LoRA
+    streaming binding that owns the factors.
     """
 
-    __slots__ = ("_factors", "_handle")
+    def hook(
+        _module: nn.Module,
+        inputs: tuple[torch.Tensor, ...],
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        a = lora_a.get_parameter("weight").to(output.dtype)
+        b = lora_b.get_parameter("weight").to(output.dtype)
+        return output + _routed_residual(inputs[0], a, b, strength)
 
-    def __init__(
-        self,
-        parent: nn.Module,
-        factors: Sequence[ScaledLoRAFactor],
-        device: torch.device,
-        dtype: torch.dtype | None = None,
-    ) -> None:
-        # Move each factor pair to the target device/dtype once; strength
-        # stays extrinsic and is applied at the hook, not baked in.
-        gpu_factors = [
-            ScaledLoRAFactor(
-                factor.a.to(device=device, dtype=dtype, non_blocking=True),
-                factor.b.to(device=device, dtype=dtype, non_blocking=True),
-                factor.strength,
-            )
-            for factor in factors
-        ]
-        # The closure captures `gpu_factors` so the GPU tensors stay alive
-        # while the hook is registered; self._factors holds the same refs
-        # so remove() can drop them.
-        self._factors = gpu_factors
-
-        def hook(
-            _module: nn.Module,
-            inputs: tuple[torch.Tensor, ...],
-            output: torch.Tensor,
-        ) -> torch.Tensor:
-            return output + _routed_residual(inputs[0], gpu_factors)
-
-        self._handle = parent.register_forward_hook(hook)
-
-    def remove(self) -> None:
-        self._handle.remove()
-        # Drop the GPU factors. Unregistering removes the hook function from
-        # the module's _forward_hooks dict, so the closure that also captured
-        # them becomes unreachable and Python refcount-GCs it.
-        self._factors = None
+    return parent.register_forward_hook(hook)
 
 
 # ---------------------------------------------------------------------------
@@ -479,7 +468,11 @@ class LoRARouteHandle:
 # ---------------------------------------------------------------------------
 
 
-def _build_lora_module(state_dict: dict[str, torch.Tensor]) -> nn.Module:
+def _build_lora_module(
+    state_dict: dict[str, torch.Tensor],
+    *,
+    dtype: torch.dtype | None = None,
+) -> nn.Module:
     """Build an ``nn.Module`` from a LoRA state dict.
 
     The state-dict keys are already module paths, so each factor tensor is
@@ -489,7 +482,8 @@ def _build_lora_module(state_dict: dict[str, torch.Tensor]) -> nn.Module:
     indexes an ``nn.ModuleList`` (extended with empty holder modules to reach
     the index, so block positions stay true even when some blocks are
     unadapted); a name segment is an attribute submodule. Well-formedness is
-    checked separately by :func:`_validate_lora_state_dict`.
+    checked separately by :func:`_validate_lora_state_dict`. ``dtype`` casts
+    each factor as it is placed.
     """
     factor_keys = [
         key for key in state_dict
@@ -505,6 +499,8 @@ def _build_lora_module(state_dict: dict[str, torch.Tensor]) -> nn.Module:
     )
     for key in factor_keys:
         tensor = state_dict[key]
+        if dtype is not None:
+            tensor = tensor.to(dtype)
         *mod_segs, param_name = key.split(".")
         node: nn.Module = root
         for i, seg in enumerate(mod_segs):
