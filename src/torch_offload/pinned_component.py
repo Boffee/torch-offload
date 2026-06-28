@@ -198,9 +198,7 @@ class PinnedComponent:
         """
         return self._instance.register_post_copy_hook(name, hook)
 
-    def activate(
-        self, device: torch.device | str | None = None, **kwargs: object,
-    ) -> None:
+    def activate(self, device: torch.device, **kwargs: object) -> None:
         """Activate the managed tensors on ``device``.
 
         CUDA activation bulk-DMAs pinned weights to GPU: per-tensor
@@ -230,7 +228,7 @@ class PinnedComponent:
                 f"on {self._active_device}. Deactivate first, or check "
                 "for a leaked context manager."
             )
-        active_device = self._resolve_device(device)
+        active_device = canonical_device(device)
         if active_device.type == "cpu":
             self._instance.install_pinned()
         elif active_device.type == "cuda":
@@ -326,19 +324,6 @@ class PinnedComponent:
                 yield
         finally:
             self._optimizer_step_active = False
-
-    # ------------------------------------------------------------------
-    # Internals
-    # ------------------------------------------------------------------
-
-    def _resolve_device(self, device: torch.device | str | None) -> torch.device:
-        if device is not None:
-            return canonical_device(device)
-        raise ValueError(
-            "PinnedComponent.activate() requires a device; pass "
-            "activate(device) from the owning binding/component."
-        )
-
 
 __all__ = [
     "PinnedComponent",

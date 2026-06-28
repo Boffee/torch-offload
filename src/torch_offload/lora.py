@@ -245,18 +245,19 @@ class LoRA:
         """Currently active device, or ``None`` when inactive."""
         return self._active_device
 
-    def activate(
-        self, device: torch.device | str | None = None, **kwargs: object,
-    ) -> None:
+    def activate(self, device: torch.device, **kwargs: object) -> None:
         if self._active_device is not None:
             raise RuntimeError(
                 "LoRA.activate() called while already active on "
                 f"{self._active_device}. Deactivate first."
             )
-        active_device = self._resolve_device(device)
-        self._active_device = active_device
+        # Device-type validation (CUDA/CPU only; MPS and others are rejected)
+        # and bare-CUDA index resolution belong to the pinned/streamed
+        # components, which canonicalize their own copy. We canonicalize once
+        # here only for a stable active_device identity.
+        self._active_device = canonical_device(device)
         try:
-            self._composite.activate(active_device, **kwargs)
+            self._composite.activate(self._active_device, **kwargs)
         except BaseException:
             self._active_device = None
             raise
@@ -266,19 +267,6 @@ class LoRA:
             self._composite.deactivate()
         finally:
             self._active_device = None
-
-    @staticmethod
-    def _resolve_device(device: torch.device | str | None) -> torch.device:
-        if device is None:
-            raise ValueError(
-                "LoRA.activate() requires a device; pass activate(device)."
-            )
-        resolved = canonical_device(device)
-        if resolved.type not in ("cpu", "cuda"):
-            raise ValueError(
-                f"LoRA.activate() supports CUDA or CPU; got {resolved}."
-            )
-        return resolved
 
 
 class LoRATransform:

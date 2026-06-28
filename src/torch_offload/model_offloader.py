@@ -426,11 +426,9 @@ class ModelOffloader:
                 "for a leaked context manager."
             )
         active_device = self._resolve_device(device)
-        if active_device.type not in ("cpu", "cuda"):
-            raise ValueError(
-                "ModelOffloader.activate() supports CUDA or CPU; "
-                f"got {active_device}."
-        )
+        # cpu/cuda support is validated at the leaf components (and the
+        # merge-LoRA hook path enforces its stricter cuda requirement);
+        # don't re-check the device kind here.
         self._active_device = active_device
         try:
             # Register LoRA hooks (incl. merge post-copy hooks installed on the

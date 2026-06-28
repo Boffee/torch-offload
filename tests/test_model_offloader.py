@@ -491,11 +491,13 @@ class TestStreamedComponentBackendActivation:
         )
         try:
             streamer.activate(
-                "cpu", stream_config=StreamConfig(num_resident_blocks=1),
+                torch.device("cpu"),
+                stream_config=StreamConfig(num_resident_blocks=1),
             )
             with pytest.raises(RuntimeError, match="already.*active"):
                 streamer.activate(
-                    "cpu", stream_config=StreamConfig(num_resident_blocks=1),
+                    torch.device("cpu"),
+                    stream_config=StreamConfig(num_resident_blocks=1),
                 )
         finally:
             streamer.deactivate()
@@ -2856,7 +2858,7 @@ class TestStreamedComponentActivateTwice:
             # double-install of forward-pre hooks.
             streamer = streamed_components(offloader)[0]
             with pytest.raises(RuntimeError, match="already.*active"):
-                streamer.activate("cuda")
+                streamer.activate(torch.device("cuda"))
         finally:
             offloader.deactivate()
 

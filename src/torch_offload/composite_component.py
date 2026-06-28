@@ -111,9 +111,7 @@ class CompositeComponent:
             name, hook,
         )
 
-    def activate(
-        self, device: torch.device | str | None = None, **kwargs: object,
-    ) -> None:
+    def activate(self, device: torch.device, **kwargs: object) -> None:
         """Activate every component, in order, on ``device``.
 
         Self-cleaning on failure: if a component's ``activate`` raises, the

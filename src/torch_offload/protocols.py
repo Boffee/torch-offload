@@ -82,20 +82,19 @@ class ModelStrategyComponent(Protocol):
     component in order; return values are ignored.
     """
 
-    def activate(
-        self, device: torch.device | str | None = None, **kwargs: object,
-    ) -> None:
+    def activate(self, device: torch.device, **kwargs: object) -> None:
         """Make this piece's contribution ready for compute.
 
         Implementations may move weights to GPU, allocate a target pool,
         register forward hooks, install an mmap, or do nothing for
         always-resident pieces. Not necessarily re-entrant -- call
-        :meth:`deactivate` before activating again. ``device`` lets a
-        top-level cache pass through the caller's acquire-time device;
-        resources that require an explicit device should raise when it
-        is omitted. Extra keyword arguments carry resource-specific
-        activation policy (e.g. a streamed component's ``stream_config``);
-        resources that don't use them ignore them.
+        :meth:`deactivate` before activating again. ``device`` is the
+        concrete compute device chosen by the owning binding; components
+        are always handed a resolved device (the binding boundary turns
+        an omitted device into an error before it reaches a component).
+        Extra keyword arguments carry resource-specific activation policy
+        (e.g. a streamed component's ``stream_config``); resources that
+        don't use them ignore them.
         """
         ...
 
