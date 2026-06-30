@@ -13,7 +13,7 @@ to be lifted into its own package when a second consumer appears.
 | Module | Role |
 |---|---|
 | `model_cache.py` | `ModelCache`, `ModelSpec`, `LoRASpec` — high-level public API for cached model and LoRA resources |
-| `protocols.py` | `ResourceStore`, `ResourceBinding`, `ModelStrategy` / `ModelStrategyComponent` plug-in contracts |
+| `protocols.py` | `ResourceStore`, `ResourceBinding` plug-in contracts |
 | `model_offloader.py` | `ModelOffloaderStore`, `ModelOffloader` — lower-level store/binding for whole-model bulk pinned-CPU↔GPU or streamed block offload |
 | `pinned_component.py` | `PinnedComponentStore`, `PinnedComponent` — lower-level reusable pinned backing storage plus lifecycle-only pinned component used by `ModelOffloader` |
 | `streamed_component.py` | `StreamedComponentStore`, `StreamedComponent` — lower-level streamed backing storage plus per-block-list streaming component |
@@ -538,8 +538,7 @@ ModelCache
 per-use lifecycle contract: `value`, `activate(device=None, **kwargs)`,
 and `deactivate()` — `activate` accepts resource-specific activation
 policy as keyword arguments (a streamed binding's `stream_config`),
-which non-streaming resources ignore. `ModelStrategy` specializes
-`ResourceBinding` for `nn.Module` values and adds `model`.
+which non-streaming resources ignore.
 
 `ModelCache` caches stores and creates bindings for `use()` calls.
 Whether a second concurrent same-key binding is allowed is decided by
@@ -573,9 +572,9 @@ spec = ResourceSpec(
 )
 ```
 
-A narrower `ModelStrategyComponent` Protocol (just `activate` +
-`deactivate`, no `model`) describes pieces composable inside a top-level
-model binding. `StreamedComponent` and `PinnedComponent` both satisfy it.
+`StreamedComponent` and `PinnedComponent` are composable
+`activate`/`deactivate` lifecycle pieces (no `value` or `model`) that live
+inside a top-level model binding rather than acting as one themselves.
 
 `TensorAdapter` is the per-parameter extension point. Its base contract
 only covers inference movement: clone/pin, H2D copy, GPU wrapper rebuild,

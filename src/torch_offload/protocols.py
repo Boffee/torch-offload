@@ -2,11 +2,6 @@
 
 These Protocols form the contract:
 
-- :class:`ModelStrategyComponent` -- pure lifecycle. A piece composable
-  inside a top-level model binding (see :class:`ModelOffloader`).
-  Just ``activate(device=...)`` + ``deactivate()``. Components do not
-  expose a value because their parent composite owns it.
-
 - :class:`ResourceStore` -- cached backing state. A store owns the
   budgeted cache bytes and can be reused across independent activations.
 
@@ -15,10 +10,6 @@ These Protocols form the contract:
   :class:`~torch_offload.model_cache.ModelCache` creates one binding per
   ``use()`` call from a cached store. ``T`` is the type yielded by
   :meth:`~ModelCache.use`.
-
-- :class:`ModelStrategy` -- model-specific specialization of
-  :class:`ResourceBinding[nn.Module]`. Adds a ``model`` convenience
-  property for code that works specifically with model bindings.
 
 Top-level :class:`ResourceBinding` implementations in this package:
 :class:`~torch_offload.ModelOffloader` (whole-model bulk DMA or streamed
@@ -30,8 +21,9 @@ factor storage).
 Future resources (disk-mmap, NVMe-paged, multi-GPU shard) satisfy the
 :class:`ResourceStore` / :class:`ResourceBinding` split.
 
-Component implementations include :class:`~torch_offload.PinnedComponent`
-and :class:`~torch_offload.StreamedComponent`.
+Composable lifecycle pieces inside a model binding include
+:class:`~torch_offload.PinnedComponent` and
+:class:`~torch_offload.StreamedComponent`.
 
 Lifecycle
 ---------
@@ -68,45 +60,6 @@ from __future__ import annotations
 from typing import Protocol, TypeVar, runtime_checkable
 
 import torch
-from torch import nn
-
-
-@runtime_checkable
-class ModelStrategyComponent(Protocol):
-    """Lifecycle-only contract for a piece composable inside a
-    top-level model binding.
-
-    Components do not expose a model -- their parent composite owns
-    that. They just contribute to the lifecycle: activate, deactivate.
-    The composite calls ``activate(device)`` / ``deactivate()`` on each
-    component in order; return values are ignored.
-    """
-
-    def activate(self, device: torch.device, **kwargs: object) -> None:
-        """Make this piece's contribution ready for compute.
-
-        Implementations may move weights to GPU, allocate a target pool,
-        register forward hooks, install an mmap, or do nothing for
-        always-resident pieces. Not necessarily re-entrant -- call
-        :meth:`deactivate` before activating again. ``device`` is the
-        concrete compute device chosen by the owning binding; components
-        are always handed a resolved device (the binding boundary turns
-        an omitted device into an error before it reaches a component).
-        Extra keyword arguments carry resource-specific activation policy
-        (e.g. a streamed component's ``stream_config``); resources that
-        don't use them ignore them.
-        """
-        ...
-
-    def deactivate(self) -> None:
-        """Undo :meth:`activate`.
-
-        Should be infallible under normal use: callers may treat a
-        raising ``deactivate()`` as unrecoverable for that binding since
-        the binding's internal state is unknown after the failure.
-        """
-        ...
-
 
 T_co = TypeVar("T_co", covariant=True)
 
@@ -143,18 +96,4 @@ class ResourceBinding(Protocol[T_co]):
 
     def deactivate(self) -> None:
         """Undo :meth:`activate`. Store bytes remain held."""
-        ...
-
-
-@runtime_checkable
-class ModelStrategy(ResourceBinding[nn.Module], Protocol):
-    """Model-specific cache binding.
-
-    Adds a ``model`` convenience property (equivalent to :attr:`value`)
-    for code that works specifically with model bindings.
-    """
-
-    @property
-    def model(self) -> nn.Module:
-        """The wrapped model for this binding."""
         ...

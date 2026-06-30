@@ -1,6 +1,6 @@
 """Tests for ``torch_offload.model_cache.ModelCache``.
 
-Uses a fake :class:`ModelStrategy` (``FakeBinding``) to exercise the
+Uses a fake :class:`ResourceBinding` (``FakeBinding``) to exercise the
 cache without needing actual GPU memory or pinning. The fake records
 every lifecycle call so tests can assert ordering and counts.
 """
@@ -28,7 +28,7 @@ from torch_offload import (
     ObjectSpec,
     ResourceSpec,
 )
-from torch_offload.protocols import ModelStrategy, ResourceStore
+from torch_offload.protocols import ResourceBinding, ResourceStore
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -66,7 +66,7 @@ class FakeStore:
 
 
 class FakeBinding:
-    """In-memory fake satisfying the :class:`ModelStrategy` protocol.
+    """In-memory fake satisfying the :class:`ResourceBinding` protocol.
 
     Records every lifecycle call. Optionally raises on activate via
     an injected exception for failure-mode tests.
@@ -137,7 +137,7 @@ def _make_factory(
     return factory
 
 
-def _bind_fake_store(store: ResourceStore) -> ModelStrategy:
+def _bind_fake_store(store: ResourceStore) -> ResourceBinding[nn.Module]:
     return cast(FakeStore, store).bind()
 
 
@@ -1179,7 +1179,7 @@ class TestHostEmptyCache:
 
 
 # ---------------------------------------------------------------------------
-# ModelStrategy structural check
+# ResourceBinding structural check
 # ---------------------------------------------------------------------------
 
 
@@ -1188,7 +1188,7 @@ class TestStrategyConformance:
         store = FakeStore(100)
         s = FakeBinding(store)
         assert isinstance(store, ResourceStore)
-        assert isinstance(s, ModelStrategy)
+        assert isinstance(s, ResourceBinding)
 
 
 # ---------------------------------------------------------------------------

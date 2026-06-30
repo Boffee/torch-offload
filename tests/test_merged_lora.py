@@ -38,7 +38,6 @@ from torch_offload.module_names import canonical_param_name
 from torch_offload.pinned_module import PinnedModuleInstance
 from torch_offload.pinned_param import PinnedParam
 from torch_offload.protocols import (
-    ModelStrategyComponent,
     ResourceBinding,
     ResourceStore,
 )
@@ -1578,7 +1577,7 @@ class TestLoRAResource:
         # not a cache ResourceStore/ResourceBinding. The cache holds the
         # store; the ModelOffloader drives the binding's streaming.
         binding = store.bind()
-        assert isinstance(binding, ModelStrategyComponent)
+        assert callable(binding.activate) and callable(binding.deactivate)
         assert not isinstance(binding, ResourceBinding)
         assert not isinstance(binding, ResourceStore)
 

@@ -80,9 +80,9 @@ def _stream_config_from_kwargs(kwargs: dict[str, object]) -> StreamConfig:
     """Extract the optional ``stream_config`` activation kwarg.
 
     :meth:`StreamedComponent.activate` accepts ``**kwargs`` to satisfy the
-    open :class:`~torch_offload.protocols.ModelStrategyComponent` lifecycle
-    contract; the streamer is the one component that consumes a
-    ``stream_config``. Absent (or ``None``) falls back to the default policy.
+    open component lifecycle contract; the streamer is the one component
+    that consumes a ``stream_config``. Absent (or ``None``) falls back to
+    the default policy.
     """
     stream_config = kwargs.get("stream_config")
     if stream_config is None:
@@ -784,8 +784,7 @@ class StreamedComponent:
 
     A :class:`StreamedComponent` is a *component* meant to be composed
     inside a :class:`~torch_offload.model_offloader.ModelOffloader`.
-    It deliberately does NOT implement
-    :class:`~torch_offload.protocols.ModelStrategy` (its
+    It deliberately is NOT a top-level model binding (its
     :meth:`activate` returns ``None`` because it doesn't own the
     model). For top-level use, build a model binding via
     :class:`~torch_offload.model_offloader.ModelOffloader`.
