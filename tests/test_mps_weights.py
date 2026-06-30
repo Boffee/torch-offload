@@ -9,7 +9,7 @@ import pytest
 import torch
 from torch import nn
 
-from torch_offload import ModelStrategy, MpsWeights
+from torch_offload import MpsWeights, ResourceBinding
 from torch_offload._devices import canonical_device
 
 MPS = pytest.mark.skipif(
@@ -53,11 +53,11 @@ class _FakeMpsWeights(MpsWeights):
         return source.clone(memory_format=torch.contiguous_format)
 
 
-class TestModelStrategyConformance:
+class TestResourceBindingConformance:
     def test_isinstance_runtime_check(self) -> None:
         strategy = _FakeMpsWeights(_make_simple_model())
         try:
-            assert isinstance(strategy, ModelStrategy)
+            assert isinstance(strategy, ResourceBinding)
         finally:
             strategy.deactivate()
 

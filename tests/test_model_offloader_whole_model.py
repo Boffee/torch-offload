@@ -11,9 +11,9 @@ from torch import nn
 from torch_offload import (
     ModelOffloader,
     ModelOffloaderStore,
-    ModelStrategy,
     PinnedComponent,
     PinnedComponentStore,
+    ResourceBinding,
 )
 
 from tests.conftest import pinned_component
@@ -52,23 +52,23 @@ def _unique_pinned_buffer_count(pw: ModelOffloader) -> int:
 
 
 # ---------------------------------------------------------------------------
-# ModelStrategy protocol conformance
+# ResourceBinding protocol conformance
 # ---------------------------------------------------------------------------
 
 
-class TestModelStrategyConformance:
+class TestResourceBindingConformance:
     def test_isinstance_runtime_check(self) -> None:
         pw = _make_model_offloader(_make_simple_model())
         try:
-            assert isinstance(pw, ModelStrategy)
+            assert isinstance(pw, ResourceBinding)
         finally:
             pw.deactivate()
 
-    def test_component_is_not_top_level_strategy(self) -> None:
+    def test_component_is_not_top_level_binding(self) -> None:
         model = _make_simple_model()
         component = PinnedComponentStore.from_module(model).bind(model)
         try:
-            assert not isinstance(component, ModelStrategy)
+            assert not isinstance(component, ResourceBinding)
         finally:
             component.deactivate()
 

@@ -20,8 +20,8 @@ from torch import nn
 from torch_offload import (
     ModelOffloader,
     ModelOffloaderStore,
-    ModelStrategy,
     PinnedComponent,
+    ResourceBinding,
     StreamConfig,
     StreamedComponent,
     StreamedComponentStore,
@@ -145,11 +145,11 @@ def _make_trainable_block_model(num_blocks: int = 4, width: int = 8) -> nn.Modul
 
 
 # ---------------------------------------------------------------------------
-# ModelStrategy conformance
+# ResourceBinding conformance
 # ---------------------------------------------------------------------------
 
 
-class TestModelStrategyConformance:
+class TestResourceBindingConformance:
     def test_isinstance_runtime_check(self) -> None:
         m = _make_block_model()
         strategy = _make_model_offloader(
@@ -157,7 +157,7 @@ class TestModelStrategyConformance:
             blocks_attr=["transformer_blocks"],
         )
         try:
-            assert isinstance(strategy, ModelStrategy)
+            assert isinstance(strategy, ResourceBinding)
         finally:
             strategy.deactivate()
 

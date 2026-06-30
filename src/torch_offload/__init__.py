@@ -45,7 +45,7 @@ MXFP4) / scaled-FP8 / INT8 / INT4 (tile-packed) packed weights, and
 tensor-parallel ``DTensor`` weights wrapping any of the above).
 
 :class:`ModelOffloader` and :class:`MpsWeights` implement the
-:class:`ModelStrategy` Protocol —
+:class:`ResourceBinding` Protocol —
 the plug-in contract for per-use bindings that :class:`ModelCache`
 activates.
 
@@ -129,8 +129,6 @@ from .model_offloader import ModelOffloader, ModelOffloaderStore
 from .mps_weights import MpsWeights
 from .pinned_component import PinnedComponent, PinnedComponentStore
 from .protocols import (
-    ModelStrategy,
-    ModelStrategyComponent,
     ResourceBinding,
     ResourceStore,
 )
@@ -157,8 +155,6 @@ __all__ = [
     "ModelOffloader",
     "ModelOffloaderStore",
     "ModelSpec",
-    "ModelStrategy",
-    "ModelStrategyComponent",
     "ModelTooLargeError",
     "MpsWeights",
     "ObjectSpec",

@@ -382,7 +382,7 @@ class ModelOffloader:
         self._loras = []
         self._lora_mode = "merge"
 
-    # ------------------------------------------------- ModelStrategy interface
+    # ----------------------------------------------- ResourceBinding interface
 
     @property
     def model(self) -> nn.Module:

@@ -7,9 +7,8 @@ streamed block groups
 (:class:`~torch_offload.streamed_component.StreamedComponent`) — and drives
 them together: activate/deactivate as a unit, coordinate the optimizer-step
 boundary, aggregate managed names, and route post-copy hooks to the owning
-component. It satisfies
-:class:`~torch_offload.protocols.ModelStrategyComponent`, so a composite is
-itself composable.
+component. Like the components it holds, it is a composable
+activate/deactivate lifecycle piece, so a composite is itself composable.
 
 The pinned remainder and the streamed groups are stored as separate fields
 (the package only ever composes these two kinds), but orchestration is
