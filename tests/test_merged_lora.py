@@ -33,8 +33,7 @@ from torch_offload import (
     StreamedComponent,
     merge_lora,
 )
-from torch_offload.model_offloader import LoraMode, _routed_factor_dtype
-from torch_offload.module_names import canonical_param_name
+from torch_offload.model_offloader import LoraMode
 from torch_offload.pinned_module import PinnedModuleInstance
 from torch_offload.pinned_param import PinnedParam
 from torch_offload.protocols import (
@@ -250,13 +249,9 @@ def _strategy_stream_config(
 
 def _has_post_copy_hook(strategy: ModelOffloader, target_key: str) -> bool:
     """Check whether a merge hook is installed for the given target."""
-    canonical_param_names = {
-        canonical_param_name(name): name
-        for name in strategy.param_names
-    }
-    param_name = canonical_param_names.get(target_key)
-    if param_name is None:
+    if target_key not in strategy.param_names:
         return False
+    param_name = target_key
     component = strategy._composite.component_for_param_name(param_name)
     if isinstance(component, PinnedComponent):
         instance = component._instance
@@ -270,15 +265,21 @@ def _has_post_copy_hook(strategy: ModelOffloader, target_key: str) -> bool:
 def _activate_loras_for_test(
     strategy: ModelOffloader,
 ) -> int:
-    targets = strategy._group_lora_factors_by_param_name(strategy._loras)
     if strategy._lora_mode == "merge":
-        strategy._register_lora_hooks(torch.device("cuda"), targets)
+        targets = strategy._group_lora_factors_by_param_name(strategy._loras)
+        try:
+            strategy._register_merge_lora_hooks(torch.device("cuda"), targets)
+        except BaseException:
+            strategy._clear_active_lora_hooks()
+            raise
         return len(targets)
+    before = len(strategy._lora_hook_handles)
     try:
-        strategy._register_lora_hooks(torch.device("cpu"), targets)
+        strategy._register_routed_lora_hooks(torch.device("cpu"))
+        return len(strategy._lora_hook_handles) - before
     finally:
         strategy._clear_active_lora_hooks()
-    return len(targets)
+        strategy._teardown_lora_bindings()
 
 
 # ---------------------------------------------------------------------------
@@ -361,6 +362,36 @@ class TestLoRAConstruction:
         lora = _make_lora(1, 16, prefix="diffusion_model.")
         assert "diffusion_model.transformer_blocks.0.attn.weight" in lora.targets
         assert "transformer_blocks.0.attn.weight" not in lora.targets
+
+    def test_from_state_dict_dtype_casts_factors_at_build(self) -> None:
+        # Routed callers pass the model's compute dtype so factors stream and
+        # reside at that width (and the hook's per-forward cast is a no-op).
+        sd = _make_lora_sd(num_blocks=2, dim=16, seed=1)  # fp32 factors
+        store = LoRAStore.from_state_dict(state_dict=sd, dtype=torch.bfloat16)
+        for name, p in store.module.named_parameters():
+            assert p.dtype == torch.bfloat16, name
+        # Default keeps the stored dtype.
+        kept = LoRAStore.from_state_dict(state_dict=sd)
+        for _name, p in kept.module.named_parameters():
+            assert p.dtype == torch.float32
+
+    def test_from_state_dict_rejects_non_floating_dtype(self) -> None:
+        # A non-floating dtype would slip past the float-factor validation
+        # (which runs on the original tensors) and silently produce int factors.
+        sd = _make_lora_sd(num_blocks=1, dim=16, seed=1)
+        with pytest.raises(ValueError, match="floating-point"):
+            LoRAStore.from_state_dict(state_dict=sd, dtype=torch.int8)
+
+    def test_factor_holders_resolves_target_to_holder_modules(self) -> None:
+        # The routed seam: a target weight key maps to its (lora_A, lora_B)
+        # holder *modules* (stable identity), not the churning weight tensors.
+        sd = _make_lora_sd(num_blocks=2, dim=16, seed=2)
+        store = LoRAStore.from_state_dict(state_dict=sd)
+        a, b = store.factor_holders("transformer_blocks.1.attn.weight")
+        assert a is store.module.get_submodule("transformer_blocks.1.attn.lora_A")
+        assert b is store.module.get_submodule("transformer_blocks.1.attn.lora_B")
+        assert a.get_parameter("weight").shape == (4, 16)
+        assert b.get_parameter("weight").shape == (16, 4)
 
 
 # ---------------------------------------------------------------------------
@@ -795,8 +826,10 @@ class TestMergeCorrectness:
             s.deactivate()
 
     @CUDA
-    def test_peft_wrapped_model_matches_all_targets(self) -> None:
-        """PEFT renames params with ``.base_layer.``; set_loras must still match."""
+    def test_base_layer_named_target_merges_with_exact_keys(self) -> None:
+        """A model whose weight lives at a nested ``.base_layer.`` path (e.g.
+        PEFT-wrapped) merges when the LoRA keys that exact path. The offloader
+        does no key remapping — the caller builds keys that match the model."""
 
         class PEFTBlock(nn.Module):
             def __init__(self, dim: int) -> None:
@@ -828,7 +861,15 @@ class TestMergeCorrectness:
             for i in range(4)
         }
 
-        lora = _make_lora(num_blocks=4, dim=16, seed=42)
+        # Keys match the model's real paths, ``.base_layer.`` and all.
+        g = torch.Generator().manual_seed(42)
+        sd: dict[str, torch.Tensor] = {}
+        for b in range(4):
+            base = f"transformer_blocks.{b}.attn.base_layer"
+            sd[f"{base}.lora_A.weight"] = torch.randn(4, 16, generator=g)
+            sd[f"{base}.lora_B.weight"] = torch.randn(16, 4, generator=g)
+        lora = LoRAStore.from_state_dict(state_dict=sd)
+
         s = _make_strategy(m)
         _set_loras(s, [(lora, 0.7)])
         s.activate("cuda", stream_config=_strategy_stream_config(m))
@@ -842,11 +883,12 @@ class TestMergeCorrectness:
                 )
                 torch.cuda.synchronize()
                 expected = _expected_merged_weight(
-                    captured_base[i].to("cuda"), [(lora, 0.7)], i, "attn.weight",
+                    captured_base[i].to("cuda"), [(lora, 0.7)], i,
+                    "attn.base_layer.weight",
                 )
                 actual = m.transformer_blocks[i].attn.base_layer.weight.detach()
                 assert torch.allclose(actual, expected, rtol=0.01, atol=0.01), (
-                    f"block {i} PEFT-wrapped merge mismatch"
+                    f"block {i} base_layer merge mismatch"
                 )
         finally:
             s.deactivate()
@@ -1407,13 +1449,13 @@ class TestRoutedMode:
         }
         lora = LoRAStore.from_state_dict(state_dict=sd)
         _set_loras(s, [(lora, 1.0)], mode="routed")
-        targets = s._group_lora_factors_by_param_name(s._loras)
-        s._register_lora_hooks(torch.device("cpu"), targets)
+        s._register_routed_lora_hooks(torch.device("cpu"))
         try:
             assert len(model.embed._forward_hooks) == (1 if target == "embed" else 0)
             assert len(model.head._forward_hooks) == (1 if target == "head" else 0)
         finally:
             s._clear_active_lora_hooks()
+            s._teardown_lora_bindings()
 
         # Merge mode also matches by name; it mutates the copied backing,
         # so the normal shared-storage effect is preserved.
@@ -1488,46 +1530,208 @@ class TestRoutedMode:
             s.deactivate()
 
 
-class TestRoutedFactorDtype:
-    """Unit tests for the compute-dtype probe used to cast routed LoRA
-    factors. The probe must return the layer's *output* dtype, not the
-    weight's *storage* dtype — for quantized layers these differ.
-    """
+class TestRoutedStreaming:
+    """Routed LoRA on the streaming foundation (#31): per-LoRA stacked hooks
+    read the LoRA's resident factors, co-scheduled with the base model."""
 
-    def test_plain_linear_returns_weight_dtype(self) -> None:
-        layer = nn.Linear(8, 8, bias=False).to(torch.bfloat16)
-        assert _routed_factor_dtype(layer) is torch.bfloat16
+    def test_multi_lora_stacked_hooks_compose_additively(self) -> None:
+        # One block (so the two adapters don't feed each other across blocks)
+        # and a fully-linear tail, so LoRA residuals superpose:
+        # y(L1+L2) == y(L1) + y(L2) - y0. Two LoRAs on the one attn.weight
+        # install two stacked forward-POST hooks; additive hook chaining must
+        # sum them with no central grouping.
+        torch.manual_seed(0)
+        m = _make_bf16_model(num_blocks=1, dim=16).to(torch.float32)
+        x = torch.randn(3, 16)
+        lora1 = _make_lora(num_blocks=1, dim=16, seed=1)
+        lora2 = _make_lora(num_blocks=1, dim=16, seed=2)
+        s = _make_model_offloader(m, blocks_attr=["transformer_blocks"])
 
-    def test_module_compute_dtype_takes_precedence(self) -> None:
-        # BitsAndBytes Linear4bit pattern: subclass of nn.Linear that
-        # exposes `compute_dtype` on the module. Probe must prefer that
-        # over weight.dtype (which is int8 for bnb's Int8Params).
-        layer = nn.Linear(8, 8, bias=False).to(torch.bfloat16)
-        layer.compute_dtype = torch.float16  # type: ignore[assignment]
-        assert _routed_factor_dtype(layer) is torch.float16
+        def routed_forward(
+            loras: list[tuple[LoRAStore, float]],
+        ) -> torch.Tensor:
+            if loras:
+                _set_loras(s, loras, mode="routed")
+            s.activate(torch.device("cpu"))
+            try:
+                return m(x).clone()
+            finally:
+                s.deactivate()
 
-    def test_quanto_adapter_reports_compute_dtype(self) -> None:
-        # quanto's WeightQBytesTensor wraps an int8 _data plus a fp
-        # _scale, but the wrapper-subclass dtype is set to scale.dtype
-        # (per `_make_wrapper_subclass(... dtype=scale.dtype ...)`).
-        # The routed probe now asks the tensor adapter for the logical
-        # compute dtype instead of reading storage internals directly.
-        quanto = pytest.importorskip("optimum.quanto")
-        from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
-
-        rows, cols = 4, 8
-        data = torch.randint(-128, 127, (rows, cols), dtype=torch.int8)
-        scale = torch.rand(rows, 1, dtype=torch.bfloat16)
-        qt = WeightQBytesTensor.create(
-            quanto.qint8, 0, (rows, cols), (cols, 1), data, scale, None,
+        y0 = routed_forward([])
+        y1 = routed_forward([(lora1, 0.7)])
+        y2 = routed_forward([(lora2, 1.3)])
+        y12 = routed_forward([(lora1, 0.7), (lora2, 1.3)])
+        torch.testing.assert_close(
+            y12, y1 + y2 - y0, rtol=1e-3, atol=1e-3,
         )
-        layer = nn.Linear(cols, rows, bias=False)
-        layer.weight = nn.Parameter(qt, requires_grad=False)
 
-        # Storage is int8; advertised dtype is bf16 (matches scale).
-        assert layer.weight._data.dtype == torch.int8
-        assert layer.weight.dtype == torch.bfloat16
-        assert _routed_factor_dtype(layer) is torch.bfloat16
+    def test_routed_nested_base_layer_path(self) -> None:
+        # A weight nested under ``.base_layer.`` (e.g. PEFT-wrapped). Routed
+        # resolves the hook onto that nested Linear and reads the factor from
+        # the matching nested holder — both keyed at the exact model path.
+        class PEFTBlock(nn.Module):
+            def __init__(self, dim: int) -> None:
+                super().__init__()
+                self.attn = nn.Module()
+                self.attn.base_layer = nn.Linear(dim, dim, bias=False)
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                return self.attn.base_layer(x)
+
+        class M(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.transformer_blocks = nn.ModuleList(
+                    [PEFTBlock(16) for _ in range(2)]
+                )
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                for blk in self.transformer_blocks:
+                    x = blk(x)
+                return x
+
+        m = M()
+        for p in m.parameters():
+            p.requires_grad = False
+        base_w = [
+            m.transformer_blocks[b].attn.base_layer.weight.detach().clone()
+            for b in range(2)
+        ]
+        # Keys match the model's real ``.base_layer.`` paths exactly.
+        g = torch.Generator().manual_seed(3)
+        sd: dict[str, torch.Tensor] = {}
+        for b in range(2):
+            base = f"transformer_blocks.{b}.attn.base_layer"
+            sd[f"{base}.lora_A.weight"] = torch.randn(4, 16, generator=g)
+            sd[f"{base}.lora_B.weight"] = torch.randn(16, 4, generator=g)
+        lora = LoRAStore.from_state_dict(state_dict=sd)
+        assert set(lora.targets) == {
+            "transformer_blocks.0.attn.base_layer.weight",
+            "transformer_blocks.1.attn.base_layer.weight",
+        }
+
+        s = _make_model_offloader(m, blocks_attr=["transformer_blocks"])
+        _set_loras(s, [(lora, 0.5)], mode="routed")
+        x = torch.randn(2, 16)
+        s.activate(torch.device("cpu"))
+        try:
+            actual = m(x).clone()
+            # The hook lands on the matched ``.base_layer`` Linear.
+            assert (
+                len(m.transformer_blocks[0].attn.base_layer._forward_hooks) == 1
+            )
+        finally:
+            s.deactivate()
+
+        h = x
+        for b in range(2):
+            out = F.linear(h, base_w[b])
+            a = sd[f"transformer_blocks.{b}.attn.base_layer.lora_A.weight"]
+            bb = sd[f"transformer_blocks.{b}.attn.base_layer.lora_B.weight"]
+            h = out + 0.5 * (h @ a.T) @ bb.T
+        torch.testing.assert_close(actual, h, rtol=1e-4, atol=1e-4)
+
+    def test_deactivate_tears_down_lora_bindings(self) -> None:
+        m = _make_bf16_model(num_blocks=2, dim=16)
+        lora = _make_lora(num_blocks=2, dim=16, seed=4)
+        s = _make_model_offloader(m, blocks_attr=["transformer_blocks"])
+
+        _set_loras(s, [(lora, 1.0)], mode="routed")
+        s.activate(torch.device("cpu"))
+        # One streaming engine; one stacked hook per (LoRA, target).
+        assert len(s._lora_bindings) == 1
+        assert s._lora_bindings[0].active_device == torch.device("cpu")
+        assert len(s._lora_hook_handles) == 2
+
+        s.deactivate()
+        assert s._lora_bindings == []
+        assert s._lora_hook_handles == []
+        assert s._loras == []
+
+        # Re-activation after re-recording works (loras clear on deactivate).
+        _set_loras(s, [(lora, 1.0)], mode="routed")
+        s.activate(torch.device("cpu"))
+        try:
+            assert len(s._lora_bindings) == 1
+        finally:
+            s.deactivate()
+
+    @CUDA
+    def test_routed_streaming_matches_merge(self) -> None:
+        # A blocks_attr LoRA streams its factors co-scheduled with the model
+        # (num_resident_blocks=1 forces streaming). Routed (resident-factor
+        # residual) must match merge (weight-bake) bit-close, and the factor
+        # holder modules must keep stable identity across stream load/evict
+        # (the hook caches the node, not the churning .weight).
+        m = _make_bf16_model(num_blocks=2, dim=16)
+        lora = LoRAStore.from_state_dict(
+            state_dict=_make_lora_sd(num_blocks=2, dim=16, seed=7),
+            blocks_attr=["transformer_blocks"],
+        )
+        x = torch.randn(2, 16, dtype=torch.bfloat16, device="cuda")
+        s = _make_model_offloader(m, blocks_attr=["transformer_blocks"])
+        cfg = _strategy_stream_config(m, num_resident_blocks=1)
+
+        _set_loras(s, [(lora, 0.5)], mode="merge")
+        s.activate("cuda", stream_config=cfg)
+        try:
+            merged = m(x).clone()
+            torch.cuda.synchronize()
+        finally:
+            s.deactivate()
+
+        a_node_before = lora.module.get_submodule(
+            "transformer_blocks.0.attn.lora_A",
+        )
+        _set_loras(s, [(lora, 0.5)], mode="routed")
+        s.activate("cuda", stream_config=cfg)
+        try:
+            routed = m(x).clone()
+            torch.cuda.synchronize()
+            a_node_after = lora.module.get_submodule(
+                "transformer_blocks.0.attn.lora_A",
+            )
+        finally:
+            s.deactivate()
+
+        assert a_node_before is a_node_after
+        # Routed (resident-factor residual) vs merge (weight-bake) differ only
+        # by bf16 rounding of the separate residual GEMMs.
+        torch.testing.assert_close(routed, merged, rtol=0.1, atol=0.1)
+
+    def test_activate_rolls_back_composite_when_routed_registration_fails(
+        self,
+    ) -> None:
+        # Routed hooks install AFTER the composite is live. If registration
+        # raises (here: a target the model doesn't manage), the now-resident
+        # composite must be torn back down — not stranded. Proven by a clean
+        # re-activation, which the composite's "already active" guard would
+        # otherwise reject.
+        m = _make_bf16_model(num_blocks=2, dim=16)
+        sd = {
+            "transformer_blocks.0.absent.lora_A.weight": torch.randn(4, 16),
+            "transformer_blocks.0.absent.lora_B.weight": torch.randn(16, 4),
+        }
+        bad = LoRAStore.from_state_dict(
+            state_dict=sd, blocks_attr=["transformer_blocks"],
+        )
+        s = _make_model_offloader(m, blocks_attr=["transformer_blocks"])
+        _set_loras(s, [(bad, 1.0)], mode="routed")
+
+        with pytest.raises(ValueError, match="not managed"):
+            s.activate(torch.device("cpu"))
+
+        assert s.active_device is None
+        assert s._lora_bindings == []
+        assert s._lora_hook_handles == []
+        # Composite was deactivated -> a fresh activation succeeds and runs.
+        s.activate(torch.device("cpu"))
+        try:
+            out = m(torch.randn(2, 16, dtype=torch.bfloat16))
+            assert out.shape == (2, 16)
+        finally:
+            s.deactivate()
 
 
 class TestDeactivateCleanupInvariants:
@@ -1547,6 +1751,34 @@ class TestDeactivateCleanupInvariants:
 
         with pytest.raises(RuntimeError):
             s.deactivate()
+
+    def test_deactivate_tears_down_composite_even_if_binding_raises(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # A routed LoRA binding whose deactivate() raises (e.g. a factor
+        # eviction CUDA error) must NOT prevent the base composite teardown —
+        # otherwise the model would leak resident. CPU activation is enough to
+        # exercise the lifecycle ordering.
+        m = _make_bf16_model(num_blocks=2, dim=16)
+        lora = _make_lora(num_blocks=2, dim=16, seed=4)
+        s = _make_model_offloader(m, blocks_attr=["transformer_blocks"])
+        _set_loras(s, [(lora, 1.0)], mode="routed")
+        s.activate(torch.device("cpu"))
+        assert s._lora_bindings  # a live streaming engine to sabotage
+
+        def boom() -> None:
+            raise RuntimeError("binding eviction failed")
+
+        monkeypatch.setattr(s._lora_bindings[0], "deactivate", boom)
+
+        with pytest.raises(RuntimeError, match="binding eviction failed"):
+            s.deactivate()
+
+        # Despite the binding failure, the composite was deactivated and the
+        # offloader reports inactive -> a fresh activation succeeds.
+        assert s.active_device is None
+        s.activate(torch.device("cpu"))
+        s.deactivate()
 
 
 # ---------------------------------------------------------------------------

@@ -76,8 +76,8 @@ drop those references and rebuild from a fresh model instance.
      streaming is configured.
 
 Optional LoRA merging is requested via :meth:`ModelOffloader.set_loras`
-and resolved on activation by installing post-copy hooks for canonical
-managed parameter targets. Unknown targets raise during activation. The
+and resolved on activation by installing post-copy hooks for managed
+parameter targets. Unknown targets raise during activation. The
 hooks run immediately after the owning component copies a base weight
 from pinned CPU storage to GPU, so block-streamed and non-block weights
 use the same merge path. Merge eligibility is owned by the selected

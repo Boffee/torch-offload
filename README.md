@@ -17,7 +17,7 @@ to be lifted into its own package when a second consumer appears.
 | `model_offloader.py` | `ModelOffloaderStore`, `ModelOffloader` — lower-level store/binding for whole-model bulk pinned-CPU↔GPU or streamed block offload |
 | `pinned_component.py` | `PinnedComponentStore`, `PinnedComponent` — lower-level reusable pinned backing storage plus lifecycle-only pinned component used by `ModelOffloader` |
 | `streamed_component.py` | `StreamedComponentStore`, `StreamedComponent` — lower-level streamed backing storage plus per-block-list streaming component |
-| `lora.py` | `LoRAStore`, `LoRA`, `LoRATransform`, `LoRARouteHandle` — pinned factor storage + streamable binding + merge / routed-hook application |
+| `lora.py` | `LoRAStore`, `LoRA`, `LoRATransform` — pinned factor storage + streamable binding + merge / routed-hook application |
 | `merge.py` | `merge_lora()` — permanent in-place LoRA merge into base weights (alternative to `set_loras`) |
 | `pinned_param.py` | `PinnedParam` — per-parameter pinning primitive (handles plain tensors, quanto, GGUF, bitsandbytes, DTensor, and TorchAO scaled-FP8 / INT8 / MX (MXFP8, MXFP4) / NVFP4 / INT4 tile-packed via adapters; see [Quantized weight support](#quantized-weight-support)) |
 | `pinned_module.py` | Internal name-keyed pinned module storage plus concrete module bindings |
@@ -183,8 +183,9 @@ bulk-pinned component that activation copies to the GPU.
 `cpu` is a pass-through over the already-installed pinned CPU storage:
 no target pool, no streaming hooks, no weight copies.
 `set_loras(..., mode="merge")` is CUDA-only; use routed LoRA mode for
-CPU activation. Routed LoRA still installs forward hooks and materializes
-LoRA factors on the activation device.
+CPU activation. Routed LoRA installs forward hooks and streams its
+factors co-scheduled with the model, so they page onto the activation
+device with the block they belong to.
 
 By default, trainable parameters (e.g. LoRA adapters) are managed by
 the composed `PinnedComponent`: they move to GPU on CUDA activation and
@@ -214,11 +215,12 @@ Gradients are not streamed; PyTorch owns `param.grad` normally.
 
 `ModelOffloader` supports optional per-weight LoRA merging via
 `set_loras()`. LoRA requests are applied during activation; merge mode
-installs activation-scoped post-copy hooks for canonical managed
-parameter targets. Unknown targets raise during activation. PEFT
-`.base_layer.` model parameter paths are canonicalized for lookup, so
-LoRA target keys should use the logical form like
-`blocks.0.attn.weight`. Each hook runs immediately after the owning
+installs activation-scoped post-copy hooks for managed parameter
+targets. Unknown targets raise during activation. LoRA target keys must
+match the model's parameter names exactly; any remapping — stripping a
+`diffusion_model.` prefix, inserting a PEFT `.base_layer.` segment — is
+the caller's job when building the LoRA state dict. Each hook runs
+immediately after the owning
 component copies the base weight from pinned CPU storage to GPU, so both
 block-streamed and non-block weights use the same merge path. Merge
 compatibility is adapter-owned: plain dense tensors opt into in-place
@@ -265,7 +267,12 @@ the previous merge — no explicit unmerge step needed.
 `set_loras` accepts `mode="routed"` as an alternative to the default
 `mode="merge"`. Routed mode installs a forward hook on each matched
 `nn.Linear` parent — `y = base(x) + alpha * B * A * x` — instead of merging
-into the base weight. Use it when:
+into the base weight. Each LoRA streams as its own engine co-scheduled
+with the model, so a factor block is GPU-resident only while its base
+block runs (bounded residency, not the whole adapter at once); multiple
+LoRAs on one target stack as additive hooks. **Routed mode is
+inference-only:** the streamed factors are frozen (`requires_grad=False`)
+and no gradient flows to them. Use it when:
 
 - The base weight is quantized or otherwise structured, but still exposes
   a logical `nn.Linear` weight shape and compute dtype, and its adapter
@@ -274,10 +281,10 @@ into the base weight. Use it when:
 - You want to switch LoRAs frequently without re-streaming the
   underlying base weight.
 
-Routed mode is restricted to `nn.Linear` parents and rejects tied
-weights (the hook would only fire on one alias). Packed formats whose
-parameter shape differs from the logical matmul weight need a per-format
-route layer.
+Routed mode is restricted to `nn.Linear` parents. It handles tied
+weights by hooking only the exact parent module named by the target, so
+it never mutates shared storage. Packed formats whose parameter shape
+differs from the logical matmul weight need a per-format route layer.
 
 For a one-shot **permanent** merge — bake the LoRA into the model
 weights and discard the LoRA — use `merge_lora`:
