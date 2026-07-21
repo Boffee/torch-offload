@@ -287,9 +287,8 @@ class ModelOffloader:
     def _clear_active_lora_hooks(self) -> None:
         hook_handles = self._lora_hook_handles
         self._lora_hook_handles = []
-        with contextlib.ExitStack() as stack:
-            for handle in hook_handles:
-                stack.callback(handle.remove)
+        for handle in reversed(hook_handles):
+            handle.remove()
 
     def _deactivate_loras(self) -> None:
         """Release active routed LoRAs in reverse order. Idempotent."""
