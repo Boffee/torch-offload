@@ -784,14 +784,14 @@ class StreamedComponent:
 
     A :class:`StreamedComponent` is a *component* meant to be composed
     inside a :class:`~torch_offload.model_offloader.ModelOffloader`.
-    It deliberately is NOT a top-level model binding (its
+    It deliberately is NOT a top-level model runtime (its
     :meth:`activate` returns ``None`` because it doesn't own the
-    model). For top-level use, build a model binding via
+    model). For top-level use, build a model runtime via
     :class:`~torch_offload.model_offloader.ModelOffloader`.
 
     Lifecycle is uniform with :class:`PinnedComponent`: store construction
     pins (so ``cache_bytes`` is final at construction time, ready
-    for :class:`~torch_offload.model_cache.ModelCache` admission), and
+    for :class:`~torch_offload.resource_cache.ResourceCache` admission), and
     ``activate`` brings to CUDA or marks CPU active, ``deactivate`` returns state to
     pinned CPU and removes hooks. The residency/prefetch policy
     (``num_resident_blocks``, ``num_prefetch_blocks``, ``cyclic``) is supplied

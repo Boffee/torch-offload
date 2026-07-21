@@ -8,10 +8,9 @@ import torch
 from torch import nn
 
 from torch_offload import (
-    LoRAStore,
+    LoRA,
     LoRATransform,
     ModelOffloader,
-    ModelOffloaderStore,
     ScaledLoRAFactor,
     StreamConfig,
     merge_lora,
@@ -20,6 +19,7 @@ from torch_offload.int8_adapter import Int8Adapter
 from torch_offload.pinned_param import PinnedParam
 from torch_offload.streamed_component import _param_target_layout
 from torch_offload.tensor_adapter_registry import select_adapter, tensor_id
+from tests.conftest import activated_model
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -30,12 +30,11 @@ def _make_model_offloader(
     blocks_attr: list[str] = [],
     stream_trainable_weights: bool = False,
 ) -> ModelOffloader:
-    store = ModelOffloaderStore.from_module(
+    return ModelOffloader.from_module(
         model,
         blocks_attr=blocks_attr,
         stream_trainable_weights=stream_trainable_weights,
     )
-    return store.bind(model)
 
 
 def _int8_config(*, dynamic_activation: bool) -> object:
@@ -51,11 +50,7 @@ def _int8_config(*, dynamic_activation: bool) -> object:
         # it — or a future release moves it.
         pytest.skip(f"torchao int8 API unavailable: {exc}")
 
-    return (
-        Int8DynamicActivationInt8WeightConfig(version=2)
-        if dynamic_activation
-        else Int8WeightOnlyConfig(version=2)
-    )
+    return Int8DynamicActivationInt8WeightConfig(version=2) if dynamic_activation else Int8WeightOnlyConfig(version=2)
 
 
 def _int8_tensor_cls() -> type:
@@ -91,7 +86,10 @@ def _make_int8(
 
 
 def _make_int8_pergroup(
-    *, rows: int = 32, cols: int = 128, group_size: int = 64,
+    *,
+    rows: int = 32,
+    cols: int = 128,
+    group_size: int = 64,
 ) -> torch.Tensor:
     pytest.importorskip("torchao")
     try:
@@ -101,9 +99,7 @@ def _make_int8_pergroup(
         pytest.skip(f"torchao per-group int8 API unavailable: {exc}")
 
     layer = nn.Linear(cols, rows, bias=False).to(torch.bfloat16)
-    quantize_(
-        layer, Int8WeightOnlyConfig(granularity=PerGroup(group_size), version=2)
-    )
+    quantize_(layer, Int8WeightOnlyConfig(granularity=PerGroup(group_size), version=2))
     return layer.weight.data
 
 
@@ -130,10 +126,7 @@ class TestInt8Adapter:
         if qt.zero_point is not None:
             assert pinned.zero_point is not None
             assert pinned.zero_point.is_pinned()
-            assert (
-                pinned.zero_point.data_ptr()
-                == pinned_param.pinned_state.storage[2].data_ptr()
-            )
+            assert pinned.zero_point.data_ptr() == pinned_param.pinned_state.storage[2].data_ptr()
         assert pinned.block_size == qt.block_size
         assert pinned.dtype == qt.dtype
         assert pinned_param.compute_dtype is torch.bfloat16
@@ -155,16 +148,10 @@ class TestInt8Adapter:
         assert _param_target_layout(p1) == _param_target_layout(p2)
 
     def test_target_layout_tracks_activation_quantization(self) -> None:
-        with_activation = nn.Parameter(
-            _make_int8(dynamic_activation=True), requires_grad=False
-        )
-        weight_only = nn.Parameter(
-            _make_int8(dynamic_activation=False), requires_grad=False
-        )
+        with_activation = nn.Parameter(_make_int8(dynamic_activation=True), requires_grad=False)
+        weight_only = nn.Parameter(_make_int8(dynamic_activation=False), requires_grad=False)
 
-        assert _param_target_layout(with_activation) != _param_target_layout(
-            weight_only
-        )
+        assert _param_target_layout(with_activation) != _param_target_layout(weight_only)
 
     def test_no_cpu_round_trip_or_trainable_swap_capability(self) -> None:
         pinned_param = PinnedParam(
@@ -178,13 +165,9 @@ class TestInt8Adapter:
             pinned_param.validate_parameter_data_swap_target()
 
     @pytest.mark.parametrize("dynamic_activation", [False, True])
-    def test_dequantize_requantize_preserves_representation(
-        self, dynamic_activation: bool
-    ) -> None:
+    def test_dequantize_requantize_preserves_representation(self, dynamic_activation: bool) -> None:
         int8_cls = _int8_tensor_cls()
-        qt = _make_int8(
-            rows=32, cols=16, dynamic_activation=dynamic_activation
-        )
+        qt = _make_int8(rows=32, cols=16, dynamic_activation=dynamic_activation)
         dense = Int8Adapter.dequantize(qt)
         assert dense.dtype is torch.float32
         torch.testing.assert_close(dense, qt.dequantize().to(torch.float32))
@@ -235,7 +218,7 @@ class TestInt8Adapter:
             requires_grad=False,
         )
         original_qdata = model.lin.weight.data.qdata.clone()
-        lora = LoRAStore.from_state_dict(
+        lora = LoRA.from_state_dict(
             state_dict={
                 "lin.lora_A.weight": torch.randn(4, 128),
                 "lin.lora_B.weight": torch.randn(32, 4),
@@ -256,7 +239,10 @@ class TestInt8Adapter:
         int8_cls = _int8_tensor_cls()
         base = _make_int8(rows=32, cols=16)
         like = int8_cls(
-            base.qdata, base.scale, list(base.block_size), base.dtype,
+            base.qdata,
+            base.scale,
+            list(base.block_size),
+            base.dtype,
             zero_point=None,
         )
         assert like.zero_point is None
@@ -311,7 +297,7 @@ class TestInt8Adapter:
         # copy_into mutates the weight's storage in place, so snapshot the
         # original int8 bytes rather than holding a tensor ref.
         original_qdata = model.lin.weight.data.qdata.clone()
-        lora = LoRAStore.from_state_dict(
+        lora = LoRA.from_state_dict(
             state_dict={
                 "lin.lora_A.weight": torch.randn(4, 16),
                 "lin.lora_B.weight": torch.randn(16, 4),
@@ -359,9 +345,7 @@ class TestInt8Adapter:
         assert torch.equal(gpu_param.data.scale.cpu(), pinned.scale)
         if pinned.zero_point is not None:
             assert gpu_param.data.zero_point is not None
-            assert torch.equal(
-                gpu_param.data.zero_point.cpu(), pinned.zero_point
-            )
+            assert torch.equal(gpu_param.data.zero_point.cpu(), pinned.zero_point)
 
     @CUDA
     @pytest.mark.parametrize("dynamic_activation", [False, True])
@@ -376,7 +360,7 @@ class TestInt8Adapter:
 
         try:
             x = torch.randn(128, 64, dtype=torch.bfloat16, device="cuda")
-            with strategy.use("cuda") as active:
+            with activated_model(strategy, "cuda") as active:
                 y = active(x)
                 torch.cuda.synchronize()
             assert y.shape == (128, 128)
@@ -412,21 +396,20 @@ class TestInt8Adapter:
             model,
             blocks_attr=["blocks"],
         )
-        lora = LoRAStore.from_state_dict(
+        lora = LoRA.from_state_dict(
             state_dict={
                 "blocks.0.lora_A.weight": torch.randn(4, 128),
                 "blocks.0.lora_B.weight": torch.randn(128, 4),
             }
         )
-        offloader.set_loras([lora], strengths=[0.25], mode="routed")
-
         try:
             x = torch.randn(128, 128, dtype=torch.bfloat16, device="cuda")
-            with offloader.use(
+            with activated_model(offloader,
                 "cuda",
-                stream_config=StreamConfig(
-                    num_resident_blocks=1, num_prefetch_blocks=0
-                ),
+                loras=[lora],
+                lora_strengths=[0.25],
+                lora_mode="routed",
+                stream_config=StreamConfig(num_resident_blocks=1, num_prefetch_blocks=0),
             ) as active:
                 y = active(x)
                 torch.cuda.synchronize()
@@ -465,7 +448,7 @@ class TestInt8Adapter:
         rank = 4
         a = torch.randn(rank, 32)
         b = torch.randn(32, rank)
-        lora = LoRAStore.from_state_dict(
+        lora = LoRA.from_state_dict(
             state_dict={
                 "blocks.0.lora_A.weight": a,
                 "blocks.0.lora_B.weight": b,
@@ -475,24 +458,21 @@ class TestInt8Adapter:
         # offloader merges into a byte-identical GPU copy of the weight.
         qt_cuda = qt.cuda()
         expected_dense = qt_cuda.dequantize().to(torch.float32)
-        expected_dense.addmm_(
-            b.cuda().to(torch.float32), a.cuda().to(torch.float32), alpha=0.5
-        )
+        expected_dense.addmm_(b.cuda().to(torch.float32), a.cuda().to(torch.float32), alpha=0.5)
         expected = Int8Adapter.requantize(expected_dense, like=qt_cuda)
 
         offloader = _make_model_offloader(
             model,
             blocks_attr=["blocks"],
         )
-        offloader.set_loras([lora], strengths=[0.5], mode="merge")
-
         try:
             x = torch.randn(8, 32, dtype=torch.bfloat16, device="cuda")
-            with offloader.use(
+            with activated_model(offloader,
                 "cuda",
-                stream_config=StreamConfig(
-                    num_resident_blocks=1, num_prefetch_blocks=0
-                ),
+                loras=[lora],
+                lora_strengths=[0.5],
+                lora_mode="merge",
+                stream_config=StreamConfig(num_resident_blocks=1, num_prefetch_blocks=0),
             ) as active:
                 merged = active.blocks[0].weight.data
                 assert isinstance(merged, int8_cls)

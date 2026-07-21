@@ -2,10 +2,11 @@
 
 High-level API:
 
-- :class:`ModelCache` with :class:`ModelSpec` caches model stores and
-  creates per-use :class:`ModelOffloader` bindings. Use
-  :class:`LoRASpec` with ``ModelCache.use(..., loras=[...])`` to cache
-  LoRA resources and apply them during model activation.
+- :class:`ResourceCache` accepts structural :class:`ResourceSpec` implementations
+  and leases reusable model, LoRA, and object stores under a host-memory
+  budget. :class:`CachedModelRunner` composes a
+  leased :class:`ModelSpec` with optional :class:`LoRASpec` resources,
+  and activates the cached :class:`ModelOffloader`.
   :class:`ObjectSpec` caches general Python objects (tokenizers,
   processors, configs) in the same registry; by default they are
   charged zero bytes and live until explicitly evicted.
@@ -13,9 +14,9 @@ High-level API:
 Lower-level resource bindings:
 
 - :class:`ModelOffloader` -- whole-model pinned-CPU bulk cache when
-  created by ``ModelOffloaderStore.from_module(model).bind(model)``, or
-  per-block streaming when the store is constructed with ``blocks_attr``
-  and ``num_resident_blocks``. Streaming mode supports optional LoRA merge,
+  created by ``ModelOffloader.from_module(model)``, or per-block streaming
+  when it is constructed with ``blocks_attr``
+  and activation receives a :class:`StreamConfig`. Streaming mode supports optional LoRA merge,
   trainable-parameter support, CUDA prefetch on a secondary stream, and
   activation checkpointing through autograd backward. By default,
   trainable params are managed by
@@ -23,7 +24,7 @@ Lower-level resource bindings:
   ``stream_trainable_weights=True`` to stream in-block trainable weights
   and materialize them only around ``optimizer.step()``. That step runs on
   the GPU via the ``optimizer_step()`` context; calling ``optimizer.step()``
-  outside ``use()`` instead runs the optimizer on CPU over the pinned
+  after deactivation instead runs the optimizer on CPU over the pinned
   weights (state stays on host). On deactivation every managed trainable's
   ``.grad`` follows its ``.data`` to pinned CPU, so the context-free CPU
   step works for both streamed and non-streamed trainables — keep such
@@ -44,16 +45,12 @@ decomposition, GGUF packed weights, TorchAO NVFP4 / MX (MXFP8,
 MXFP4) / scaled-FP8 / INT8 / INT4 (tile-packed) packed weights, and
 tensor-parallel ``DTensor`` weights wrapping any of the above).
 
-:class:`ModelOffloader` and :class:`MpsWeights` implement the
-:class:`ResourceBinding` Protocol —
-the plug-in contract for per-use bindings that :class:`ModelCache`
-activates.
+:class:`ModelOffloader` and :class:`MpsWeights` are cached resources that also
+implement the :class:`ResourceBinding` Protocol. Each owns exactly one model
+runtime and is reused sequentially.
 
-Package stores make ``cache_bytes`` final before use: for
-:class:`ModelOffloader`, store construction pins reusable backing storage
-and ``bind(model)`` creates the bound model binding; for self-binding stores
-like :class:`MpsWeights`, construction owns that work. ``activate(device)``
-then makes the binding usable on the requested device. For
+Package resources make ``cache_bytes`` final during construction.
+``activate(device)`` then makes the resource usable on the requested device. For
 :class:`ModelOffloader`, ``deactivate()`` returns managed tensors to
 pinned CPU. For :class:`MpsWeights`,
 construction has already materialized the model on MPS, so
@@ -75,9 +72,9 @@ drop those references and rebuild from a fresh model instance.
   2. One :class:`StreamedComponent` per ``blocks_attr`` path when
      streaming is configured.
 
-Optional LoRA merging is requested via :meth:`ModelOffloader.set_loras`
-and resolved on activation by installing post-copy hooks for managed
-parameter targets. Unknown targets raise during activation. The
+Optional LoRA merging is requested directly on :meth:`ModelOffloader.activate`
+and resolved by installing post-copy hooks for managed parameter targets.
+Unknown targets raise during activation. The
 hooks run immediately after the owning component copies a base weight
 from pinned CPU storage to GPU, so block-streamed and non-block weights
 use the same merge path. Merge eligibility is owned by the selected
@@ -87,10 +84,14 @@ dequantize/requantize plus ``copy_into`` merge, otherwise use routed
 LoRA when their module exposes a compatible logical Linear weight shape
 and compute dtype.
 
-:class:`ModelCache` manages cached backing stores with policy-driven
-eviction, creates per-use bindings, and owns transactional admission.
-Trainable model specs reuse their primary model across sequential
-uses and reject concurrent same-key bindings. Custom
+:class:`LoRA` owns its pinned factor storage and one exclusive merge or routed
+activation lifecycle. It is reusable sequentially; overlapping use raises
+:class:`LoRARuntimeInUseError` immediately.
+
+:class:`ResourceCache` manages cached backing stores with policy-driven
+eviction, reference-counted leases, and transactional admission.
+:class:`CachedModelRunner` owns dependency leasing, LoRA attachment, and device
+activation. Each model offloader and LoRA rejects overlapping use. Custom
 :class:`EvictionPolicy`
 implementations can replace the default LRU behavior. See its docstring
 for design notes.
@@ -99,44 +100,52 @@ Compatibility
 -------------
 - **``torch.compile`` is not supported** for managed modules.
 - **Wrap before DDP/FSDP**, not after.
-- **Coarse cache concurrency.** :class:`ModelCache` serializes cache
-  metadata/lifecycle operations and releases its lock while caller code
-  runs inside a use context. Individual yielded model objects are not made
-  safe for concurrent same-key execution by the cache.
+- **Coarse cache concurrency.** :class:`ResourceCache` serializes cache
+  metadata and lease operations and releases its lock while caller code
+  holds a lease. Model and LoRA cache entries support one active use at a time.
 """
 
+from .cached_model_runner import CachedModelRunner
 from .gguf_adapter import GGUFWeight
-from .lora import LoRA, LoRAFactor, LoRAStore, LoRATransform, ScaledLoRAFactor
-from .merge import merge_lora
-from .model_cache import (
-    DuplicateModelKeyError,
-    EvictionCandidate,
-    EvictionContext,
-    EvictionPolicy,
-    EvictionPolicyError,
-    LoRASpec,
-    LRUEvictionPolicy,
-    ModelCache,
-    ModelCacheError,
-    ModelInUseError,
-    ModelNotRegisteredError,
-    ModelSpec,
-    ModelTooLargeError,
-    ObjectSpec,
-    ResourceSpec,
+from .lora import (
+    LoRA,
+    LoRAFactor,
+    LoRARuntimeInUseError,
+    LoRATransform,
+    ScaledLoRAFactor,
 )
-from .model_offloader import ModelOffloader, ModelOffloaderStore
+from .merge import merge_lora
+from .model_offloader import ModelOffloader, ModelRuntimeInUseError
 from .mps_weights import MpsWeights
 from .pinned_component import PinnedComponent, PinnedComponentStore
 from .protocols import (
     ResourceBinding,
+    ResourceSpec,
     ResourceStore,
 )
+from .resource_cache import (
+    CacheError,
+    DuplicateResourceKeyError,
+    EvictionCandidate,
+    EvictionContext,
+    EvictionPolicy,
+    EvictionPolicyError,
+    LRUEvictionPolicy,
+    ResourceCache,
+    ResourceCachedError,
+    ResourceInfo,
+    ResourceLeasedError,
+    ResourceNotRegisteredError,
+    ResourceTooLargeError,
+)
+from .resource_specs import LoRASpec, ModelSpec, ObjectSpec
 from .stream_config import StreamConfig
 from .streamed_component import StreamedComponent, StreamedComponentStore
 
 __all__ = [
-    "DuplicateModelKeyError",
+    "CacheError",
+    "CachedModelRunner",
+    "DuplicateResourceKeyError",
     "EvictionCandidate",
     "EvictionContext",
     "EvictionPolicy",
@@ -145,24 +154,25 @@ __all__ = [
     "LRUEvictionPolicy",
     "LoRA",
     "LoRAFactor",
+    "LoRARuntimeInUseError",
     "LoRASpec",
-    "LoRAStore",
     "LoRATransform",
-    "ModelCache",
-    "ModelCacheError",
-    "ModelInUseError",
-    "ModelNotRegisteredError",
     "ModelOffloader",
-    "ModelOffloaderStore",
+    "ModelRuntimeInUseError",
     "ModelSpec",
-    "ModelTooLargeError",
     "MpsWeights",
     "ObjectSpec",
     "PinnedComponent",
     "PinnedComponentStore",
     "ResourceBinding",
+    "ResourceCache",
+    "ResourceCachedError",
+    "ResourceInfo",
+    "ResourceLeasedError",
+    "ResourceNotRegisteredError",
     "ResourceSpec",
     "ResourceStore",
+    "ResourceTooLargeError",
     "ScaledLoRAFactor",
     "StreamConfig",
     "StreamedComponent",

@@ -15,13 +15,18 @@ themselves, so they are unaffected.
 
 from __future__ import annotations
 
+import contextlib
 from typing import TYPE_CHECKING
 
 import pytest
 import torch
 
 if TYPE_CHECKING:
-    from collections.abc import Generator
+    from collections.abc import Generator, Iterator
+
+    from torch import nn
+
+    from torch_offload import ModelOffloader
 
 
 def pytest_configure(config: pytest.Config) -> None:
@@ -38,6 +43,20 @@ def pytest_runtest_call(item: pytest.Item) -> Generator[None, None, None]:
         outcome.force_exception(
             pytest.skip.Exception(f"needs a CUDA GPU: {exc}", _use_item_location=True)
         )
+
+
+@contextlib.contextmanager
+def activated_model(
+    offloader: ModelOffloader,
+    device: torch.device | str,
+    **kwargs: object,
+) -> Iterator[nn.Module]:
+    """Test-only exception-safe scope for the low-level activation API."""
+    offloader.activate(device, **kwargs)
+    try:
+        yield offloader.value
+    finally:
+        offloader.deactivate()
 
 
 def streamed_components(offloader: object) -> list:

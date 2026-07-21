@@ -8,7 +8,7 @@ check rejected any block that differed — the case these tests cover.
 
 from __future__ import annotations
 
-from tests.conftest import streamed_components
+from tests.conftest import activated_model, streamed_components
 
 from collections.abc import Sequence
 
@@ -16,7 +16,7 @@ import pytest
 import torch
 from torch import nn
 
-from torch_offload import ModelOffloaderStore, StreamConfig
+from torch_offload import ModelOffloader, StreamConfig
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -76,11 +76,10 @@ def test_heterogeneous_block_list_builds_and_partitions_signatures() -> None:
 
     # Before morphing slots this raised ValueError("Block 1 ... layout
     # differs from block 0 ...") right here.
-    store = ModelOffloaderStore.from_module(
+    offloader = ModelOffloader.from_module(
         model,
         blocks_attr=["blocks"],
     )
-    offloader = store.bind(model)
 
     signatures = _streamed_component(offloader)._block_signatures
     assert len(signatures) == len(dtypes)
@@ -93,10 +92,10 @@ def test_heterogeneous_block_list_builds_and_partitions_signatures() -> None:
 
 def test_signature_distinguishes_each_dtype() -> None:
     model = _frozen_model(16, [torch.float32, torch.float16, torch.bfloat16])
-    offloader = ModelOffloaderStore.from_module(
+    offloader = ModelOffloader.from_module(
         model,
         blocks_attr=["blocks"],
-    ).bind(model)
+    )
     signatures = _streamed_component(offloader)._block_signatures
     assert len(set(signatures)) == 3
 
@@ -117,12 +116,12 @@ def test_cuda_streams_mixed_dtype_blocks_matches_reference() -> None:
     with torch.no_grad():
         reference = model(x)
 
-    offloader = ModelOffloaderStore.from_module(
+    offloader = ModelOffloader.from_module(
         model,
         blocks_attr=["blocks"],
-    ).bind(model)
+    )
 
-    with torch.no_grad(), offloader.use(
+    with torch.no_grad(), activated_model(offloader,
         "cuda",
         stream_config=StreamConfig(num_resident_blocks=1, num_prefetch_blocks=2),
     ) as bound:
@@ -143,13 +142,13 @@ def test_cuda_morphing_pool_reuses_targets_across_iterations() -> None:
     x = torch.randn(2, dim)
 
     num_resident, num_prefetch = 1, 2
-    offloader = ModelOffloaderStore.from_module(
+    offloader = ModelOffloader.from_module(
         model,
         blocks_attr=["blocks"],
-    ).bind(model)
+    )
 
     component = _streamed_component(offloader)
-    with torch.no_grad(), offloader.use(
+    with torch.no_grad(), activated_model(offloader,
         "cuda",
         stream_config=StreamConfig(
             num_resident_blocks=num_resident,
@@ -220,13 +219,13 @@ def test_cuda_streams_mixed_quant_and_plain_blocks() -> None:
         reference = model(x.cuda()).cpu()
     model.cpu()
 
-    offloader = ModelOffloaderStore.from_module(
+    offloader = ModelOffloader.from_module(
         model,
         blocks_attr=["blocks"],
-    ).bind(model)
+    )
     assert len(set(_streamed_component(offloader)._block_signatures)) == 2
 
-    with torch.no_grad(), offloader.use(
+    with torch.no_grad(), activated_model(offloader,
         "cuda",
         stream_config=StreamConfig(num_resident_blocks=1, num_prefetch_blocks=2),
     ) as bound:

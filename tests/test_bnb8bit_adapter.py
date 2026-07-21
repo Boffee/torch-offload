@@ -9,9 +9,8 @@ import torch
 from torch import nn
 
 from torch_offload import (
-    LoRAStore,
+    LoRA,
     ModelOffloader,
-    ModelOffloaderStore,
     StreamConfig,
     merge_lora,
 )
@@ -19,6 +18,7 @@ from torch_offload.bnb8bit_adapter import Bnb8bitAdapter
 from torch_offload.pinned_param import PinnedParam
 from torch_offload.streamed_component import _param_target_layout
 from torch_offload.tensor_adapter_registry import tensor_id
+from tests.conftest import activated_model
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -29,12 +29,11 @@ def _make_model_offloader(
     blocks_attr: list[str] = [],
     stream_trainable_weights: bool = False,
 ) -> ModelOffloader:
-    store = ModelOffloaderStore.from_module(
+    return ModelOffloader.from_module(
         model,
         blocks_attr=blocks_attr,
         stream_trainable_weights=stream_trainable_weights,
     )
-    return store.bind(model)
 
 
 def _make_int8(
@@ -219,7 +218,7 @@ class TestBnb8bitAdapter:
         # Int8Params is already a Parameter — assign it directly.
         model.lin.weight = _make_int8(rows=64, cols=32)
         original_cb = model.lin.weight.CB.clone()
-        lora = LoRAStore.from_state_dict(
+        lora = LoRA.from_state_dict(
             state_dict={
                 "lin.lora_A.weight": torch.randn(4, 32),
                 "lin.lora_B.weight": torch.randn(64, 4),
@@ -243,7 +242,7 @@ class TestBnb8bitAdapter:
         model = M().to("cuda")
         model.lin.weight = _make_int8(rows=64, cols=32, device="cuda")
         original_cb = model.lin.weight.CB.clone()
-        lora = LoRAStore.from_state_dict(
+        lora = LoRA.from_state_dict(
             state_dict={
                 "lin.lora_A.weight": torch.randn(4, 32),
                 "lin.lora_B.weight": torch.randn(64, 4),
@@ -272,7 +271,7 @@ class TestBnb8bitAdapter:
         model.b.weight = shared  # tied
 
         with pytest.raises(NotImplementedError, match="Tied"):
-            ModelOffloaderStore.from_module(model)
+            ModelOffloader.from_module(model)
 
     @CUDA
     def test_allocate_copy_make_gpu_param_preserves_wrapper(self) -> None:
@@ -318,11 +317,11 @@ class TestBnb8bitAdapter:
         # `layer` is still pre-forward here, so the store pins CB/SCB.
         strategy = _make_model_offloader(layer)
         try:
-            # Multiple use() cycles exercise the init_8bit_state re-fire:
+            # Multiple activation cycles exercise the init_8bit_state re-fire:
             # each activation installs a fresh CB-bearing weight, so the
             # module state is repopulated without the adapter touching it.
             for _ in range(3):
-                with strategy.use("cuda") as active:
+                with activated_model(strategy, "cuda") as active:
                     y = active(x)
                     torch.cuda.synchronize()
                 assert y.shape == (8, 128)
@@ -330,45 +329,6 @@ class TestBnb8bitAdapter:
                 torch.testing.assert_close(y, reference)
         finally:
             strategy.deactivate()
-
-    @CUDA
-    def test_store_binds_unquantized_meta_skeleton(self) -> None:
-        # End to end: a store pinned from a real pre-forward int8 model accepts
-        # a separately-built META skeleton whose weight is an unquantized
-        # placeholder (CB None). Previously bind raised because matches rejected
-        # the placeholder before the layout was ever compared.
-        bnb = pytest.importorskip("bitsandbytes")
-        layer = bnb.nn.Linear8bitLt(
-            64, 128, bias=False, has_fp16_weights=False
-        ).to("cuda")
-        # Reference twin from the SAME pre-forward CB/SCB (never forward `layer`).
-        cb = layer.weight.CB.clone()
-        scb = layer.weight.SCB.clone()
-        ref_layer = bnb.nn.Linear8bitLt(
-            64, 128, bias=False, has_fp16_weights=False
-        ).to("cuda")
-        ref_layer._parameters["weight"] = bnb.nn.Int8Params(
-            cb.clone(), requires_grad=False, has_fp16_weights=False,
-            CB=cb.clone(), SCB=scb.clone(),
-        )
-        x = torch.randn(8, 64, dtype=torch.float16, device="cuda")
-        reference = ref_layer(x)
-
-        # `layer` is still pre-forward here, so the store pins CB/SCB.
-        store = ModelOffloaderStore.from_module(layer)
-        with torch.device("meta"):
-            skeleton = bnb.nn.Linear8bitLt(64, 128, bias=False, has_fp16_weights=False)
-        assert skeleton.weight.CB is None
-        binding = store.bind(skeleton)
-        try:
-            with binding.use("cuda") as active:
-                y = active(x)
-                torch.cuda.synchronize()
-            assert y.shape == (8, 128)
-            assert y.dtype is torch.float16
-            torch.testing.assert_close(y, reference)
-        finally:
-            binding.deactivate()
 
     @CUDA
     def test_model_offloader_streamed_int8_blocks(self) -> None:
@@ -414,7 +374,7 @@ class TestBnb8bitAdapter:
         )
         try:
             for _ in range(3):
-                with offloader.use(
+                with activated_model(offloader,
                     "cuda", stream_config=StreamConfig(num_prefetch_blocks=0)
                 ) as active:
                     y = active(x)

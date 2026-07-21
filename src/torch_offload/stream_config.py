@@ -6,7 +6,7 @@ how far ahead to prefetch, and whether the block sequence is cyclic.
 
 These are deliberately *not* part of the pinned backing store. They do not
 affect what is pinned to host or the cache budget (``cache_bytes``), so they
-ride :meth:`activate` (and :meth:`ModelCache.use`) rather than store
+ride :meth:`activate` (or :meth:`CachedModelRunner.use`) rather than store
 construction — the value flows straight to where it is consumed, with no
 component state to fall out of sync with a running stream.
 ``num_resident_blocks`` is clamped to the block count at activation, so one
@@ -58,13 +58,9 @@ class StreamConfig:
         # activation, so one config stays valid across models of
         # different depths.
         if self.num_resident_blocks < 1:
-            raise ValueError(
-                f"num_resident_blocks ({self.num_resident_blocks}) must be >= 1"
-            )
+            raise ValueError(f"num_resident_blocks ({self.num_resident_blocks}) must be >= 1")
         if self.num_prefetch_blocks < 0:
-            raise ValueError(
-                f"num_prefetch_blocks ({self.num_prefetch_blocks}) must be >= 0"
-            )
+            raise ValueError(f"num_prefetch_blocks ({self.num_prefetch_blocks}) must be >= 0")
 
 
 #: Default policy used when ``activate`` is called without a ``stream_config``

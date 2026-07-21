@@ -19,16 +19,16 @@ from torch import nn
 
 from torch_offload import (
     ModelOffloader,
-    ModelOffloaderStore,
     PinnedComponent,
     ResourceBinding,
+    ResourceStore,
     StreamConfig,
     StreamedComponent,
     StreamedComponentStore,
 )
 from torch_offload.composite_component import CompositeComponent
 
-from tests.conftest import pinned_component, streamed_components
+from tests.conftest import activated_model, pinned_component, streamed_components
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -39,12 +39,11 @@ def _make_model_offloader(
     blocks_attr: list[str] = [],
     stream_trainable_weights: bool = False,
 ) -> ModelOffloader:
-    store = ModelOffloaderStore.from_module(
+    return ModelOffloader.from_module(
         model,
         blocks_attr=blocks_attr,
         stream_trainable_weights=stream_trainable_weights,
     )
-    return store.bind(model)
 
 
 def _make_streamed_component(
@@ -89,9 +88,7 @@ def _make_block_model(num_blocks: int = 4, width: int = 8) -> nn.Module:
         def __init__(self):
             super().__init__()
             self.embed = nn.Linear(width, width, bias=False)
-            self.transformer_blocks = nn.ModuleList(
-                [nn.Linear(width, width, bias=False) for _ in range(num_blocks)]
-            )
+            self.transformer_blocks = nn.ModuleList([nn.Linear(width, width, bias=False) for _ in range(num_blocks)])
             self.head = nn.Linear(width, width, bias=False)
 
         def forward(self, x):
@@ -120,19 +117,17 @@ def _make_trainable_block_model(num_blocks: int = 4, width: int = 8) -> nn.Modul
         def __init__(self) -> None:
             super().__init__()
             self.embed = nn.Linear(width, width, bias=False)
-            self.transformer_blocks = nn.ModuleList(
-                nn.Linear(width, width, bias=False) for _ in range(num_blocks)
-            )
+            self.transformer_blocks = nn.ModuleList(nn.Linear(width, width, bias=False) for _ in range(num_blocks))
             self.head = nn.Linear(width, width, bias=False)
 
-        def forward(
-            self, x: torch.Tensor, *, use_checkpoint: bool = False
-        ) -> torch.Tensor:
+        def forward(self, x: torch.Tensor, *, use_checkpoint: bool = False) -> torch.Tensor:
             x = self.embed(x)
             for block in self.transformer_blocks:
                 if use_checkpoint:
                     x = torch.utils.checkpoint.checkpoint(
-                        block, x, use_reentrant=False,
+                        block,
+                        x,
+                        use_reentrant=False,
                     )
                 else:
                     x = block(x)
@@ -150,13 +145,14 @@ def _make_trainable_block_model(num_blocks: int = 4, width: int = 8) -> nn.Modul
 
 
 class TestResourceBindingConformance:
-    def test_isinstance_runtime_check(self) -> None:
+    def test_is_cached_store_and_runtime_binding(self) -> None:
         m = _make_block_model()
         strategy = _make_model_offloader(
             m,
             blocks_attr=["transformer_blocks"],
         )
         try:
+            assert isinstance(strategy, ResourceStore)
             assert isinstance(strategy, ResourceBinding)
         finally:
             strategy.deactivate()
@@ -182,11 +178,10 @@ class TestResourceBindingConformance:
 class TestConstructorPins:
     def test_constructor_pins_blocks(self) -> None:
         m = _make_block_model()
-        store = ModelOffloaderStore.from_module(
+        strategy = ModelOffloader.from_module(
             m,
             blocks_attr=["transformer_blocks"],
         )
-        strategy = store.bind(m)
         try:
             # Block weights are pinned via registry replacement.
             for block in m.transformer_blocks:
@@ -194,7 +189,7 @@ class TestConstructorPins:
             # Non-block (embed/head) also pinned via composed PinnedComponent.
             assert m.embed.weight.is_pinned()
             assert m.head.weight.is_pinned()
-            assert store.cache_bytes > 0
+            assert strategy.cache_bytes > 0
         finally:
             strategy.deactivate()
 
@@ -213,8 +208,9 @@ class TestLifecycle:
         )
         try:
             assert strategy.active_device is None
-            with strategy.use(
-                "cpu", stream_config=StreamConfig(num_resident_blocks=2),
+            with activated_model(strategy,
+                "cpu",
+                stream_config=StreamConfig(num_resident_blocks=2),
             ):
                 assert strategy.active_device == torch.device("cpu")
             assert strategy.active_device is None
@@ -230,7 +226,8 @@ class TestLifecycle:
         )
         try:
             strategy.activate(
-                "cuda", stream_config=StreamConfig(num_resident_blocks=2),
+                "cuda",
+                stream_config=StreamConfig(num_resident_blocks=2),
             )
             assert strategy.model is m
         finally:
@@ -246,7 +243,8 @@ class TestLifecycle:
         )
         try:
             strategy.activate(
-                "cuda", stream_config=StreamConfig(num_resident_blocks=2),
+                "cuda",
+                stream_config=StreamConfig(num_resident_blocks=2),
             )
             assert strategy._active_device == expected
             assert streamed_components(strategy)[0]._active_device == expected
@@ -268,17 +266,13 @@ class TestLifecycle:
             blocks_attr=["transformer_blocks"],
         )
         try:
-            pinned_block_params = [
-                block.weight for block in m_off.transformer_blocks
-            ]
-            with strategy.use(
-                "cpu", stream_config=StreamConfig(num_resident_blocks=2),
+            pinned_block_params = [block.weight for block in m_off.transformer_blocks]
+            with activated_model(strategy,
+                "cpu",
+                stream_config=StreamConfig(num_resident_blocks=2),
             ) as cpu_model:
                 assert strategy._active_device == torch.device("cpu")
-                assert all(
-                    s._active_device == torch.device("cpu")
-                    for s in streamed_components(strategy)
-                )
+                assert all(s._active_device == torch.device("cpu") for s in streamed_components(strategy))
                 assert all(s._executor is None for s in streamed_components(strategy))
                 assert all(
                     block.weight is pinned
@@ -303,11 +297,13 @@ class TestLifecycle:
         m = _make_block_model()
         target = torch.device("cuda")
         strategy = _make_model_offloader(
-            m, blocks_attr=["transformer_blocks"],
+            m,
+            blocks_attr=["transformer_blocks"],
         )
         try:
             strategy.activate(
-                "cuda", stream_config=StreamConfig(num_resident_blocks=2),
+                "cuda",
+                stream_config=StreamConfig(num_resident_blocks=2),
             )
             assert m.embed.weight.is_cuda
             assert m.head.weight.is_cuda
@@ -319,11 +315,13 @@ class TestLifecycle:
         m = _make_block_model()
         target = torch.device("cuda")
         strategy = _make_model_offloader(
-            m, blocks_attr=["transformer_blocks"],
+            m,
+            blocks_attr=["transformer_blocks"],
         )
         try:
             strategy.activate(
-                "cuda", stream_config=StreamConfig(num_resident_blocks=2),
+                "cuda",
+                stream_config=StreamConfig(num_resident_blocks=2),
             )
             assert m.embed.weight.is_cuda
             strategy.deactivate()
@@ -338,15 +336,18 @@ class TestLifecycle:
         m = _make_block_model()
         target = torch.device("cuda")
         strategy = _make_model_offloader(
-            m, blocks_attr=["transformer_blocks"],
+            m,
+            blocks_attr=["transformer_blocks"],
         )
         try:
             strategy.activate(
-                "cuda", stream_config=StreamConfig(num_resident_blocks=2),
+                "cuda",
+                stream_config=StreamConfig(num_resident_blocks=2),
             )
             strategy.deactivate()
             strategy.activate(
-                "cuda", stream_config=StreamConfig(num_resident_blocks=2),
+                "cuda",
+                stream_config=StreamConfig(num_resident_blocks=2),
             )
             strategy.deactivate()
         finally:
@@ -365,7 +366,8 @@ class TestLifecycle:
             strategy.deactivate()
 
     def test_double_activate_raises_before_component_activation(
-        self, monkeypatch: pytest.MonkeyPatch,
+        self,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         m = _make_block_model()
         strategy = _make_model_offloader(
@@ -374,7 +376,8 @@ class TestLifecycle:
         )
         try:
             strategy.activate(
-                "cpu", stream_config=StreamConfig(num_resident_blocks=2),
+                "cpu",
+                stream_config=StreamConfig(num_resident_blocks=2),
             )
 
             def fail_activate(device: torch.device | str | None = None) -> None:
@@ -389,7 +392,8 @@ class TestLifecycle:
             )
             with pytest.raises(RuntimeError, match=r"already.*active"):
                 strategy.activate(
-                    "cpu", stream_config=StreamConfig(num_resident_blocks=2),
+                    "cpu",
+                    stream_config=StreamConfig(num_resident_blocks=2),
                 )
         finally:
             strategy.deactivate()
@@ -412,20 +416,20 @@ class TestStreamedComponentBackendActivation:
         try:
             pinned_params = [block.weight for block in m.transformer_blocks]
             with streamer.use(
-                "cpu", stream_config=StreamConfig(num_resident_blocks=2),
+                "cpu",
+                stream_config=StreamConfig(num_resident_blocks=2),
             ):
                 assert streamer._active_device == torch.device("cpu")
                 assert streamer._executor is None
                 assert all(
                     block.weight is pinned
                     for block, pinned in zip(
-                        m.transformer_blocks, pinned_params, strict=True,
+                        m.transformer_blocks,
+                        pinned_params,
+                        strict=True,
                     )
                 )
-                assert all(
-                    len(block._forward_pre_hooks) == 0
-                    for block in m.transformer_blocks
-                )
+                assert all(len(block._forward_pre_hooks) == 0 for block in m.transformer_blocks)
                 with torch.no_grad():
                     got = m(x)
 
@@ -438,9 +442,7 @@ class TestStreamedComponentBackendActivation:
 
     def test_direct_cpu_trainable_step_preserves_updates(self) -> None:
         torch.manual_seed(0)
-        blocks = nn.ModuleList(
-            [nn.Linear(4, 4, bias=False), nn.Linear(4, 4, bias=False)]
-        )
+        blocks = nn.ModuleList([nn.Linear(4, 4, bias=False), nn.Linear(4, 4, bias=False)])
         param_ids = {i: id(block.weight) for i, block in enumerate(blocks)}
         before = {i: block.weight.detach().clone() for i, block in enumerate(blocks)}
         optimizer = torch.optim.SGD(blocks.parameters(), lr=0.1)
@@ -449,16 +451,12 @@ class TestStreamedComponentBackendActivation:
             blocks=list(blocks),
         )
         try:
-            pinned_data_ptrs = {
-                i: block.weight.data_ptr() for i, block in enumerate(blocks)
-            }
+            pinned_data_ptrs = {i: block.weight.data_ptr() for i, block in enumerate(blocks)}
             with streamer.use(
-                "cpu", stream_config=StreamConfig(num_resident_blocks=1),
+                "cpu",
+                stream_config=StreamConfig(num_resident_blocks=1),
             ):
-                assert pinned_data_ptrs == {
-                    i: block.weight.data_ptr()
-                    for i, block in enumerate(blocks)
-                }
+                assert pinned_data_ptrs == {i: block.weight.data_ptr() for i, block in enumerate(blocks)}
                 x = torch.randn(2, 4)
                 target = torch.randn(2, 4)
                 out = x
@@ -467,16 +465,10 @@ class TestStreamedComponentBackendActivation:
                 ((out - target) ** 2).mean().backward()
                 with streamer.optimizer_step():
                     optimizer.step()
-                active_after = {
-                    i: block.weight.detach().clone()
-                    for i, block in enumerate(blocks)
-                }
+                active_after = {i: block.weight.detach().clone() for i, block in enumerate(blocks)}
 
             assert param_ids == {i: id(block.weight) for i, block in enumerate(blocks)}
-            assert any(
-                not torch.allclose(active_after[i], before[i])
-                for i in active_after
-            )
+            assert any(not torch.allclose(active_after[i], before[i]) for i in active_after)
             for i, block in enumerate(blocks):
                 torch.testing.assert_close(block.weight, active_after[i])
                 assert block.weight.device == torch.device("cpu")
@@ -517,7 +509,8 @@ class TestCleanup:
             blocks_attr=["transformer_blocks"],
         )
         strategy.activate(
-            "cuda", stream_config=StreamConfig(num_resident_blocks=2),
+            "cuda",
+            stream_config=StreamConfig(num_resident_blocks=2),
         )
         strategy.deactivate()
         # Model is back in CPU/pinned state — usable, just without the
@@ -542,7 +535,8 @@ class TestCleanup:
             blocks_attr=["transformer_blocks"],
         )
         strategy.activate(
-            "cuda", stream_config=StreamConfig(num_resident_blocks=2),
+            "cuda",
+            stream_config=StreamConfig(num_resident_blocks=2),
         )
         assert strategy._composite._teardown_stack is not None
         strategy.deactivate()
@@ -567,7 +561,8 @@ class TestCleanup:
             blocks_attr=["transformer_blocks"],
         )
         strategy.activate(
-            "cuda", stream_config=StreamConfig(num_resident_blocks=2),
+            "cuda",
+            stream_config=StreamConfig(num_resident_blocks=2),
         )  # installs hooks; no deactivate
         streamer = streamed_components(strategy)[0]
         streamer_ref = weakref.ref(streamer)
@@ -595,7 +590,8 @@ class TestCleanup:
             blocks_attr=["transformer_blocks"],
         )
         strategy.activate(
-            "cuda", stream_config=StreamConfig(num_resident_blocks=2),
+            "cuda",
+            stream_config=StreamConfig(num_resident_blocks=2),
         )
         # Drop without deactivate.
         del strategy
@@ -633,7 +629,8 @@ class TestHookLifecycle:
         )
         try:
             strategy.activate(
-                "cuda", stream_config=StreamConfig(num_resident_blocks=2),
+                "cuda",
+                stream_config=StreamConfig(num_resident_blocks=2),
             )
             for block in m.transformer_blocks:
                 assert len(block._forward_pre_hooks) > 0
@@ -651,7 +648,8 @@ class TestHookLifecycle:
             blocks_attr=["transformer_blocks"],
         )
         strategy.activate(
-            "cuda", stream_config=StreamConfig(num_resident_blocks=2),
+            "cuda",
+            stream_config=StreamConfig(num_resident_blocks=2),
         )
         blocks = list(m.transformer_blocks)
         strategy.deactivate()
@@ -671,7 +669,8 @@ class TestCyclicPrefetch:
     """
 
     def _record_prefetches(
-        self, streamer: StreamedComponent,
+        self,
+        streamer: StreamedComponent,
     ) -> tuple[list[int], object]:
         """Wrap streamer._submit_prefetch to record idx without disabling
         the actual prefetch (so on-GPU residency stays consistent)."""
@@ -697,10 +696,12 @@ class TestCyclicPrefetch:
         )
         streamer: StreamedComponent = streamed_components(strategy)[0]
 
-        with strategy.use(
+        with activated_model(strategy,
             "cuda",
             stream_config=StreamConfig(
-                num_resident_blocks=3, num_prefetch_blocks=2, cyclic=True,
+                num_resident_blocks=3,
+                num_prefetch_blocks=2,
+                cyclic=True,
             ),
         ):
             recorded, _ = self._record_prefetches(streamer)
@@ -733,10 +734,12 @@ class TestCyclicPrefetch:
         )
         streamer: StreamedComponent = streamed_components(strategy)[0]
 
-        with strategy.use(
+        with activated_model(strategy,
             "cuda",
             stream_config=StreamConfig(
-                num_resident_blocks=3, num_prefetch_blocks=2, cyclic=False,
+                num_resident_blocks=3,
+                num_prefetch_blocks=2,
+                cyclic=False,
             ),
         ):
             recorded, _ = self._record_prefetches(streamer)
@@ -765,10 +768,12 @@ class TestCyclicPrefetch:
         )
         streamer: StreamedComponent = streamed_components(strategy)[0]
 
-        with strategy.use(
+        with activated_model(strategy,
             "cuda",
             stream_config=StreamConfig(
-                num_resident_blocks=3, num_prefetch_blocks=1, cyclic=True,
+                num_resident_blocks=3,
+                num_prefetch_blocks=1,
+                cyclic=True,
             ),
         ):
             recorded, _ = self._record_prefetches(streamer)
@@ -804,10 +809,12 @@ class TestCyclicPrefetch:
             blocks_attr=["transformer_blocks"],
         )
         try:
-            with strategy.use(
+            with activated_model(strategy,
                 "cuda",
                 stream_config=StreamConfig(
-                    num_resident_blocks=3, num_prefetch_blocks=2, cyclic=True,
+                    num_resident_blocks=3,
+                    num_prefetch_blocks=2,
+                    cyclic=True,
                 ),
             ):
                 with torch.no_grad():
@@ -832,10 +839,12 @@ class TestCyclicPrefetch:
         )
         streamer: StreamedComponent = streamed_components(strategy)[0]
 
-        with strategy.use(
+        with activated_model(strategy,
             "cuda",
             stream_config=StreamConfig(
-                num_resident_blocks=2, num_prefetch_blocks=1, cyclic=True,
+                num_resident_blocks=2,
+                num_prefetch_blocks=1,
+                cyclic=True,
             ),
         ):
             recorded, _ = self._record_prefetches(streamer)
@@ -875,7 +884,8 @@ class TestForwardCorrectness:
         )
         try:
             strategy.activate(
-                "cuda", stream_config=StreamConfig(num_resident_blocks=2),
+                "cuda",
+                stream_config=StreamConfig(num_resident_blocks=2),
             )
             with torch.no_grad():
                 got = m_off(x)
@@ -895,7 +905,8 @@ class TestForwardCorrectness:
         try:
             x = torch.randn(2, 8, device="cuda")
             strategy.activate(
-                "cuda", stream_config=StreamConfig(num_resident_blocks=2),
+                "cuda",
+                stream_config=StreamConfig(num_resident_blocks=2),
             )
             with torch.no_grad():
                 first = m(x)
@@ -903,7 +914,8 @@ class TestForwardCorrectness:
             strategy.deactivate()
 
             strategy.activate(
-                "cuda", stream_config=StreamConfig(num_resident_blocks=2),
+                "cuda",
+                stream_config=StreamConfig(num_resident_blocks=2),
             )
             with torch.no_grad():
                 second = m(x)
@@ -930,8 +942,9 @@ class TestValidation:
             blocks_attr=["transformer_blocks"],
         )
         try:
-            with strategy.use(
-                "cuda", stream_config=StreamConfig(num_resident_blocks=8),
+            with activated_model(strategy,
+                "cuda",
+                stream_config=StreamConfig(num_resident_blocks=8),
             ):
                 m(torch.randn(2, 8, device="cuda"))
         finally:
@@ -963,13 +976,13 @@ class TestValidation:
 
 
 # ---------------------------------------------------------------------------
-# ModelCache integration: cache_bytes is final at construction
+# ResourceCache integration: cache_bytes is final at construction
 # ---------------------------------------------------------------------------
 
 
-class TestModelCacheIntegration:
-    def test_model_spec_default_reuses_canonical_model(self) -> None:
-        from torch_offload import ModelCache, ModelSpec
+class TestResourceCacheIntegration:
+    def test_model_spec_reuses_single_model(self) -> None:
+        from torch_offload import CachedModelRunner, ResourceCache, ModelSpec
 
         device = torch.device("cpu")
         factory_calls = 0
@@ -979,16 +992,19 @@ class TestModelCacheIntegration:
             factory_calls += 1
             return _make_block_model(num_blocks=4, width=8)
 
-        cache = ModelCache(max_cache_bytes=10_000_000)
+        cache = ResourceCache(max_cache_bytes=10_000_000)
+        runner = CachedModelRunner(cache)
         spec = ModelSpec(
             key="xformer",
             estimated_cache_bytes=1024,
             factory=factory,
-            blocks_attr=["transformer_blocks"],
+            blocks_attr=("transformer_blocks",),
         )
 
-        with cache.use(
-            spec, device=device, num_resident_blocks=2,
+        with runner.use(
+            spec,
+            device=device,
+            stream_config=StreamConfig(num_resident_blocks=2),
         ) as first_model:
             assert isinstance(first_model, nn.Module)
             assert all(not param.is_meta for param in first_model.parameters())
@@ -1001,80 +1017,125 @@ class TestModelCacheIntegration:
         assert info.cached
         assert info.cache_bytes is not None
         assert info.cache_bytes > 0
-        assert info.active_count == 0
+        assert info.lease_count == 0
 
-        # Second sequential use returns the same canonical model; factory
-        # is not called again.
-        with cache.use(
-            "xformer", device=device, num_resident_blocks=2,
+        # Second sequential use returns the same cached model; factory is
+        # not called again.
+        with runner.use(
+            spec,
+            device=device,
+            stream_config=StreamConfig(num_resident_blocks=2),
         ) as second_model:
             assert second_model is first_model
         assert factory_calls == 1
 
         cache.clear()
 
-    def test_model_spec_default_rejects_nested_binding(self) -> None:
-        from torch_offload import ModelCache, ModelInUseError, ModelSpec
-
-        cache = ModelCache(max_cache_bytes=10_000_000)
-        spec = ModelSpec(
-            key="xformer",
-            estimated_cache_bytes=1024,
-            factory=lambda: _make_block_model(num_blocks=4, width=8),
-            blocks_attr=["transformer_blocks"],
-        )
-
-        with cache.use(spec, device="cpu", num_resident_blocks=2):
-            with pytest.raises(ModelInUseError, match="xformer"):
-                with cache.use("xformer", device="cpu", num_resident_blocks=2):
-                    pass
-
-        assert cache.info("xformer").active_count == 0
-        cache.clear()
-
-    def test_model_spec_skeleton_factory_supports_nested_bindings(self) -> None:
-        from torch_offload import ModelCache, ModelSpec
+    def test_model_spec_leases_the_same_offloader(self) -> None:
+        from torch_offload import ResourceCache, ModelSpec
 
         factory_calls = 0
-        skeleton_calls = 0
 
         def factory():
             nonlocal factory_calls
             factory_calls += 1
-            return _make_block_model(num_blocks=4, width=8)
+            return _make_block_model()
 
-        def skeleton_factory():
-            nonlocal skeleton_calls
-            skeleton_calls += 1
-            with torch.device("meta"):
-                return _make_block_model(num_blocks=4, width=8)
-
-        cache = ModelCache(max_cache_bytes=10_000_000)
+        cache = ResourceCache(max_cache_bytes=10_000_000)
         spec = ModelSpec(
             key="xformer",
             estimated_cache_bytes=1024,
             factory=factory,
-            skeleton_factory=skeleton_factory,
-            blocks_attr=["transformer_blocks"],
+            blocks_attr=("transformer_blocks",),
         )
 
-        with cache.use(
-            spec, device="cpu", num_resident_blocks=2,
-        ) as first_model:
-            with cache.use(
-                "xformer", device="cpu", num_resident_blocks=2,
-            ) as second_model:
-                assert first_model is not second_model
-                assert all(not p.is_meta for p in first_model.parameters())
-                assert all(not p.is_meta for p in second_model.parameters())
-                assert cache.info("xformer").active_count == 2
+        with cache.lease(spec) as first_offloader:
+            assert isinstance(first_offloader, ModelOffloader)
+            with cache.lease(spec) as second_offloader:
+                assert second_offloader is first_offloader
+                assert cache.info("xformer").lease_count == 2
 
         assert factory_calls == 1
-        assert skeleton_calls == 2
+        cache.clear()
+
+    def test_model_spec_rejects_nested_use(self) -> None:
+        from torch_offload import CachedModelRunner, ResourceCache, ModelRuntimeInUseError, ModelSpec
+
+        cache = ResourceCache(max_cache_bytes=10_000_000)
+        runner = CachedModelRunner(cache)
+        spec = ModelSpec(
+            key="xformer",
+            estimated_cache_bytes=1024,
+            factory=lambda: _make_block_model(num_blocks=4, width=8),
+            blocks_attr=("transformer_blocks",),
+        )
+
+        config = StreamConfig(num_resident_blocks=2)
+        with runner.use(spec, device="cpu", stream_config=config):
+            with pytest.raises(ModelRuntimeInUseError, match="overlapping"):
+                with runner.use(spec, device="cpu", stream_config=config):
+                    pass
+
+        assert cache.info("xformer").lease_count == 0
+        cache.clear()
+
+    def test_runner_deactivates_after_body_error(self) -> None:
+        from torch_offload import CachedModelRunner, ResourceCache, ModelSpec
+
+        cache = ResourceCache(max_cache_bytes=10_000_000)
+        runner = CachedModelRunner(cache)
+        spec = ModelSpec(
+            key="xformer",
+            estimated_cache_bytes=1024,
+            factory=lambda: _make_block_model(num_blocks=4, width=8),
+            blocks_attr=("transformer_blocks",),
+        )
+
+        with pytest.raises(ValueError, match="caller failed"):
+            with runner.use(spec, device="cpu"):
+                raise ValueError("caller failed")
+
+        assert cache.info("xformer").lease_count == 0
+        # A second activation proves the runner deactivated the shared
+        # offloader and released its single-runtime claim.
+        with runner.use(spec, device="cpu"):
+            pass
+
+        cache.clear()
+
+    def test_separate_runners_share_the_same_single_runtime_guard(self) -> None:
+        from torch_offload import CachedModelRunner, ResourceCache, ModelRuntimeInUseError, ModelSpec
+
+        cache = ResourceCache(max_cache_bytes=10_000_000)
+        first_runner = CachedModelRunner(cache)
+        second_runner = CachedModelRunner(cache)
+        spec = ModelSpec(
+            key="xformer",
+            estimated_cache_bytes=1024,
+            factory=lambda: _make_block_model(num_blocks=4, width=8),
+            blocks_attr=("transformer_blocks",),
+        )
+
+        config = StreamConfig(num_resident_blocks=2)
+        with first_runner.use(
+            spec,
+            device="cpu",
+            stream_config=config,
+        ):
+            with pytest.raises(ModelRuntimeInUseError, match="overlapping"):
+                with second_runner.use(
+                    spec,
+                    device="cpu",
+                    stream_config=config,
+                ):
+                    pass
+            assert cache.info("xformer").lease_count == 1
+
+        assert cache.info("xformer").lease_count == 0
         cache.clear()
 
     def test_model_spec_trainable_reuses_primary_model(self) -> None:
-        from torch_offload import ModelCache, ModelSpec
+        from torch_offload import CachedModelRunner, ResourceCache, ModelSpec
 
         device = torch.device("cpu")
         factory_calls = 0
@@ -1084,17 +1145,18 @@ class TestModelCacheIntegration:
             factory_calls += 1
             return nn.Linear(8, 8, bias=False)
 
-        cache = ModelCache(max_cache_bytes=10_000_000)
+        cache = ResourceCache(max_cache_bytes=10_000_000)
+        runner = CachedModelRunner(cache)
         spec = ModelSpec(
             key="trainable",
             estimated_cache_bytes=1024,
             factory=factory,
         )
 
-        with cache.use(spec, device=device) as first_model:
+        with runner.use(spec, device=device) as first_model:
             first_param_ids = [id(param) for param in first_model.parameters()]
 
-        with cache.use("trainable", device=device) as second_model:
+        with runner.use(spec, device=device) as second_model:
             assert second_model is first_model
             assert [id(param) for param in second_model.parameters()] == first_param_ids
 
@@ -1102,54 +1164,23 @@ class TestModelCacheIntegration:
         cache.clear()
 
     def test_model_spec_trainable_rejects_nested_binding(self) -> None:
-        from torch_offload import ModelCache, ModelInUseError, ModelSpec
+        from torch_offload import CachedModelRunner, ResourceCache, ModelRuntimeInUseError, ModelSpec
 
-        cache = ModelCache(max_cache_bytes=10_000_000)
+        cache = ResourceCache(max_cache_bytes=10_000_000)
+        runner = CachedModelRunner(cache)
         spec = ModelSpec(
             key="trainable",
             estimated_cache_bytes=1024,
             factory=lambda: nn.Linear(8, 8, bias=False),
         )
 
-        with cache.use(spec, device="cpu"):
-            with pytest.raises(ModelInUseError, match="trainable"):
-                with cache.use("trainable", device="cpu"):
+        with runner.use(spec, device="cpu"):
+            with pytest.raises(ModelRuntimeInUseError, match="overlapping"):
+                with runner.use(spec, device="cpu"):
                     pass
 
-        assert cache.info("trainable").active_count == 0
+        assert cache.info("trainable").lease_count == 0
         cache.clear()
-
-    def test_model_spec_trainable_ignores_skeleton_factory(self) -> None:
-        from torch_offload import ModelCache, ModelInUseError, ModelSpec
-
-        skeleton_calls = 0
-
-        def skeleton_factory():
-            nonlocal skeleton_calls
-            skeleton_calls += 1
-            with torch.device("meta"):
-                return nn.Linear(8, 8, bias=False)
-
-        cache = ModelCache(max_cache_bytes=10_000_000)
-        spec = ModelSpec(
-            key="trainable",
-            estimated_cache_bytes=1024,
-            factory=lambda: nn.Linear(8, 8, bias=False),
-            skeleton_factory=skeleton_factory,
-        )
-
-        with cache.use(spec, device="cpu") as first_model:
-            with pytest.raises(ModelInUseError, match="trainable"):
-                with cache.use("trainable", device="cpu"):
-                    pass
-
-        with cache.use("trainable", device="cpu") as second_model:
-            assert second_model is first_model
-
-        # skeleton_factory is ignored for trainable stores.
-        assert skeleton_calls == 0
-        cache.clear()
-
 
 # ---------------------------------------------------------------------------
 # Activate failure cleanup contract
@@ -1161,9 +1192,8 @@ class TestActivateFailureCleanup:
     def test_partial_activate_failure_rolls_back_other_components(self, monkeypatch) -> None:
         # If a streamer's activate raises, the composite's `with stack:`
         # rolls back the already-activated components. _teardown_stack stays
-        # None because pop_all()
-        # was never reached. Caller's responsibility to drop the
-        # strategy reference for full cleanup.
+        # None because pop_all() was never reached, and the offloader releases
+        # its activation claim so the same cached runtime remains reusable.
         m = _make_block_model()
         strategy = _make_model_offloader(
             m,
@@ -1180,10 +1210,19 @@ class TestActivateFailureCleanup:
 
         with pytest.raises(RuntimeError, match="simulated activate failure"):
             strategy.activate(
-                "cuda", stream_config=StreamConfig(num_resident_blocks=2),
+                "cuda",
+                stream_config=StreamConfig(num_resident_blocks=2),
             )
 
         assert strategy._composite._teardown_stack is None
+        assert strategy.active_device is None
+
+        monkeypatch.setattr(streamer, "_register_hooks", original_register_hooks)
+        with activated_model(strategy,
+            "cuda",
+            stream_config=StreamConfig(num_resident_blocks=2),
+        ):
+            pass
 
     def test_failing_components_own_deactivate_runs(self) -> None:
         # Regression: previously the composite registered each
@@ -1259,7 +1298,8 @@ class TestPrefetchFailureOnDeactivate:
             blocks_attr=["transformer_blocks"],
         )
         strategy.activate(
-            "cuda", stream_config=StreamConfig(num_resident_blocks=2),
+            "cuda",
+            stream_config=StreamConfig(num_resident_blocks=2),
         )
         streamer = streamed_components(strategy)[0]
         # Inject a pre-failed Future so deactivate's drain loop hits it.
@@ -1273,8 +1313,13 @@ class TestPrefetchFailureOnDeactivate:
         # Even though we raised, cleanup completed.
         assert not streamer._hooks
         assert streamer._executor is None
+        assert strategy.active_device is None
 
-        strategy.deactivate()
+        with activated_model(strategy,
+            "cpu",
+            stream_config=StreamConfig(num_resident_blocks=2),
+        ):
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -1286,20 +1331,19 @@ class TestConstructedStateIsInactive:
     """Verifies the 'constructed but not active' state has no GPU
     footprint — the payoff of composer-owned stream/non-block partitioning.
     Without it, non-block siblings (embed, head, norms) would sit on
-    the activation device permanently, defeating ModelCache eviction."""
+    the activation device permanently, defeating ResourceCache eviction."""
 
     @CUDA
     def test_constructed_has_no_params_on_activation_device(self) -> None:
         m = _make_block_model(num_blocks=4, width=8)
         target = torch.device("cuda")
         strategy = _make_model_offloader(
-            m, blocks_attr=["transformer_blocks"],
+            m,
+            blocks_attr=["transformer_blocks"],
         )
         try:
             for p in m.parameters():
-                assert p.device != target, (
-                    f"constructed state leaked GPU residency: {p.shape}@{p.device}"
-                )
+                assert p.device != target, f"constructed state leaked GPU residency: {p.shape}@{p.device}"
         finally:
             strategy.deactivate()
 
@@ -1309,22 +1353,19 @@ class TestConstructedStateIsInactive:
         class BlockOnly(nn.Module):
             def __init__(self):
                 super().__init__()
-                self.transformer_blocks = nn.ModuleList(
-                    [nn.Linear(4, 4, bias=False) for _ in range(4)]
-                )
+                self.transformer_blocks = nn.ModuleList([nn.Linear(4, 4, bias=False) for _ in range(4)])
 
         m = BlockOnly()
         for p in m.parameters():
             p.requires_grad = False
-        store = ModelOffloaderStore.from_module(
+        strategy = ModelOffloader.from_module(
             m,
             blocks_attr=["transformer_blocks"],
         )
-        strategy = store.bind(m)
         try:
             # No PinnedComponent component, just StreamedComponent.
             assert pinned_component(strategy) is None
-            assert store.cache_bytes > 0  # block bytes only
+            assert strategy.cache_bytes > 0  # block bytes only
         finally:
             strategy.deactivate()
 
@@ -1346,21 +1387,21 @@ class TestBufferOnlyNonBlock:
             def __init__(self):
                 super().__init__()
                 self.rope = RopeTable()
-                self.transformer_blocks = nn.ModuleList(
-                    [nn.Linear(4, 4, bias=False) for _ in range(4)]
-                )
+                self.transformer_blocks = nn.ModuleList([nn.Linear(4, 4, bias=False) for _ in range(4)])
 
         m = M()
         for p in m.parameters():
             p.requires_grad = False
         target = torch.device("cuda")
         strategy = _make_model_offloader(
-            m, blocks_attr=["transformer_blocks"],
+            m,
+            blocks_attr=["transformer_blocks"],
         )
         try:
             assert m.rope.table.is_pinned()
             strategy.activate(
-                "cuda", stream_config=StreamConfig(num_resident_blocks=2),
+                "cuda",
+                stream_config=StreamConfig(num_resident_blocks=2),
             )
             assert m.rope.table.is_cuda
             strategy.deactivate()
@@ -1383,9 +1424,7 @@ class TestSharedStorageLocalBehavior:
         class M(nn.Module):
             def __init__(self):
                 super().__init__()
-                self.transformer_blocks = nn.ModuleList(
-                    [block, nn.Linear(4, 4, bias=False)]
-                )
+                self.transformer_blocks = nn.ModuleList([block, nn.Linear(4, 4, bias=False)])
                 self.first_block = block
 
         m = M()
@@ -1411,9 +1450,7 @@ class TestSharedStorageLocalBehavior:
         class M(nn.Module):
             def __init__(self):
                 super().__init__()
-                self.transformer_blocks = nn.ModuleList(
-                    [TiedBlock(shared_0), TiedBlock(shared_1)]
-                )
+                self.transformer_blocks = nn.ModuleList([TiedBlock(shared_0), TiedBlock(shared_1)])
 
         m = M()
         for p in m.parameters():
@@ -1442,9 +1479,7 @@ class TestSharedStorageLocalBehavior:
         class M(nn.Module):
             def __init__(self):
                 super().__init__()
-                self.transformer_blocks = nn.ModuleList(
-                    [TiedBufBlock(), TiedBufBlock()]
-                )
+                self.transformer_blocks = nn.ModuleList([TiedBufBlock(), TiedBufBlock()])
 
         m = M()
         for p in m.parameters():
@@ -1472,9 +1507,7 @@ class TestSharedStorageLocalBehavior:
         class M(nn.Module):
             def __init__(self):
                 super().__init__()
-                self.transformer_blocks = nn.ModuleList(
-                    [TiedBufBlock(), TiedBufBlock()]
-                )
+                self.transformer_blocks = nn.ModuleList([TiedBufBlock(), TiedBufBlock()])
 
         m = M()
         for p in m.parameters():
@@ -1501,9 +1534,7 @@ class TestSharedStorageLocalBehavior:
             def __init__(self):
                 super().__init__()
                 self.embed = embed
-                self.transformer_blocks = nn.ModuleList(
-                    [nn.Linear(8, 8, bias=False) for _ in range(4)]
-                )
+                self.transformer_blocks = nn.ModuleList([nn.Linear(8, 8, bias=False) for _ in range(4)])
                 self.head = head
 
         m = M()
@@ -1518,15 +1549,7 @@ class TestSharedStorageLocalBehavior:
             non_block = pinned_component(strategy)
             assert non_block is not None
             assert non_block.param_names == {"embed.weight", "head.weight"}
-            assert (
-                len(
-                    {
-                        id(non_block._instance.params[name])
-                        for name in non_block.param_names
-                    }
-                )
-                == 1
-            )
+            assert len({id(non_block._instance.params[name]) for name in non_block.param_names}) == 1
         finally:
             strategy.deactivate()
 
@@ -1542,9 +1565,7 @@ class TestDirectParentStateHandled:
             def __init__(self):
                 super().__init__()
                 self.scale_shift = nn.Parameter(torch.randn(4), requires_grad=False)
-                self.transformer_blocks = nn.ModuleList(
-                    [nn.Linear(4, 4, bias=False) for _ in range(4)]
-                )
+                self.transformer_blocks = nn.ModuleList([nn.Linear(4, 4, bias=False) for _ in range(4)])
 
         m = M()
         for p in m.parameters():
@@ -1564,9 +1585,7 @@ class TestDirectParentStateHandled:
                 super().__init__()
                 self.root_param = nn.Parameter(torch.randn(4), requires_grad=False)
                 self.encoder = nn.Module()
-                self.encoder.blocks = nn.ModuleList(
-                    [nn.Linear(4, 4, bias=False) for _ in range(4)]
-                )
+                self.encoder.blocks = nn.ModuleList([nn.Linear(4, 4, bias=False) for _ in range(4)])
 
         m = M()
         for p in m.parameters():
@@ -1585,9 +1604,7 @@ class TestDirectParentStateHandled:
             def __init__(self):
                 super().__init__()
                 self.register_buffer("table", torch.randn(8))
-                self.transformer_blocks = nn.ModuleList(
-                    [nn.Linear(4, 4, bias=False) for _ in range(4)]
-                )
+                self.transformer_blocks = nn.ModuleList([nn.Linear(4, 4, bias=False) for _ in range(4)])
 
         m = M()
         for p in m.parameters():
@@ -1628,9 +1645,7 @@ class TestBlockBuffersPinned:
         class M(nn.Module):
             def __init__(self):
                 super().__init__()
-                self.transformer_blocks = nn.ModuleList(
-                    TiedBufferBlock() for _ in range(num_blocks)
-                )
+                self.transformer_blocks = nn.ModuleList(TiedBufferBlock() for _ in range(num_blocks))
 
         return M()
 
@@ -1644,9 +1659,7 @@ class TestBlockBuffersPinned:
         class M(nn.Module):
             def __init__(self):
                 super().__init__()
-                self.transformer_blocks = nn.ModuleList(
-                    [BlockWithBuffer() for _ in range(4)]
-                )
+                self.transformer_blocks = nn.ModuleList([BlockWithBuffer() for _ in range(4)])
 
         m = M()
         for p in m.parameters():
@@ -1658,8 +1671,7 @@ class TestBlockBuffersPinned:
         try:
             for block in m.transformer_blocks:
                 assert block.table.is_pinned(), (
-                    "block buffer must be pinned for honest cache_bytes "
-                    "and to avoid silently-synchronous H2D copies"
+                    "block buffer must be pinned for honest cache_bytes and to avoid silently-synchronous H2D copies"
                 )
         finally:
             strategy.deactivate()
@@ -1707,7 +1719,8 @@ class TestBlockBuffersPinned:
                 assert block.buf_a.is_pinned()
 
             strategy.activate(
-                "cuda", stream_config=StreamConfig(num_resident_blocks=1),
+                "cuda",
+                stream_config=StreamConfig(num_resident_blocks=1),
             )
             resident = m.transformer_blocks[0]
             assert resident.buf_a is resident.buf_b
@@ -1774,9 +1787,7 @@ class TestBlockLayoutCompatibility:
         class M(nn.Module):
             def __init__(self):
                 super().__init__()
-                self.blocks = nn.ModuleList(
-                    [nn.Linear(4, 4, bias=False), nn.Linear(8, 8, bias=False)]
-                )
+                self.blocks = nn.ModuleList([nn.Linear(4, 4, bias=False), nn.Linear(8, 8, bias=False)])
 
         m = M()
         for p in m.parameters():
@@ -1835,7 +1846,8 @@ class TestBlockLayoutCompatibility:
             blocks=[shared, shared],
         )
         with component.use(
-            "cuda", stream_config=StreamConfig(num_resident_blocks=1),
+            "cuda",
+            stream_config=StreamConfig(num_resident_blocks=1),
         ):
             assert len(shared._forward_pre_hooks) == 1
 
@@ -1844,7 +1856,8 @@ class TestBlockLayoutCompatibility:
             def __init__(self, buffer_size: int):
                 super().__init__()
                 self.weight = nn.Parameter(
-                    torch.randn(4, 4), requires_grad=False,
+                    torch.randn(4, 4),
+                    requires_grad=False,
                 )
                 self.register_buffer("table", torch.randn(buffer_size))
 
@@ -1858,7 +1871,8 @@ class TestBlockLayoutCompatibility:
             def __init__(self, table: torch.Tensor):
                 super().__init__()
                 self.weight = nn.Parameter(
-                    torch.randn(4, 4), requires_grad=False,
+                    torch.randn(4, 4),
+                    requires_grad=False,
                 )
                 self.register_buffer("table", table)
 
@@ -1908,7 +1922,8 @@ class TestBlockLayoutCompatibility:
             def __init__(self):
                 super().__init__()
                 self.weight = nn.Parameter(
-                    torch.randn(4, 4), requires_grad=False,
+                    torch.randn(4, 4),
+                    requires_grad=False,
                 )
                 self.register_buffer("foo", torch.randn(4))
 
@@ -1916,7 +1931,8 @@ class TestBlockLayoutCompatibility:
             def __init__(self):
                 super().__init__()
                 self.weight = nn.Parameter(
-                    torch.randn(4, 4), requires_grad=False,
+                    torch.randn(4, 4),
+                    requires_grad=False,
                 )
                 self.register_buffer("bar", torch.randn(4))
 
@@ -1951,11 +1967,11 @@ class TestBlockLayoutCompatibility:
         assert blocks[0].foo is original_params[0]
         assert blocks[1].bar is original_params[1]
         for param, orig_pin in zip(
-            original_params, original_pinned, strict=True,
+            original_params,
+            original_pinned,
+            strict=True,
         ):
-            assert param.is_pinned() == orig_pin, (
-                "param was pinned despite pre-pin validation failure"
-            )
+            assert param.is_pinned() == orig_pin, "param was pinned despite pre-pin validation failure"
 
 
 # ---------------------------------------------------------------------------
@@ -1966,7 +1982,8 @@ class TestBlockLayoutCompatibility:
 class TestMultiComponentCleanup:
     @CUDA
     def test_pinned_deactivate_failure_still_runs_streamer_deactivate(
-        self, monkeypatch,
+        self,
+        monkeypatch,
     ) -> None:
         # ExitStack continues unwinding callbacks even when one raises.
         # If non-block PinnedComponent raises during deactivate, streamers
@@ -1986,7 +2003,8 @@ class TestMultiComponentCleanup:
         monkeypatch.setattr(PinnedComponent, "deactivate", broken_deactivate)
         try:
             strategy.activate(
-                "cuda", stream_config=StreamConfig(num_resident_blocks=2),
+                "cuda",
+                stream_config=StreamConfig(num_resident_blocks=2),
             )
             assert m.embed.weight.is_cuda  # type: ignore[union-attr]
 
@@ -2014,12 +2032,8 @@ class TestStreamedNameSelection:
             blocks=list(m.transformer_blocks),
         )
         try:
-            assert streamer.streamed_param_names_by_block == [["weight"]] * len(
-                m.transformer_blocks
-            )
-            assert streamer.streamed_buffer_names_by_block == [[]] * len(
-                m.transformer_blocks
-            )
+            assert streamer.streamed_param_names_by_block == [["weight"]] * len(m.transformer_blocks)
+            assert streamer.streamed_buffer_names_by_block == [[]] * len(m.transformer_blocks)
         finally:
             streamer.deactivate()
 
@@ -2030,10 +2044,7 @@ class TestStreamedNameSelection:
             blocks_path="transformer_blocks",
         )
         try:
-            assert streamer.param_names == {
-                f"transformer_blocks.{i}.weight"
-                for i in range(len(m.transformer_blocks))
-            }
+            assert streamer.param_names == {f"transformer_blocks.{i}.weight" for i in range(len(m.transformer_blocks))}
         finally:
             streamer.deactivate()
 
@@ -2050,8 +2061,7 @@ class TestStreamedNameSelection:
         streamer = store.bind(target)
         try:
             assert streamer.param_names == {
-                f"transformer_blocks.{i}.weight"
-                for i in range(len(target.transformer_blocks))
+                f"transformer_blocks.{i}.weight" for i in range(len(target.transformer_blocks))
             }
             for prototype_block, target_block in zip(
                 prototype.transformer_blocks,
@@ -2064,35 +2074,6 @@ class TestStreamedNameSelection:
             assert not target.embed.weight.is_pinned()
         finally:
             streamer.deactivate()
-
-    def test_model_offloader_store_binds_compatible_model(self) -> None:
-        torch.manual_seed(0)
-        prototype = _make_block_model()
-        target = _make_block_model()
-
-        store = ModelOffloaderStore.from_module(
-            prototype,
-            blocks_attr=["transformer_blocks"],
-        )
-        strategy = store.bind(target)
-        try:
-            assert isinstance(strategy, ModelOffloader)
-            assert strategy.model is target
-            assert strategy.param_names == frozenset(
-                name
-                for name, _param in target.named_parameters(
-                    remove_duplicate=False,
-                )
-            )
-            assert strategy.buffer_names == frozenset()
-            for name, param in target.named_parameters(remove_duplicate=False):
-                prototype_param = dict(
-                    prototype.named_parameters(remove_duplicate=False)
-                )[name]
-                assert param.is_pinned()
-                torch.testing.assert_close(param, prototype_param)
-        finally:
-            strategy.deactivate()
 
     def test_model_offloader_exposes_all_managed_buffer_names(self) -> None:
         class BufferBlock(nn.Module):
@@ -2195,14 +2176,9 @@ class TestStreamedNameSelection:
             non_block = pinned_component(strategy)
             assert non_block is not None
 
-            assert streamer.streamed_param_names_by_block == [["weight"]] * len(
-                m.transformer_blocks
-            )
+            assert streamer.streamed_param_names_by_block == [["weight"]] * len(m.transformer_blocks)
             assert non_block.param_names == {"embed.weight", "head.weight"}
-            assert all(
-                not name.startswith("transformer_blocks.")
-                for name in non_block.param_names
-            )
+            assert all(not name.startswith("transformer_blocks.") for name in non_block.param_names)
         finally:
             strategy.deactivate()
 
@@ -2231,6 +2207,7 @@ class TestStreamedComponentContractGuard:
         assert isinstance(block_0.weight, nn.Parameter)
         assert block_0.weight.requires_grad
 
+
 class TestMixedGradTieDetection:
     """Mixed-grad shared storage is rejected by the owning component."""
 
@@ -2244,9 +2221,7 @@ class TestMixedGradTieDetection:
         class M(nn.Module):
             def __init__(self):
                 super().__init__()
-                self.transformer_blocks = nn.ModuleList(
-                    [nn.Linear(4, 4, bias=False), nn.Linear(4, 4, bias=False)]
-                )
+                self.transformer_blocks = nn.ModuleList([nn.Linear(4, 4, bias=False), nn.Linear(4, 4, bias=False)])
                 self.alias_a = nn.Module()
                 self.alias_b = nn.Module()
                 self.alias_a.weight = a
@@ -2272,9 +2247,7 @@ class TestMixedGradTieDetection:
         class M(nn.Module):
             def __init__(self):
                 super().__init__()
-                self.transformer_blocks = nn.ModuleList(
-                    [nn.Linear(4, 4, bias=False), nn.Linear(4, 4, bias=False)]
-                )
+                self.transformer_blocks = nn.ModuleList([nn.Linear(4, 4, bias=False), nn.Linear(4, 4, bias=False)])
                 self.alias_a = nn.Module()
                 self.alias_b = nn.Module()
                 self.alias_a.weight = a
@@ -2304,9 +2277,7 @@ class TestMixedGradTieDetection:
         class M(nn.Module):
             def __init__(self):
                 super().__init__()
-                self.transformer_blocks = nn.ModuleList(
-                    [nn.Linear(4, 4, bias=False), nn.Linear(4, 4, bias=False)]
-                )
+                self.transformer_blocks = nn.ModuleList([nn.Linear(4, 4, bias=False), nn.Linear(4, 4, bias=False)])
                 self.alias_a = nn.Module()
                 self.alias_b = nn.Module()
                 self.alias_a.weight = a
@@ -2326,8 +2297,9 @@ class TestMixedGradTieDetection:
             assert m.alias_b.weight is b
             assert a.data_ptr() == b.data_ptr()
 
-            with strategy.use(
-                "cuda", stream_config=StreamConfig(num_resident_blocks=1),
+            with activated_model(strategy,
+                "cuda",
+                stream_config=StreamConfig(num_resident_blocks=1),
             ):
                 assert a.is_cuda
                 assert b.is_cuda
@@ -2346,8 +2318,9 @@ class TestMixedGradTieDetection:
             torch.testing.assert_close(a.detach(), expected)
             torch.testing.assert_close(b.detach(), expected)
 
-            with strategy.use(
-                "cuda", stream_config=StreamConfig(num_resident_blocks=1),
+            with activated_model(strategy,
+                "cuda",
+                stream_config=StreamConfig(num_resident_blocks=1),
             ):
                 assert a.data_ptr() == b.data_ptr()
                 torch.testing.assert_close(a.detach().cpu(), expected)
@@ -2369,9 +2342,7 @@ class TestMixedGradTieDetection:
         class M(nn.Module):
             def __init__(self):
                 super().__init__()
-                self.transformer_blocks = nn.ModuleList(
-                    [TiedTrainableBlock(), TiedTrainableBlock()]
-                )
+                self.transformer_blocks = nn.ModuleList([TiedTrainableBlock(), TiedTrainableBlock()])
 
         m = M()
         strategy = _make_model_offloader(
@@ -2402,9 +2373,7 @@ class TestMixedGradTieDetection:
         class M(nn.Module):
             def __init__(self):
                 super().__init__()
-                self.transformer_blocks = nn.ModuleList(
-                    [TiedTrainableBlock(shared_0), TiedTrainableBlock(shared_1)]
-                )
+                self.transformer_blocks = nn.ModuleList([TiedTrainableBlock(shared_0), TiedTrainableBlock(shared_1)])
                 # HF-style flag so the in-block-trainable activate-time
                 # guard would pass; we don't actually activate.
                 for blk in self.transformer_blocks:
@@ -2435,9 +2404,7 @@ class TestMixedGradTieDetection:
         class M(nn.Module):
             def __init__(self):
                 super().__init__()
-                self.transformer_blocks = nn.ModuleList(
-                    [TrainableBlock(), TrainableBlock()]
-                )
+                self.transformer_blocks = nn.ModuleList([TrainableBlock(), TrainableBlock()])
 
         m = M()
         strategy = _make_model_offloader(
@@ -2544,9 +2511,7 @@ class TestLoRAInBlockRouting:
         class M(nn.Module):
             def __init__(self):
                 super().__init__()
-                self.transformer_blocks = nn.ModuleList(
-                    [nn.Linear(4, 4, bias=False), nn.Linear(4, 4, bias=False)]
-                )
+                self.transformer_blocks = nn.ModuleList([nn.Linear(4, 4, bias=False), nn.Linear(4, 4, bias=False)])
                 # Non-block content: one frozen + one trainable.
                 self.frozen_head = nn.Linear(4, 4, bias=False)
                 self.trainable_bias = nn.Parameter(torch.zeros(4))
@@ -2572,8 +2537,7 @@ class TestLoRAInBlockRouting:
                     assert name in pinned.param_names
                 else:
                     assert name not in pinned.param_names, (
-                        f"param {name} (requires_grad={param.requires_grad}) "
-                        "leaked into PinnedComponent"
+                        f"param {name} (requires_grad={param.requires_grad}) leaked into PinnedComponent"
                     )
         finally:
             strat.deactivate()
@@ -2617,11 +2581,7 @@ class TestTrainingWithCheckpointing:
         m_baseline.to("cuda")
         out_b = m_baseline(x, use_checkpoint=True)
         ((out_b - target) ** 2).mean().backward()
-        baseline_grads = {
-            n: p.grad.detach().clone()
-            for n, p in m_baseline.named_parameters()
-            if p.grad is not None
-        }
+        baseline_grads = {n: p.grad.detach().clone() for n, p in m_baseline.named_parameters() if p.grad is not None}
         assert baseline_grads, "baseline run produced no grads — bad fixture"
 
         # num_resident_blocks=2 + num_prefetch_blocks=0 → pool size 2 < 4 blocks,
@@ -2633,35 +2593,36 @@ class TestTrainingWithCheckpointing:
             stream_trainable_weights=True,
         )
         try:
-            with offloader.use(
+            with activated_model(offloader,
                 "cuda",
                 stream_config=StreamConfig(
-                    num_resident_blocks=2, num_prefetch_blocks=0,
+                    num_resident_blocks=2,
+                    num_prefetch_blocks=0,
                 ),
             ) as gpu_model:
                 out_s = gpu_model(x, use_checkpoint=True)
                 ((out_s - target) ** 2).mean().backward()
                 torch.cuda.synchronize()
                 streamed_grads = {
-                    n: p.grad.detach().clone()
-                    for n, p in gpu_model.named_parameters()
-                    if p.grad is not None
+                    n: p.grad.detach().clone() for n, p in gpu_model.named_parameters() if p.grad is not None
                 }
         finally:
             offloader.deactivate()
 
         assert set(baseline_grads) == set(streamed_grads), (
-            f"grad keys differ: baseline={sorted(baseline_grads)}, "
-            f"streamed={sorted(streamed_grads)}"
+            f"grad keys differ: baseline={sorted(baseline_grads)}, streamed={sorted(streamed_grads)}"
         )
         for name, g_baseline in baseline_grads.items():
             torch.testing.assert_close(
-                streamed_grads[name], g_baseline, atol=1e-5, rtol=1e-5,
+                streamed_grads[name],
+                g_baseline,
+                atol=1e-5,
+                rtol=1e-5,
             )
 
     @CUDA
     def test_streamed_trainable_cpu_optimizer_step_without_context(self) -> None:
-        """A plain ``optimizer.step()`` outside ``use()`` (and outside
+        """A plain ``optimizer.step()`` while deactivated (and outside
         ``optimizer_step()``) runs the optimizer on CPU over the pinned
         trainable weights: states allocate on the host, and the in-place
         update writes through to what the next forward streams.
@@ -2686,15 +2647,11 @@ class TestTrainingWithCheckpointing:
         class M(nn.Module):
             def __init__(self, width: int, n: int) -> None:
                 super().__init__()
-                self.transformer_blocks = nn.ModuleList(
-                    Block(width) for _ in range(n)
-                )
+                self.transformer_blocks = nn.ModuleList(Block(width) for _ in range(n))
 
             def forward(self, x: torch.Tensor) -> torch.Tensor:
                 for block in self.transformer_blocks:
-                    x = torch.utils.checkpoint.checkpoint(
-                        block, x, use_reentrant=False
-                    )
+                    x = torch.utils.checkpoint.checkpoint(block, x, use_reentrant=False)
                 return x
 
         m = M(8, 3)
@@ -2708,10 +2665,11 @@ class TestTrainingWithCheckpointing:
         try:
             for _ in range(2):
                 x = torch.randn(4, 8, device="cuda")
-                with offloader.use(
+                with activated_model(offloader,
                     "cuda",
                     stream_config=StreamConfig(
-                        num_resident_blocks=1, num_prefetch_blocks=0,
+                        num_resident_blocks=1,
+                        num_prefetch_blocks=0,
                     ),
                 ) as gpu_model:
                     gpu_model(x).sum().backward()
@@ -2728,10 +2686,11 @@ class TestTrainingWithCheckpointing:
                 updated = weight.detach().clone()
 
                 # Write-through: the next forward streams the updated weight.
-                with offloader.use(
+                with activated_model(offloader,
                     "cuda",
                     stream_config=StreamConfig(
-                        num_resident_blocks=1, num_prefetch_blocks=0,
+                        num_resident_blocks=1,
+                        num_prefetch_blocks=0,
                     ),
                 ):
                     assert torch.equal(
@@ -2740,12 +2699,7 @@ class TestTrainingWithCheckpointing:
                     )
 
             # The optimizer's state (Adam moments) lives on the host, not GPU.
-            assert all(
-                not t.is_cuda
-                for state in opt.state.values()
-                for t in state.values()
-                if torch.is_tensor(t)
-            )
+            assert all(not t.is_cuda for state in opt.state.values() for t in state.values() if torch.is_tensor(t))
         finally:
             offloader.deactivate()
 
@@ -2762,16 +2716,18 @@ class TestTrainingWithCheckpointing:
             blocks_attr=["transformer_blocks"],
         )
         try:
-            with offloader.use(
+            with activated_model(offloader,
                 "cuda",
                 stream_config=StreamConfig(
-                    num_resident_blocks=2, num_prefetch_blocks=0,
+                    num_resident_blocks=2,
+                    num_prefetch_blocks=0,
                 ),
             ) as gpu_model:
                 x = torch.randn(2, 8, device="cuda")
                 out = gpu_model(x, use_checkpoint=False)
                 with pytest.raises(
-                    RuntimeError, match="modified by an inplace operation",
+                    RuntimeError,
+                    match="modified by an inplace operation",
                 ):
                     out.sum().backward()
         finally:
@@ -2799,7 +2755,9 @@ def _make_offloader_for_warning_test(model: nn.Module) -> ModelOffloader:
 
 
 def _make_lora_in_block_model(
-    num_blocks: int = 4, width: int = 8, rank: int = 2,
+    num_blocks: int = 4,
+    width: int = 8,
+    rank: int = 2,
 ) -> nn.Module:
     """LoRA-in-block model: each streamed block contains a frozen base
     Linear plus trainable lora_a / lora_b adapters. Forward computes
@@ -2821,17 +2779,15 @@ def _make_lora_in_block_model(
     class M(nn.Module):
         def __init__(self) -> None:
             super().__init__()
-            self.transformer_blocks = nn.ModuleList(
-                LoRABlock() for _ in range(num_blocks)
-            )
+            self.transformer_blocks = nn.ModuleList(LoRABlock() for _ in range(num_blocks))
 
-        def forward(
-            self, x: torch.Tensor, *, use_checkpoint: bool = False
-        ) -> torch.Tensor:
+        def forward(self, x: torch.Tensor, *, use_checkpoint: bool = False) -> torch.Tensor:
             for block in self.transformer_blocks:
                 if use_checkpoint:
                     x = torch.utils.checkpoint.checkpoint(
-                        block, x, use_reentrant=False,
+                        block,
+                        x,
+                        use_reentrant=False,
                     )
                 else:
                     x = block(x)
@@ -2850,7 +2806,8 @@ class TestStreamedComponentActivateTwice:
         )
         try:
             offloader.activate(
-                "cuda", stream_config=StreamConfig(num_resident_blocks=3),
+                "cuda",
+                stream_config=StreamConfig(num_resident_blocks=3),
             )
             # Reach into the streamer and call activate again — the
             # composer's activate handles its own teardown ExitStack,
@@ -2890,15 +2847,9 @@ class TestInBlockTrainableStreamingEndToEnd:
         m_baseline.to("cuda")
         out_b = m_baseline(x, use_checkpoint=True)
         ((out_b - target) ** 2).mean().backward()
-        baseline_grads = {
-            n: p.grad.detach().clone()
-            for n, p in m_baseline.named_parameters()
-            if p.grad is not None
-        }
+        baseline_grads = {n: p.grad.detach().clone() for n, p in m_baseline.named_parameters() if p.grad is not None}
         # LoRA params should have gradients on the baseline.
-        assert any("lora_" in n for n in baseline_grads), (
-            "fixture invariant: baseline produces lora_* gradients"
-        )
+        assert any("lora_" in n for n in baseline_grads), "fixture invariant: baseline produces lora_* gradients"
 
         # Flag the blocks so the activate-time hard guard passes.
         for block in m_streamed.transformer_blocks:
@@ -2910,30 +2861,31 @@ class TestInBlockTrainableStreamingEndToEnd:
             stream_trainable_weights=True,
         )
         try:
-            with offloader.use(
+            with activated_model(offloader,
                 "cuda",
                 stream_config=StreamConfig(
-                    num_resident_blocks=2, num_prefetch_blocks=0,
+                    num_resident_blocks=2,
+                    num_prefetch_blocks=0,
                 ),
             ) as gpu_model:
                 out_s = gpu_model(x, use_checkpoint=True)
                 ((out_s - target) ** 2).mean().backward()
                 torch.cuda.synchronize()
                 streamed_grads = {
-                    n: p.grad.detach().clone()
-                    for n, p in gpu_model.named_parameters()
-                    if p.grad is not None
+                    n: p.grad.detach().clone() for n, p in gpu_model.named_parameters() if p.grad is not None
                 }
         finally:
             offloader.deactivate()
 
         assert set(baseline_grads) == set(streamed_grads), (
-            f"grad keys differ: baseline={sorted(baseline_grads)}, "
-            f"streamed={sorted(streamed_grads)}"
+            f"grad keys differ: baseline={sorted(baseline_grads)}, streamed={sorted(streamed_grads)}"
         )
         for name, g_baseline in baseline_grads.items():
             torch.testing.assert_close(
-                streamed_grads[name], g_baseline, atol=1e-5, rtol=1e-5,
+                streamed_grads[name],
+                g_baseline,
+                atol=1e-5,
+                rtol=1e-5,
             )
 
     @CUDA
@@ -2950,10 +2902,12 @@ class TestInBlockTrainableStreamingEndToEnd:
             block.gradient_checkpointing = True
 
         opt_baseline = torch.optim.SGD(
-            [p for p in m_baseline.parameters() if p.requires_grad], lr=0.1,
+            [p for p in m_baseline.parameters() if p.requires_grad],
+            lr=0.1,
         )
         opt_offloaded = torch.optim.SGD(
-            [p for p in m_offloaded.parameters() if p.requires_grad], lr=0.1,
+            [p for p in m_offloaded.parameters() if p.requires_grad],
+            lr=0.1,
         )
 
         x = torch.randn(2, 8, device="cuda")
@@ -2963,21 +2917,18 @@ class TestInBlockTrainableStreamingEndToEnd:
         out_b = m_baseline(x, use_checkpoint=True)
         ((out_b - target) ** 2).mean().backward()
         opt_baseline.step()
-        baseline_after = {
-            n: p.detach().clone().cpu()
-            for n, p in m_baseline.named_parameters()
-            if p.requires_grad
-        }
+        baseline_after = {n: p.detach().clone().cpu() for n, p in m_baseline.named_parameters() if p.requires_grad}
 
         offloader = _make_model_offloader(
             m_offloaded,
             blocks_attr=["transformer_blocks"],
         )
         try:
-            with offloader.use(
+            with activated_model(offloader,
                 "cuda",
                 stream_config=StreamConfig(
-                    num_resident_blocks=2, num_prefetch_blocks=0,
+                    num_resident_blocks=2,
+                    num_prefetch_blocks=0,
                 ),
             ) as gpu_model:
                 out_s = gpu_model(x, use_checkpoint=True)
@@ -2988,16 +2939,15 @@ class TestInBlockTrainableStreamingEndToEnd:
         finally:
             offloader.deactivate()
 
-        offloaded_after = {
-            n: p.detach().clone().cpu()
-            for n, p in m_offloaded.named_parameters()
-            if p.requires_grad
-        }
+        offloaded_after = {n: p.detach().clone().cpu() for n, p in m_offloaded.named_parameters() if p.requires_grad}
 
         assert set(baseline_after) == set(offloaded_after)
         for name, baseline_t in baseline_after.items():
             torch.testing.assert_close(
-                offloaded_after[name], baseline_t, atol=1e-5, rtol=1e-5,
+                offloaded_after[name],
+                baseline_t,
+                atol=1e-5,
+                rtol=1e-5,
             )
 
     @CUDA
@@ -3014,10 +2964,12 @@ class TestInBlockTrainableStreamingEndToEnd:
             block.gradient_checkpointing = True
 
         opt_baseline = torch.optim.SGD(
-            [p for p in m_baseline.parameters() if p.requires_grad], lr=0.1,
+            [p for p in m_baseline.parameters() if p.requires_grad],
+            lr=0.1,
         )
         opt_streamed = torch.optim.SGD(
-            [p for p in m_streamed.parameters() if p.requires_grad], lr=0.1,
+            [p for p in m_streamed.parameters() if p.requires_grad],
+            lr=0.1,
         )
 
         x = torch.randn(2, 8, device="cuda")
@@ -3027,11 +2979,7 @@ class TestInBlockTrainableStreamingEndToEnd:
         out_b = m_baseline(x, use_checkpoint=True)
         ((out_b - target) ** 2).mean().backward()
         opt_baseline.step()
-        baseline_after = {
-            n: p.detach().clone().cpu()
-            for n, p in m_baseline.named_parameters()
-            if p.requires_grad
-        }
+        baseline_after = {n: p.detach().clone().cpu() for n, p in m_baseline.named_parameters() if p.requires_grad}
 
         offloader = _make_model_offloader(
             m_streamed,
@@ -3039,10 +2987,11 @@ class TestInBlockTrainableStreamingEndToEnd:
             stream_trainable_weights=True,
         )
         try:
-            with offloader.use(
+            with activated_model(offloader,
                 "cuda",
                 stream_config=StreamConfig(
-                    num_resident_blocks=2, num_prefetch_blocks=0,
+                    num_resident_blocks=2,
+                    num_prefetch_blocks=0,
                 ),
             ) as gpu_model:
                 out_s = gpu_model(x, use_checkpoint=True)
@@ -3055,16 +3004,15 @@ class TestInBlockTrainableStreamingEndToEnd:
 
         # After deactivate, all params live on pinned CPU. Compare the
         # source-of-truth (pinned host clones).
-        streamed_after = {
-            n: p.detach().clone().cpu()
-            for n, p in m_streamed.named_parameters()
-            if p.requires_grad
-        }
+        streamed_after = {n: p.detach().clone().cpu() for n, p in m_streamed.named_parameters() if p.requires_grad}
 
         assert set(baseline_after) == set(streamed_after)
         for name, baseline_t in baseline_after.items():
             torch.testing.assert_close(
-                streamed_after[name], baseline_t, atol=1e-5, rtol=1e-5,
+                streamed_after[name],
+                baseline_t,
+                atol=1e-5,
+                rtol=1e-5,
             )
 
     @CUDA
@@ -3077,9 +3025,7 @@ class TestInBlockTrainableStreamingEndToEnd:
             block.gradient_checkpointing = True
 
         # Snapshot Parameter ids BEFORE the offloader is constructed.
-        initial_ids: dict[str, int] = {
-            n: id(p) for n, p in m.named_parameters() if p.requires_grad
-        }
+        initial_ids: dict[str, int] = {n: id(p) for n, p in m.named_parameters() if p.requires_grad}
 
         offloader = _make_model_offloader(
             m,
@@ -3087,10 +3033,11 @@ class TestInBlockTrainableStreamingEndToEnd:
             stream_trainable_weights=True,
         )
         try:
-            with offloader.use(
+            with activated_model(offloader,
                 "cuda",
                 stream_config=StreamConfig(
-                    num_resident_blocks=1, num_prefetch_blocks=0,
+                    num_resident_blocks=1,
+                    num_prefetch_blocks=0,
                 ),
             ) as gpu_model:
                 # Run forward to warm the target pool.
@@ -3099,58 +3046,31 @@ class TestInBlockTrainableStreamingEndToEnd:
 
                 # Inside gather_for_step: trainable .data should be on GPU.
                 with offloader.gather_for_step():
-                    inside_ids = {
-                        n: id(p)
-                        for n, p in gpu_model.named_parameters()
-                        if p.requires_grad
-                    }
-                    inside_devices = {
-                        n: p.data.device.type
-                        for n, p in gpu_model.named_parameters()
-                        if p.requires_grad
-                    }
+                    inside_ids = {n: id(p) for n, p in gpu_model.named_parameters() if p.requires_grad}
+                    inside_devices = {n: p.data.device.type for n, p in gpu_model.named_parameters() if p.requires_grad}
 
                 # After gather_for_step exit: .data should be back on CPU.
-                after_ids = {
-                    n: id(p)
-                    for n, p in gpu_model.named_parameters()
-                    if p.requires_grad
-                }
-                after_devices = {
-                    n: p.data.device.type
-                    for n, p in gpu_model.named_parameters()
-                    if p.requires_grad
-                }
+                after_ids = {n: id(p) for n, p in gpu_model.named_parameters() if p.requires_grad}
+                after_devices = {n: p.data.device.type for n, p in gpu_model.named_parameters() if p.requires_grad}
         finally:
             offloader.deactivate()
 
         assert initial_ids == inside_ids == after_ids, (
-            "Parameter object identity must be preserved across the "
-            "gather_for_step boundary"
+            "Parameter object identity must be preserved across the gather_for_step boundary"
         )
         for n, dev in inside_devices.items():
-            assert dev == "cuda", (
-                f"{n} .data should be on cuda inside gather_for_step, got {dev}"
-            )
+            assert dev == "cuda", f"{n} .data should be on cuda inside gather_for_step, got {dev}"
         for n, dev in after_devices.items():
-            assert dev == "cpu", (
-                f"{n} .data should be back on cpu after gather_for_step, "
-                f"got {dev}"
-            )
+            assert dev == "cpu", f"{n} .data should be back on cpu after gather_for_step, got {dev}"
 
     def test_cpu_pass_through_trainable_step_preserves_updates(self) -> None:
         torch.manual_seed(0)
         m = _make_lora_in_block_model(num_blocks=2, width=8, rank=2)
-        param_ids = {
-            n: id(p) for n, p in m.named_parameters() if p.requires_grad
-        }
-        before = {
-            n: p.detach().clone()
-            for n, p in m.named_parameters()
-            if p.requires_grad
-        }
+        param_ids = {n: id(p) for n, p in m.named_parameters() if p.requires_grad}
+        before = {n: p.detach().clone() for n, p in m.named_parameters() if p.requires_grad}
         optimizer = torch.optim.SGD(
-            [p for p in m.parameters() if p.requires_grad], lr=0.1,
+            [p for p in m.parameters() if p.requires_grad],
+            lr=0.1,
         )
 
         offloader = _make_model_offloader(
@@ -3159,8 +3079,9 @@ class TestInBlockTrainableStreamingEndToEnd:
             stream_trainable_weights=True,
         )
         try:
-            with offloader.use(
-                "cpu", stream_config=StreamConfig(num_resident_blocks=1),
+            with activated_model(offloader,
+                "cpu",
+                stream_config=StreamConfig(num_resident_blocks=1),
             ) as cpu_model:
                 x = torch.randn(2, 8)
                 target = torch.randn(2, 8)
@@ -3168,24 +3089,11 @@ class TestInBlockTrainableStreamingEndToEnd:
                 ((out - target) ** 2).mean().backward()
                 with offloader.optimizer_step():
                     optimizer.step()
-                active_after = {
-                    n: p.detach().clone()
-                    for n, p in cpu_model.named_parameters()
-                    if p.requires_grad
-                }
+                active_after = {n: p.detach().clone() for n, p in cpu_model.named_parameters() if p.requires_grad}
 
-            after_deactivate = {
-                n: p.detach().clone()
-                for n, p in m.named_parameters()
-                if p.requires_grad
-            }
-            assert param_ids == {
-                n: id(p) for n, p in m.named_parameters() if p.requires_grad
-            }
-            assert any(
-                not torch.allclose(active_after[n], before[n])
-                for n in active_after
-            )
+            after_deactivate = {n: p.detach().clone() for n, p in m.named_parameters() if p.requires_grad}
+            assert param_ids == {n: id(p) for n, p in m.named_parameters() if p.requires_grad}
+            assert any(not torch.allclose(active_after[n], before[n]) for n in active_after)
             for name, active_value in active_after.items():
                 torch.testing.assert_close(after_deactivate[name], active_value)
             for p in m.parameters():
@@ -3221,10 +3129,11 @@ class TestRevisedDataOnlyDesign:
             blocks_attr=["transformer_blocks"],
             stream_trainable_weights=True,
         )
-        with offloader.use(
+        with activated_model(offloader,
             "cuda",
             stream_config=StreamConfig(
-                num_resident_blocks=1, num_prefetch_blocks=0,
+                num_resident_blocks=1,
+                num_prefetch_blocks=0,
             ),
         ) as gpu_model:
             x = torch.randn(2, 8, device="cuda")
@@ -3242,17 +3151,12 @@ class TestRevisedDataOnlyDesign:
         # After deactivate: grads (and data) are on CPU.
         for n, p in m.named_parameters():
             if p.requires_grad:
-                assert p.data.device.type == "cpu", (
-                    f"{n}: .data expected on cpu after deactivate, got {p.data.device}"
-                )
+                assert p.data.device.type == "cpu", f"{n}: .data expected on cpu after deactivate, got {p.data.device}"
                 assert p.grad is None or p.grad.device.type == "cpu", (
                     f"{n}: .grad expected None or on cpu after deactivate, "
                     f"got {p.grad.device if p.grad is not None else None}"
                 )
-                assert p.grad is not None, (
-                    f"{n}: deactivate should preserve grad (just move it), "
-                    f"not clear it"
-                )
+                assert p.grad is not None, f"{n}: deactivate should preserve grad (just move it), not clear it"
 
     @CUDA
     def test_reactivate_moves_existing_grads_to_gpu_for_accumulation(self) -> None:
@@ -3274,11 +3178,7 @@ class TestRevisedDataOnlyDesign:
         for x, target in batches:
             out = m_baseline(x, use_checkpoint=True)
             ((out - target) ** 2).mean().backward()
-        baseline_grads = {
-            n: p.grad.detach().clone()
-            for n, p in m_baseline.named_parameters()
-            if p.grad is not None
-        }
+        baseline_grads = {n: p.grad.detach().clone() for n, p in m_baseline.named_parameters() if p.grad is not None}
 
         for block in m_streamed.transformer_blocks:
             block.gradient_checkpointing = True
@@ -3289,10 +3189,11 @@ class TestRevisedDataOnlyDesign:
             stream_trainable_weights=True,
         )
 
-        with offloader.use(
+        with activated_model(offloader,
             "cuda",
             stream_config=StreamConfig(
-                num_resident_blocks=1, num_prefetch_blocks=0,
+                num_resident_blocks=1,
+                num_prefetch_blocks=0,
             ),
         ) as gpu_model:
             x, target = batches[0]
@@ -3301,34 +3202,30 @@ class TestRevisedDataOnlyDesign:
 
         # Deactivate returns existing grads to CPU.
         assert all(
-            p.grad is not None and p.grad.device.type == "cpu"
-            for p in m_streamed.parameters()
-            if p.requires_grad
+            p.grad is not None and p.grad.device.type == "cpu" for p in m_streamed.parameters() if p.requires_grad
         )
 
-        with offloader.use(
+        with activated_model(offloader,
             "cuda",
             stream_config=StreamConfig(
-                num_resident_blocks=1, num_prefetch_blocks=0,
+                num_resident_blocks=1,
+                num_prefetch_blocks=0,
             ),
         ) as gpu_model:
             assert all(
-                p.grad is not None and p.grad.device.type == "cuda"
-                for p in gpu_model.parameters()
-                if p.requires_grad
+                p.grad is not None and p.grad.device.type == "cuda" for p in gpu_model.parameters() if p.requires_grad
             )
             x, target = batches[1]
             out = gpu_model(x, use_checkpoint=True)
             ((out - target) ** 2).mean().backward()
-            streamed_grads = {
-                n: p.grad.detach().clone()
-                for n, p in gpu_model.named_parameters()
-                if p.grad is not None
-            }
+            streamed_grads = {n: p.grad.detach().clone() for n, p in gpu_model.named_parameters() if p.grad is not None}
 
         for name, baseline_grad in baseline_grads.items():
             torch.testing.assert_close(
-                streamed_grads[name], baseline_grad, atol=1e-5, rtol=1e-5,
+                streamed_grads[name],
+                baseline_grad,
+                atol=1e-5,
+                rtol=1e-5,
             )
 
     @CUDA
@@ -3343,10 +3240,11 @@ class TestRevisedDataOnlyDesign:
             stream_trainable_weights=True,
         )
         try:
-            with offloader.use(
+            with activated_model(offloader,
                 "cuda",
                 stream_config=StreamConfig(
-                    num_resident_blocks=1, num_prefetch_blocks=0,
+                    num_resident_blocks=1,
+                    num_prefetch_blocks=0,
                 ),
             ) as gpu_model:
                 x = torch.randn(2, 8, device="cuda")
@@ -3373,11 +3271,7 @@ class TestRevisedDataOnlyDesign:
             block.gradient_checkpointing = True
 
         # Snapshot pre-step trainable .data.
-        pre_step = {
-            n: p.data.detach().clone()
-            for n, p in m.named_parameters()
-            if p.requires_grad
-        }
+        pre_step = {n: p.data.detach().clone() for n, p in m.named_parameters() if p.requires_grad}
 
         offloader = _make_model_offloader(
             m,
@@ -3386,10 +3280,11 @@ class TestRevisedDataOnlyDesign:
         )
         sentinel = RuntimeError("simulated optimizer.step failure")
         try:
-            with offloader.use(
+            with activated_model(offloader,
                 "cuda",
                 stream_config=StreamConfig(
-                    num_resident_blocks=1, num_prefetch_blocks=0,
+                    num_resident_blocks=1,
+                    num_prefetch_blocks=0,
                 ),
             ) as gpu_model:
                 x = torch.randn(2, 8, device="cuda")
@@ -3409,14 +3304,12 @@ class TestRevisedDataOnlyDesign:
 
         # The +1 mutation must have made it back to pinned despite
         # the exception inside the gather body.
-        for n, post in (
-            (n, p.data.detach().clone())
-            for n, p in m.named_parameters()
-            if p.requires_grad
-        ):
+        for n, post in ((n, p.data.detach().clone()) for n, p in m.named_parameters() if p.requires_grad):
             torch.testing.assert_close(
-                post.cpu(), pre_step[n].cpu() + 1.0,
-                atol=1e-5, rtol=1e-5,
+                post.cpu(),
+                pre_step[n].cpu() + 1.0,
+                atol=1e-5,
+                rtol=1e-5,
                 msg=lambda m, n=n: f"{n}: partial step not preserved ({m})",
             )
 
@@ -3440,11 +3333,7 @@ class TestRevisedDataOnlyDesign:
         m_baseline.to("cuda")
         out_b = m_baseline(x, use_checkpoint=True)
         ((out_b - target) ** 2).mean().backward()
-        baseline_grads = {
-            n: p.grad.detach().clone()
-            for n, p in m_baseline.named_parameters()
-            if p.grad is not None
-        }
+        baseline_grads = {n: p.grad.detach().clone() for n, p in m_baseline.named_parameters() if p.grad is not None}
 
         for block in m_streamed.transformer_blocks:
             block.gradient_checkpointing = True
@@ -3455,26 +3344,28 @@ class TestRevisedDataOnlyDesign:
             stream_trainable_weights=True,
         )
         try:
-            with offloader.use(
+            with activated_model(offloader,
                 "cuda",
                 stream_config=StreamConfig(
-                    num_resident_blocks=3, num_prefetch_blocks=2,
+                    num_resident_blocks=3,
+                    num_prefetch_blocks=2,
                 ),
             ) as gpu_model:
                 out_s = gpu_model(x, use_checkpoint=True)
                 ((out_s - target) ** 2).mean().backward()
                 torch.cuda.synchronize()
                 streamed_grads = {
-                    n: p.grad.detach().clone()
-                    for n, p in gpu_model.named_parameters()
-                    if p.grad is not None
+                    n: p.grad.detach().clone() for n, p in gpu_model.named_parameters() if p.grad is not None
                 }
         finally:
             offloader.deactivate()
 
         for name, g_baseline in baseline_grads.items():
             torch.testing.assert_close(
-                streamed_grads[name], g_baseline, atol=1e-5, rtol=1e-5,
+                streamed_grads[name],
+                g_baseline,
+                atol=1e-5,
+                rtol=1e-5,
             )
 
     @CUDA
@@ -3492,10 +3383,12 @@ class TestRevisedDataOnlyDesign:
             block.gradient_checkpointing = True
 
         opt_baseline = torch.optim.Adam(
-            [p for p in m_baseline.parameters() if p.requires_grad], lr=1e-3,
+            [p for p in m_baseline.parameters() if p.requires_grad],
+            lr=1e-3,
         )
         opt_streamed = torch.optim.Adam(
-            [p for p in m_streamed.parameters() if p.requires_grad], lr=1e-3,
+            [p for p in m_streamed.parameters() if p.requires_grad],
+            lr=1e-3,
         )
 
         # Same batch each iteration so updates are deterministic.
@@ -3508,11 +3401,7 @@ class TestRevisedDataOnlyDesign:
             out_b = m_baseline(x, use_checkpoint=True)
             ((out_b - target) ** 2).mean().backward()
             opt_baseline.step()
-        baseline_after = {
-            n: p.detach().clone().cpu()
-            for n, p in m_baseline.named_parameters()
-            if p.requires_grad
-        }
+        baseline_after = {n: p.detach().clone().cpu() for n, p in m_baseline.named_parameters() if p.requires_grad}
 
         offloader = _make_model_offloader(
             m_streamed,
@@ -3520,10 +3409,11 @@ class TestRevisedDataOnlyDesign:
             stream_trainable_weights=True,
         )
         try:
-            with offloader.use(
+            with activated_model(offloader,
                 "cuda",
                 stream_config=StreamConfig(
-                    num_resident_blocks=2, num_prefetch_blocks=0,
+                    num_resident_blocks=2,
+                    num_prefetch_blocks=0,
                 ),
             ) as gpu_model:
                 for _ in range(3):
@@ -3535,14 +3425,13 @@ class TestRevisedDataOnlyDesign:
         finally:
             offloader.deactivate()
 
-        streamed_after = {
-            n: p.detach().clone().cpu()
-            for n, p in m_streamed.named_parameters()
-            if p.requires_grad
-        }
+        streamed_after = {n: p.detach().clone().cpu() for n, p in m_streamed.named_parameters() if p.requires_grad}
         for name, baseline_t in baseline_after.items():
             torch.testing.assert_close(
-                streamed_after[name], baseline_t, atol=1e-5, rtol=1e-5,
+                streamed_after[name],
+                baseline_t,
+                atol=1e-5,
+                rtol=1e-5,
             )
 
 
@@ -3581,7 +3470,9 @@ class TestScheduleModel:
         mirror = _make_block_list_model(mirror_blocks, "blocks")
         sched = _make_block_list_model(sched_blocks, "blocks")
         store = StreamedComponentStore.from_module(
-            mirror, blocks_path="blocks", stream_trainable_weights=False,
+            mirror,
+            blocks_path="blocks",
+            stream_trainable_weights=False,
         )
         streamer = store.bind(mirror, schedule_model=sched)
 
@@ -3593,7 +3484,9 @@ class TestScheduleModel:
         mirror_blocks = self._blocks()
         mirror = _make_block_list_model(mirror_blocks, "blocks")
         store = StreamedComponentStore.from_module(
-            mirror, blocks_path="blocks", stream_trainable_weights=False,
+            mirror,
+            blocks_path="blocks",
+            stream_trainable_weights=False,
         )
         streamer = store.bind(mirror)
         assert list(streamer.blocks) == mirror_blocks
@@ -3602,10 +3495,13 @@ class TestScheduleModel:
         mirror = _make_block_list_model(self._blocks(n=4), "blocks")
         sched = _make_block_list_model(self._blocks(n=3), "blocks")
         store = StreamedComponentStore.from_module(
-            mirror, blocks_path="blocks", stream_trainable_weights=False,
+            mirror,
+            blocks_path="blocks",
+            stream_trainable_weights=False,
         )
         with pytest.raises(
-            ValueError, match="schedule_model has too few blocks",
+            ValueError,
+            match="schedule_model has too few blocks",
         ):
             store.bind(mirror, schedule_model=sched)
 
@@ -3617,11 +3513,14 @@ class TestScheduleModel:
         bind_model = _make_block_list_model(bind_blocks, "blocks")
         sched = _make_block_list_model(self._blocks(n=3), "blocks")
         store = StreamedComponentStore.from_module(
-            mirror, blocks_path="blocks", stream_trainable_weights=False,
+            mirror,
+            blocks_path="blocks",
+            stream_trainable_weights=False,
         )
         before = [b.weight.data_ptr() for b in bind_blocks]
         with pytest.raises(
-            ValueError, match="schedule_model has too few blocks",
+            ValueError,
+            match="schedule_model has too few blocks",
         ):
             store.bind(bind_model, schedule_model=sched)
         after = [b.weight.data_ptr() for b in bind_blocks]
@@ -3636,7 +3535,9 @@ class TestScheduleModel:
         mirror = _make_block_list_model(mirror_blocks, "blocks")
         sched = _make_block_list_model(sched_blocks, "blocks")
         store = StreamedComponentStore.from_module(
-            mirror, blocks_path="blocks", stream_trainable_weights=False,
+            mirror,
+            blocks_path="blocks",
+            stream_trainable_weights=False,
         )
         streamer = store.bind(mirror, schedule_model=sched)
         assert list(streamer.blocks) == sched_blocks[:3]
@@ -3649,7 +3550,9 @@ class TestScheduleModel:
         mixed: list[nn.Module] = [nn.Module(), real[0], nn.Module(), real[1]]
         mirror = _make_block_list_model(mixed, "blocks")
         store = StreamedComponentStore.from_module(
-            mirror, blocks_path="blocks", stream_trainable_weights=False,
+            mirror,
+            blocks_path="blocks",
+            stream_trainable_weights=False,
         )
         assert store.block_indices == (1, 3)
         assert len(store._block_stores) == 2
@@ -3664,7 +3567,9 @@ class TestScheduleModel:
         sched_blocks = self._blocks(n=4)
         sched = _make_block_list_model(sched_blocks, "blocks")
         store = StreamedComponentStore.from_module(
-            mirror, blocks_path="blocks", stream_trainable_weights=False,
+            mirror,
+            blocks_path="blocks",
+            stream_trainable_weights=False,
         )
         streamer = store.bind(mirror, schedule_model=sched)
         assert list(streamer.blocks) == [sched_blocks[1], sched_blocks[3]]
@@ -3677,7 +3582,9 @@ class TestScheduleModel:
         store_model = _make_block_list_model(self._blocks(n=3), "blocks")
         bind_model = _make_block_list_model(self._blocks(n=5), "blocks")
         store = StreamedComponentStore.from_module(
-            store_model, blocks_path="blocks", stream_trainable_weights=False,
+            store_model,
+            blocks_path="blocks",
+            stream_trainable_weights=False,
         )
         with pytest.raises(ValueError, match="does not occupy"):
             store.bind(bind_model)
@@ -3690,18 +3597,23 @@ class TestScheduleModel:
         mixed: list[nn.Module] = [real[0], real[1], nn.Module()]
         bind_model = _make_block_list_model(mixed, "blocks")
         store = StreamedComponentStore.from_module(
-            bind_model, blocks_path="blocks", stream_trainable_weights=False,
+            bind_model,
+            blocks_path="blocks",
+            stream_trainable_weights=False,
         )
         assert store.block_indices == (0, 1)
         store.bind(bind_model)  # empty holder at position 2 is fine
 
     def test_all_empty_blocks_raises(self) -> None:
         mirror = _make_block_list_model(
-            [nn.Module(), nn.Module()], "blocks",
+            [nn.Module(), nn.Module()],
+            "blocks",
         )
         with pytest.raises(ValueError, match="no streamable blocks"):
             StreamedComponentStore.from_module(
-                mirror, blocks_path="blocks", stream_trainable_weights=False,
+                mirror,
+                blocks_path="blocks",
+                stream_trainable_weights=False,
             )
 
     def test_component_rejects_mismatched_trigger_modules(self) -> None:
@@ -3709,24 +3621,13 @@ class TestScheduleModel:
         # independent of the store's earlier check.
         mirror = _make_block_list_model(self._blocks(n=4), "blocks")
         store = StreamedComponentStore.from_module(
-            mirror, blocks_path="blocks", stream_trainable_weights=False,
+            mirror,
+            blocks_path="blocks",
+            stream_trainable_weights=False,
         )
         instances = store.bind(mirror)._block_instances
         with pytest.raises(ValueError, match="one trigger per streamed block"):
             StreamedComponent(instances, trigger_modules=[nn.Linear(8, 8)])
-
-    def test_offloader_store_threads_schedule_model_to_streamed(self) -> None:
-        # The seam threads through CompositeComponentStore + ModelOffloaderStore:
-        # binding the top-level store with schedule_model lands the triggers on
-        # the schedule model's blocks.
-        mirror_blocks = self._blocks()
-        sched_blocks = self._blocks()
-        mirror = _make_block_list_model(mirror_blocks, "blocks")
-        sched = _make_block_list_model(sched_blocks, "blocks")
-        store = ModelOffloaderStore.from_module(mirror, blocks_attr=["blocks"])
-        offloader = store.bind(mirror, schedule_model=sched)
-        streamer = streamed_components(offloader)[0]
-        assert list(streamer.blocks) == sched_blocks
 
     @CUDA
     def test_schedule_model_redirects_streaming_triggers(self) -> None:
@@ -3738,14 +3639,18 @@ class TestScheduleModel:
         mirror = _make_block_list_model(mirror_blocks, "blocks")
         sched = _make_block_list_model(sched_blocks, "blocks").to("cuda")
         store = StreamedComponentStore.from_module(
-            mirror, blocks_path="blocks", stream_trainable_weights=False,
+            mirror,
+            blocks_path="blocks",
+            stream_trainable_weights=False,
         )
         streamer = store.bind(mirror, schedule_model=sched)
 
         with streamer.use(
             "cuda",
             stream_config=StreamConfig(
-                num_resident_blocks=1, num_prefetch_blocks=1, cyclic=False,
+                num_resident_blocks=1,
+                num_prefetch_blocks=1,
+                cyclic=False,
             ),
         ):
             # Hooks are on the schedule blocks, not the mirror blocks.

@@ -13,6 +13,7 @@ parameter instead of a freshly loaded activation parameter.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -20,7 +21,7 @@ from typing import Any
 
 from torch import nn
 
-from .lora import LoRAStore, LoRATransform
+from .lora import LoRA, LoRATransform
 from .tensor_adapter_registry import param_tensor_id
 
 logger = logging.getLogger(__name__)
@@ -43,12 +44,32 @@ class _MergeOp:
 
 def merge_lora(
     model: nn.Module,
-    loras: Sequence[tuple[LoRAStore, float]],
+    loras: Sequence[tuple[LoRA, float]],
 ) -> int:
     """Merge one or more LoRAs into model parameters in-place.
 
-    Returns the number of parameters that were modified.
+    Returns the number of parameters that were modified. Every LoRA is claimed
+    exclusively for the duration of the merge; an adapter already attached to
+    another model fails immediately.
     """
+    if len({id(lora) for lora, _strength in loras}) != len(loras):
+        raise ValueError(
+            "merge_lora() does not accept the same LoRA instance more than once"
+        )
+
+    with contextlib.ExitStack() as stack:
+        for lora, _strength in loras:
+            if not isinstance(lora, LoRA):
+                raise TypeError("merge_lora() expects LoRA instances")
+            lora.activate(mode="merge")
+            stack.callback(lora.deactivate)
+        return _merge_loras(model, loras)
+
+
+def _merge_loras(
+    model: nn.Module,
+    loras: Sequence[tuple[LoRA, float]],
+) -> int:
     params_by_target = _collect_params_by_target(model)
 
     merge_ops: list[_MergeOp] = []
