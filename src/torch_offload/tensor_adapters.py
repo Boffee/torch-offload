@@ -22,9 +22,11 @@ provide a layout signature for block-pool compatibility checks. Extra
 operations are expressed as small optional protocols so callers ask for
 the exact capability they need instead of hard-coding tensor classes.
 
-This module is internal to :mod:`torch_offload`. It contains the base
-contracts and plain tensor adapter only; built-in adapter selection
-lives in :mod:`tensor_adapter_registry`.
+The base :class:`TensorAdapter` contract is public through
+:mod:`torch_offload`; downstream implementations can register themselves with
+:func:`torch_offload.register_adapter`. The remaining helpers, optional
+capability protocols, and plain tensor implementation live here; built-in and
+external adapter selection lives in :mod:`tensor_adapter_registry`.
 """
 
 from __future__ import annotations

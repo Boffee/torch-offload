@@ -88,6 +88,12 @@ and compute dtype.
 read that backing directly and may overlap; routed hooks stage their own
 per-forward device copies.
 
+Downstream tensor subclasses can participate in pinning and movement without
+adding format-specific dependencies here: implement the public
+:class:`TensorAdapter` contract and register it during application startup with
+:func:`register_adapter`. Registered adapters are used for both movement and
+tied-storage identity.
+
 :class:`ResourceCache` manages cached backing stores with policy-driven
 eviction, reference-counted leases, and transactional admission.
 :class:`CachedModelRunner` owns dependency leasing, LoRA attachment, and device
@@ -142,6 +148,8 @@ from .resource_cache import (
 from .resource_specs import LoRASpec, ModelSpec, ObjectSpec
 from .stream_config import StreamConfig
 from .streamed_component import StreamedComponent, StreamedComponentStore
+from .tensor_adapter_registry import register_adapter
+from .tensor_adapters import TensorAdapter
 
 __all__ = [
     "CacheError",
@@ -178,5 +186,7 @@ __all__ = [
     "StreamConfig",
     "StreamedComponent",
     "StreamedComponentStore",
+    "TensorAdapter",
     "merge_lora",
+    "register_adapter",
 ]

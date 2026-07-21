@@ -1,12 +1,15 @@
-"""Explicit tensor adapter selection and tensor identity.
+"""Tensor adapter registration, selection, and tensor identity.
 
 The adapter classes themselves live in ``tensor_adapters.py`` and the
 format-specific modules. This module is the one normal Python place that
-knows the built-in dispatch order and adapter-defined tensor identity.
+knows the dispatch order and adapter-defined tensor identity. Downstream
+tensor subclasses can participate through :func:`register_adapter` without
+adding a format-specific dependency to this package.
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -24,14 +27,15 @@ from .nvfp4_adapter import Nvfp4Adapter
 from .quanto_adapter import QuantoAdapter
 from .tensor_adapters import RegularAdapter, TensorAdapter
 
-# Built-in adapters in dispatch order; first match wins. RegularAdapter is
-# last — it matches only exact torch.Tensor/nn.Parameter, so structured
-# subclasses reach their dedicated adapter first. DTensorAdapter is first: a
-# DTensor is an outer wrapper (its local shard, possibly quantized, is moved
-# by whatever adapter the registry selects for it), so it is checked before
-# the local-shard adapters.
+# DTensorAdapter is always checked before registered and built-in adapters: a
+# DTensor is an outer wrapper whose local shard is delegated back through this
+# registry. External adapters therefore compose inside DTensor without
+# replacing its distributed wrapper behavior.
+
+# Remaining built-in adapters in dispatch order; first match wins.
+# RegularAdapter is last — it matches only exact torch.Tensor/nn.Parameter, so
+# structured subclasses reach their dedicated adapter first.
 _BUILTIN_ADAPTERS: tuple[type[TensorAdapter[Any, Any]], ...] = (
-    DTensorAdapter,
     QuantoAdapter,
     Bnb4bitAdapter,
     Bnb8bitAdapter,
@@ -44,16 +48,81 @@ _BUILTIN_ADAPTERS: tuple[type[TensorAdapter[Any, Any]], ...] = (
     RegularAdapter,
 )
 
+# Process-global external registrations. New adapters are prepended so a later,
+# more-specific registration can override an earlier broad match. Registration
+# is intended for application initialization, before models are constructed.
+_REGISTERED_ADAPTERS: list[type[TensorAdapter[Any, Any]]] = []
+
+
+def register_adapter(
+    adapter_cls: type[TensorAdapter[Any, Any]],
+) -> Callable[[], None]:
+    """Register a stateless external tensor adapter.
+
+    External adapters are checked newest-first, after :class:`DTensorAdapter`
+    and before all other built-ins. ``adapter_cls`` must satisfy the
+    :class:`TensorAdapter` protocol and be constructible without arguments.
+
+    Registration is process-global and intended for application startup,
+    before constructing models or pinned resources. Returns an idempotent
+    callable that removes this registration, primarily for tests and scoped
+    integrations.
+    """
+    if not isinstance(adapter_cls, type):
+        raise TypeError(
+            "register_adapter() expects a TensorAdapter class, "
+            f"got {type(adapter_cls).__name__}"
+        )
+    if adapter_cls is DTensorAdapter or adapter_cls in _BUILTIN_ADAPTERS:
+        raise ValueError(
+            f"TensorAdapter {adapter_cls.__name__!r} is already built in"
+        )
+    if adapter_cls in _REGISTERED_ADAPTERS:
+        raise ValueError(
+            f"TensorAdapter {adapter_cls.__name__!r} is already registered"
+        )
+
+    try:
+        adapter = adapter_cls()
+    except TypeError as exc:
+        raise TypeError(
+            f"TensorAdapter {adapter_cls.__name__!r} must be constructible "
+            "without arguments"
+        ) from exc
+    if not isinstance(adapter, TensorAdapter):
+        raise TypeError(
+            f"Adapter {adapter_cls.__name__!r} does not satisfy the "
+            "TensorAdapter protocol"
+        )
+
+    _REGISTERED_ADAPTERS.insert(0, adapter_cls)
+    removed = False
+
+    def remove_adapter() -> None:
+        nonlocal removed
+
+        if removed:
+            return
+        _REGISTERED_ADAPTERS.remove(adapter_cls)
+        removed = True
+
+    return remove_adapter
+
 
 def select_adapter(t: torch.Tensor) -> TensorAdapter[Any, Any]:
-    """Return the built-in adapter that handles ``t``."""
+    """Return the highest-priority adapter that handles ``t``."""
+    if DTensorAdapter.matches(t):
+        return DTensorAdapter()
+    for adapter_cls in _REGISTERED_ADAPTERS:
+        if adapter_cls.matches(t):
+            return adapter_cls()
     for adapter_cls in _BUILTIN_ADAPTERS:
         if adapter_cls.matches(t):
             return adapter_cls()
     raise NotImplementedError(
         f"No TensorAdapter for tensor type {type(t).__name__!r}. "
         "Plain tensors are handled by RegularAdapter; tensor subclasses "
-        "need a dedicated adapter."
+        "need a dedicated adapter registered with register_adapter()."
     )
 
 
@@ -101,6 +170,7 @@ __all__ = [
     "buffer_tensor_id",
     "param_representation",
     "param_tensor_id",
+    "register_adapter",
     "select_adapter",
     "tensor_id",
 ]
