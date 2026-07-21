@@ -3,7 +3,8 @@
 :class:`LoRA` pairs, validates, and pins factor matrices from a flat
 safetensors state dict at construction. The raw state dict is not retained —
 the resource owns the only copy of the pinned factors plus one exclusive
-activation lifecycle.
+routed activation lifecycle. Merge consumers only read the immutable pinned
+factor backing and may overlap.
 
 Two application paths apply the resource's factors:
 
@@ -66,7 +67,7 @@ LoRAMode = Literal["merge", "routed"]
 
 
 class LoRARuntimeInUseError(RuntimeError):
-    """A LoRA resource already has an active use."""
+    """A LoRA resource already has an active routed use."""
 
 
 @dataclass(slots=True, frozen=True)
@@ -150,7 +151,7 @@ class ScaledLoRAFactor:
 
 
 class LoRA:
-    """Reusable pinned LoRA resource with one exclusive active use.
+    """Reusable pinned LoRA resource with one exclusive routed use.
 
     Build once from a flat ``state_dict``: the factors are paired, validated,
     and built into an ``nn.Module`` whose factors sit at their dotted paths
@@ -165,12 +166,10 @@ class LoRA:
 
     Satisfies :class:`~torch_offload.protocols.ResourceStore`, so it can be
     registered in :class:`~torch_offload.ResourceCache` for budget tracking and
-    policy-driven eviction. The cached resource is reused sequentially: every
-    merge or routed use must call :meth:`activate` and :meth:`deactivate`, and
-    an overlapping activation fails immediately with
-    :class:`LoRARuntimeInUseError`. Merge activation only holds that exclusive
-    claim; routed activation additionally streams factors GPU-resident,
-    co-scheduled with the base model.
+    policy-driven eviction. Merge consumers read the immutable pinned factors
+    directly and may overlap. Routed use calls :meth:`activate` and
+    :meth:`deactivate` to bind transient factor residency; overlapping routed
+    activations fail immediately with :class:`LoRARuntimeInUseError`.
 
     Strength is extrinsic — specify it when passing the resource to
     :meth:`ModelOffloader.activate` via ``lora_strengths``.
@@ -259,48 +258,38 @@ class LoRA:
         self,
         device: torch.device | str | None = None,
         *,
-        mode: LoRAMode,
         schedule_model: nn.Module | None = None,
         **kwargs: object,
     ) -> None:
-        """Claim this LoRA for one merge or routed use.
+        """Activate this LoRA for one routed use.
 
-        Merge mode keeps factors in pinned CPU storage and only holds the
-        exclusive-use claim. Routed mode additionally binds a transient
-        component to this LoRA's factor-holder module and co-schedules its
-        streamed blocks against the required ``schedule_model``.
+        Binds a transient component to this LoRA's factor-holder module and
+        co-schedules its streamed blocks against the required
+        ``schedule_model``. Merge consumers do not need activation because
+        they read the immutable pinned factor backing directly.
         """
-        if mode not in ("merge", "routed"):
+        if device is None:
+            raise ValueError("LoRA routed activation requires a device")
+        if schedule_model is None:
             raise ValueError(
-                "LoRA mode must be 'merge' or 'routed', "
-                f"got {mode!r}"
+                "LoRA routed activation requires a schedule_model"
             )
-        active_device: torch.device | None = None
-        if mode == "routed":
-            if device is None:
-                raise ValueError("LoRA routed activation requires a device")
-            if schedule_model is None:
-                raise ValueError(
-                    "LoRA routed activation requires a schedule_model"
-                )
-            active_device = canonical_device(device)
+        active_device = canonical_device(device)
 
         if not self._activation_lock.acquire(blocking=False):
             raise LoRARuntimeInUseError(
-                "LoRA already has an active use; overlapping LoRA "
+                "LoRA already has an active routed use; overlapping routed "
                 "activations are not supported"
             )
 
         self._active = True
         try:
-            if mode == "routed":
-                assert active_device is not None
-                composite = self._composite_store.bind(
-                    self._module,
-                    schedule_model=schedule_model,
-                )
-                self._composite = composite
-                composite.activate(active_device, **kwargs)
+            composite = self._composite_store.bind(
+                self._module,
+                schedule_model=schedule_model,
+            )
+            self._composite = composite
+            composite.activate(active_device, **kwargs)
         except BaseException:
             try:
                 if self._composite is not None:
@@ -312,7 +301,7 @@ class LoRA:
             raise
 
     def deactivate(self) -> None:
-        """Release the active use and any routed factor residency."""
+        """Release the active routed use and its factor residency."""
         if not self._active:
             return
         composite = self._composite

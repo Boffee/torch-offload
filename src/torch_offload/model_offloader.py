@@ -126,8 +126,8 @@ class ModelOffloader:
         self._cache_bytes = cache_bytes
         self._activation_lock = threading.Lock()
         self._lora_hook_handles: list[_RemovableHook] = []
-        # Every merge or routed LoRA use is exclusive. Routed LoRAs additionally
-        # own a streaming engine co-scheduled with this model.
+        # Routed LoRAs own an exclusive streaming engine co-scheduled with this
+        # model. Merge hooks read immutable pinned factor backing directly.
         self._active_loras: list[LoRA] = []
 
     @classmethod
@@ -227,15 +227,6 @@ class ModelOffloader:
             )
             self._lora_hook_handles.append(handle)
 
-    def _activate_merge_loras(
-        self,
-        loras: Sequence[tuple[LoRA, float]],
-    ) -> None:
-        """Claim every merge LoRA without materializing routed factors."""
-        for lora, _strength in loras:
-            lora.activate(mode="merge")
-            self._active_loras.append(lora)
-
     def _register_routed_lora_hooks(
         self,
         loras: Sequence[tuple[LoRA, float]],
@@ -255,7 +246,6 @@ class ModelOffloader:
         for lora, strength in loras:
             lora.activate(
                 active_device,
-                mode="routed",
                 schedule_model=self._model,
                 **kwargs,
             )
@@ -302,7 +292,7 @@ class ModelOffloader:
                 stack.callback(handle.remove)
 
     def _deactivate_loras(self) -> None:
-        """Release active LoRAs in reverse order. Idempotent."""
+        """Release active routed LoRAs in reverse order. Idempotent."""
         active_loras = self._active_loras
         self._active_loras = []
         with contextlib.ExitStack() as stack:
@@ -394,7 +384,6 @@ class ModelOffloader:
             # composite activates, so they fire as each base weight streams in.
             if active_loras and lora_mode == "merge":
                 targets = self._group_lora_factors_by_param_name(active_loras)
-                self._activate_merge_loras(active_loras)
                 self._register_merge_lora_hooks(active_device, targets)
             # The composite self-cleans its components if activation fails midway.
             self._composite.activate(active_device, **kwargs)

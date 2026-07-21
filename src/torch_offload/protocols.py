@@ -18,9 +18,10 @@ Top-level :class:`ResourceBinding` implementations in this package:
 :class:`~torch_offload.ModelOffloader` (whole-model bulk DMA or streamed
 block offload) and :class:`~torch_offload.MpsWeights` (whole-model
 CPU->MPS materialization without a second CPU cache). A
-:class:`~torch_offload.LoRA` is itself the cached adapter resource; its
-exclusive merge or routed lifecycle is driven by the
-:class:`~torch_offload.ModelOffloader` it is attached to.
+:class:`~torch_offload.LoRA` is itself the cached adapter resource. Merge
+consumers read its immutable pinned backing directly; its exclusive routed
+lifecycle is driven by the :class:`~torch_offload.ModelOffloader` it is
+attached to.
 
 Composable lifecycle pieces inside a model runtime include
 :class:`~torch_offload.PinnedComponent` and

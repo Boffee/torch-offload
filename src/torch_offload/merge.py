@@ -13,7 +13,6 @@ parameter instead of a freshly loaded activation parameter.
 
 from __future__ import annotations
 
-import contextlib
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -52,23 +51,20 @@ def merge_lora(
 ) -> int:
     """Merge one or more LoRAs into model parameters in-place.
 
-    Returns the number of unique parameters that were modified. Every LoRA is
-    claimed exclusively for the duration of the merge; an adapter already
-    attached to another model fails immediately. All target names and merge
-    capabilities are validated before any parameter is modified.
+    Returns the number of unique parameters that were modified. Merge reads
+    immutable pinned factor backing, so the same LoRA may also serve other
+    merge or routed uses. All target names and merge capabilities are
+    validated before any parameter is modified.
     """
     if len({id(lora) for lora, _strength in loras}) != len(loras):
         raise ValueError(
             "merge_lora() does not accept the same LoRA instance more than once"
         )
 
-    with contextlib.ExitStack() as stack:
-        for lora, _strength in loras:
-            if not isinstance(lora, LoRA):
-                raise TypeError("merge_lora() expects LoRA instances")
-            lora.activate(mode="merge")
-            stack.callback(lora.deactivate)
-        return _merge_loras(model, loras)
+    for lora, _strength in loras:
+        if not isinstance(lora, LoRA):
+            raise TypeError("merge_lora() expects LoRA instances")
+    return _merge_loras(model, loras)
 
 
 def _merge_loras(

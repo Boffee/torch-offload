@@ -58,10 +58,11 @@ def _factor_tensors(factor: LoRAFactor) -> tuple[torch.Tensor, torch.Tensor]:
     return factor.a.make_cpu_param().data, factor.b.make_cpu_param().data
 
 
-def _assert_lora_available(lora: LoRA) -> None:
-    """Prove that ``lora`` no longer holds its exclusive-use claim."""
-    lora.activate(mode="merge")
-    lora.deactivate()
+def _assert_lora_routing_available(lora: LoRA) -> None:
+    """Prove that ``lora`` no longer holds its routed-use claim."""
+    assert not lora._active
+    assert lora._activation_lock.acquire(blocking=False)
+    lora._activation_lock.release()
 
 
 def _make_model_offloader(
@@ -311,7 +312,6 @@ def _activate_loras_for_test(
     if mode == "merge":
         targets = strategy._group_lora_factors_by_param_name(loras)
         try:
-            strategy._activate_merge_loras(loras)
             strategy._register_merge_lora_hooks(torch.device("cuda"), targets)
         except BaseException:
             strategy._clear_active_loras()
@@ -636,7 +636,7 @@ class TestActivationLoraValidation:
         _request_loras(s, [(lora, 1.0)], mode="merge")
         with pytest.raises(ValueError, match="merge mode requires CUDA"):
             _activate(s, "cpu", stream_config=_strategy_stream_config(m))
-        _assert_lora_available(lora)
+        _assert_lora_routing_available(lora)
 
     def test_clear_active_loras_clears_previous_merge_hooks(self) -> None:
         m = _make_bf16_model()
@@ -646,6 +646,24 @@ class TestActivationLoraValidation:
         assert _has_post_copy_hook(s, "transformer_blocks.0.attn.weight")
         s._clear_active_loras()
         assert not _has_post_copy_hook(s, "transformer_blocks.0.attn.weight")
+
+    def test_merge_hooks_can_share_lora_with_routed_runtime(self) -> None:
+        m = _make_bf16_model()
+        s = _make_strategy(m)
+        lora = _make_lora(4, 16)
+        _request_loras(s, [(lora, 1.0)])
+        _activate_loras_for_test(s)
+        try:
+            assert _has_post_copy_hook(
+                s,
+                "transformer_blocks.0.attn.weight",
+            )
+            lora.activate("cpu", schedule_model=m)
+            lora.deactivate()
+        finally:
+            s._clear_active_lora_hooks()
+
+        _assert_lora_routing_available(lora)
 
     def test_accepts_quanto_target_in_merge_mode(self) -> None:
         quanto = pytest.importorskip("optimum.quanto")
@@ -1142,26 +1160,34 @@ class TestLoRATransform:
 
 
 class TestPermanentMerge:
-    def test_rejects_lora_with_an_active_use(self) -> None:
+    def test_can_share_lora_with_an_active_routed_use(self) -> None:
         m = _make_bf16_model(num_blocks=2, dim=16).to(torch.float32)
         lora = _make_lora(num_blocks=2, dim=16)
         before = m.transformer_blocks[0].attn.weight.detach().clone()
+        expected = _expected_merged_weight(
+            before,
+            [(lora, 1.0)],
+            0,
+            "attn.weight",
+        )
 
-        lora.activate(mode="merge")
+        lora.activate(
+            "cpu",
+            schedule_model=_make_bf16_model(num_blocks=2, dim=16),
+        )
         try:
-            with pytest.raises(LoRARuntimeInUseError, match="active use"):
-                merge_lora(m, [(lora, 1.0)])
+            assert merge_lora(m, [(lora, 1.0)]) == 2
         finally:
             lora.deactivate()
 
-        torch.testing.assert_close(m.transformer_blocks[0].attn.weight, before)
+        torch.testing.assert_close(m.transformer_blocks[0].attn.weight, expected)
 
-    def test_releases_lora_after_merge(self) -> None:
+    def test_merge_leaves_routed_runtime_available(self) -> None:
         m = _make_bf16_model(num_blocks=2, dim=16).to(torch.float32)
         lora = _make_lora(num_blocks=2, dim=16)
 
         assert merge_lora(m, [(lora, 1.0)]) == 2
-        _assert_lora_available(lora)
+        _assert_lora_routing_available(lora)
 
     def test_rejects_unknown_targets_without_mutation(self) -> None:
         m = _make_bf16_model(num_blocks=2, dim=16).to(torch.float32)
@@ -1180,7 +1206,7 @@ class TestPermanentMerge:
 
         for name, param in m.named_parameters():
             torch.testing.assert_close(param, before[name])
-        _assert_lora_available(lora)
+        _assert_lora_routing_available(lora)
 
     def test_multiple_loras_on_one_target_count_one_parameter(self) -> None:
         class M(nn.Module):
@@ -1958,7 +1984,7 @@ class TestRoutedStreaming:
             _activate(s, torch.device("cpu"))
 
         assert s.active_device is None
-        _assert_lora_available(bad)
+        _assert_lora_routing_available(bad)
         assert s._active_loras == []
         assert s._lora_hook_handles == []
         # Composite was deactivated -> a fresh activation succeeds and runs.
@@ -2138,7 +2164,7 @@ class TestLoRAResource:
             lora_specs=[lora_spec],
             lora_mode="routed",
         ) as first:
-            with pytest.raises(LoRARuntimeInUseError, match="active use"):
+            with pytest.raises(LoRARuntimeInUseError, match="active routed use"):
                 with runner.use(
                     second_spec,
                     device="cpu",
@@ -2423,52 +2449,28 @@ class TestLoRABlocksAttr:
 
 
 # ---------------------------------------------------------------------------
-# Unified LoRA activation lifecycle
+# Routed LoRA activation lifecycle
 # ---------------------------------------------------------------------------
 
 
 class TestLoRAActivation:
-    def test_merge_activation_holds_claim_without_binding_composite(self) -> None:
-        lora = _make_lora(num_blocks=4, dim=16)
-        lora.activate(mode="merge")
-        try:
-            assert lora._composite is None
-            with pytest.raises(LoRARuntimeInUseError, match="active use"):
-                lora.activate(mode="merge")
-        finally:
-            lora.deactivate()
-        _assert_lora_available(lora)
-
-    def test_cpu_activation_round_trips(self) -> None:
+    def test_cpu_activation_round_trips_and_rejects_overlap(self) -> None:
         lora = _make_lora(num_blocks=4, dim=16)
         model = _make_bf16_model(num_blocks=4, dim=16)
         lora.activate(
             torch.device("cpu"),
-            mode="routed",
             schedule_model=model,
         )
         try:
             assert lora._composite is not None
-            with pytest.raises(LoRARuntimeInUseError, match="active use"):
-                lora.activate(mode="merge")
-        finally:
-            lora.deactivate()
-        _assert_lora_available(lora)
-
-    @pytest.mark.parametrize("second_mode", ["merge", "routed"])
-    def test_rejects_every_overlapping_use(self, second_mode: LoRAMode) -> None:
-        lora = _make_lora(num_blocks=2, dim=8)
-        model = _make_bf16_model(num_blocks=2, dim=8)
-        lora.activate(mode="merge")
-        try:
-            with pytest.raises(LoRARuntimeInUseError, match="active use"):
+            with pytest.raises(LoRARuntimeInUseError, match="active routed use"):
                 lora.activate(
                     torch.device("cpu"),
-                    mode=second_mode,
                     schedule_model=model,
                 )
         finally:
             lora.deactivate()
+        _assert_lora_routing_available(lora)
 
     def test_activate_rejects_unsupported_device(self) -> None:
         # Device-type validation is delegated to the offload components, which
@@ -2478,10 +2480,9 @@ class TestLoRAActivation:
         with pytest.raises(ValueError, match="supports CUDA or CPU"):
             lora.activate(
                 torch.device("mps"),
-                mode="routed",
                 schedule_model=_make_bf16_model(num_blocks=2, dim=8),
             )
-        _assert_lora_available(lora)
+        _assert_lora_routing_available(lora)
 
     def test_deactivate_releases_claim_even_if_teardown_raises(
         self,
@@ -2490,7 +2491,6 @@ class TestLoRAActivation:
         lora = _make_lora(num_blocks=2, dim=8)
         lora.activate(
             torch.device("cpu"),
-            mode="routed",
             schedule_model=_make_bf16_model(num_blocks=2, dim=8),
         )
 
@@ -2501,7 +2501,7 @@ class TestLoRAActivation:
         lora._composite.deactivate = boom  # type: ignore[method-assign]
         with pytest.raises(RuntimeError, match="teardown failed"):
             lora.deactivate()
-        _assert_lora_available(lora)
+        _assert_lora_routing_available(lora)
 
     def test_two_model_offloaders_cannot_share_active_lora(self) -> None:
         lora = _make_lora(num_blocks=2, dim=8)
@@ -2510,7 +2510,7 @@ class TestLoRAActivation:
 
         first.activate("cpu", loras=[lora], lora_mode="routed")
         try:
-            with pytest.raises(LoRARuntimeInUseError, match="active use"):
+            with pytest.raises(LoRARuntimeInUseError, match="active routed use"):
                 second.activate("cpu", loras=[lora], lora_mode="routed")
             assert second.active_device is None
             assert first.value(torch.randn(2, 8)).shape == (2, 8)
@@ -2527,17 +2527,18 @@ class TestLoRAActivation:
             _make_bf16_model(2, 8).to(torch.float32),
         )
 
-        busy.activate(mode="merge")
+        busy_model = _make_bf16_model(2, 8)
+        busy.activate("cpu", schedule_model=busy_model)
         try:
-            with pytest.raises(LoRARuntimeInUseError, match="active use"):
+            with pytest.raises(LoRARuntimeInUseError, match="active routed use"):
                 offloader.activate(
                     "cpu",
                     loras=[available, busy],
                     lora_mode="routed",
                 )
-            _assert_lora_available(available)
-            with pytest.raises(LoRARuntimeInUseError, match="active use"):
-                busy.activate(mode="merge")
+            _assert_lora_routing_available(available)
+            with pytest.raises(LoRARuntimeInUseError, match="active routed use"):
+                busy.activate("cpu", schedule_model=busy_model)
             assert offloader.active_device is None
         finally:
             busy.deactivate()
@@ -2574,7 +2575,6 @@ class TestLoRAActivation:
 
         lora.activate(
             torch.device("cuda"),
-            mode="routed",
             schedule_model=model,
             stream_config=StreamConfig(
                 num_resident_blocks=1,
