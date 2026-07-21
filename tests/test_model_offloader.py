@@ -3436,149 +3436,31 @@ class TestRevisedDataOnlyDesign:
 
 
 # ---------------------------------------------------------------------------
-# schedule_model: redirect streaming triggers onto a parallel co-scheduled model
+# Sparse streamed block groups
 # ---------------------------------------------------------------------------
 
 
-def _record_block_triggers(streamer: StreamedComponent) -> list[int]:
-    """Record the idx of each block-forward trigger without altering behavior."""
-    fired: list[int] = []
-    original = streamer._before_block_forward
-
-    def record(idx: int, **kwargs: object) -> None:
-        fired.append(idx)
-        original(idx, **kwargs)  # type: ignore[arg-type]
-
-    streamer._before_block_forward = record  # type: ignore[method-assign]
-    return fired
-
-
-class TestScheduleModel:
-    def _blocks(self, n: int = 4, width: int = 8) -> list[nn.Module]:
+class TestSparseBlockStore:
+    @staticmethod
+    def _blocks(n: int = 4, width: int = 8) -> list[nn.Module]:
         blocks = [nn.Linear(width, width, bias=False) for _ in range(n)]
         for block in blocks:
-            for p in block.parameters():
-                p.requires_grad = False
+            block.requires_grad_(False)
         return blocks
 
-    def test_schedule_model_blocks_become_triggers(self) -> None:
-        # Built from the mirror, bound with schedule_model=sched: the
-        # component's trigger sites are the SCHEDULE model's blocks, not the
-        # mirror's own (whose forward never runs in the redesign).
-        mirror_blocks = self._blocks()
-        sched_blocks = self._blocks()
-        mirror = _make_block_list_model(mirror_blocks, "blocks")
-        sched = _make_block_list_model(sched_blocks, "blocks")
-        store = StreamedComponentStore.from_module(
-            mirror,
-            blocks_path="blocks",
-            stream_trainable_weights=False,
-        )
-        streamer = store.bind(mirror, schedule_model=sched)
-
-        assert list(streamer.blocks) == sched_blocks
-        assert all(b not in mirror_blocks for b in streamer.blocks)
-
-    def test_default_triggers_are_own_blocks(self) -> None:
-        # No schedule_model: each block triggers its own streaming (unchanged).
-        mirror_blocks = self._blocks()
-        mirror = _make_block_list_model(mirror_blocks, "blocks")
-        store = StreamedComponentStore.from_module(
-            mirror,
-            blocks_path="blocks",
-            stream_trainable_weights=False,
-        )
-        streamer = store.bind(mirror)
-        assert list(streamer.blocks) == mirror_blocks
-
-    def test_schedule_model_too_few_blocks_raises(self) -> None:
-        mirror = _make_block_list_model(self._blocks(n=4), "blocks")
-        sched = _make_block_list_model(self._blocks(n=3), "blocks")
-        store = StreamedComponentStore.from_module(
-            mirror,
-            blocks_path="blocks",
-            stream_trainable_weights=False,
-        )
-        with pytest.raises(
-            ValueError,
-            match="schedule_model has too few blocks",
-        ):
-            store.bind(mirror, schedule_model=sched)
-
-    def test_schedule_model_mismatch_preflights_before_binding(self) -> None:
-        # A too-short schedule_model must raise BEFORE store.bind installs
-        # pinned params into the (separate) bind model — no partial mutation.
-        mirror = _make_block_list_model(self._blocks(n=4), "blocks")
-        bind_blocks = self._blocks(n=4)
-        bind_model = _make_block_list_model(bind_blocks, "blocks")
-        sched = _make_block_list_model(self._blocks(n=3), "blocks")
-        store = StreamedComponentStore.from_module(
-            mirror,
-            blocks_path="blocks",
-            stream_trainable_weights=False,
-        )
-        before = [b.weight.data_ptr() for b in bind_blocks]
-        with pytest.raises(
-            ValueError,
-            match="schedule_model has too few blocks",
-        ):
-            store.bind(bind_model, schedule_model=sched)
-        after = [b.weight.data_ptr() for b in bind_blocks]
-        assert before == after  # bind model left untouched
-
-    def test_schedule_model_with_extra_blocks_triggers_on_occupied(self) -> None:
-        # A full-coverage store binding a LARGER schedule model triggers on the
-        # leading occupied positions (the extra tail blocks never fire). This
-        # is the relaxed bound: schedule_model only needs enough blocks.
-        mirror_blocks = self._blocks(n=3)
-        sched_blocks = self._blocks(n=5)
-        mirror = _make_block_list_model(mirror_blocks, "blocks")
-        sched = _make_block_list_model(sched_blocks, "blocks")
-        store = StreamedComponentStore.from_module(
-            mirror,
-            blocks_path="blocks",
-            stream_trainable_weights=False,
-        )
-        streamer = store.bind(mirror, schedule_model=sched)
-        assert list(streamer.blocks) == sched_blocks[:3]
-
-    def test_empty_holder_blocks_are_skipped(self) -> None:
-        # A LoRA-style block list: empty holders at positions 0 and 2, real
-        # (param-bearing) blocks at 1 and 3. from_module streams only the real
-        # blocks and records their true indices.
+    def test_empty_blocks_are_skipped(self) -> None:
         real = self._blocks(n=2)
         mixed: list[nn.Module] = [nn.Module(), real[0], nn.Module(), real[1]]
-        mirror = _make_block_list_model(mixed, "blocks")
+        model = _make_block_list_model(mixed, "blocks")
         store = StreamedComponentStore.from_module(
-            mirror,
+            model,
             blocks_path="blocks",
             stream_trainable_weights=False,
         )
         assert store.block_indices == (1, 3)
-        assert len(store._block_stores) == 2
+        assert list(store.bind(model).blocks) == real
 
-    def test_subset_triggers_on_true_schedule_indices(self) -> None:
-        # The occupied positions index into the schedule model: a mirror with
-        # empties at 0 and 2 triggers on the schedule model's blocks 1 and 3,
-        # not its first two.
-        real = self._blocks(n=2)
-        mixed: list[nn.Module] = [nn.Module(), real[0], nn.Module(), real[1]]
-        mirror = _make_block_list_model(mixed, "blocks")
-        sched_blocks = self._blocks(n=4)
-        sched = _make_block_list_model(sched_blocks, "blocks")
-        store = StreamedComponentStore.from_module(
-            mirror,
-            blocks_path="blocks",
-            stream_trainable_weights=False,
-        )
-        streamer = store.bind(mirror, schedule_model=sched)
-        assert list(streamer.blocks) == [sched_blocks[1], sched_blocks[3]]
-
-    def test_bind_model_with_unmanaged_nonempty_blocks_raises(self) -> None:
-        # A 3-block store bound to a 5-block model: positions 3 and 4 are
-        # non-empty and unoccupied, so they would be silently unmanaged (never
-        # moved or streamed). The bind model — unlike schedule_model — must
-        # reject them.
+    def test_bind_rejects_unmanaged_nonempty_blocks(self) -> None:
         store_model = _make_block_list_model(self._blocks(n=3), "blocks")
         bind_model = _make_block_list_model(self._blocks(n=5), "blocks")
         store = StreamedComponentStore.from_module(
@@ -3589,78 +3471,22 @@ class TestScheduleModel:
         with pytest.raises(ValueError, match="does not occupy"):
             store.bind(bind_model)
 
-    def test_bind_model_empty_unoccupied_blocks_allowed(self) -> None:
-        # The mirror of test_subset_triggers... covers the converse: a bind
-        # model whose unoccupied positions are EMPTY holders binds fine. Here
-        # an empty trailing holder past the occupied range is also accepted.
+    def test_bind_allows_empty_unoccupied_blocks(self) -> None:
         real = self._blocks(n=2)
-        mixed: list[nn.Module] = [real[0], real[1], nn.Module()]
-        bind_model = _make_block_list_model(mixed, "blocks")
+        model = _make_block_list_model([*real, nn.Module()], "blocks")
         store = StreamedComponentStore.from_module(
-            bind_model,
+            model,
             blocks_path="blocks",
             stream_trainable_weights=False,
         )
         assert store.block_indices == (0, 1)
-        store.bind(bind_model)  # empty holder at position 2 is fine
+        store.bind(model)
 
-    def test_all_empty_blocks_raises(self) -> None:
-        mirror = _make_block_list_model(
-            [nn.Module(), nn.Module()],
-            "blocks",
-        )
+    def test_all_empty_blocks_raise(self) -> None:
+        model = _make_block_list_model([nn.Module(), nn.Module()], "blocks")
         with pytest.raises(ValueError, match="no streamable blocks"):
             StreamedComponentStore.from_module(
-                mirror,
+                model,
                 blocks_path="blocks",
                 stream_trainable_weights=False,
             )
-
-    def test_component_rejects_mismatched_trigger_modules(self) -> None:
-        # Defense-in-depth: the component validates trigger count directly,
-        # independent of the store's earlier check.
-        mirror = _make_block_list_model(self._blocks(n=4), "blocks")
-        store = StreamedComponentStore.from_module(
-            mirror,
-            blocks_path="blocks",
-            stream_trainable_weights=False,
-        )
-        instances = store.bind(mirror)._block_instances
-        with pytest.raises(ValueError, match="one trigger per streamed block"):
-            StreamedComponent(instances, trigger_modules=[nn.Linear(8, 8)])
-
-    @CUDA
-    def test_schedule_model_redirects_streaming_triggers(self) -> None:
-        # End-to-end co-scheduling: hooks land on the schedule model's blocks
-        # (not the mirror's), and forwarding the schedule blocks streams the
-        # mirror's instances in lockstep.
-        mirror_blocks = self._blocks()
-        sched_blocks = self._blocks()
-        mirror = _make_block_list_model(mirror_blocks, "blocks")
-        sched = _make_block_list_model(sched_blocks, "blocks").to("cuda")
-        store = StreamedComponentStore.from_module(
-            mirror,
-            blocks_path="blocks",
-            stream_trainable_weights=False,
-        )
-        streamer = store.bind(mirror, schedule_model=sched)
-
-        with streamer.use(
-            "cuda",
-            stream_config=StreamConfig(
-                num_resident_blocks=1,
-                num_prefetch_blocks=1,
-                cyclic=False,
-            ),
-        ):
-            # Hooks are on the schedule blocks, not the mirror blocks.
-            assert all(not b._forward_pre_hooks for b in mirror_blocks)
-            assert all(len(sb._forward_pre_hooks) == 1 for sb in sched_blocks)
-
-            fired = _record_block_triggers(streamer)
-            x = torch.randn(2, 8, device="cuda")
-            for sb in sched_blocks:
-                sb(x)
-            torch.cuda.synchronize()
-            # Each schedule block's forward fired its mirror instance's load.
-            assert fired == [0, 1, 2, 3]

@@ -67,7 +67,6 @@ from .pinned_module import (
     PostCopyHook,
     PostCopyHookHandle,
 )
-from .pinned_param import PinnedParam
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,10 +116,6 @@ class PinnedComponentStore:
     def has_trainables(self) -> bool:
         """Whether any pinned parameter is trainable."""
         return self._module_store.has_trainables
-
-    def pinned_params(self) -> dict[str, PinnedParam]:
-        """Pinned params in this store, by name (matches :attr:`param_names`)."""
-        return dict(self._module_store.params)
 
     def bind(self, model: nn.Module) -> PinnedComponent:
         """Bind this store's pinned backing bytes to ``model``."""

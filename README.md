@@ -19,7 +19,7 @@ to be lifted into its own package when a second consumer appears.
 | `model_offloader.py` | `ModelOffloader` — cached single-model runtime for whole-model bulk pinned-CPU↔GPU or streamed block offload |
 | `pinned_component.py` | `PinnedComponentStore`, `PinnedComponent` — lower-level reusable pinned backing storage plus lifecycle-only pinned component used by `ModelOffloader` |
 | `streamed_component.py` | `StreamedComponentStore`, `StreamedComponent` — lower-level streamed backing storage plus per-block-list streaming component |
-| `lora.py` | `LoRA`, `LoRATransform` — cached pinned factors, merge transforms, and exclusive routed activation |
+| `lora.py` | `LoRA`, `LoRATransform` — cached pinned factors plus merge and routed application hooks |
 | `merge.py` | `merge_lora()` — permanent in-place LoRA merge into base weights |
 | `pinned_param.py` | `PinnedParam` — per-parameter pinning primitive (handles plain tensors, quanto, GGUF, bitsandbytes, DTensor, and TorchAO scaled-FP8 / INT8 / MX (MXFP8, MXFP4) / NVFP4 / INT4 tile-packed via adapters; see [Quantized weight support](#quantized-weight-support)) |
 | `pinned_module.py` | Internal name-keyed pinned module storage plus concrete module bindings |
@@ -185,9 +185,9 @@ bulk-pinned component that activation copies to the GPU.
 `cpu` is a pass-through over the already-installed pinned CPU storage:
 no target pool, no streaming hooks, no weight copies.
 `lora_mode="merge"` is CUDA-only; use routed LoRA mode for
-CPU activation. Routed LoRA installs forward hooks and streams its
-factors co-scheduled with the model, so they page onto the activation
-device with the block they belong to.
+CPU activation. Routed LoRA installs target-Linear hooks: a forward-PRE
+hook copies that target's pinned factors to the input device, and a
+forward-POST hook applies the residual and releases those device copies.
 
 By default, trainable parameters (e.g. LoRA adapters) are managed by
 the composed `PinnedComponent`: they move to GPU on CUDA activation and
@@ -249,16 +249,12 @@ offload = ModelOffloader.from_module(
 )
 device = torch.device("cuda")
 
-# Each LoRA owns immutable pinned factors; merge consumers may share them.
-# Matching blocks_attr enables bounded factor streaming in routed mode.
-lora_blocks = ("transformer_blocks",)
+# Each LoRA owns immutable pinned factors shared by merge and routed uses.
 lora_a = LoRA.from_state_dict(
     state_dict=load_file("lora_a.safetensors"),
-    blocks_attr=lora_blocks,
 )
 lora_b = LoRA.from_state_dict(
     state_dict=load_file("lora_b.safetensors"),
-    blocks_attr=lora_blocks,
 )
 
 offload.activate(
@@ -277,24 +273,22 @@ Block reload from pristine pinned CPU storage automatically clears
 the previous merge — no explicit unmerge step needed.
 
 Pass `lora_mode="routed"` as an alternative to the default merge mode.
-Routed mode installs a forward hook on each matched
+Routed mode installs a forward hook pair on each matched
 `nn.Linear` parent — `y = base(x) + alpha * B * A * x` — instead of merging
-into the base weight. A LoRA constructed with block paths matching the
-base model streams as its own engine co-scheduled with that model, so a
-factor block is GPU-resident only while its base block runs. Without
-`blocks_attr`, the whole adapter remains resident for the activation.
-Multiple LoRAs on one target stack as additive hooks. **Routed mode is
-inference-only:** the streamed factors are frozen (`requires_grad=False`)
-and no gradient flows to them. Routed activation is exclusive because it owns
-mutable factor residency; merge consumers remain read-only and may overlap
-with it. Use routed mode when:
+into the base weight. Its PRE hook copies only that target's factors from
+pinned CPU storage to the invocation's input device; its POST hook applies
+the residual and releases those device tensors. Multiple LoRAs on one target
+are grouped into one hook pair and summed independently. **Routed mode is
+inference-only:** factors are frozen (`requires_grad=False`) and no gradient
+flows to them. LoRA backing is immutable, so merge and routed uses may overlap
+across model runtimes. Use routed mode when:
 
 - The base weight is quantized or otherwise structured, but still exposes
   a logical `nn.Linear` weight shape and compute dtype, and its adapter
   does not support merge updates. `lora_mode="routed"` works because it
   doesn't touch the base.
-- You want to switch LoRAs frequently without re-streaming the
-  underlying base weight.
+- You want to switch LoRAs frequently without re-streaming the underlying
+  base weight or retaining the whole adapter on GPU.
 
 Routed mode is restricted to `nn.Linear` parents. It handles tied
 weights by hooking only the exact parent module named by the target, so
@@ -468,7 +462,6 @@ style_lora = LoRASpec(
     key="style-lora",
     estimated_cache_bytes=512 * 1024**2,
     factory=lambda: load_file("style.safetensors"),
-    blocks_attr=("transformer_blocks",),
     dtype=torch.bfloat16,
 )
 
@@ -490,10 +483,9 @@ The runner leases LoRA resources before admitting the model resource. An adapter
 selected for a use therefore cannot be evicted by that same model admission.
 All leases unwind in reverse order if construction or activation
 fails. `lora_strengths` defaults to `1.0` per LoRA; when supplied, it must
-have the same length as `lora_specs`. Merge uses may share one cached LoRA
-across model runtimes. Each cached LoRA supports one routed activation at a
-time; overlapping routed uses fail immediately and sequential reuse remains
-supported.
+have the same length as `lora_specs`. Merge and routed uses may share one
+cached LoRA across model runtimes because each runtime owns its own hooks and
+temporary device copies.
 
 For direct resource access, use a cache lease:
 
@@ -553,9 +545,8 @@ CachedModelRunner
    |
    +-- lease LoRASpec(s), then ModelSpec
    +-- ModelOffloader.activate(loras=...) claims the model runtime
-   |     (routed mode also activates each LoRA runtime)
    +-- yield ModelOffloader.value
-   +-- ModelOffloader.deactivate() removes LoRA hooks/residency + releases model
+   +-- ModelOffloader.deactivate() removes LoRA hooks + releases model
 ```
 
 `ResourceSpec` is the structural registration contract: `key`,
@@ -567,10 +558,9 @@ eviction but does not create or activate a runtime.
 `ResourceBinding` is the active-resource lifecycle contract: `value`,
 `activate(device=None, **kwargs)`, and `deactivate()`.
 `ModelOffloader` is both a cached `ResourceStore` and a `ResourceBinding`;
-`LoRA` is a cached `ResourceStore` with an exclusive routed activation
-lifecycle driven by the `ModelOffloader` consuming it. Merge reads do not
-activate the LoRA. It does not expose a separate binding or a model-like
-`value`.
+`LoRA` is an immutable cached `ResourceStore`. It exposes neither an active
+lifecycle nor a model-like `value`; merge and routed hooks read its pinned
+factor backing directly.
 
 A custom cached resource needs only one spec and one store:
 
@@ -623,18 +613,17 @@ plus `copy_into` (quantized wrappers).
 Cached resources own cache accounting. Pinning happens during construction so
 `cache_bytes` is final at admission time; leases protect resources while they
 are used. `ModelOffloader` owns one exclusive activation lifecycle. `LoRA`
-only needs an exclusive activation for routed factor residency:
+remains immutable pinned backing throughout its lease:
 
 ```
 ModelOffloader: construct -> lease -> activate <-> deactivate -> release lease
-LoRA (routed):   construct -> lease -> activate <-> deactivate -> release lease
-LoRA (merge):    construct -> lease -> read pinned factors -> release lease
+LoRA:            construct -> lease -> read pinned factors -> release lease
 ```
 
 `ModelOffloader.activate(device=...)` makes the model usable for compute on the
-requested device. `LoRA.activate(device, schedule_model=...)` activates factor
-residency for a routed use. Merge mode reads immutable pinned factors directly
-and does not activate the LoRA runtime.
+requested device. Merge hooks copy factors when their base weight is loaded;
+routed PRE hooks copy factors for one Linear invocation and routed POST hooks
+release them after enqueueing the residual.
 `ModelOffloader`, `MpsWeights`, `PinnedComponent`, and
 `StreamedComponent` require an explicit device. CUDA activation uses the
 streaming/DMA path where applicable; CPU activation is pass-through over
@@ -663,8 +652,8 @@ partially constructed resource/model as unrecoverable: drop those references
 and rebuild from a fresh model instance. If `activate()` raises, the offloader
 rolls back its active components and releases its activation claim, so a later
 well-formed activation may retry the same cached resource. Routed LoRA
-activation failures likewise release every acquired adapter claim; permanent
-merge validates all targets before mutation and does not acquire a LoRA runtime.
+hook-registration failures remove any hooks already installed; permanent merge
+validates all targets before mutation.
 This is a low-level library; we don't guard against caller misuse.
 
 ## Compatibility
@@ -872,7 +861,6 @@ than silent corruption.
 | `ResourceLeasedError` | A cache mutation targets a currently leased entry |
 | `ResourceCachedError` | `unregister(..., evict=False)` targets an entry with a built store |
 | `ModelRuntimeInUseError` | Any caller overlaps activation of the same cached `ModelOffloader` |
-| `LoRARuntimeInUseError` | Any caller overlaps routed use of the same cached `LoRA` |
 | `DuplicateResourceKeyError` | `register()` is called for an existing key without `replace=True` |
 | `ResourceNotRegisteredError` | `lease(str)` is called for an unknown key |
 

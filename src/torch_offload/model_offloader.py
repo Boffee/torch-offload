@@ -126,9 +126,6 @@ class ModelOffloader:
         self._cache_bytes = cache_bytes
         self._activation_lock = threading.Lock()
         self._lora_hook_handles: list[_RemovableHook] = []
-        # Routed LoRAs own an exclusive streaming engine co-scheduled with this
-        # model. Merge hooks read immutable pinned factor backing directly.
-        self._active_loras: list[LoRA] = []
 
     @classmethod
     def from_module(
@@ -229,45 +226,25 @@ class ModelOffloader:
 
     def _register_routed_lora_hooks(
         self,
-        loras: Sequence[tuple[LoRA, float]],
-        active_device: torch.device,
-        **kwargs: object,
+        targets: _LoraParamMap,
     ) -> None:
-        """Stream each LoRA's factors co-scheduled with the model and install
-        a forward-POST residual hook per (LoRA, target) on the target Linear.
+        """Install one staged PRE/POST routed hook per target Linear.
 
-        Each LoRA binds as its own streaming engine (``schedule_model`` = this
-        model), activated under the SAME stream config as the base composite,
-        so factor block *i* is GPU-resident exactly while base block *i* runs.
-        Multiple LoRAs on one Linear stack as independent additive hooks. The
-        hooks read the resident factors fresh each forward; the engines own
-        the factor lifetime and are torn down on deactivate.
+        The PRE hook copies all LoRA factors for that target from immutable
+        pinned backing to the invocation's input device. The POST hook applies
+        their additive residual and releases the staged device tensors.
         """
-        for lora, strength in loras:
-            lora.activate(
-                active_device,
-                schedule_model=self._model,
-                **kwargs,
-            )
-            self._active_loras.append(lora)
-            for target_key in lora.targets:
-                managed = self._require_managed_target(target_key)
-                parent, _leaf = resolve_parent_leaf(self._model, managed)
-                if not isinstance(parent, nn.Linear):
-                    raise ValueError(
-                        f"Routed LoRA mode requires nn.Linear targets; "
-                        f"target {managed!r} has parent module of "
-                        f"type {type(parent).__name__}. Use mode='merge' "
-                        f"for non-Linear targets."
-                    )
-                lora_a, lora_b = lora.factor_holders(target_key)
-                handle = install_routed_residual_hook(
-                    parent,
-                    lora_a,
-                    lora_b,
-                    strength,
+        for param_name, factors in targets.items():
+            parent, _leaf = resolve_parent_leaf(self._model, param_name)
+            if not isinstance(parent, nn.Linear):
+                raise ValueError(
+                    f"Routed LoRA mode requires nn.Linear targets; "
+                    f"target {param_name!r} has parent module of "
+                    f"type {type(parent).__name__}. Use mode='merge' "
+                    f"for non-Linear targets."
                 )
-                self._lora_hook_handles.append(handle)
+            handle = install_routed_residual_hook(parent, factors)
+            self._lora_hook_handles.append(handle)
 
     def _register_post_copy_hook(
         self,
@@ -289,20 +266,6 @@ class ModelOffloader:
         self._lora_hook_handles = []
         for handle in reversed(hook_handles):
             handle.remove()
-
-    def _deactivate_loras(self) -> None:
-        """Release active routed LoRAs in reverse order. Idempotent."""
-        active_loras = self._active_loras
-        self._active_loras = []
-        with contextlib.ExitStack() as stack:
-            for lora in active_loras:
-                stack.callback(lora.deactivate)
-
-    def _clear_active_loras(self) -> None:
-        try:
-            self._clear_active_lora_hooks()
-        finally:
-            self._deactivate_loras()
 
     # ----------------------------------------------- ResourceBinding interface
 
@@ -377,28 +340,20 @@ class ModelOffloader:
                 loras,
                 lora_strengths=lora_strengths,
             )
-            # cpu/cuda support is validated at the leaf components (and the
-            # merge-LoRA hook path enforces its stricter cuda requirement).
-            # Merge LoRA: post-copy hooks must be installed BEFORE the
-            # composite activates, so they fire as each base weight streams in.
-            if active_loras and lora_mode == "merge":
+            # LoRA hooks are installed before the composite activates. Merge
+            # hooks must be present for the first base-weight copy; routed
+            # hooks do no work until a target Linear runs.
+            if active_loras:
                 targets = self._group_lora_factors_by_param_name(active_loras)
-                self._register_merge_lora_hooks(active_device, targets)
+                if lora_mode == "merge":
+                    self._register_merge_lora_hooks(active_device, targets)
+                else:
+                    self._register_routed_lora_hooks(targets)
             # The composite self-cleans its components if activation fails midway.
             self._composite.activate(active_device, **kwargs)
-            # Routed LoRA: factor streaming + forward-POST residual hooks are
-            # installed AFTER the composite is live (the hooks only fire during
-            # forward, so post-activate install is safe). Engines stream under
-            # the same kwargs/StreamConfig as the base composite.
-            if active_loras and lora_mode == "routed":
-                self._register_routed_lora_hooks(
-                    active_loras,
-                    active_device,
-                    **kwargs,
-                )
         except BaseException:
             try:
-                self._clear_active_loras()
+                self._clear_active_lora_hooks()
             finally:
                 try:
                     # Idempotent before/after partial composite activation.
@@ -411,13 +366,11 @@ class ModelOffloader:
     def deactivate(self) -> None:
         if self._active_device is None:
             return
-        # LoRA teardown runs first (hooks, then active resources), but the
-        # composite teardown must run no matter what — a LoRA that raises on
-        # the way out (e.g. a factor eviction hitting a CUDA error) must not
-        # strand the base model resident on GPU. The activation claim is held
-        # until every teardown path completes.
+        # Remove LoRA hooks before returning the model to pinned storage. The
+        # composite teardown and activation-lock release still run if a custom
+        # hook handle unexpectedly raises during removal.
         try:
-            self._clear_active_loras()
+            self._clear_active_lora_hooks()
         finally:
             try:
                 self._composite.deactivate()

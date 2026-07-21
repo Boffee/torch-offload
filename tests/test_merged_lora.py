@@ -17,12 +17,13 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+import torch_offload.lora as lora_impl
+
 from torch_offload import (
     CachedModelRunner,
     LoRA,
     LoRAFactor,
     LoRAMode,
-    LoRARuntimeInUseError,
     LoRATransform,
     ResourceCache,
     ModelOffloader,
@@ -56,13 +57,6 @@ CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def _factor_tensors(factor: LoRAFactor) -> tuple[torch.Tensor, torch.Tensor]:
     """Materialize a pinned :class:`LoRAFactor`'s ``(a, b)`` as CPU tensors."""
     return factor.a.make_cpu_param().data, factor.b.make_cpu_param().data
-
-
-def _assert_lora_routing_available(lora: LoRA) -> None:
-    """Prove that ``lora`` no longer holds its routed-use claim."""
-    assert not lora._active
-    assert lora._activation_lock.acquire(blocking=False)
-    lora._activation_lock.release()
 
 
 def _make_model_offloader(
@@ -314,16 +308,16 @@ def _activate_loras_for_test(
         try:
             strategy._register_merge_lora_hooks(torch.device("cuda"), targets)
         except BaseException:
-            strategy._clear_active_loras()
+            strategy._clear_active_lora_hooks()
             raise
         return len(targets)
+    targets = strategy._group_lora_factors_by_param_name(loras)
     before = len(strategy._lora_hook_handles)
     try:
-        strategy._register_routed_lora_hooks(loras, torch.device("cpu"))
+        strategy._register_routed_lora_hooks(targets)
         return len(strategy._lora_hook_handles) - before
     finally:
         strategy._clear_active_lora_hooks()
-        strategy._deactivate_loras()
 
 
 # ---------------------------------------------------------------------------
@@ -332,6 +326,10 @@ def _activate_loras_for_test(
 
 
 class TestLoRAConstruction:
+    def test_rejects_state_dict_without_factors(self) -> None:
+        with pytest.raises(ValueError, match="no factor pairs"):
+            LoRA.from_state_dict(state_dict={"adapter.alpha": torch.tensor(4.0)})
+
     def test_unpaired_a_factor(self) -> None:
         sd = {"transformer_blocks.0.attn.lora_A.weight": torch.randn(4, 16)}
         with pytest.raises(ValueError, match="Unpaired"):
@@ -374,8 +372,7 @@ class TestLoRAConstruction:
             assert b.is_pinned()
 
     def test_factor_pinned_params_build_instance_without_repin(self) -> None:
-        """Streaming keystone: a factor's pinned params drop straight into a
-        PinnedModuleInstance — the same PinnedParam objects, no re-pin."""
+        """Pinned factors can be consumed without cloning or re-pinning."""
         lora = _make_lora(1, 16, rank=4)
         factor = lora.targets["transformer_blocks.0.attn.weight"]
         assert isinstance(factor.a, PinnedParam)
@@ -389,8 +386,7 @@ class TestLoRAConstruction:
             params={"a": factor.a, "b": factor.b},
             buffers={},
         )
-        # The streaming target pool will fill from these exact pinned
-        # objects; nothing is cloned or re-pinned on the way to an instance.
+        # Consumers retain the exact pinned objects.
         assert instance.params["a"] is factor.a
         assert instance.params["b"] is factor.b
 
@@ -408,8 +404,8 @@ class TestLoRAConstruction:
         assert "transformer_blocks.0.attn.weight" not in lora.targets
 
     def test_from_state_dict_dtype_casts_factors_at_build(self) -> None:
-        # Routed callers pass the model's compute dtype so factors stream and
-        # reside at that width (and the hook's per-forward cast is a no-op).
+        # Routed callers pass the model's compute dtype to reduce cache bytes
+        # and per-forward transfer volume.
         sd = _make_lora_sd(num_blocks=2, dim=16, seed=1)  # fp32 factors
         store = LoRA.from_state_dict(state_dict=sd, dtype=torch.bfloat16)
         for factor in store.targets.values():
@@ -438,20 +434,6 @@ class TestLoRAConstruction:
         sd = _make_lora_sd(num_blocks=1, dim=16, seed=1)
         with pytest.raises(ValueError, match="floating-point"):
             LoRA.from_state_dict(state_dict=sd, dtype=torch.int8)
-
-    def test_factor_holders_resolves_target_to_holder_modules(self) -> None:
-        # The routed seam: a target weight key maps to its (lora_A, lora_B)
-        # holder *modules* (stable identity), not the churning weight tensors.
-        sd = _make_lora_sd(num_blocks=2, dim=16, seed=2)
-        store = LoRA.from_state_dict(state_dict=sd)
-        a, b = store.factor_holders("transformer_blocks.1.attn.weight")
-        same_a, same_b = store.factor_holders(
-            "transformer_blocks.1.attn.weight"
-        )
-        assert a is same_a
-        assert b is same_b
-        assert a.get_parameter("weight").shape == (4, 16)
-        assert b.get_parameter("weight").shape == (16, 4)
 
 
 # ---------------------------------------------------------------------------
@@ -636,34 +618,15 @@ class TestActivationLoraValidation:
         _request_loras(s, [(lora, 1.0)], mode="merge")
         with pytest.raises(ValueError, match="merge mode requires CUDA"):
             _activate(s, "cpu", stream_config=_strategy_stream_config(m))
-        _assert_lora_routing_available(lora)
 
-    def test_clear_active_loras_clears_previous_merge_hooks(self) -> None:
+    def test_clear_active_lora_hooks_clears_previous_merge_hooks(self) -> None:
         m = _make_bf16_model()
         s = _make_strategy(m)
         _request_loras(s, [(_make_lora(4, 16, rank=4), 1.0)])
         _activate_loras_for_test(s)
         assert _has_post_copy_hook(s, "transformer_blocks.0.attn.weight")
-        s._clear_active_loras()
+        s._clear_active_lora_hooks()
         assert not _has_post_copy_hook(s, "transformer_blocks.0.attn.weight")
-
-    def test_merge_hooks_can_share_lora_with_routed_runtime(self) -> None:
-        m = _make_bf16_model()
-        s = _make_strategy(m)
-        lora = _make_lora(4, 16)
-        _request_loras(s, [(lora, 1.0)])
-        _activate_loras_for_test(s)
-        try:
-            assert _has_post_copy_hook(
-                s,
-                "transformer_blocks.0.attn.weight",
-            )
-            lora.activate("cpu", schedule_model=m)
-            lora.deactivate()
-        finally:
-            s._clear_active_lora_hooks()
-
-        _assert_lora_routing_available(lora)
 
     def test_accepts_quanto_target_in_merge_mode(self) -> None:
         quanto = pytest.importorskip("optimum.quanto")
@@ -737,8 +700,6 @@ class TestActivationLoraValidation:
             assert not _has_post_copy_hook(s, "transformer_blocks.0.attn.weight")
         finally:
             s.deactivate()
-
-        assert s._active_loras == []
 
 
 # ---------------------------------------------------------------------------
@@ -1162,6 +1123,8 @@ class TestLoRATransform:
 class TestPermanentMerge:
     def test_can_share_lora_with_an_active_routed_use(self) -> None:
         m = _make_bf16_model(num_blocks=2, dim=16).to(torch.float32)
+        routed_model = _make_bf16_model(num_blocks=2, dim=16).to(torch.float32)
+        routed = _make_model_offloader(routed_model)
         lora = _make_lora(num_blocks=2, dim=16)
         before = m.transformer_blocks[0].attn.weight.detach().clone()
         expected = _expected_merged_weight(
@@ -1171,23 +1134,18 @@ class TestPermanentMerge:
             "attn.weight",
         )
 
-        lora.activate(
+        routed.activate(
             "cpu",
-            schedule_model=_make_bf16_model(num_blocks=2, dim=16),
+            loras=[lora],
+            lora_mode="routed",
         )
         try:
             assert merge_lora(m, [(lora, 1.0)]) == 2
+            assert routed_model(torch.randn(2, 16)).shape == (2, 16)
         finally:
-            lora.deactivate()
+            routed.deactivate()
 
         torch.testing.assert_close(m.transformer_blocks[0].attn.weight, expected)
-
-    def test_merge_leaves_routed_runtime_available(self) -> None:
-        m = _make_bf16_model(num_blocks=2, dim=16).to(torch.float32)
-        lora = _make_lora(num_blocks=2, dim=16)
-
-        assert merge_lora(m, [(lora, 1.0)]) == 2
-        _assert_lora_routing_available(lora)
 
     def test_rejects_unknown_targets_without_mutation(self) -> None:
         m = _make_bf16_model(num_blocks=2, dim=16).to(torch.float32)
@@ -1206,7 +1164,6 @@ class TestPermanentMerge:
 
         for name, param in m.named_parameters():
             torch.testing.assert_close(param, before[name])
-        _assert_lora_routing_available(lora)
 
     def test_multiple_loras_on_one_target_count_one_parameter(self) -> None:
         class M(nn.Module):
@@ -1717,13 +1674,15 @@ class TestRoutedMode:
         lora = LoRA.from_state_dict(state_dict=sd)
         _request_loras(s, [(lora, 1.0)], mode="routed")
         active_loras, _mode = _LORA_REQUESTS.pop(s)
-        s._register_routed_lora_hooks(active_loras, torch.device("cpu"))
+        targets = s._group_lora_factors_by_param_name(active_loras)
+        s._register_routed_lora_hooks(targets)
         try:
             assert len(model.embed._forward_hooks) == (1 if target == "embed" else 0)
             assert len(model.head._forward_hooks) == (1 if target == "head" else 0)
+            assert len(model.embed._forward_pre_hooks) == (1 if target == "embed" else 0)
+            assert len(model.head._forward_pre_hooks) == (1 if target == "head" else 0)
         finally:
             s._clear_active_lora_hooks()
-            s._deactivate_loras()
 
         # Merge mode also matches by name; it mutates the copied backing,
         # so the normal shared-storage effect is preserved.
@@ -1796,16 +1755,14 @@ class TestRoutedMode:
             s.deactivate()
 
 
-class TestRoutedStreaming:
-    """Routed LoRA on the streaming foundation (#31): per-LoRA stacked hooks
-    read the LoRA's resident factors, co-scheduled with the base model."""
+class TestRoutedStaging:
+    """Routed LoRA stages pinned factors in target PRE hooks."""
 
     def test_multi_lora_stacked_hooks_compose_additively(self) -> None:
         # One block (so the two adapters don't feed each other across blocks)
         # and a fully-linear tail, so LoRA residuals superpose:
-        # y(L1+L2) == y(L1) + y(L2) - y0. Two LoRAs on the one attn.weight
-        # install two stacked forward-POST hooks; additive hook chaining must
-        # sum them with no central grouping.
+        # y(L1+L2) == y(L1) + y(L2) - y0. Two LoRAs on one target are grouped
+        # into one hook pair and retain their independent strengths.
         torch.manual_seed(0)
         m = _make_bf16_model(num_blocks=1, dim=16).to(torch.float32)
         x = torch.randn(3, 16)
@@ -1835,10 +1792,90 @@ class TestRoutedStreaming:
             atol=1e-3,
         )
 
+    def test_pre_hook_stages_grouped_factors_each_forward(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        m = _make_bf16_model(num_blocks=1, dim=16).to(torch.float32)
+        loras = [
+            (_make_lora(num_blocks=1, dim=16, seed=1), 0.7),
+            (_make_lora(num_blocks=1, dim=16, seed=2), 1.3),
+        ]
+        calls: list[tuple[int, torch.device]] = []
+        original = lora_impl._stage_routed_factors
+
+        def record_stage(
+            factors: Sequence[ScaledLoRAFactor],
+            x: torch.Tensor,
+        ) -> tuple[ScaledLoRAFactor, ...]:
+            calls.append((len(factors), x.device))
+            return original(factors, x)
+
+        monkeypatch.setattr(lora_impl, "_stage_routed_factors", record_stage)
+        s = _make_model_offloader(m)
+        s.activate(
+            "cpu",
+            loras=[lora for lora, _strength in loras],
+            lora_strengths=[strength for _lora, strength in loras],
+            lora_mode="routed",
+        )
+        try:
+            target = m.transformer_blocks[0].attn
+            assert len(target._forward_pre_hooks) == 1
+            assert len(target._forward_hooks) == 1
+            x = torch.randn(2, 16)
+            m(x)
+            m(x)
+            assert calls == [
+                (2, torch.device("cpu")),
+                (2, torch.device("cpu")),
+            ]
+        finally:
+            s.deactivate()
+
+    def test_failed_linear_forward_discards_staged_factors(self) -> None:
+        class FailingLinear(nn.Linear):
+            fail = True
+
+            def forward(self, input_tensor: torch.Tensor) -> torch.Tensor:
+                if self.fail:
+                    raise RuntimeError("linear failed")
+                return super().forward(input_tensor)
+
+        class M(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.target = FailingLinear(3, 3, bias=False)
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                return self.target(x)
+
+        m = M()
+        m.requires_grad_(False)
+        lora = LoRA.from_state_dict(
+            {
+                "target.lora_A.weight": torch.randn(1, 3),
+                "target.lora_B.weight": torch.randn(3, 1),
+            }
+        )
+        s = _make_model_offloader(m)
+        s.activate("cpu", loras=[lora], lora_mode="routed")
+        try:
+            with pytest.raises(RuntimeError, match="linear failed"):
+                m(torch.randn(2, 3))
+            hook_handle = s._lora_hook_handles[0]
+            assert isinstance(hook_handle, lora_impl._RoutedLoRAHookHandle)
+            assert hook_handle._staged == []
+
+            m.target.fail = False
+            assert m(torch.randn(2, 3)).shape == (2, 3)
+            assert hook_handle._staged == []
+        finally:
+            s.deactivate()
+
     def test_routed_nested_base_layer_path(self) -> None:
         # A weight nested under ``.base_layer.`` (e.g. PEFT-wrapped). Routed
-        # resolves the hook onto that nested Linear and reads the factor from
-        # the matching nested holder — both keyed at the exact model path.
+        # resolves the hook onto that exact nested Linear.
         class PEFTBlock(nn.Module):
             def __init__(self, dim: int) -> None:
                 super().__init__()
@@ -1894,40 +1931,34 @@ class TestRoutedStreaming:
             h = out + 0.5 * (h @ a.T) @ bb.T
         torch.testing.assert_close(actual, h, rtol=1e-4, atol=1e-4)
 
-    def test_deactivate_releases_active_loras(self) -> None:
+    def test_deactivate_removes_staging_hooks(self) -> None:
         m = _make_bf16_model(num_blocks=2, dim=16)
         lora = _make_lora(num_blocks=2, dim=16, seed=4)
         s = _make_model_offloader(m, blocks_attr=["transformer_blocks"])
 
         _request_loras(s, [(lora, 1.0)], mode="routed")
         _activate(s, torch.device("cpu"))
-        # One streaming engine; one stacked hook per (LoRA, target).
-        assert s._active_loras == [lora]
+        # One paired handle per target.
         assert len(s._lora_hook_handles) == 2
 
         s.deactivate()
-        assert s._active_loras == []
         assert s._lora_hook_handles == []
 
         # A new activation-scoped request works after teardown.
         _request_loras(s, [(lora, 1.0)], mode="routed")
         _activate(s, torch.device("cpu"))
         try:
-            assert len(s._active_loras) == 1
+            assert len(s._lora_hook_handles) == 2
         finally:
             s.deactivate()
 
     @CUDA
-    def test_routed_streaming_matches_merge(self) -> None:
-        # A blocks_attr LoRA streams its factors co-scheduled with the model
-        # (num_resident_blocks=1 forces streaming). Routed (resident-factor
-        # residual) must match merge (weight-bake) bit-close, and the factor
-        # holder modules must keep stable identity across stream load/evict
-        # (the hook caches the node, not the churning .weight).
+    def test_routed_staging_matches_merge_with_streamed_model(self) -> None:
+        # Per-target factor staging must compose with a streamed base model and
+        # match merge mode bit-close.
         m = _make_bf16_model(num_blocks=2, dim=16)
         lora = LoRA.from_state_dict(
             state_dict=_make_lora_sd(num_blocks=2, dim=16, seed=7),
-            blocks_attr=["transformer_blocks"],
         )
         x = torch.randn(2, 16, dtype=torch.bfloat16, device="cuda")
         s = _make_model_offloader(m, blocks_attr=["transformer_blocks"])
@@ -1941,42 +1972,29 @@ class TestRoutedStreaming:
         finally:
             s.deactivate()
 
-        a_node_before, _ = lora.factor_holders(
-            "transformer_blocks.0.attn.weight",
-        )
         _request_loras(s, [(lora, 0.5)], mode="routed")
         _activate(s, "cuda", stream_config=cfg)
         try:
             routed = m(x).clone()
             torch.cuda.synchronize()
-            a_node_after, _ = lora.factor_holders(
-                "transformer_blocks.0.attn.weight",
-            )
         finally:
             s.deactivate()
 
-        assert a_node_before is a_node_after
-        # Routed (resident-factor residual) vs merge (weight-bake) differ only
+        # Routed residual vs merge (weight-bake) differ only
         # by bf16 rounding of the separate residual GEMMs.
         torch.testing.assert_close(routed, merged, rtol=0.1, atol=0.1)
 
     def test_activate_rolls_back_composite_when_routed_registration_fails(
         self,
     ) -> None:
-        # Routed hooks install AFTER the composite is live. If registration
-        # raises (here: a target the model doesn't manage), the now-resident
-        # composite must be torn back down — not stranded. Proven by a clean
-        # re-activation, which the composite's "already active" guard would
-        # otherwise reject.
+        # If route registration raises, activation must release its claim and
+        # leave no hooks. Proven by a clean re-activation.
         m = _make_bf16_model(num_blocks=2, dim=16)
         sd = {
             "transformer_blocks.0.absent.lora_A.weight": torch.randn(4, 16),
             "transformer_blocks.0.absent.lora_B.weight": torch.randn(16, 4),
         }
-        bad = LoRA.from_state_dict(
-            state_dict=sd,
-            blocks_attr=["transformer_blocks"],
-        )
+        bad = LoRA.from_state_dict(state_dict=sd)
         s = _make_model_offloader(m, blocks_attr=["transformer_blocks"])
         _request_loras(s, [(bad, 1.0)], mode="routed")
 
@@ -1984,8 +2002,6 @@ class TestRoutedStreaming:
             _activate(s, torch.device("cpu"))
 
         assert s.active_device is None
-        _assert_lora_routing_available(bad)
-        assert s._active_loras == []
         assert s._lora_hook_handles == []
         # Composite was deactivated -> a fresh activation succeeds and runs.
         _activate(s, torch.device("cpu"))
@@ -2015,35 +2031,6 @@ class TestDeactivateCleanupInvariants:
         with pytest.raises(RuntimeError):
             s.deactivate()
 
-    def test_deactivate_tears_down_composite_even_if_lora_raises(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        # A routed LoRA whose deactivate() raises (e.g. a factor
-        # eviction CUDA error) must NOT prevent the base composite teardown —
-        # otherwise the model would leak resident. CPU activation is enough to
-        # exercise the lifecycle ordering.
-        m = _make_bf16_model(num_blocks=2, dim=16)
-        lora = _make_lora(num_blocks=2, dim=16, seed=4)
-        s = _make_model_offloader(m, blocks_attr=["transformer_blocks"])
-        _request_loras(s, [(lora, 1.0)], mode="routed")
-        _activate(s, torch.device("cpu"))
-        assert s._active_loras  # a live streaming engine to sabotage
-
-        def boom() -> None:
-            raise RuntimeError("LoRA eviction failed")
-
-        monkeypatch.setattr(s._active_loras[0], "deactivate", boom)
-
-        with pytest.raises(RuntimeError, match="LoRA eviction failed"):
-            s.deactivate()
-
-        # Despite the LoRA failure, the composite was deactivated and the
-        # offloader reports inactive -> a fresh activation succeeds.
-        assert s.active_device is None
-        _activate(s, torch.device("cpu"))
-        s.deactivate()
-
 
 # ---------------------------------------------------------------------------
 # Cache budget
@@ -2062,12 +2049,13 @@ class TestCacheBytes:
 
 
 class TestLoRAResource:
-    def test_lora_is_cached_resource_with_activation_lifecycle(self) -> None:
+    def test_lora_is_immutable_cached_resource(self) -> None:
         lora = _make_lora(num_blocks=2, dim=8, rank=2)
         assert isinstance(lora, ResourceStore)
         assert not isinstance(lora, ResourceBinding)
         assert not isinstance(lora, nn.Module)
-        assert callable(lora.activate) and callable(lora.deactivate)
+        assert not hasattr(lora, "activate")
+        assert not hasattr(lora, "deactivate")
 
     def test_lora_through_resource_cache(self) -> None:
         sd = _make_lora_sd(num_blocks=2, dim=8, rank=2)
@@ -2138,7 +2126,7 @@ class TestLoRAResource:
             assert torch.allclose(actual, expected, rtol=1e-5, atol=1e-5)
         assert factory_calls["lora"] == 1
 
-    def test_cached_lora_rejects_overlap_across_model_runtimes(self) -> None:
+    def test_cached_lora_can_overlap_across_model_runtimes(self) -> None:
         cache = ResourceCache(10**9)
         runner = CachedModelRunner(cache)
         lora_spec = LoRASpec(
@@ -2164,24 +2152,16 @@ class TestLoRAResource:
             lora_specs=[lora_spec],
             lora_mode="routed",
         ) as first:
-            with pytest.raises(LoRARuntimeInUseError, match="active routed use"):
-                with runner.use(
-                    second_spec,
-                    device="cpu",
-                    lora_specs=[lora_spec],
-                    lora_mode="routed",
-                ):
-                    pass
+            with runner.use(
+                second_spec,
+                device="cpu",
+                lora_specs=[lora_spec],
+                lora_mode="routed",
+            ) as second:
+                assert cache.info("lora:shared").lease_count == 2
+                assert first(x).shape == (2, 8)
+                assert second(x).shape == (2, 8)
             assert cache.info("lora:shared").lease_count == 1
-            assert first(x).shape == (2, 8)
-
-        with runner.use(
-            second_spec,
-            device="cpu",
-            lora_specs=[lora_spec],
-            lora_mode="routed",
-        ) as second:
-            assert second(x).shape == (2, 8)
 
     def test_runner_rejects_strength_mismatch_before_cache_admission(self) -> None:
         factory_calls = {"lora": 0, "model": 0}
@@ -2288,313 +2268,3 @@ class TestLoRAResource:
 
 
 # ---------------------------------------------------------------------------
-# LoRA-owned module + composite store (blocks_attr)
-# ---------------------------------------------------------------------------
-
-
-class TestLoRABlocksAttr:
-    """LoRA factors live in an nn.Module pinned via a CompositeComponentStore;
-    blocks_attr groups factor blocks into a streamed component."""
-
-    def test_targets_match_all_pinned(self) -> None:
-        # A blocks_attr-built LoRA derives the same targets (keys + factor
-        # bytes + cache_bytes) as the default all-pinned one, so it merges
-        # identically — the transitive guarantee for the merge suite.
-        sd = _make_lora_sd(num_blocks=4, dim=16, seed=7)
-        pinned = LoRA.from_state_dict(state_dict=sd)
-        streamed = LoRA.from_state_dict(state_dict=sd, blocks_attr=["transformer_blocks"])
-        assert set(pinned.targets) == set(streamed.targets)
-        for key in pinned.targets:
-            pa, pb = _factor_tensors(pinned.targets[key])
-            sa, sb = _factor_tensors(streamed.targets[key])
-            torch.testing.assert_close(pa, sa)
-            torch.testing.assert_close(pb, sb)
-        assert pinned.cache_bytes == streamed.cache_bytes
-
-    def test_scaled_factor_views_pinned_memory(self) -> None:
-        # The derived factor's .scaled() must view pinned host bytes, or
-        # merge's non_blocking H2D silently degrades to a sync stall.
-        sd = _make_lora_sd(num_blocks=2, dim=16)
-        lora = LoRA.from_state_dict(state_dict=sd, blocks_attr=["transformer_blocks"])
-        factor = next(iter(lora.targets.values()))
-        scaled = factor.scaled(1.0)
-        assert scaled.a.is_pinned()
-        assert scaled.b.is_pinned()
-
-    def test_blocks_attr_builds_streamed_component(self) -> None:
-        sd = _make_lora_sd(num_blocks=4, dim=16)
-        lora = LoRA.from_state_dict(state_dict=sd, blocks_attr=["transformer_blocks"])
-        streamed = lora._composite_store.streamed_stores
-        assert len(streamed) == 1
-        assert streamed[0].blocks_path == "transformer_blocks"
-        # Default (no blocks_attr) keeps everything pinned, no streamed group.
-        assert LoRA.from_state_dict(state_dict=sd)._composite_store.streamed_stores == ()
-
-    @staticmethod
-    def _sparse_sd() -> dict[str, torch.Tensor]:
-        # Adapts only blocks 0 and 2 — block 1 is unadapted.
-        g = torch.Generator().manual_seed(0)
-        sd: dict[str, torch.Tensor] = {}
-        for b in (0, 2):
-            base = f"transformer_blocks.{b}.attn"
-            sd[f"{base}.lora_A.weight"] = torch.randn(4, 16, generator=g)
-            sd[f"{base}.lora_B.weight"] = torch.randn(16, 4, generator=g)
-        return sd
-
-    def test_path_walk_indexes_sparse_blocks_with_empty_holders(self) -> None:
-        # Path-walk construction indexes blocks truly: the gap at block 1
-        # becomes an empty holder so blocks 0 and 2 keep their real indices.
-        # No manual padding — it falls out of the dotted paths.
-        lora = LoRA.from_state_dict(state_dict=self._sparse_sd())
-        blocks = lora._module.transformer_blocks  # type: ignore[union-attr]
-        assert len(blocks) == 3
-        assert list(blocks[1].parameters()) == []  # empty holder at the gap
-        assert set(lora.targets) == {
-            "transformer_blocks.0.attn.weight",
-            "transformer_blocks.2.attn.weight",
-        }
-
-    def test_nested_module_list_paths(self) -> None:
-        # Consecutive numeric segments build a ModuleList-of-ModuleLists: the
-        # holder type follows whether the *next* segment is an index, so nested
-        # lists (e.g. grouped/MoE blocks at ``0.1``) round-trip correctly.
-        g = torch.Generator().manual_seed(0)
-        sd = {
-            "blocks.0.1.attn.lora_A.weight": torch.randn(4, 16, generator=g),
-            "blocks.0.1.attn.lora_B.weight": torch.randn(16, 4, generator=g),
-        }
-        lora = LoRA.from_state_dict(state_dict=sd)
-        assert set(lora.targets) == {"blocks.0.1.attn.weight"}
-        blocks = lora._module.blocks  # type: ignore[union-attr]
-        assert isinstance(blocks, nn.ModuleList)
-        assert isinstance(blocks[0], nn.ModuleList)
-        # The path the routed apply resolves on the model is reachable.
-        assert lora.factor_holders("blocks.0.1.attn.weight")[0] is not None
-
-    def test_root_level_numeric_paths(self) -> None:
-        # A root-level nn.Sequential / nn.ModuleList model has params like
-        # ``0.weight``, so factor keys start with an index — the root holder
-        # must itself be a ModuleList (regression: a plain-Module root crashed
-        # the path-walk on the first numeric segment).
-        g = torch.Generator().manual_seed(0)
-        sd = {
-            "0.lora_A.weight": torch.randn(4, 16, generator=g),
-            "0.lora_B.weight": torch.randn(16, 4, generator=g),
-        }
-        lora = LoRA.from_state_dict(state_dict=sd)
-        assert set(lora.targets) == {"0.weight"}
-        assert isinstance(lora._module, nn.ModuleList)
-
-    def test_sparse_blocks_attr_streaming_skips_empty_holders(self) -> None:
-        # A sparse LoRA streams fine now (#26): the empty holder block at the
-        # gap is skipped, the two adapted blocks pass the uniform-name check,
-        # and their TRUE indices are recorded so the seam can co-schedule them
-        # against the matching base-model blocks.
-        lora = LoRA.from_state_dict(
-            state_dict=self._sparse_sd(),
-            blocks_attr=["transformer_blocks"],
-        )
-        (streamed,) = lora._composite_store.streamed_stores
-        assert streamed.block_indices == (0, 2)
-        assert len(streamed._block_stores) == 2
-        # Names use TRUE indices (0, 2), so there is no bogus block-1 target
-        # and no duplicate block-2 target leaking through the pinned remainder.
-        assert streamed.param_names == frozenset(
-            {
-                "transformer_blocks.0.attn.lora_A.weight",
-                "transformer_blocks.0.attn.lora_B.weight",
-                "transformer_blocks.2.attn.lora_A.weight",
-                "transformer_blocks.2.attn.lora_B.weight",
-            }
-        )
-        assert set(lora.targets) == {
-            "transformer_blocks.0.attn.weight",
-            "transformer_blocks.2.attn.weight",
-        }
-
-    def test_non_block_adapter_goes_to_pinned_remainder(self) -> None:
-        sd = _make_lora_sd(num_blocks=2, dim=16)
-        sd["embed.lora_A.weight"] = torch.randn(4, 16)
-        sd["embed.lora_B.weight"] = torch.randn(16, 4)
-        lora = LoRA.from_state_dict(state_dict=sd, blocks_attr=["transformer_blocks"])
-        assert lora._composite_store.pinned_store is not None
-        assert "embed.weight" in lora.targets
-        assert "transformer_blocks.0.attn.weight" in lora.targets
-
-    @CUDA
-    def test_blocks_attr_merge_matches_manual_baseline(self) -> None:
-        # End-to-end: a streamed-store-pinned LoRA merges correctly, proving
-        # the derived factors keep pinned-view async H2D semantics.
-        m = _make_bf16_model(num_blocks=4, dim=16)
-        captured = {i: m.transformer_blocks[i].attn.weight.detach().clone() for i in range(4)}
-        sd = _make_lora_sd(num_blocks=4, dim=16, seed=3)
-        lora = LoRA.from_state_dict(state_dict=sd, blocks_attr=["transformer_blocks"])
-        s = _make_strategy(m)
-        _request_loras(s, [(lora, 0.5)])
-        _activate(s, "cuda", stream_config=_strategy_stream_config(m))
-        try:
-            for i in range(4):
-                _ = m.transformer_blocks[i](torch.randn(2, 16, dtype=torch.bfloat16, device="cuda"))
-                torch.cuda.synchronize()
-                expected = _expected_merged_weight(
-                    captured[i].to("cuda"),
-                    [(lora, 0.5)],
-                    i,
-                    "attn.weight",
-                )
-                actual = m.transformer_blocks[i].attn.weight.detach()
-                assert torch.allclose(actual, expected, rtol=0.01, atol=0.01)
-        finally:
-            s.deactivate()
-
-
-# ---------------------------------------------------------------------------
-# Routed LoRA activation lifecycle
-# ---------------------------------------------------------------------------
-
-
-class TestLoRAActivation:
-    def test_cpu_activation_round_trips_and_rejects_overlap(self) -> None:
-        lora = _make_lora(num_blocks=4, dim=16)
-        model = _make_bf16_model(num_blocks=4, dim=16)
-        lora.activate(
-            torch.device("cpu"),
-            schedule_model=model,
-        )
-        try:
-            assert lora._composite is not None
-            with pytest.raises(LoRARuntimeInUseError, match="active routed use"):
-                lora.activate(
-                    torch.device("cpu"),
-                    schedule_model=model,
-                )
-        finally:
-            lora.deactivate()
-        _assert_lora_routing_available(lora)
-
-    def test_activate_rejects_unsupported_device(self) -> None:
-        # Device-type validation is delegated to the offload components, which
-        # support CUDA/CPU only — MPS (and anything else) is rejected there
-        # (no MPS backend needed: rejection is by device.type before any move).
-        lora = _make_lora(num_blocks=2, dim=8)
-        with pytest.raises(ValueError, match="supports CUDA or CPU"):
-            lora.activate(
-                torch.device("mps"),
-                schedule_model=_make_bf16_model(num_blocks=2, dim=8),
-            )
-        _assert_lora_routing_available(lora)
-
-    def test_deactivate_releases_claim_even_if_teardown_raises(
-        self,
-    ) -> None:
-        # A teardown error must not leave the resource claim wedged.
-        lora = _make_lora(num_blocks=2, dim=8)
-        lora.activate(
-            torch.device("cpu"),
-            schedule_model=_make_bf16_model(num_blocks=2, dim=8),
-        )
-
-        def boom() -> None:
-            raise RuntimeError("teardown failed")
-
-        assert lora._composite is not None
-        lora._composite.deactivate = boom  # type: ignore[method-assign]
-        with pytest.raises(RuntimeError, match="teardown failed"):
-            lora.deactivate()
-        _assert_lora_routing_available(lora)
-
-    def test_two_model_offloaders_cannot_share_active_lora(self) -> None:
-        lora = _make_lora(num_blocks=2, dim=8)
-        first = _make_model_offloader(_make_bf16_model(2, 8).to(torch.float32))
-        second = _make_model_offloader(_make_bf16_model(2, 8).to(torch.float32))
-
-        first.activate("cpu", loras=[lora], lora_mode="routed")
-        try:
-            with pytest.raises(LoRARuntimeInUseError, match="active routed use"):
-                second.activate("cpu", loras=[lora], lora_mode="routed")
-            assert second.active_device is None
-            assert first.value(torch.randn(2, 8)).shape == (2, 8)
-        finally:
-            first.deactivate()
-
-        second.activate("cpu", loras=[lora], lora_mode="routed")
-        second.deactivate()
-
-    def test_lora_conflict_rolls_back_preceding_lora_and_model(self) -> None:
-        available = _make_lora(num_blocks=2, dim=8, seed=1)
-        busy = _make_lora(num_blocks=2, dim=8, seed=2)
-        offloader = _make_model_offloader(
-            _make_bf16_model(2, 8).to(torch.float32),
-        )
-
-        busy_model = _make_bf16_model(2, 8)
-        busy.activate("cpu", schedule_model=busy_model)
-        try:
-            with pytest.raises(LoRARuntimeInUseError, match="active routed use"):
-                offloader.activate(
-                    "cpu",
-                    loras=[available, busy],
-                    lora_mode="routed",
-                )
-            _assert_lora_routing_available(available)
-            with pytest.raises(LoRARuntimeInUseError, match="active routed use"):
-                busy.activate("cpu", schedule_model=busy_model)
-            assert offloader.active_device is None
-        finally:
-            busy.deactivate()
-
-        offloader.activate("cpu")
-        offloader.deactivate()
-
-    @CUDA
-    def test_factor_blocks_stream_co_scheduled_with_model(self) -> None:
-        # The factor block for adapter slot i lands on GPU when the MATCHING
-        # base-model block runs its forward (schedule_model co-scheduling),
-        # bounded by the residency budget, and the streamed bytes equal the
-        # pinned master. This is the resident streaming a future routed path
-        # reads off the module.
-        dim, num_blocks = 16, 4
-        lora = LoRA.from_state_dict(
-            _make_lora_sd(num_blocks=num_blocks, dim=dim, seed=9),
-            blocks_attr=["transformer_blocks"],
-        )
-        model = _make_bf16_model(num_blocks=num_blocks, dim=dim).to("cuda")
-        factor_holders = [
-            lora.factor_holders(
-                f"transformer_blocks.{i}.attn.weight"
-            )
-            for i in range(num_blocks)
-        ]
-        cpu_factors = [
-            (
-                a.get_parameter("weight").detach().clone(),
-                b.get_parameter("weight").detach().clone(),
-            )
-            for a, b in factor_holders
-        ]
-
-        lora.activate(
-            torch.device("cuda"),
-            schedule_model=model,
-            stream_config=StreamConfig(
-                num_resident_blocks=1,
-                num_prefetch_blocks=1,
-            ),
-        )
-        try:
-            x = torch.randn(2, dim, dtype=torch.bfloat16, device="cuda")
-            for i in range(num_blocks):
-                model.transformer_blocks[i](x)
-                torch.cuda.synchronize()
-                a = factor_holders[i][0].get_parameter("weight")
-                b = factor_holders[i][1].get_parameter("weight")
-                assert a.is_cuda and b.is_cuda
-                torch.testing.assert_close(a.cpu(), cpu_factors[i][0])
-                torch.testing.assert_close(b.cpu(), cpu_factors[i][1])
-        finally:
-            lora.deactivate()
-
-        # Teardown returns every factor block to pinned CPU.
-        for a, b in factor_holders:
-            assert not a.get_parameter("weight").is_cuda
-            assert not b.get_parameter("weight").is_cuda

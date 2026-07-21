@@ -84,16 +84,14 @@ dequantize/requantize plus ``copy_into`` merge, otherwise use routed
 LoRA when their module exposes a compatible logical Linear weight shape
 and compute dtype.
 
-:class:`LoRA` owns its pinned factor storage. Merge consumers read that
-immutable backing directly and may overlap; routed use owns one exclusive
-activation lifecycle, and overlapping routed activation raises
-:class:`LoRARuntimeInUseError` immediately.
+:class:`LoRA` owns immutable pinned factor storage. Merge and routed consumers
+read that backing directly and may overlap; routed hooks stage their own
+per-forward device copies.
 
 :class:`ResourceCache` manages cached backing stores with policy-driven
 eviction, reference-counted leases, and transactional admission.
 :class:`CachedModelRunner` owns dependency leasing, LoRA attachment, and device
-activation. Each model offloader rejects overlapping use, as does each routed
-LoRA runtime. Custom
+activation. Each model offloader rejects overlapping use. Custom
 :class:`EvictionPolicy`
 implementations can replace the default LRU behavior. See its docstring
 for design notes.
@@ -104,8 +102,8 @@ Compatibility
 - **Wrap before DDP/FSDP**, not after.
 - **Coarse cache concurrency.** :class:`ResourceCache` serializes cache
   metadata and lease operations and releases its lock while caller code
-  holds a lease. Model cache entries and routed LoRA runtimes support one
-  active use at a time; merge consumers may share LoRA backing.
+  holds a lease. Model cache entries support one active use at a time; LoRA
+  backing may be shared.
 """
 
 from .cached_model_runner import CachedModelRunner
@@ -114,7 +112,6 @@ from .lora import (
     LoRA,
     LoRAFactor,
     LoRAMode,
-    LoRARuntimeInUseError,
     LoRATransform,
     ScaledLoRAFactor,
 )
@@ -159,7 +156,6 @@ __all__ = [
     "LoRA",
     "LoRAFactor",
     "LoRAMode",
-    "LoRARuntimeInUseError",
     "LoRASpec",
     "LoRATransform",
     "ModelOffloader",

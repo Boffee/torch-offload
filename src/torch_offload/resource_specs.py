@@ -54,22 +54,19 @@ class ModelSpec(Generic[M]):
 class LoRASpec:
     """LoRA resource built from a state-dict factory.
 
-    ``blocks_attr`` and ``dtype`` are forwarded to
-    :meth:`LoRA.from_state_dict`. Pass the base model's block paths so
-    routed mode can co-schedule factor blocks with that model.
+    ``dtype`` is forwarded to :meth:`LoRA.from_state_dict`; matching the
+    model's compute dtype reduces routed per-forward transfer volume.
     """
 
     key: str
     estimated_cache_bytes: int
     factory: Callable[[], dict[str, torch.Tensor]]
-    blocks_attr: tuple[str, ...] = ()
     dtype: torch.dtype | None = None
 
     def build_store(self) -> LoRA:
         """Build and pin this reusable adapter resource."""
         return LoRA.from_state_dict(
             self.factory(),
-            blocks_attr=self.blocks_attr,
             dtype=self.dtype,
         )
 
