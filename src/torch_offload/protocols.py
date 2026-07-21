@@ -45,7 +45,7 @@ unsupported; drop those references and rebuild from a fresh model
 instance.
 
 ``activate()/deactivate()`` may be repeated as many times as you want.
-:class:`~torch_offload.CachedModelRunner` combines cache leases with an
+:class:`~torch_offload.ModelCache` combines cache leases with an
 exception-safe model activation scope.
 
 There is no ``close()``. To release store ``cache_bytes`` (typically

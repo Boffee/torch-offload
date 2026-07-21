@@ -30,7 +30,7 @@ Design highlights
   ``max_cache_bytes`` (typically pinned host memory). Activation and GPU
   residency belong to resources and consumers such as
   :class:`~torch_offload.ModelOffloader` and
-  :class:`~torch_offload.CachedModelRunner`.
+  :class:`~torch_offload.ModelCache`.
 - **Policy interface.** Host-cache eviction is delegated to an
   :class:`EvictionPolicy`; the default preserves LRU eviction.
 - **Coarse thread-safety.** Public cache operations are protected by an

@@ -20,11 +20,11 @@ from torch import nn
 import torch_offload.lora as lora_impl
 
 from torch_offload import (
-    CachedModelRunner,
     LoRA,
     LoRAFactor,
     LoRAMode,
     LoRATransform,
+    ModelCache,
     ResourceCache,
     ModelOffloader,
     ModelSpec,
@@ -2070,7 +2070,7 @@ class TestLoRAResource:
         with cache.lease("lora:test") as lora2:
             assert lora2 is lora
 
-    def test_cached_model_runner_applies_loras_and_holds_leases(
+    def test_model_cache_applies_loras_and_holds_leases(
         self,
     ) -> None:
         sd = _make_lora_sd(num_blocks=2, dim=8, rank=2, seed=17)
@@ -2081,8 +2081,7 @@ class TestLoRAResource:
             factory_calls["lora"] += 1
             return sd
 
-        cache = ResourceCache(10**9)
-        runner = CachedModelRunner(cache)
+        cache = ModelCache(10**9)
         lora_spec = LoRASpec(
             key="lora:style",
             estimated_cache_bytes=1000,
@@ -2095,7 +2094,7 @@ class TestLoRAResource:
         )
 
         x = torch.randn(2, 8)
-        with runner.use(
+        with cache.use(
             model_spec,
             device="cpu",
             lora_specs=[lora_spec],
@@ -2112,7 +2111,7 @@ class TestLoRAResource:
         assert cache.info("model").lease_count == 0
         assert factory_calls["lora"] == 1
 
-        with runner.use(
+        with cache.use(
             model_spec,
             device="cpu",
             lora_specs=[lora_spec],
@@ -2125,8 +2124,7 @@ class TestLoRAResource:
         assert factory_calls["lora"] == 1
 
     def test_cached_lora_can_overlap_across_model_runtimes(self) -> None:
-        cache = ResourceCache(10**9)
-        runner = CachedModelRunner(cache)
+        cache = ModelCache(10**9)
         lora_spec = LoRASpec(
             key="lora:shared",
             estimated_cache_bytes=1000,
@@ -2144,13 +2142,13 @@ class TestLoRAResource:
         )
         x = torch.randn(2, 8)
 
-        with runner.use(
+        with cache.use(
             first_spec,
             device="cpu",
             lora_specs=[lora_spec],
             lora_mode="routed",
         ) as first:
-            with runner.use(
+            with cache.use(
                 second_spec,
                 device="cpu",
                 lora_specs=[lora_spec],
@@ -2161,7 +2159,7 @@ class TestLoRAResource:
                 assert second(x).shape == (2, 8)
             assert cache.info("lora:shared").lease_count == 1
 
-    def test_runner_rejects_strength_mismatch_before_cache_admission(self) -> None:
+    def test_model_cache_rejects_strength_mismatch_before_admission(self) -> None:
         factory_calls = {"lora": 0, "model": 0}
 
         def lora_factory() -> dict[str, torch.Tensor]:
@@ -2182,11 +2180,10 @@ class TestLoRAResource:
             estimated_cache_bytes=10**6,
             factory=model_factory,
         )
-        cache = ResourceCache(10**9)
-        runner = CachedModelRunner(cache)
+        cache = ModelCache(10**9)
 
         with pytest.raises(ValueError, match="same length"):
-            with runner.use(
+            with cache.use(
                 model_spec,
                 device="cpu",
                 lora_specs=[lora_spec],
@@ -2200,7 +2197,7 @@ class TestLoRAResource:
         with pytest.raises(ResourceNotRegisteredError):
             cache.info("model")
 
-    def test_runner_rejects_duplicate_lora_before_cache_admission(self) -> None:
+    def test_model_cache_rejects_duplicate_lora_before_admission(self) -> None:
         factory_calls = {"lora": 0, "model": 0}
 
         def lora_factory() -> dict[str, torch.Tensor]:
@@ -2221,11 +2218,10 @@ class TestLoRAResource:
             estimated_cache_bytes=10**6,
             factory=model_factory,
         )
-        cache = ResourceCache(10**9)
-        runner = CachedModelRunner(cache)
+        cache = ModelCache(10**9)
 
         with pytest.raises(ValueError, match="same LoRA resource key"):
-            with runner.use(
+            with cache.use(
                 model_spec,
                 device="cpu",
                 lora_specs=[lora_spec, lora_spec],
@@ -2236,7 +2232,7 @@ class TestLoRAResource:
         assert factory_calls == {"lora": 0, "model": 0}
 
     def test_lora_leased_during_resource_cache_miss(self) -> None:
-        # The LoRAs acquired by a runner use are leased before the
+        # The LoRAs acquired by a model-cache use are leased before the
         # model store builds, so a model cache-miss must fail admission
         # rather than evict a lora it is about to be applied with.
         lora_spec = LoRASpec(
@@ -2250,10 +2246,9 @@ class TestLoRAResource:
             factory=lambda: _make_bf16_model(num_blocks=2, dim=8).to(torch.float32),
         )
 
-        cache = ResourceCache(10_000)
-        runner = CachedModelRunner(cache)
+        cache = ModelCache(10_000)
         with pytest.raises(ResourceTooLargeError):
-            with runner.use(
+            with cache.use(
                 model_spec,
                 device="cpu",
                 lora_specs=[lora_spec],

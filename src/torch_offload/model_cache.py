@@ -1,8 +1,9 @@
-"""Composition layer for cached model and LoRA resources.
+"""Model-aware resource cache.
 
-The cache owns resource admission and leases; this runner owns LoRA attachment
-and device activation. Keeping those responsibilities separate lets
-:class:`ResourceCache` remain unaware of models and adapters.
+:class:`ResourceCache` owns resource admission, accounting, leases, and
+eviction. :class:`ModelCache` specializes it with activation-scoped model use,
+including LoRA dependency leasing and device activation, while keeping the
+generic cache machinery unaware of models and adapters.
 """
 
 from __future__ import annotations
@@ -23,16 +24,13 @@ from .stream_config import StreamConfig
 M = TypeVar("M", bound=nn.Module)
 
 
-class CachedModelRunner:
-    """Activate cached model runtimes with leased LoRA dependencies.
+class ModelCache(ResourceCache):
+    """Resource cache with model activation and LoRA coordination.
 
-    A model cache entry owns one :class:`ModelOffloader` and supports
-    sequential reuse only. Its lifecycle rejects overlapping uses regardless
-    of how many runners share the cache.
+    Inherits the complete resource-agnostic cache API. Each model entry owns
+    one :class:`ModelOffloader` and supports sequential reuse only; overlapping
+    uses of the same entry fail regardless of which caller initiates them.
     """
-
-    def __init__(self, cache: ResourceCache) -> None:
-        self._cache = cache
 
     @contextlib.contextmanager
     def use(
@@ -45,7 +43,7 @@ class CachedModelRunner:
         lora_mode: LoRAMode = "merge",
         stream_config: StreamConfig | None = None,
     ) -> Iterator[M]:
-        """Lease dependencies and activate the cached model runtime.
+        """Lease dependencies and activate a cached model runtime.
 
         ``lora_strengths`` defaults to one for each LoRA and, when supplied,
         must have the same length as ``lora_specs``. A LoRA resource key may
@@ -64,7 +62,7 @@ class CachedModelRunner:
 
         # Dependencies are leased first, so admitting the model cannot evict a
         # LoRA selected for this same runtime.
-        with self._cache.lease_many((*specs, model)) as resources:
+        with self.lease_many((*specs, model)) as resources:
             loras = cast(tuple[LoRA, ...], resources[:-1])
             offloader = cast(ModelOffloader, resources[-1])
             config = stream_config if stream_config is not None else StreamConfig()
@@ -81,4 +79,4 @@ class CachedModelRunner:
                 offloader.deactivate()
 
 
-__all__ = ["CachedModelRunner"]
+__all__ = ["ModelCache"]
