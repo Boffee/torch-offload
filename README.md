@@ -13,8 +13,8 @@ to be lifted into its own package when a second consumer appears.
 | Module | Role |
 |---|---|
 | `resource_cache.py` | `ResourceCache`, eviction policy, cache metadata, and cache errors |
+| `model_cache.py` | `ModelCache` — model-aware `ResourceCache` with activation and LoRA coordination |
 | `resource_specs.py` | `ModelSpec`, `LoRASpec`, `ObjectSpec` — standard frozen resource specifications |
-| `cached_model_runner.py` | `CachedModelRunner` — leases cached model runtimes and LoRA dependencies |
 | `protocols.py` | `ResourceSpec`, `ResourceStore`, `ResourceBinding` plug-in contracts |
 | `model_offloader.py` | `ModelOffloader` — cached single-model runtime for whole-model bulk pinned-CPU↔GPU or streamed block offload |
 | `pinned_component.py` | `PinnedComponentStore`, `PinnedComponent` — lower-level reusable pinned backing storage plus lifecycle-only pinned component used by `ModelOffloader` |
@@ -54,16 +54,16 @@ This library gives you:
 2. **Activation lifecycles** that move one cached model onto a compute device.
 3. **A resource cache** that evicts least-recently-used unleased entries and
    protects leased stores from eviction.
-4. **A model runner** that leases model and LoRA resources and owns their
+4. **A model-aware cache** that leases model and LoRA resources and owns their
    device lifecycle.
 
 ## When to use what
 
 | Situation | Use |
 |---|---|
-| Most application code, especially multiple models or repeated calls | Use **`CachedModelRunner`** with a **`ResourceCache`** and **`ModelSpec`** |
-| Model too big for a CUDA GPU even when active | Use **`ModelSpec(..., blocks_attr=...)`** and pass a **`StreamConfig`** to the runner |
-| LoRA adapters reused across calls | Pass **`LoRASpec`** entries through **`CachedModelRunner.use()`** |
+| Most application code, especially multiple models or repeated calls | Use **`ModelCache`** with **`ModelSpec`** |
+| Model too big for a CUDA GPU even when active | Use **`ModelSpec(..., blocks_attr=...)`** and pass a **`StreamConfig`** to `ModelCache.use()` |
+| LoRA adapters reused across calls | Pass **`LoRASpec`** entries through **`ModelCache.use()`** |
 | Low-level/manual lifecycle for one model | Use **`ModelOffloader.from_module(model)`** directly |
 | Component or resource development | Use the lower-level store/binding protocols and component stores directly |
 
@@ -71,10 +71,9 @@ This library gives you:
 
 ```python
 import torch
-from torch_offload import CachedModelRunner, ResourceCache, ModelSpec
+from torch_offload import ModelCache, ModelSpec
 
-cache = ResourceCache(max_cache_bytes=24 * 1024**3)
-runner = CachedModelRunner(cache)
+cache = ModelCache(max_cache_bytes=24 * 1024**3)
 model_spec = ModelSpec(
     key="main",
     estimated_cache_bytes=12 * 1024**3,
@@ -83,16 +82,17 @@ model_spec = ModelSpec(
 device = torch.device("cuda")
 
 # First use builds and leases the runtime.
-with runner.use(model_spec, device=device) as gpu_model:
+with cache.use(model_spec, device=device) as gpu_model:
     output = gpu_model(input_tensor)
 
-with runner.use(model_spec, device=device) as gpu_model:
+with cache.use(model_spec, device=device) as gpu_model:
     output = gpu_model(input_tensor_2)
 ```
 
-`ModelSpec` factories should build fresh modules. The cache owns construction,
-leases, accounting, and eviction; the runner owns activation. One model cache
-entry contains one `ModelOffloader` and one model instance. Uses are sequential:
+`ModelCache` inherits the complete `ResourceCache` API, adding model activation
+and LoRA coordination to the same registry and memory budget. `ModelSpec`
+factories should build fresh modules. One model cache entry contains one
+`ModelOffloader` and one model instance. Uses are sequential:
 an overlapping activation raises `ModelRuntimeInUseError`. Applications that
 need concurrent replicas must register separately constructed models under
 distinct cache keys, which intentionally duplicates their pinned host storage.
@@ -102,7 +102,7 @@ any escaped model references.
 ## Manual offloader lifecycle
 
 Use `ModelOffloader` directly when you want explicit lifecycle control without
-`ResourceCache`.
+`ModelCache`.
 
 ```python
 import torch
@@ -170,7 +170,7 @@ del offload, model  # drop refs to free pinned host memory
 
 The residency policy lives on `StreamConfig`, supplied per activation
 (`offload.activate(device, stream_config=...)` or
-`runner.use(..., stream_config=...)`) — it governs GPU residency, a
+`cache.use(..., stream_config=...)`) — it governs GPU residency, a
 runtime concern, and is not part of the pinned backing. `num_resident_blocks=1`
 (the default) is right for almost all workloads: eviction is LRU, so a
 sequential pass through the blocks reloads every block each iteration
@@ -430,21 +430,19 @@ CPU storage, and leaves gradients on GPU.
 ## Cached model details
 
 `ResourceCache` owns only reusable-resource admission, accounting, leases, and
-eviction. `CachedModelRunner` leases dependencies and owns LoRA attachment and
-device activation.
+eviction. `ModelCache` inherits that API and adds dependency leasing, LoRA
+attachment, and device activation for model uses.
 
 ```python
 from torch_offload import (
-    CachedModelRunner,
     LoRASpec,
-    ResourceCache,
+    ModelCache,
     ModelSpec,
     StreamConfig,
 )
 from safetensors.torch import load_file
 
-cache = ResourceCache(max_cache_bytes=80 * 1024**3)
-runner = CachedModelRunner(cache)
+cache = ModelCache(max_cache_bytes=80 * 1024**3)
 device = "cuda:0"
 
 text_encoder = ModelSpec(
@@ -465,10 +463,10 @@ style_lora = LoRASpec(
     dtype=torch.bfloat16,
 )
 
-with runner.use(text_encoder, device=device) as enc:
+with cache.use(text_encoder, device=device) as enc:
     embeddings = enc.encode(prompt)
 
-with runner.use(
+with cache.use(
     diffusion_model,
     device=device,
     lora_specs=[style_lora],
@@ -479,8 +477,8 @@ with runner.use(
     latent = model(...)
 ```
 
-The runner leases LoRA resources before admitting the model resource. An adapter
-selected for a use therefore cannot be evicted by that same model admission.
+The model cache leases LoRA resources before admitting the model resource. An
+adapter selected for a use therefore cannot be evicted by that same model admission.
 All leases unwind in reverse order if construction or activation
 fails. `lora_strengths` defaults to `1.0` per LoRA; when supplied, it must
 have the same length as `lora_specs`. Merge and routed uses may share one
@@ -520,7 +518,7 @@ registration / cache admission
         |
         v
   +-------------+
-  | ResourceCache  |  owns admission, accounting, eviction, and leases
+  | ModelCache  |  extends ResourceCache with model-aware use
   +-------------+
         |
         +-- builds/admit --> ModelOffloader (one model, one runtime)
@@ -539,9 +537,9 @@ registration / cache admission
         |
         +-- chooses inactive victims via EvictionPolicy
 
-runner.use(...)
----------------
-CachedModelRunner
+ModelCache.use(...)
+-------------------
+ModelCache
    |
    +-- lease LoRASpec(s), then ModelSpec
    +-- ModelOffloader.activate(loras=...) claims the model runtime

@@ -982,7 +982,7 @@ class TestValidation:
 
 class TestResourceCacheIntegration:
     def test_model_spec_reuses_single_model(self) -> None:
-        from torch_offload import CachedModelRunner, ResourceCache, ModelSpec
+        from torch_offload import ModelCache, ModelSpec
 
         device = torch.device("cpu")
         factory_calls = 0
@@ -992,8 +992,7 @@ class TestResourceCacheIntegration:
             factory_calls += 1
             return _make_block_model(num_blocks=4, width=8)
 
-        cache = ResourceCache(max_cache_bytes=10_000_000)
-        runner = CachedModelRunner(cache)
+        cache = ModelCache(max_cache_bytes=10_000_000)
         spec = ModelSpec(
             key="xformer",
             estimated_cache_bytes=1024,
@@ -1001,7 +1000,7 @@ class TestResourceCacheIntegration:
             blocks_attr=("transformer_blocks",),
         )
 
-        with runner.use(
+        with cache.use(
             spec,
             device=device,
             stream_config=StreamConfig(num_resident_blocks=2),
@@ -1021,7 +1020,7 @@ class TestResourceCacheIntegration:
 
         # Second sequential use returns the same cached model; factory is
         # not called again.
-        with runner.use(
+        with cache.use(
             spec,
             device=device,
             stream_config=StreamConfig(num_resident_blocks=2),
@@ -1059,10 +1058,9 @@ class TestResourceCacheIntegration:
         cache.clear()
 
     def test_model_spec_rejects_nested_use(self) -> None:
-        from torch_offload import CachedModelRunner, ResourceCache, ModelRuntimeInUseError, ModelSpec
+        from torch_offload import ModelCache, ModelRuntimeInUseError, ModelSpec
 
-        cache = ResourceCache(max_cache_bytes=10_000_000)
-        runner = CachedModelRunner(cache)
+        cache = ModelCache(max_cache_bytes=10_000_000)
         spec = ModelSpec(
             key="xformer",
             estimated_cache_bytes=1024,
@@ -1071,19 +1069,18 @@ class TestResourceCacheIntegration:
         )
 
         config = StreamConfig(num_resident_blocks=2)
-        with runner.use(spec, device="cpu", stream_config=config):
+        with cache.use(spec, device="cpu", stream_config=config):
             with pytest.raises(ModelRuntimeInUseError, match="overlapping"):
-                with runner.use(spec, device="cpu", stream_config=config):
+                with cache.use(spec, device="cpu", stream_config=config):
                     pass
 
         assert cache.info("xformer").lease_count == 0
         cache.clear()
 
-    def test_runner_deactivates_after_body_error(self) -> None:
-        from torch_offload import CachedModelRunner, ResourceCache, ModelSpec
+    def test_model_cache_deactivates_after_body_error(self) -> None:
+        from torch_offload import ModelCache, ModelSpec
 
-        cache = ResourceCache(max_cache_bytes=10_000_000)
-        runner = CachedModelRunner(cache)
+        cache = ModelCache(max_cache_bytes=10_000_000)
         spec = ModelSpec(
             key="xformer",
             estimated_cache_bytes=1024,
@@ -1092,50 +1089,27 @@ class TestResourceCacheIntegration:
         )
 
         with pytest.raises(ValueError, match="caller failed"):
-            with runner.use(spec, device="cpu"):
+            with cache.use(spec, device="cpu"):
                 raise ValueError("caller failed")
 
         assert cache.info("xformer").lease_count == 0
-        # A second activation proves the runner deactivated the shared
+        # A second activation proves the cache deactivated the shared
         # offloader and released its single-runtime claim.
-        with runner.use(spec, device="cpu"):
+        with cache.use(spec, device="cpu"):
             pass
 
         cache.clear()
 
-    def test_separate_runners_share_the_same_single_runtime_guard(self) -> None:
-        from torch_offload import CachedModelRunner, ResourceCache, ModelRuntimeInUseError, ModelSpec
+    def test_model_cache_is_a_resource_cache(self) -> None:
+        from torch_offload import ModelCache, ResourceCache
 
-        cache = ResourceCache(max_cache_bytes=10_000_000)
-        first_runner = CachedModelRunner(cache)
-        second_runner = CachedModelRunner(cache)
-        spec = ModelSpec(
-            key="xformer",
-            estimated_cache_bytes=1024,
-            factory=lambda: _make_block_model(num_blocks=4, width=8),
-            blocks_attr=("transformer_blocks",),
-        )
+        cache = ModelCache(max_cache_bytes=10_000_000)
 
-        config = StreamConfig(num_resident_blocks=2)
-        with first_runner.use(
-            spec,
-            device="cpu",
-            stream_config=config,
-        ):
-            with pytest.raises(ModelRuntimeInUseError, match="overlapping"):
-                with second_runner.use(
-                    spec,
-                    device="cpu",
-                    stream_config=config,
-                ):
-                    pass
-            assert cache.info("xformer").lease_count == 1
-
-        assert cache.info("xformer").lease_count == 0
-        cache.clear()
+        assert isinstance(cache, ResourceCache)
+        assert cache.max_cache_bytes == 10_000_000
 
     def test_model_spec_trainable_reuses_primary_model(self) -> None:
-        from torch_offload import CachedModelRunner, ResourceCache, ModelSpec
+        from torch_offload import ModelCache, ModelSpec
 
         device = torch.device("cpu")
         factory_calls = 0
@@ -1145,18 +1119,17 @@ class TestResourceCacheIntegration:
             factory_calls += 1
             return nn.Linear(8, 8, bias=False)
 
-        cache = ResourceCache(max_cache_bytes=10_000_000)
-        runner = CachedModelRunner(cache)
+        cache = ModelCache(max_cache_bytes=10_000_000)
         spec = ModelSpec(
             key="trainable",
             estimated_cache_bytes=1024,
             factory=factory,
         )
 
-        with runner.use(spec, device=device) as first_model:
+        with cache.use(spec, device=device) as first_model:
             first_param_ids = [id(param) for param in first_model.parameters()]
 
-        with runner.use(spec, device=device) as second_model:
+        with cache.use(spec, device=device) as second_model:
             assert second_model is first_model
             assert [id(param) for param in second_model.parameters()] == first_param_ids
 
@@ -1164,19 +1137,18 @@ class TestResourceCacheIntegration:
         cache.clear()
 
     def test_model_spec_trainable_rejects_nested_binding(self) -> None:
-        from torch_offload import CachedModelRunner, ResourceCache, ModelRuntimeInUseError, ModelSpec
+        from torch_offload import ModelCache, ModelRuntimeInUseError, ModelSpec
 
-        cache = ResourceCache(max_cache_bytes=10_000_000)
-        runner = CachedModelRunner(cache)
+        cache = ModelCache(max_cache_bytes=10_000_000)
         spec = ModelSpec(
             key="trainable",
             estimated_cache_bytes=1024,
             factory=lambda: nn.Linear(8, 8, bias=False),
         )
 
-        with runner.use(spec, device="cpu"):
+        with cache.use(spec, device="cpu"):
             with pytest.raises(ModelRuntimeInUseError, match="overlapping"):
-                with runner.use(spec, device="cpu"):
+                with cache.use(spec, device="cpu"):
                     pass
 
         assert cache.info("trainable").lease_count == 0

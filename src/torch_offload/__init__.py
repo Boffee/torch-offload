@@ -4,9 +4,9 @@ High-level API:
 
 - :class:`ResourceCache` accepts structural :class:`ResourceSpec` implementations
   and leases reusable model, LoRA, and object stores under a host-memory
-  budget. :class:`CachedModelRunner` composes a
-  leased :class:`ModelSpec` with optional :class:`LoRASpec` resources,
-  and activates the cached :class:`ModelOffloader`.
+  budget. :class:`ModelCache` specializes it with model-aware use: it composes
+  a leased :class:`ModelSpec` with optional :class:`LoRASpec` resources and
+  activates the cached :class:`ModelOffloader`.
   :class:`ObjectSpec` caches general Python objects (tokenizers,
   processors, configs) in the same registry; by default they are
   charged zero bytes and live until explicitly evicted.
@@ -96,7 +96,7 @@ tied-storage identity.
 
 :class:`ResourceCache` manages cached backing stores with policy-driven
 eviction, reference-counted leases, and transactional admission.
-:class:`CachedModelRunner` owns dependency leasing, LoRA attachment, and device
+:class:`ModelCache` owns dependency leasing, LoRA attachment, and device
 activation. Each model offloader rejects overlapping use. Custom
 :class:`EvictionPolicy`
 implementations can replace the default LRU behavior. See its docstring
@@ -112,7 +112,6 @@ Compatibility
   backing may be shared.
 """
 
-from .cached_model_runner import CachedModelRunner
 from .gguf_adapter import GGUFWeight
 from .lora import (
     LoRA,
@@ -122,6 +121,7 @@ from .lora import (
     ScaledLoRAFactor,
 )
 from .merge import merge_lora
+from .model_cache import ModelCache
 from .model_offloader import ModelOffloader, ModelRuntimeInUseError
 from .mps_weights import MpsWeights
 from .pinned_component import PinnedComponent, PinnedComponentStore
@@ -153,7 +153,6 @@ from .tensor_adapters import TensorAdapter
 
 __all__ = [
     "CacheError",
-    "CachedModelRunner",
     "DuplicateResourceKeyError",
     "EvictionCandidate",
     "EvictionContext",
@@ -166,6 +165,7 @@ __all__ = [
     "LoRAMode",
     "LoRASpec",
     "LoRATransform",
+    "ModelCache",
     "ModelOffloader",
     "ModelRuntimeInUseError",
     "ModelSpec",

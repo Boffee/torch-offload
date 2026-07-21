@@ -298,7 +298,7 @@ class ModelOffloader:
         raise ValueError(
             "ModelOffloader.activate() requires a device; pass "
             "activate(device) or use this binding through "
-            "CachedModelRunner.use(..., device=...)"
+            "ModelCache.use(..., device=...)"
         )
 
     def activate(
