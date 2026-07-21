@@ -21,7 +21,6 @@ from typing import Any
 from torch import nn
 
 from .lora import LoRAStore, LoRATransform
-from .module_names import canonical_param_name
 from .tensor_adapter_registry import param_tensor_id
 
 logger = logging.getLogger(__name__)
@@ -93,7 +92,7 @@ def merge_lora(
 def _collect_params_by_target(model: nn.Module) -> dict[str, nn.Parameter]:
     params_by_target: dict[str, nn.Parameter] = {}
     for name, param in model.named_parameters(remove_duplicate=False):
-        params_by_target[canonical_param_name(name)] = param
+        params_by_target[name] = param
     return params_by_target
 
 

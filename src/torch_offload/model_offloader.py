@@ -16,12 +16,14 @@ from torch import nn
 
 from ._devices import canonical_device
 from .composite_component import CompositeComponent, CompositeComponentStore
-from .lora import LoRARouteHandle, LoRAStore, LoRATransform, ScaledLoRAFactor
-from .module_names import (
-    canonical_param_name,
-    resolve_parent_leaf,
+from .lora import (
+    LoRA,
+    LoRAStore,
+    LoRATransform,
+    ScaledLoRAFactor,
+    install_routed_residual_hook,
 )
-from .tensor_adapter_registry import param_representation, select_adapter
+from .module_names import resolve_parent_leaf
 
 LoraMode = Literal["merge", "routed"]
 _LoraParamMap = dict[str, list[ScaledLoRAFactor]]
@@ -87,34 +89,6 @@ __all__ = [
     "ModelOffloader",
     "ModelOffloaderStore",
 ]
-
-
-def _routed_factor_dtype(module: nn.Module) -> torch.dtype:
-    """Compute dtype to cast routed-mode LoRA factors into.
-
-    For routed LoRA, the hook adds ``x @ A.T @ B.T`` to the layer's
-    output, so factors must land in the same dtype the layer produces.
-
-    Probe order:
-
-    - ``module.compute_dtype`` — BitsAndBytes ``Linear4bit`` and
-      similar modules that carry an explicit compute-dtype attribute.
-    - ``select_adapter(...).compute_dtype(...)`` on the weight's
-      representation — plain tensors return ``weight.dtype``;
-      structured/quantized wrappers can return their logical matmul dtype
-      instead of packed storage dtype.
-    """
-    compute = getattr(module, "compute_dtype", None)
-    if compute is not None:
-        return compute
-    weight = getattr(module, "weight", None)
-    if not isinstance(weight, torch.Tensor):
-        raise TypeError(
-            f"Routed LoRA mode requires a tensor-like weight on "
-            f"{type(module).__name__}; got {type(weight).__name__}"
-        )
-    representation = param_representation(weight)
-    return select_adapter(representation).compute_dtype(representation)
 
 
 class ModelOffloader:
@@ -198,6 +172,9 @@ class ModelOffloader:
         self._active_device: torch.device | None = None
         self._composite = composite
         self._lora_hook_handles: list[_RemovableHook] = []
+        # Routed mode binds each LoRA as its own streaming engine,
+        # co-scheduled with this model; tracked here to deactivate on teardown.
+        self._lora_bindings: list[LoRA] = []
         # Configured LoRA request. set_loras() only records caller intent;
         # activate(device) groups targets and validates the requested
         # application path once the runtime context is known.
@@ -222,11 +199,11 @@ class ModelOffloader:
 
         ``mode``:
 
-        LoRA target keys must be canonical managed parameter names.
-        Unknown targets raise during activation. PEFT ``.base_layer.``
-        model parameter paths are canonicalized for lookup, so a LoRA
-        target like ``"blocks.0.attn.weight"`` can match a managed model
-        parameter named ``"blocks.0.attn.base_layer.weight"``.
+        LoRA target keys must match the model's managed parameter names
+        exactly; unknown targets raise during activation. Any key
+        remapping (stripping a ``diffusion_model.`` prefix, inserting a
+        PEFT ``.base_layer.`` segment, …) is the caller's responsibility
+        when building the LoRA state dict.
 
         - ``"merge"`` (default): on CUDA activation, installs a
           post-copy hook per target. The hook applies
@@ -235,19 +212,24 @@ class ModelOffloader:
           Requires CUDA activation and a base-weight adapter that
           supports dense in-place ``addmm_`` or dequantize/requantize
           plus ``copy_into`` merge.
-        - ``"routed"``: on activation, registers a forward hook on each
+        - ``"routed"``: on activation, each LoRA is streamed as its own
+          engine co-scheduled with this model (so its factor block *i* is
+          GPU-resident only while base block *i* runs — bounded residency),
+          and a forward-POST hook is installed per (LoRA, target) on the
           target's parent module. Forward becomes
           ``y = base(x) + alpha * B * A * x``. Doesn't touch the base
-          weight in place. Restricted to ``nn.Linear`` parents (the math
-          assumes ``y = x @ W.T``); non-Linear parents raise. Shared
-          weight storage is allowed because routed mode hooks the exact
-          matched parent module instead of mutating weight bytes.
-          Quantized bases work when the matched module still exposes the
-          logical ``nn.Linear`` weight shape and either its adapter
-          reports a logical compute dtype or the module exposes
-          ``compute_dtype``. Packed formats whose parameter shape
-          differs from the logical matmul weight need a per-format route
-          layer.
+          weight in place; multiple LoRAs on one target stack as additive
+          hooks. Restricted to ``nn.Linear`` parents (the math assumes
+          ``y = x @ W.T``); non-Linear parents raise. Shared weight storage
+          is allowed because routed mode hooks the exact matched parent
+          module instead of mutating weight bytes. The factor is cast to the
+          layer's output dtype in the hook, so quantized bases work when the
+          matched module still exposes the logical ``nn.Linear`` weight
+          shape; packed formats whose parameter shape differs from the
+          logical matmul weight need a per-format route layer.
+          **Inference-only:** the streamed factors are frozen
+          (``requires_grad=False``) and no gradient flows to them.
+
         Routed mode requires activations to reach the hooked layer in
         the layer's compute dtype (or under autocast). Mixed-dtype
         inputs without autocast will error in the hook's matmul.
@@ -281,44 +263,35 @@ class ModelOffloader:
         self._loras = list(zip(lora_list, strength_list, strict=True))
         self._lora_mode = mode if lora_list else "merge"
 
+    def _require_managed_target(self, target_key: str) -> str:
+        """Validate that ``target_key`` names a parameter this offloader
+        manages, returning it unchanged.
+
+        LoRA target keys must match the model's own parameter paths
+        exactly. Any key remapping (stripping a ``diffusion_model.``
+        prefix, inserting a PEFT ``.base_layer.`` segment, …) is the
+        caller's responsibility when building the LoRA state dict.
+        """
+        if target_key not in self.param_names:
+            sample = sorted(self.param_names)[:3]
+            raise ValueError(
+                f"LoRA target {target_key!r} is not managed by this "
+                "ModelOffloader. LoRA target keys must match the model's "
+                f"parameter names exactly. Sample managed keys: {sample} ..."
+            )
+        return target_key
+
     def _group_lora_factors_by_param_name(
         self, loras: Sequence[tuple[LoRAStore, float]],
     ) -> _LoraParamMap:
         per_param: _LoraParamMap = {}
-        param_names = self.param_names
-        canonical_param_names = {
-            canonical_param_name(param_name): param_name
-            for param_name in param_names
-        }
         for lora, strength in loras:
             for target_key, factor in lora.targets.items():
-                param_name = canonical_param_names.get(target_key)
-                if param_name is None:
-                    sample_index = sorted(canonical_param_names)[:3]
-                    raise ValueError(
-                        f"LoRA target {target_key!r} is not managed by "
-                        "this ModelOffloader. LoRA target keys must use "
-                        "canonical model parameter names. Sample managed "
-                        f"keys: {sample_index} ..."
-                    )
-                per_param.setdefault(param_name, []).append(
+                managed = self._require_managed_target(target_key)
+                per_param.setdefault(managed, []).append(
                     factor.scaled(strength)
                 )
-
         return per_param
-
-    def _register_lora_hooks(
-        self, active_device: torch.device, targets: _LoraParamMap,
-    ) -> None:
-        self._clear_active_lora_hooks()
-        try:
-            if self._lora_mode == "merge":
-                self._register_merge_lora_hooks(active_device, targets)
-            else:
-                self._register_routed_lora_hooks(active_device, targets)
-        except BaseException:
-            self._clear_active_lora_hooks()
-            raise
 
     def _register_merge_lora_hooks(
         self, active_device: torch.device, targets: _LoraParamMap,
@@ -338,25 +311,37 @@ class ModelOffloader:
             self._lora_hook_handles.append(handle)
 
     def _register_routed_lora_hooks(
-        self,
-        active_device: torch.device,
-        targets: _LoraParamMap,
+        self, active_device: torch.device, **kwargs: object,
     ) -> None:
-        for param_name, factors in targets.items():
-            parent, _leaf = resolve_parent_leaf(self._model, param_name)
-            if not isinstance(parent, nn.Linear):
-                raise ValueError(
-                    f"Routed LoRA mode requires nn.Linear targets; "
-                    f"target {param_name!r} has parent module of "
-                    f"type {type(parent).__name__}. Use mode='merge' "
-                    f"for non-Linear targets, or wrap the model with "
-                    f"PEFT for richer per-type routing."
+        """Stream each LoRA's factors co-scheduled with the model and install
+        a forward-POST residual hook per (LoRA, target) on the target Linear.
+
+        Each LoRA binds as its own streaming engine (``schedule_model`` = this
+        model), activated under the SAME stream config as the base composite,
+        so factor block *i* is GPU-resident exactly while base block *i* runs.
+        Multiple LoRAs on one Linear stack as independent additive hooks. The
+        hooks read the resident factors fresh each forward; the engines own
+        the factor lifetime and are torn down on deactivate.
+        """
+        for store, strength in self._loras:
+            binding = store.bind(schedule_model=self._model)
+            binding.activate(active_device, **kwargs)
+            self._lora_bindings.append(binding)
+            for target_key in store.targets:
+                managed = self._require_managed_target(target_key)
+                parent, _leaf = resolve_parent_leaf(self._model, managed)
+                if not isinstance(parent, nn.Linear):
+                    raise ValueError(
+                        f"Routed LoRA mode requires nn.Linear targets; "
+                        f"target {managed!r} has parent module of "
+                        f"type {type(parent).__name__}. Use mode='merge' "
+                        f"for non-Linear targets."
+                    )
+                lora_a, lora_b = store.factor_holders(target_key)
+                handle = install_routed_residual_hook(
+                    parent, lora_a, lora_b, strength,
                 )
-            handle = LoRARouteHandle(
-                parent, factors, active_device,
-                dtype=_routed_factor_dtype(parent),
-            )
-            self._lora_hook_handles.append(handle)
+                self._lora_hook_handles.append(handle)
 
     def _register_post_copy_hook(
         self,
@@ -377,8 +362,15 @@ class ModelOffloader:
         while self._lora_hook_handles:
             self._lora_hook_handles.pop().remove()
 
+    def _teardown_lora_bindings(self) -> None:
+        """Deactivate the routed LoRA streaming engines (evicts factors to
+        pinned CPU). Idempotent."""
+        while self._lora_bindings:
+            self._lora_bindings.pop().deactivate()
+
     def _clear_loras(self) -> None:
         self._clear_active_lora_hooks()
+        self._teardown_lora_bindings()
         self._loras = []
         self._lora_mode = "merge"
 
@@ -431,29 +423,45 @@ class ModelOffloader:
         # don't re-check the device kind here.
         self._active_device = active_device
         try:
-            # Register LoRA hooks (incl. merge post-copy hooks installed on the
-            # components) BEFORE activating, so they fire during component loads.
-            targets = (
-                self._group_lora_factors_by_param_name(self._loras)
-                if self._loras
-                else None
-            )
-            if targets is not None:
-                self._register_lora_hooks(active_device, targets)
+            # Merge LoRA: post-copy hooks must be installed BEFORE the
+            # composite activates, so they fire as each base weight streams in.
+            if self._loras and self._lora_mode == "merge":
+                targets = self._group_lora_factors_by_param_name(self._loras)
+                self._register_merge_lora_hooks(active_device, targets)
             # The composite self-cleans its components if activation fails midway.
             self._composite.activate(active_device, **kwargs)
+            # Routed LoRA: factor streaming + forward-POST residual hooks are
+            # installed AFTER the composite is live (the hooks only fire during
+            # forward, so post-activate install is safe). Engines stream under
+            # the same kwargs/StreamConfig as the base composite. A failure here
+            # must tear the now-resident composite back down — unlike the
+            # pre-activate merge path, it is already live at this point.
+            if self._loras and self._lora_mode == "routed":
+                try:
+                    self._register_routed_lora_hooks(active_device, **kwargs)
+                except BaseException:
+                    self._composite.deactivate()
+                    raise
         except BaseException:
             self._clear_loras()
             self._active_device = None
             raise
 
     def deactivate(self) -> None:
+        # LoRA teardown runs first (hooks, then streaming engines), but the
+        # composite teardown must run no matter what — a binding that raises on
+        # the way out (e.g. a factor eviction hitting a CUDA error) must not
+        # strand the base model resident on GPU. Clear _active_device up front
+        # so the binding reports inactive however the unwind goes.
+        self._active_device = None
         try:
             self._clear_active_lora_hooks()
-            self._composite.deactivate()
+            self._teardown_lora_bindings()
         finally:
-            self._clear_loras()
-            self._active_device = None
+            try:
+                self._composite.deactivate()
+            finally:
+                self._clear_loras()
 
     @contextlib.contextmanager
     def optimizer_step(self) -> Iterator[None]:

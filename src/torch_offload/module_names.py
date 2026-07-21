@@ -31,11 +31,6 @@ def resolve_parent_leaf(root: nn.Module, name: str) -> tuple[nn.Module, str]:
     return parent, leaf
 
 
-def canonical_param_name(name: str) -> str:
-    """Normalize PEFT model parameter paths for LoRA target matching."""
-    return name.replace(".base_layer.", ".")
-
-
 def parameter_names(module: nn.Module) -> set[str]:
     return {
         name
