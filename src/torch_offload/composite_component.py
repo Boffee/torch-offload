@@ -20,7 +20,7 @@ each, never branching on concrete type.
 from __future__ import annotations
 
 import contextlib
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 
 import torch
@@ -28,7 +28,7 @@ from torch import nn
 
 from .module_names import buffer_names, parameter_names
 from .pinned_component import PinnedComponent, PinnedComponentStore
-from .pinned_module import PostCopyHook, PostCopyHookHandle
+from .pinned_module import PostCopyHook
 from .streamed_component import StreamedComponent, StreamedComponentStore
 
 
@@ -103,8 +103,8 @@ class CompositeComponent:
 
     def register_post_copy_hook(
         self, name: str, hook: PostCopyHook,
-    ) -> PostCopyHookHandle:
-        """Register a post-copy hook on the component owning ``name``."""
+    ) -> Callable[[], None]:
+        """Register a post-copy hook and return its removal callable."""
         return self.component_for_param_name(name).register_post_copy_hook(
             name, hook,
         )

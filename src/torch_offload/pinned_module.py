@@ -12,7 +12,6 @@ from collections.abc import (
     Iterable,
     Iterator,
     Mapping,
-    MutableMapping,
     Sequence,
 )
 from dataclasses import dataclass, field
@@ -56,27 +55,6 @@ class PinnedModuleTarget:
 
     param_targets: dict[str, PinnedParamTarget]
     buffer_targets: dict[str, PinnedBufferTarget]
-
-
-class PostCopyHookHandle:
-    """Removal handle returned by post-copy hook registration."""
-
-    __slots__ = ("_hooks", "_key")
-
-    def __init__(
-        self,
-        hooks: MutableMapping[int, PostCopyHook],
-        key: int,
-    ) -> None:
-        self._hooks: MutableMapping[int, PostCopyHook] | None = hooks
-        self._key = key
-
-    def remove(self) -> None:
-        hooks = self._hooks
-        if hooks is None:
-            return
-        hooks.pop(self._key, None)
-        self._hooks = None
 
 
 @dataclass(slots=True)
@@ -226,8 +204,8 @@ class PinnedModuleInstance:
 
     def register_post_copy_hook(
         self, name: str, hook: PostCopyHook,
-    ) -> PostCopyHookHandle:
-        """Register a hook after this instance copies ``name`` to a target."""
+    ) -> Callable[[], None]:
+        """Register a post-copy hook and return a callable that removes it."""
         key = self.post_copy_hook_key(name)
         if key in self._post_copy_hooks:
             raise RuntimeError(
@@ -236,7 +214,17 @@ class PinnedModuleInstance:
                 "targets for the same parameter backing are unsupported."
             )
         self._post_copy_hooks[key] = hook
-        return PostCopyHookHandle(self._post_copy_hooks, key)
+        hooks = self._post_copy_hooks
+        removed = False
+
+        def remove_hook() -> None:
+            nonlocal removed
+            if removed:
+                return
+            hooks.pop(key, None)
+            removed = True
+
+        return remove_hook
 
     def post_copy_hook_key(self, name: str) -> int:
         """Stable hook/dedup key for a managed parameter name."""
@@ -788,5 +776,4 @@ __all__ = [
     "PinnedModuleTarget",
     "PinnedParamTarget",
     "PostCopyHook",
-    "PostCopyHookHandle",
 ]

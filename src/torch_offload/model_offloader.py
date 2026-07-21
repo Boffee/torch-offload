@@ -9,7 +9,6 @@ from __future__ import annotations
 import contextlib
 import threading
 from collections.abc import Callable, Iterator, Sequence
-from typing import Protocol
 
 import torch
 from torch import nn
@@ -30,10 +29,6 @@ _LoraParamMap = dict[str, list[ScaledLoRAFactor]]
 
 class ModelRuntimeInUseError(RuntimeError):
     """A model offloader already has an active use."""
-
-
-class _RemovableHook(Protocol):
-    def remove(self) -> None: ...
 
 
 __all__ = [
@@ -125,7 +120,7 @@ class ModelOffloader:
         self._composite = composite
         self._cache_bytes = cache_bytes
         self._activation_lock = threading.Lock()
-        self._lora_hook_handles: list[_RemovableHook] = []
+        self._lora_hook_removers: list[Callable[[], None]] = []
 
     @classmethod
     def from_module(
@@ -218,11 +213,11 @@ class ModelOffloader:
 
         for param_name, factors in targets.items():
             transform = LoRATransform(factors)
-            handle = self._register_post_copy_hook(
+            remove_hook = self._register_post_copy_hook(
                 param_name,
                 transform.apply,
             )
-            self._lora_hook_handles.append(handle)
+            self._lora_hook_removers.append(remove_hook)
 
     def _register_routed_lora_hooks(
         self,
@@ -243,29 +238,29 @@ class ModelOffloader:
                     f"type {type(parent).__name__}. Use mode='merge' "
                     f"for non-Linear targets."
                 )
-            handle = install_routed_residual_hook(parent, factors)
-            self._lora_hook_handles.append(handle)
+            remove_hook = install_routed_residual_hook(parent, factors)
+            self._lora_hook_removers.append(remove_hook)
 
     def _register_post_copy_hook(
         self,
         param_name: str,
         hook: Callable[[nn.Parameter], None],
-    ) -> _RemovableHook:
+    ) -> Callable[[], None]:
         return self._composite.register_post_copy_hook(param_name, hook)
 
     def register_post_copy_hook(
         self,
         param_name: str,
         hook: Callable[[nn.Parameter], None],
-    ) -> _RemovableHook:
-        """Register a hook after the owning component copies ``param_name``."""
+    ) -> Callable[[], None]:
+        """Register a post-copy hook and return a callable that removes it."""
         return self._register_post_copy_hook(param_name, hook)
 
     def _clear_active_lora_hooks(self) -> None:
-        hook_handles = self._lora_hook_handles
-        self._lora_hook_handles = []
-        for handle in reversed(hook_handles):
-            handle.remove()
+        remove_hooks = self._lora_hook_removers
+        self._lora_hook_removers = []
+        for remove_hook in reversed(remove_hooks):
+            remove_hook()
 
     # ----------------------------------------------- ResourceBinding interface
 
@@ -368,7 +363,7 @@ class ModelOffloader:
             return
         # Remove LoRA hooks before returning the model to pinned storage. The
         # composite teardown and activation-lock release still run if a custom
-        # hook handle unexpectedly raises during removal.
+        # hook remover unexpectedly raises.
         try:
             self._clear_active_lora_hooks()
         finally:

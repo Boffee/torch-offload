@@ -2134,7 +2134,7 @@ class TestStreamedNameSelection:
             blocks_path="transformer_blocks",
         )
         try:
-            handle = streamer.register_post_copy_hook(
+            remove_hook = streamer.register_post_copy_hook(
                 "transformer_blocks.1.weight",
                 lambda _param: None,
             )
@@ -2143,7 +2143,9 @@ class TestStreamedNameSelection:
             assert streamer._block_instances[1]._post_copy_hooks
             assert not streamer._block_instances[0]._post_copy_hooks
 
-            handle.remove()
+            assert callable(remove_hook)
+            remove_hook()
+            remove_hook()
             assert not streamer._block_instances[1]._post_copy_hooks
         finally:
             streamer.deactivate()

@@ -312,10 +312,10 @@ def _activate_loras_for_test(
             raise
         return len(targets)
     targets = strategy._group_lora_factors_by_param_name(loras)
-    before = len(strategy._lora_hook_handles)
+    before = len(strategy._lora_hook_removers)
     try:
         strategy._register_routed_lora_hooks(targets)
-        return len(strategy._lora_hook_handles) - before
+        return len(strategy._lora_hook_removers) - before
     finally:
         strategy._clear_active_lora_hooks()
 
@@ -1861,15 +1861,13 @@ class TestRoutedStaging:
         s = _make_model_offloader(m)
         s.activate("cpu", loras=[lora], lora_mode="routed")
         try:
+            assert len(s._lora_hook_removers) == 1
+            assert callable(s._lora_hook_removers[0])
             with pytest.raises(RuntimeError, match="linear failed"):
                 m(torch.randn(2, 3))
-            hook_handle = s._lora_hook_handles[0]
-            assert isinstance(hook_handle, lora_impl._RoutedLoRAHookHandle)
-            assert hook_handle._staged == []
 
             m.target.fail = False
             assert m(torch.randn(2, 3)).shape == (2, 3)
-            assert hook_handle._staged == []
         finally:
             s.deactivate()
 
@@ -1938,17 +1936,17 @@ class TestRoutedStaging:
 
         _request_loras(s, [(lora, 1.0)], mode="routed")
         _activate(s, torch.device("cpu"))
-        # One paired handle per target.
-        assert len(s._lora_hook_handles) == 2
+        # One paired-hook remover per target.
+        assert len(s._lora_hook_removers) == 2
 
         s.deactivate()
-        assert s._lora_hook_handles == []
+        assert s._lora_hook_removers == []
 
         # A new activation-scoped request works after teardown.
         _request_loras(s, [(lora, 1.0)], mode="routed")
         _activate(s, torch.device("cpu"))
         try:
-            assert len(s._lora_hook_handles) == 2
+            assert len(s._lora_hook_removers) == 2
         finally:
             s.deactivate()
 
@@ -2002,7 +2000,7 @@ class TestRoutedStaging:
             _activate(s, torch.device("cpu"))
 
         assert s.active_device is None
-        assert s._lora_hook_handles == []
+        assert s._lora_hook_removers == []
         # Composite was deactivated -> a fresh activation succeeds and runs.
         _activate(s, torch.device("cpu"))
         try:

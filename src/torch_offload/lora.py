@@ -33,7 +33,7 @@ on deactivate.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Literal
@@ -398,75 +398,71 @@ def _stage_routed_factors(
     )
 
 
-class _RoutedLoRAHookHandle:
-    """Paired PRE/POST hook handle with per-invocation staged factors."""
-
-    __slots__ = ("_post_handle", "_pre_handle", "_staged")
-
-    def __init__(
-        self,
-        parent: nn.Module,
-        factors: Sequence[ScaledLoRAFactor],
-    ) -> None:
-        self._staged: list[tuple[_StagedLoRAFactor, ...]] = []
-
-        def pre_hook(
-            _module: nn.Module,
-            inputs: tuple[Any, ...],
-            kwargs: dict[str, Any],
-        ) -> None:
-            x = _linear_input(inputs, kwargs)
-            self._staged.append(_stage_routed_factors(factors, x))
-
-        def post_hook(
-            _module: nn.Module,
-            inputs: tuple[Any, ...],
-            kwargs: dict[str, Any],
-            output: object,
-        ) -> object:
-            # ``always_call=True`` also reaches this hook when the Linear or an
-            # earlier hook raises. In that case there may be no staged entry or
-            # Tensor output; only discard any completed staging work.
-            staged = self._staged.pop() if self._staged else None
-            if staged is None or not isinstance(output, torch.Tensor):
-                return output
-            x = _linear_input(inputs, kwargs)
-            return output + _routed_residual(x, staged, output.dtype)
-
-        self._pre_handle = parent.register_forward_pre_hook(
-            pre_hook,
-            with_kwargs=True,
-        )
-        try:
-            self._post_handle = parent.register_forward_hook(
-                post_hook,
-                with_kwargs=True,
-                always_call=True,
-            )
-        except BaseException:
-            self._pre_handle.remove()
-            raise
-
-    def remove(self) -> None:
-        self._post_handle.remove()
-        self._pre_handle.remove()
-        self._staged.clear()
-
-
 def install_routed_residual_hook(
     parent: nn.Module,
     factors: Sequence[ScaledLoRAFactor],
-) -> _RoutedLoRAHookHandle:
+) -> Callable[[], None]:
     """Stage pinned factors in a PRE hook and add their residual in POST.
 
-    One paired handle covers every LoRA targeting this parent. Device copies
-    are scoped to a single invocation and released after the residual is
-    enqueued, so routed mode needs no adapter activation lifecycle or block
-    scheduler.
+    Returns an idempotent callable that removes both hooks. One hook pair
+    covers every LoRA targeting this parent. Device copies are scoped to a
+    single invocation and released after the residual is enqueued, so routed
+    mode needs no adapter activation lifecycle or block scheduler.
     """
     if not factors:
         raise ValueError("Routed LoRA hook requires at least one factor")
-    return _RoutedLoRAHookHandle(parent, factors)
+
+    staged_factors: list[tuple[_StagedLoRAFactor, ...]] = []
+
+    def pre_hook(
+        _module: nn.Module,
+        inputs: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> None:
+        x = _linear_input(inputs, kwargs)
+        staged_factors.append(_stage_routed_factors(factors, x))
+
+    def post_hook(
+        _module: nn.Module,
+        inputs: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        output: object,
+    ) -> object:
+        # ``always_call=True`` also reaches this hook when the Linear or an
+        # earlier hook raises. In that case there may be no staged entry or
+        # Tensor output; only discard any completed staging work.
+        staged = staged_factors.pop() if staged_factors else None
+        if staged is None or not isinstance(output, torch.Tensor):
+            return output
+        x = _linear_input(inputs, kwargs)
+        return output + _routed_residual(x, staged, output.dtype)
+
+    pre_handle = parent.register_forward_pre_hook(
+        pre_hook,
+        with_kwargs=True,
+    )
+    try:
+        post_handle = parent.register_forward_hook(
+            post_hook,
+            with_kwargs=True,
+            always_call=True,
+        )
+    except BaseException:
+        pre_handle.remove()
+        raise
+
+    removed = False
+
+    def remove_hooks() -> None:
+        nonlocal removed
+        if removed:
+            return
+        post_handle.remove()
+        pre_handle.remove()
+        staged_factors.clear()
+        removed = True
+
+    return remove_hooks
 
 
 # ---------------------------------------------------------------------------

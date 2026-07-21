@@ -53,7 +53,7 @@ Class-specific caveats
 from __future__ import annotations
 
 import contextlib
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 
 import torch
@@ -65,7 +65,6 @@ from .pinned_module import (
     PinnedModuleStore,
     PinnedModuleTarget,
     PostCopyHook,
-    PostCopyHookHandle,
 )
 
 
@@ -183,12 +182,11 @@ class PinnedComponent:
 
     def register_post_copy_hook(
         self, name: str, hook: PostCopyHook,
-    ) -> PostCopyHookHandle:
+    ) -> Callable[[], None]:
         """Register a hook after this component copies ``name`` to GPU.
 
         Package-internal: used by :class:`ModelOffloader` for merge-mode
-        LoRA. Mirrors PyTorch's hook registration pattern by returning a
-        handle whose :meth:`remove` method unregisters the hook.
+        LoRA. Returns a callable that unregisters the hook.
         """
         return self._instance.register_post_copy_hook(name, hook)
 

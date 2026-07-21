@@ -51,7 +51,7 @@ import functools
 import logging
 import weakref
 from collections import OrderedDict
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import cast
@@ -66,7 +66,6 @@ from .pinned_module import (
     PinnedModuleStore,
     PinnedModuleTarget,
     PostCopyHook,
-    PostCopyHookHandle,
 )
 from .pinned_param import PinnedParam
 from .stream_config import DEFAULT_STREAM_CONFIG, StreamConfig
@@ -889,12 +888,11 @@ class StreamedComponent:
         self,
         name: str,
         hook: PostCopyHook,
-    ) -> PostCopyHookHandle:
+    ) -> Callable[[], None]:
         """Register a hook after this component copies ``name`` to GPU.
 
         Package-internal: used by :class:`ModelOffloader` for merge-mode
-        LoRA. Mirrors PyTorch's hook registration pattern by returning a
-        handle whose :meth:`remove` method unregisters the hook.
+        LoRA. Returns a callable that unregisters the hook.
         """
         instance, name = self._resolve_param_name(name)
         return instance.register_post_copy_hook(name, hook)
