@@ -1,6 +1,6 @@
-"""Tests for LoRA merge via ``ModelOffloader.set_loras()``.
+"""Tests for activation-scoped LoRA application through ``ModelOffloader``.
 
-Covers LoRA construction validation, set_loras matching, lifecycle
+Covers LoRA construction validation, activation matching, lifecycle
 (activate/deactivate), LoRA switching, and forward-output correctness
 against a manually-merged baseline.
 
@@ -18,14 +18,16 @@ import torch.nn.functional as F
 from torch import nn
 
 from torch_offload import (
+    CachedModelRunner,
     LoRA,
     LoRAFactor,
-    LoRAStore,
+    LoRARuntimeInUseError,
     LoRATransform,
-    ModelCache,
+    ResourceCache,
     ModelOffloader,
-    ModelOffloaderStore,
     ModelSpec,
+    ResourceNotRegisteredError,
+    ResourceTooLargeError,
     PinnedComponent,
     LoRASpec,
     ScaledLoRAFactor,
@@ -33,7 +35,7 @@ from torch_offload import (
     StreamedComponent,
     merge_lora,
 )
-from torch_offload.model_offloader import LoraMode
+from torch_offload.lora import LoraMode
 from torch_offload.pinned_module import PinnedModuleInstance
 from torch_offload.pinned_param import PinnedParam
 from torch_offload.protocols import (
@@ -41,7 +43,7 @@ from torch_offload.protocols import (
     ResourceStore,
 )
 
-from tests.conftest import streamed_components
+from tests.conftest import activated_model, streamed_components
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -56,18 +58,23 @@ def _factor_tensors(factor: LoRAFactor) -> tuple[torch.Tensor, torch.Tensor]:
     return factor.a.make_cpu_param().data, factor.b.make_cpu_param().data
 
 
+def _assert_lora_available(lora: LoRA) -> None:
+    """Prove that ``lora`` no longer holds its exclusive-use claim."""
+    lora.activate(mode="merge")
+    lora.deactivate()
+
+
 def _make_model_offloader(
     model: nn.Module,
     *,
     blocks_attr: list[str] = [],
     stream_trainable_weights: bool = False,
 ) -> ModelOffloader:
-    store = ModelOffloaderStore.from_module(
+    return ModelOffloader.from_module(
         model,
         blocks_attr=blocks_attr,
         stream_trainable_weights=stream_trainable_weights,
     )
-    return store.bind(model)
 
 
 def _make_bf16_model(num_blocks: int = 4, dim: int = 16) -> nn.Module:
@@ -86,9 +93,7 @@ def _make_bf16_model(num_blocks: int = 4, dim: int = 16) -> nn.Module:
         def __init__(self) -> None:
             super().__init__()
             self.embed = nn.Linear(dim, dim, bias=False)
-            self.transformer_blocks = nn.ModuleList(
-                [Block(dim) for _ in range(num_blocks)]
-            )
+            self.transformer_blocks = nn.ModuleList([Block(dim) for _ in range(num_blocks)])
             self.head = nn.Linear(dim, dim, bias=False)
 
         def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -105,7 +110,9 @@ def _make_bf16_model(num_blocks: int = 4, dim: int = 16) -> nn.Module:
 
 
 def _make_tied_non_block_model(
-    num_blocks: int = 2, dim: int = 16, dtype: torch.dtype = torch.float32,
+    num_blocks: int = 2,
+    dim: int = 16,
+    dtype: torch.dtype = torch.float32,
 ) -> nn.Module:
     class Block(nn.Module):
         def __init__(self, dim: int) -> None:
@@ -119,9 +126,7 @@ def _make_tied_non_block_model(
         def __init__(self) -> None:
             super().__init__()
             self.embed = nn.Linear(dim, dim, bias=False)
-            self.transformer_blocks = nn.ModuleList(
-                [Block(dim) for _ in range(num_blocks)]
-            )
+            self.transformer_blocks = nn.ModuleList([Block(dim) for _ in range(num_blocks)])
             self.head = nn.Linear(dim, dim, bias=False)
             self.head.weight = self.embed.weight
 
@@ -138,7 +143,10 @@ def _make_tied_non_block_model(
 
 
 def _make_lora_sd(
-    num_blocks: int, dim: int, rank: int = 4, seed: int = 0,
+    num_blocks: int,
+    dim: int,
+    rank: int = 4,
+    seed: int = 0,
     prefix: str = "",
 ) -> dict[str, torch.Tensor]:
     """Build a flat safetensors-style state dict targeting attn.weight."""
@@ -147,38 +155,71 @@ def _make_lora_sd(
     for b in range(num_blocks):
         base = f"{prefix}transformer_blocks.{b}.attn"
         sd[f"{base}.lora_A.weight"] = torch.randn(
-            rank, dim, generator=g, dtype=torch.float32,
+            rank,
+            dim,
+            generator=g,
+            dtype=torch.float32,
         )
         sd[f"{base}.lora_B.weight"] = torch.randn(
-            dim, rank, generator=g, dtype=torch.float32,
+            dim,
+            rank,
+            generator=g,
+            dtype=torch.float32,
         )
     return sd
 
 
 def _make_lora(
-    num_blocks: int, dim: int, rank: int = 4,
-    seed: int = 0, prefix: str = "",
-) -> LoRAStore:
+    num_blocks: int,
+    dim: int,
+    rank: int = 4,
+    seed: int = 0,
+    prefix: str = "",
+) -> LoRA:
     """Build a LoRA targeting attn.weight across all blocks."""
     sd = _make_lora_sd(num_blocks, dim, rank=rank, seed=seed, prefix=prefix)
-    return LoRAStore.from_state_dict(state_dict=sd)
+    return LoRA.from_state_dict(state_dict=sd)
 
 
-def _set_loras(
+def _request_loras(
     strategy: ModelOffloader,
-    loras: Sequence[tuple[LoRAStore, float]],
+    loras: Sequence[tuple[LoRA, float]],
     *,
     mode: LoraMode = "merge",
 ) -> None:
-    strategy.set_loras(
+    normalized = strategy._normalize_loras(
         [lora for lora, _strength in loras],
-        strengths=[strength for _lora, strength in loras],
-        mode=mode,
+        lora_strengths=[strength for _lora, strength in loras],
+    )
+    _LORA_REQUESTS[strategy] = (normalized, mode)
+
+
+_LORA_REQUESTS: dict[
+    ModelOffloader,
+    tuple[list[tuple[LoRA, float]], LoraMode],
+] = {}
+
+
+def _activate(
+    strategy: ModelOffloader,
+    device: torch.device | str,
+    **kwargs: object,
+) -> None:
+    loras, mode = _LORA_REQUESTS.pop(strategy, ([], "merge"))
+    strategy.activate(
+        device,
+        loras=[lora for lora, _strength in loras],
+        lora_strengths=[strength for _lora, strength in loras],
+        lora_mode=mode,
+        **kwargs,
     )
 
 
 def _expected_merged_weight(
-    base: torch.Tensor, loras: list[tuple[LoRAStore, float]], block_idx: int, qual: str,
+    base: torch.Tensor,
+    loras: list[tuple[LoRA, float]],
+    block_idx: int,
+    qual: str,
 ) -> torch.Tensor:
     """Compute the target weight by summing all LoRA deltas onto the base."""
     out = base.clone()
@@ -199,7 +240,7 @@ def _expected_merged_weight(
 def _expected_routed_output(
     model: nn.Module,
     x: torch.Tensor,
-    loras: list[tuple[LoRAStore, float]],
+    loras: list[tuple[LoRA, float]],
 ) -> torch.Tensor:
     """Manual routed baseline using F.linear to bypass installed hooks."""
     h = F.linear(x, model.embed.weight.to(x.device))
@@ -236,7 +277,8 @@ def _make_strategy(model: nn.Module) -> ModelOffloader:
 
 
 def _strategy_stream_config(
-    model: nn.Module, num_resident_blocks: int | None = None,
+    model: nn.Module,
+    num_resident_blocks: int | None = None,
 ) -> StreamConfig:
     """Residency policy matching :func:`_make_strategy`'s old defaults.
 
@@ -265,21 +307,23 @@ def _has_post_copy_hook(strategy: ModelOffloader, target_key: str) -> bool:
 def _activate_loras_for_test(
     strategy: ModelOffloader,
 ) -> int:
-    if strategy._lora_mode == "merge":
-        targets = strategy._group_lora_factors_by_param_name(strategy._loras)
+    loras, mode = _LORA_REQUESTS.pop(strategy, ([], "merge"))
+    if mode == "merge":
+        targets = strategy._group_lora_factors_by_param_name(loras)
         try:
+            strategy._activate_merge_loras(loras)
             strategy._register_merge_lora_hooks(torch.device("cuda"), targets)
         except BaseException:
-            strategy._clear_active_lora_hooks()
+            strategy._clear_active_loras()
             raise
         return len(targets)
     before = len(strategy._lora_hook_handles)
     try:
-        strategy._register_routed_lora_hooks(torch.device("cpu"))
+        strategy._register_routed_lora_hooks(loras, torch.device("cpu"))
         return len(strategy._lora_hook_handles) - before
     finally:
         strategy._clear_active_lora_hooks()
-        strategy._teardown_lora_bindings()
+        strategy._deactivate_loras()
 
 
 # ---------------------------------------------------------------------------
@@ -291,12 +335,12 @@ class TestLoRAConstruction:
     def test_unpaired_a_factor(self) -> None:
         sd = {"transformer_blocks.0.attn.lora_A.weight": torch.randn(4, 16)}
         with pytest.raises(ValueError, match="Unpaired"):
-            LoRAStore.from_state_dict(state_dict=sd)
+            LoRA.from_state_dict(state_dict=sd)
 
     def test_unpaired_b_factor(self) -> None:
         sd = {"transformer_blocks.0.attn.lora_B.weight": torch.randn(16, 4)}
         with pytest.raises(ValueError, match="Unpaired"):
-            LoRAStore.from_state_dict(state_dict=sd)
+            LoRA.from_state_dict(state_dict=sd)
 
     def test_rejects_non_floating_factor_dtype(self) -> None:
         sd = {
@@ -304,7 +348,7 @@ class TestLoRAConstruction:
             "transformer_blocks.0.attn.lora_B.weight": torch.zeros(16, 4, dtype=torch.int32),
         }
         with pytest.raises(ValueError, match="floating-point"):
-            LoRAStore.from_state_dict(state_dict=sd)
+            LoRA.from_state_dict(state_dict=sd)
 
     def test_rejects_rank_mismatch(self) -> None:
         sd = {
@@ -312,7 +356,7 @@ class TestLoRAConstruction:
             "transformer_blocks.0.attn.lora_B.weight": torch.randn(16, 8),
         }
         with pytest.raises(ValueError, match="shape mismatch"):
-            LoRAStore.from_state_dict(state_dict=sd)
+            LoRA.from_state_dict(state_dict=sd)
 
     def test_rejects_non_2d_factor(self) -> None:
         sd = {
@@ -320,7 +364,7 @@ class TestLoRAConstruction:
             "transformer_blocks.0.attn.lora_B.weight": torch.randn(16, 4),
         }
         with pytest.raises(ValueError, match="shape mismatch"):
-            LoRAStore.from_state_dict(state_dict=sd)
+            LoRA.from_state_dict(state_dict=sd)
 
     def test_factors_are_pinned(self) -> None:
         lora = _make_lora(4, 16)
@@ -367,29 +411,45 @@ class TestLoRAConstruction:
         # Routed callers pass the model's compute dtype so factors stream and
         # reside at that width (and the hook's per-forward cast is a no-op).
         sd = _make_lora_sd(num_blocks=2, dim=16, seed=1)  # fp32 factors
-        store = LoRAStore.from_state_dict(state_dict=sd, dtype=torch.bfloat16)
-        for name, p in store.module.named_parameters():
-            assert p.dtype == torch.bfloat16, name
+        store = LoRA.from_state_dict(state_dict=sd, dtype=torch.bfloat16)
+        for factor in store.targets.values():
+            assert all(
+                tensor.dtype == torch.bfloat16
+                for tensor in _factor_tensors(factor)
+            )
         # Default keeps the stored dtype.
-        kept = LoRAStore.from_state_dict(state_dict=sd)
-        for _name, p in kept.module.named_parameters():
-            assert p.dtype == torch.float32
+        kept = LoRA.from_state_dict(state_dict=sd)
+        for factor in kept.targets.values():
+            assert all(
+                tensor.dtype == torch.float32
+                for tensor in _factor_tensors(factor)
+            )
+
+    def test_targets_are_cached_and_immutable(self) -> None:
+        lora = _make_lora(1, 16)
+        targets = lora.targets
+        assert lora.targets is targets
+        with pytest.raises(TypeError):
+            targets["other.weight"] = next(iter(targets.values()))  # type: ignore[index]
 
     def test_from_state_dict_rejects_non_floating_dtype(self) -> None:
         # A non-floating dtype would slip past the float-factor validation
         # (which runs on the original tensors) and silently produce int factors.
         sd = _make_lora_sd(num_blocks=1, dim=16, seed=1)
         with pytest.raises(ValueError, match="floating-point"):
-            LoRAStore.from_state_dict(state_dict=sd, dtype=torch.int8)
+            LoRA.from_state_dict(state_dict=sd, dtype=torch.int8)
 
     def test_factor_holders_resolves_target_to_holder_modules(self) -> None:
         # The routed seam: a target weight key maps to its (lora_A, lora_B)
         # holder *modules* (stable identity), not the churning weight tensors.
         sd = _make_lora_sd(num_blocks=2, dim=16, seed=2)
-        store = LoRAStore.from_state_dict(state_dict=sd)
+        store = LoRA.from_state_dict(state_dict=sd)
         a, b = store.factor_holders("transformer_blocks.1.attn.weight")
-        assert a is store.module.get_submodule("transformer_blocks.1.attn.lora_A")
-        assert b is store.module.get_submodule("transformer_blocks.1.attn.lora_B")
+        same_a, same_b = store.factor_holders(
+            "transformer_blocks.1.attn.weight"
+        )
+        assert a is same_a
+        assert b is same_b
         assert a.get_parameter("weight").shape == (4, 16)
         assert b.get_parameter("weight").shape == (16, 4)
 
@@ -399,33 +459,53 @@ class TestLoRAConstruction:
 # ---------------------------------------------------------------------------
 
 
-class TestSetLorasValidation:
-    def test_set_loras_defaults_strength_to_one(self) -> None:
+class TestActivationLoraValidation:
+    def test_lora_strengths_default_to_one(self) -> None:
         m = _make_bf16_model()
         s = _make_strategy(m)
         lora = _make_lora(4, 16)
-        s.set_loras([lora])
-        assert s._loras == [(lora, 1.0)]
+        assert s._normalize_loras([lora]) == [(lora, 1.0)]
 
-    def test_set_loras_accepts_strengths(self) -> None:
+    def test_accepts_lora_strengths(self) -> None:
         m = _make_bf16_model()
         s = _make_strategy(m)
         lora = _make_lora(4, 16)
-        s.set_loras([lora], strengths=[0.25], mode="routed")
-        assert s._loras == [(lora, 0.25)]
-        assert s._lora_mode == "routed"
+        assert s._normalize_loras([lora], lora_strengths=[0.25]) == [
+            (lora, 0.25),
+        ]
 
-    def test_set_loras_rejects_strength_length_mismatch(self) -> None:
+    def test_rejects_lora_strength_length_mismatch(self) -> None:
         m = _make_bf16_model()
         s = _make_strategy(m)
         with pytest.raises(ValueError, match="same length"):
-            s.set_loras([_make_lora(4, 16)], strengths=[])
+            s._normalize_loras(
+                [_make_lora(4, 16)],
+                lora_strengths=[],
+            )
 
-    def test_set_loras_rejects_tuple_pairs(self) -> None:
+    def test_rejects_tuple_pairs(self) -> None:
         m = _make_bf16_model()
         s = _make_strategy(m)
-        with pytest.raises(TypeError, match="LoRAStore instances"):
-            s.set_loras([(_make_lora(4, 16), 1.0)])  # type: ignore[list-item]
+        with pytest.raises(TypeError, match="LoRA instances"):
+            s._normalize_loras(  # type: ignore[list-item]
+                [(_make_lora(4, 16), 1.0)],
+            )
+
+    def test_rejects_duplicate_lora_instance(self) -> None:
+        m = _make_bf16_model()
+        s = _make_strategy(m)
+        lora = _make_lora(4, 16)
+        with pytest.raises(ValueError, match="same LoRA instance"):
+            s._normalize_loras([lora, lora])
+
+    def test_invalid_lora_mode_releases_activation_claim(self) -> None:
+        m = _make_bf16_model()
+        s = _make_strategy(m)
+        with pytest.raises(ValueError, match="lora_mode"):
+            s.activate("cpu", lora_mode="invalid")  # type: ignore[arg-type]
+
+        with activated_model(s, "cpu") as active:
+            assert active is m
 
     def test_target_shape_mismatch_is_deferred_until_apply(self) -> None:
         m = _make_bf16_model()
@@ -434,7 +514,7 @@ class TestSetLorasValidation:
             "transformer_blocks.0.attn.lora_A.weight": torch.randn(4, 16),
             "transformer_blocks.0.attn.lora_B.weight": torch.randn(8, 4),
         }
-        _set_loras(s, [(LoRAStore.from_state_dict(state_dict=sd), 1.0)])
+        _request_loras(s, [(LoRA.from_state_dict(state_dict=sd), 1.0)])
         _activate_loras_for_test(s)
         assert _has_post_copy_hook(s, "transformer_blocks.0.attn.weight")
 
@@ -443,7 +523,7 @@ class TestSetLorasValidation:
         for p in m.parameters():
             p.requires_grad = False
         s = _make_strategy(m)
-        _set_loras(s, [(_make_lora(4, 16), 1.0)])
+        _request_loras(s, [(_make_lora(4, 16), 1.0)])
         assert not _has_post_copy_hook(s, "transformer_blocks.0.attn.weight")
         _activate_loras_for_test(s)
         assert _has_post_copy_hook(s, "transformer_blocks.0.attn.weight")
@@ -455,7 +535,7 @@ class TestSetLorasValidation:
             "embed.lora_A.weight": torch.randn(4, 16),
             "embed.lora_B.weight": torch.randn(16, 4),
         }
-        _set_loras(s, [(LoRAStore.from_state_dict(state_dict=sd), 1.0)])
+        _request_loras(s, [(LoRA.from_state_dict(state_dict=sd), 1.0)])
         _activate_loras_for_test(s)
         assert _has_post_copy_hook(s, "embed.weight")
 
@@ -466,7 +546,7 @@ class TestSetLorasValidation:
             "head.lora_A.weight": torch.randn(4, 16),
             "head.lora_B.weight": torch.randn(16, 4),
         }
-        _set_loras(s, [(LoRAStore.from_state_dict(state_dict=sd), 1.0)], mode="merge")
+        _request_loras(s, [(LoRA.from_state_dict(state_dict=sd), 1.0)], mode="merge")
         _activate_loras_for_test(s)
         assert _has_post_copy_hook(s, "head.weight")
         assert _has_post_copy_hook(s, "embed.weight")
@@ -480,7 +560,7 @@ class TestSetLorasValidation:
             "head.lora_A.weight": torch.randn(4, 16),
             "head.lora_B.weight": torch.randn(16, 4),
         }
-        _set_loras(s, [(LoRAStore.from_state_dict(state_dict=sd), 1.0)], mode="merge")
+        _request_loras(s, [(LoRA.from_state_dict(state_dict=sd), 1.0)], mode="merge")
         with pytest.raises(RuntimeError, match="shared LoRA targets"):
             _activate_loras_for_test(s)
         assert not _has_post_copy_hook(s, "embed.weight")
@@ -508,7 +588,7 @@ class TestSetLorasValidation:
             "transformer_blocks.0.b.lora_A.weight": torch.randn(4, 16),
             "transformer_blocks.0.b.lora_B.weight": torch.randn(16, 4),
         }
-        _set_loras(s, [(LoRAStore.from_state_dict(state_dict=sd), 1.0)], mode="merge")
+        _request_loras(s, [(LoRA.from_state_dict(state_dict=sd), 1.0)], mode="merge")
         _activate_loras_for_test(s)
         assert _has_post_copy_hook(s, "transformer_blocks.0.b.weight")
         assert _has_post_copy_hook(s, "transformer_blocks.0.a.weight")
@@ -517,7 +597,7 @@ class TestSetLorasValidation:
         m = _make_bf16_model()
         s = _make_strategy(m)
         lora = _make_lora(4, 16)
-        _set_loras(s, [(lora, 1.0)])
+        _request_loras(s, [(lora, 1.0)])
         _activate_loras_for_test(s)
         assert _has_post_copy_hook(s, "transformer_blocks.0.attn.weight")
 
@@ -527,7 +607,7 @@ class TestSetLorasValidation:
         m = _make_bf16_model()
         s = _make_strategy(m)
         lora = _make_lora(4, 16, prefix="diffusion_model.")
-        _set_loras(s, [(lora, 1.0)])
+        _request_loras(s, [(lora, 1.0)])
         with pytest.raises(ValueError, match="LoRA target .* is not managed"):
             _activate_loras_for_test(s)
         assert not _has_post_copy_hook(s, "transformer_blocks.0.attn.weight")
@@ -539,41 +619,32 @@ class TestSetLorasValidation:
             "transformer_blocks.0.attn.base_layer.lora_A.weight": torch.randn(4, 16),
             "transformer_blocks.0.attn.base_layer.lora_B.weight": torch.randn(16, 4),
         }
-        _set_loras(s, [(LoRAStore.from_state_dict(state_dict=sd), 1.0)])
+        _request_loras(s, [(LoRA.from_state_dict(state_dict=sd), 1.0)])
 
         with pytest.raises(ValueError, match="LoRA target .* is not managed"):
             _activate_loras_for_test(s)
         assert not _has_post_copy_hook(s, "transformer_blocks.0.attn.weight")
         assert not _has_post_copy_hook(
-            s, "transformer_blocks.0.attn.base_layer.weight",
+            s,
+            "transformer_blocks.0.attn.base_layer.weight",
         )
 
     def test_merge_mode_activation_rejects_cpu(self) -> None:
         m = _make_bf16_model()
         s = _make_strategy(m)
-        _set_loras(s, [(_make_lora(4, 16), 1.0)], mode="merge")
+        lora = _make_lora(4, 16)
+        _request_loras(s, [(lora, 1.0)], mode="merge")
         with pytest.raises(ValueError, match="merge mode requires CUDA"):
-            s.activate("cpu", stream_config=_strategy_stream_config(m))
+            _activate(s, "cpu", stream_config=_strategy_stream_config(m))
+        _assert_lora_available(lora)
 
-    @CUDA
-    def test_set_loras_raises_while_active(self) -> None:
+    def test_clear_active_loras_clears_previous_merge_hooks(self) -> None:
         m = _make_bf16_model()
         s = _make_strategy(m)
-        _set_loras(s, [(_make_lora(4, 16), 1.0)])
-        s.activate("cuda", stream_config=_strategy_stream_config(m))
-        try:
-            with pytest.raises(RuntimeError, match="inactive"):
-                _set_loras(s, [])
-        finally:
-            s.deactivate()
-
-    def test_clear_loras_clears_previous_merge_hooks(self) -> None:
-        m = _make_bf16_model()
-        s = _make_strategy(m)
-        _set_loras(s, [(_make_lora(4, 16, rank=4), 1.0)])
+        _request_loras(s, [(_make_lora(4, 16, rank=4), 1.0)])
         _activate_loras_for_test(s)
         assert _has_post_copy_hook(s, "transformer_blocks.0.attn.weight")
-        s._clear_loras()
+        s._clear_active_loras()
         assert not _has_post_copy_hook(s, "transformer_blocks.0.attn.weight")
 
     def test_accepts_quanto_target_in_merge_mode(self) -> None:
@@ -585,7 +656,13 @@ class TestSetLorasValidation:
         data = torch.randint(-128, 127, (rows, cols), dtype=torch.int8)
         scale = torch.rand(rows, 1, dtype=torch.bfloat16)
         qt = WeightQBytesTensor.create(
-            quanto.qint8, 0, (rows, cols), (cols, 1), data, scale, None,
+            quanto.qint8,
+            0,
+            (rows, cols),
+            (cols, 1),
+            data,
+            scale,
+            None,
         )
         m.embed.weight = nn.Parameter(qt, requires_grad=False)
 
@@ -594,12 +671,12 @@ class TestSetLorasValidation:
             "embed.lora_A.weight": torch.randn(4, 16),
             "embed.lora_B.weight": torch.randn(16, 4),
         }
-        _set_loras(s, [(LoRAStore.from_state_dict(state_dict=sd), 1.0)], mode="merge")
+        _request_loras(s, [(LoRA.from_state_dict(state_dict=sd), 1.0)], mode="merge")
         assert _activate_loras_for_test(s) == 1
         assert _has_post_copy_hook(s, "embed.weight")
 
         # routed mode must still accept it.
-        _set_loras(s, [(LoRAStore.from_state_dict(state_dict=sd), 1.0)], mode="routed")
+        _request_loras(s, [(LoRA.from_state_dict(state_dict=sd), 1.0)], mode="routed")
         route_count = _activate_loras_for_test(s)
         assert route_count == 1
 
@@ -614,7 +691,7 @@ class TestSetLorasValidation:
             "embed.lora_A.weight": torch.randn(4, 16),
             "embed.lora_B.weight": torch.randn(16, 4),
         }
-        _set_loras(s, [(LoRAStore.from_state_dict(state_dict=sd), 1.0)], mode="merge")
+        _request_loras(s, [(LoRA.from_state_dict(state_dict=sd), 1.0)], mode="merge")
         _activate_loras_for_test(s)
         assert _has_post_copy_hook(s, "embed.weight")
 
@@ -625,25 +702,16 @@ class TestSetLorasValidation:
         s = _make_strategy(m)
         assert "embed.weight" in s.param_names
 
-    def test_modes_defer_until_activation(self) -> None:
-        m = _make_bf16_model()
-        s = _make_strategy(m)
-        for mode in ("merge", "routed"):
-            _set_loras(s, [(_make_lora(4, 16), 1.0)], mode=mode)
-            assert not _has_post_copy_hook(s, "transformer_blocks.0.attn.weight")
-            assert len(s._loras) == 1
-            assert s._lora_mode == mode
-
     def test_routed_mode_cpu_activation_uses_hooks(self) -> None:
         m = _make_bf16_model(num_blocks=2).to(torch.float32)
         for p in m.parameters():
             p.requires_grad = False
         loras = [(_make_lora(2, 16, seed=9), 0.75)]
         s = _make_strategy(m)
-        _set_loras(s, loras, mode="routed")
+        _request_loras(s, loras, mode="routed")
 
         x = torch.randn(2, 16)
-        s.activate("cpu", stream_config=_strategy_stream_config(m))
+        _activate(s, "cpu", stream_config=_strategy_stream_config(m))
         try:
             actual = m(x)
             expected = _expected_routed_output(m, x, loras)
@@ -652,7 +720,7 @@ class TestSetLorasValidation:
         finally:
             s.deactivate()
 
-        assert s._loras == []
+        assert s._active_loras == []
 
 
 # ---------------------------------------------------------------------------
@@ -665,9 +733,9 @@ class TestLifecycle:
     def test_activate_runs_components(self) -> None:
         m = _make_bf16_model()
         s = _make_strategy(m)
-        _set_loras(s, [(_make_lora(4, 16), 1.0)])
+        _request_loras(s, [(_make_lora(4, 16), 1.0)])
         try:
-            s.activate("cuda", stream_config=_strategy_stream_config(m))
+            _activate(s, "cuda", stream_config=_strategy_stream_config(m))
             assert m.embed.weight.is_cuda
             assert m.head.weight.is_cuda
         finally:
@@ -677,8 +745,8 @@ class TestLifecycle:
     def test_deactivate_returns_to_pinned(self) -> None:
         m = _make_bf16_model()
         s = _make_strategy(m)
-        _set_loras(s, [(_make_lora(4, 16), 1.0)])
-        s.activate("cuda", stream_config=_strategy_stream_config(m))
+        _request_loras(s, [(_make_lora(4, 16), 1.0)])
+        _activate(s, "cuda", stream_config=_strategy_stream_config(m))
         s.deactivate()
         assert m.embed.weight.is_pinned()
         assert m.head.weight.is_pinned()
@@ -687,11 +755,11 @@ class TestLifecycle:
     def test_reactivation_with_different_loras(self) -> None:
         m = _make_bf16_model()
         s = _make_strategy(m)
-        _set_loras(s, [(_make_lora(4, 16, seed=1), 1.0)])
-        s.activate("cuda", stream_config=_strategy_stream_config(m))
+        _request_loras(s, [(_make_lora(4, 16, seed=1), 1.0)])
+        _activate(s, "cuda", stream_config=_strategy_stream_config(m))
         s.deactivate()
-        _set_loras(s, [(_make_lora(4, 16, seed=2), 1.0)])
-        s.activate("cuda", stream_config=_strategy_stream_config(m))
+        _request_loras(s, [(_make_lora(4, 16, seed=2), 1.0)])
+        _activate(s, "cuda", stream_config=_strategy_stream_config(m))
         s.deactivate()
         assert m.embed.weight.is_pinned()
 
@@ -704,18 +772,24 @@ class TestLifecycle:
         sd = _make_lora_sd(num_blocks=4, dim=16, seed=3)
         g = torch.Generator().manual_seed(303)
         sd["embed.lora_A.weight"] = torch.randn(
-            4, 16, generator=g, dtype=torch.float32,
+            4,
+            16,
+            generator=g,
+            dtype=torch.float32,
         )
         sd["embed.lora_B.weight"] = torch.randn(
-            16, 4, generator=g, dtype=torch.float32,
+            16,
+            4,
+            generator=g,
+            dtype=torch.float32,
         )
         s = _make_strategy(m)
-        _set_loras(s, [(LoRAStore.from_state_dict(state_dict=sd), 1.0)], mode="merge")
-        s.activate("cuda", stream_config=_strategy_stream_config(m))
+        _request_loras(s, [(LoRA.from_state_dict(state_dict=sd), 1.0)], mode="merge")
+        _activate(s, "cuda", stream_config=_strategy_stream_config(m))
         s.deactivate()
 
-        _set_loras(s, [])
-        s.activate("cuda", stream_config=_strategy_stream_config(m))
+        _request_loras(s, [])
+        _activate(s, "cuda", stream_config=_strategy_stream_config(m))
         try:
             torch.cuda.synchronize()
             torch.testing.assert_close(
@@ -738,7 +812,7 @@ class TestLifecycle:
         m = _make_bf16_model()
         captured = m.transformer_blocks[0].attn.weight.detach().clone()
         s = _make_strategy(m)
-        s.activate("cuda", stream_config=_strategy_stream_config(m))
+        _activate(s, "cuda", stream_config=_strategy_stream_config(m))
         try:
             x = torch.randn(2, 16, dtype=torch.bfloat16, device="cuda")
             for blk in m.transformer_blocks:
@@ -746,7 +820,10 @@ class TestLifecycle:
             torch.cuda.synchronize()
             actual = m.transformer_blocks[0].attn.weight.detach()
             assert torch.allclose(
-                actual.cpu(), captured, rtol=0.0, atol=0.0,
+                actual.cpu(),
+                captured,
+                rtol=0.0,
+                atol=0.0,
             ), "no LoRAs must leave base weights unmodified"
         finally:
             s.deactivate()
@@ -761,30 +838,28 @@ class TestMergeCorrectness:
     @CUDA
     def test_merged_weights_match_manual_baseline(self) -> None:
         m = _make_bf16_model(num_blocks=4, dim=16)
-        captured_base = {
-            i: m.transformer_blocks[i].attn.weight.detach().clone()
-            for i in range(4)
-        }
+        captured_base = {i: m.transformer_blocks[i].attn.weight.detach().clone() for i in range(4)}
 
         loras = [
             (_make_lora(num_blocks=4, dim=16, seed=10), 0.5),
             (_make_lora(num_blocks=4, dim=16, seed=20), 0.25),
         ]
         s = _make_strategy(m)
-        _set_loras(s, loras)
-        s.activate("cuda", stream_config=_strategy_stream_config(m))
+        _request_loras(s, loras)
+        _activate(s, "cuda", stream_config=_strategy_stream_config(m))
         try:
             x = torch.randn(2, 16, dtype=torch.bfloat16, device="cuda")
             for blk in m.transformer_blocks:
                 x = blk(x)
             torch.cuda.synchronize()
             for i in range(4):
-                _ = m.transformer_blocks[i](
-                    torch.randn(2, 16, dtype=torch.bfloat16, device="cuda")
-                )
+                _ = m.transformer_blocks[i](torch.randn(2, 16, dtype=torch.bfloat16, device="cuda"))
                 torch.cuda.synchronize()
                 expected = _expected_merged_weight(
-                    captured_base[i].to("cuda"), loras, i, "attn.weight",
+                    captured_base[i].to("cuda"),
+                    loras,
+                    i,
+                    "attn.weight",
                 )
                 actual = m.transformer_blocks[i].attn.weight.detach()
                 assert torch.allclose(actual, expected, rtol=0.01, atol=0.01), (
@@ -806,21 +881,17 @@ class TestMergeCorrectness:
             "embed.lora_A.weight": torch.randn(4, 16, generator=g, dtype=torch.float32),
             "embed.lora_B.weight": torch.randn(16, 4, generator=g, dtype=torch.float32),
         }
-        lora = LoRAStore.from_state_dict(state_dict=sd)
+        lora = LoRA.from_state_dict(state_dict=sd)
         s = _make_strategy(m)
-        _set_loras(s, [(lora, 0.5)])
-        s.activate("cuda", stream_config=_strategy_stream_config(m))
+        _request_loras(s, [(lora, 0.5)])
+        _activate(s, "cuda", stream_config=_strategy_stream_config(m))
         try:
             factor = lora.targets["embed.weight"]
             a, b = _factor_tensors(factor)
-            expected = (
-                captured_embed + 0.5 * (b.to(torch.bfloat16) @ a.to(torch.bfloat16))
-            ).to("cuda")
+            expected = (captured_embed + 0.5 * (b.to(torch.bfloat16) @ a.to(torch.bfloat16))).to("cuda")
             actual = m.embed.weight.detach()
             assert torch.allclose(actual, expected, rtol=0.01, atol=0.01), (
-                f"non-block merge mismatch:\n"
-                f"  expected: {expected.flatten()[:4]}\n"
-                f"  actual:   {actual.flatten()[:4]}"
+                f"non-block merge mismatch:\n  expected: {expected.flatten()[:4]}\n  actual:   {actual.flatten()[:4]}"
             )
         finally:
             s.deactivate()
@@ -844,9 +915,7 @@ class TestMergeCorrectness:
         class M(nn.Module):
             def __init__(self) -> None:
                 super().__init__()
-                self.transformer_blocks = nn.ModuleList(
-                    [PEFTBlock(16) for _ in range(4)]
-                )
+                self.transformer_blocks = nn.ModuleList([PEFTBlock(16) for _ in range(4)])
 
             def forward(self, x: torch.Tensor) -> torch.Tensor:
                 for blk in self.transformer_blocks:
@@ -856,10 +925,7 @@ class TestMergeCorrectness:
         m = M().to(torch.bfloat16)
         m.requires_grad_(False)
 
-        captured_base = {
-            i: m.transformer_blocks[i].attn.base_layer.weight.detach().clone()
-            for i in range(4)
-        }
+        captured_base = {i: m.transformer_blocks[i].attn.base_layer.weight.detach().clone() for i in range(4)}
 
         # Keys match the model's real paths, ``.base_layer.`` and all.
         g = torch.Generator().manual_seed(42)
@@ -868,28 +934,26 @@ class TestMergeCorrectness:
             base = f"transformer_blocks.{b}.attn.base_layer"
             sd[f"{base}.lora_A.weight"] = torch.randn(4, 16, generator=g)
             sd[f"{base}.lora_B.weight"] = torch.randn(16, 4, generator=g)
-        lora = LoRAStore.from_state_dict(state_dict=sd)
+        lora = LoRA.from_state_dict(state_dict=sd)
 
         s = _make_strategy(m)
-        _set_loras(s, [(lora, 0.7)])
-        s.activate("cuda", stream_config=_strategy_stream_config(m))
+        _request_loras(s, [(lora, 0.7)])
+        _activate(s, "cuda", stream_config=_strategy_stream_config(m))
         try:
             x = torch.randn(2, 16, dtype=torch.bfloat16, device="cuda")
             m(x)
             torch.cuda.synchronize()
             for i in range(4):
-                _ = m.transformer_blocks[i](
-                    torch.randn(2, 16, dtype=torch.bfloat16, device="cuda")
-                )
+                _ = m.transformer_blocks[i](torch.randn(2, 16, dtype=torch.bfloat16, device="cuda"))
                 torch.cuda.synchronize()
                 expected = _expected_merged_weight(
-                    captured_base[i].to("cuda"), [(lora, 0.7)], i,
+                    captured_base[i].to("cuda"),
+                    [(lora, 0.7)],
+                    i,
                     "attn.base_layer.weight",
                 )
                 actual = m.transformer_blocks[i].attn.base_layer.weight.detach()
-                assert torch.allclose(actual, expected, rtol=0.01, atol=0.01), (
-                    f"block {i} base_layer merge mismatch"
-                )
+                assert torch.allclose(actual, expected, rtol=0.01, atol=0.01), f"block {i} base_layer merge mismatch"
         finally:
             s.deactivate()
 
@@ -945,7 +1009,13 @@ class TestLoRATransform:
         data = torch.randint(-32, 32, (rows, cols), dtype=torch.int8)
         scale = torch.rand(rows, 1, dtype=torch.bfloat16).add_(0.25)
         qt = WeightQBytesTensor.create(
-            quanto.qint8, 0, (rows, cols), (cols, 1), data, scale, None,
+            quanto.qint8,
+            0,
+            (rows, cols),
+            (cols, 1),
+            data,
+            scale,
+            None,
         )
         param = nn.Parameter(qt, requires_grad=False)
         a = torch.randn(rank, cols)
@@ -958,9 +1028,7 @@ class TestLoRATransform:
         transform.apply(param)
 
         expected_dense.addmm_(b.to(torch.float32), a.to(torch.float32), alpha=0.5)
-        expected_packed = (
-            expected_dense / scale.to(torch.float32)
-        ).round().clamp(-128, 127).to(torch.int8)
+        expected_packed = (expected_dense / scale.to(torch.float32)).round().clamp(-128, 127).to(torch.int8)
         assert param is original_param
         assert param.data._data.data_ptr() == original_packed_ptr
         assert isinstance(param.data, WeightQBytesTensor)
@@ -978,14 +1046,20 @@ class TestLoRATransform:
         data = torch.randint(-32, 32, (rows, cols), dtype=torch.int8)
         scale = torch.rand(rows, 1, dtype=torch.bfloat16).add_(0.25)
         qt = WeightQBytesTensor.create(
-            quanto.qint8, 0, (rows, cols), (cols, 1), data, scale, None,
+            quanto.qint8,
+            0,
+            (rows, cols),
+            (cols, 1),
+            data,
+            scale,
+            None,
         )
         m.embed.weight = nn.Parameter(qt, requires_grad=False)
         sd = {
             "embed.lora_A.weight": torch.randn(rank, cols),
             "embed.lora_B.weight": torch.randn(rows, rank),
         }
-        lora = LoRAStore.from_state_dict(state_dict=sd)
+        lora = LoRA.from_state_dict(state_dict=sd)
         factor = lora.targets["embed.weight"]
         a, b = _factor_tensors(factor)
         # Compute the reference on CUDA, matching the device the offloader
@@ -994,19 +1068,12 @@ class TestLoRATransform:
         # comparison is exact — so the device must match to be deterministic.
         qt_cuda = qt.cuda()
         expected_dense = qt_cuda.dequantize().to(torch.float32)
-        expected_dense.addmm_(
-            b.cuda().to(torch.float32), a.cuda().to(torch.float32), alpha=0.5
-        )
-        expected_packed = (
-            (expected_dense / scale.cuda().to(torch.float32))
-            .round()
-            .clamp(-128, 127)
-            .to(torch.int8)
-        )
+        expected_dense.addmm_(b.cuda().to(torch.float32), a.cuda().to(torch.float32), alpha=0.5)
+        expected_packed = (expected_dense / scale.cuda().to(torch.float32)).round().clamp(-128, 127).to(torch.int8)
 
         s = _make_strategy(m)
-        _set_loras(s, [(lora, 0.5)], mode="merge")
-        s.activate(
+        _request_loras(s, [(lora, 0.5)], mode="merge")
+        _activate(s,
             "cuda",
             stream_config=_strategy_stream_config(m, num_resident_blocks=1),
         )
@@ -1032,7 +1099,13 @@ class TestLoRATransform:
             data = torch.randint(-32, 32, (rows, cols), dtype=torch.int8)
             scale = torch.rand(rows, 1, dtype=torch.bfloat16).add_(0.25)
             qt = WeightQBytesTensor.create(
-                quanto.qint8, 0, (rows, cols), (cols, 1), data, scale, None,
+                quanto.qint8,
+                0,
+                (rows, cols),
+                (cols, 1),
+                data,
+                scale,
+                None,
             )
             if original_qt is None:
                 original_qt = qt
@@ -1044,18 +1117,16 @@ class TestLoRATransform:
             "transformer_blocks.0.attn.lora_A.weight": torch.randn(rank, cols),
             "transformer_blocks.0.attn.lora_B.weight": torch.randn(rows, rank),
         }
-        lora = LoRAStore.from_state_dict(state_dict=sd)
+        lora = LoRA.from_state_dict(state_dict=sd)
         factor = lora.targets["transformer_blocks.0.attn.weight"]
         a, b = _factor_tensors(factor)
         expected_dense = original_qt.dequantize().to(torch.float32)
         expected_dense.addmm_(b.to(torch.float32), a.to(torch.float32), alpha=0.5)
-        expected_packed = (
-            expected_dense / scales[0].to(torch.float32)
-        ).round().clamp(-128, 127).to(torch.int8)
+        expected_packed = (expected_dense / scales[0].to(torch.float32)).round().clamp(-128, 127).to(torch.int8)
 
         s = _make_strategy(m)
-        _set_loras(s, [(lora, 0.5)], mode="merge")
-        s.activate(
+        _request_loras(s, [(lora, 0.5)], mode="merge")
+        _activate(s,
             "cuda",
             stream_config=_strategy_stream_config(m, num_resident_blocks=1),
         )
@@ -1071,6 +1142,27 @@ class TestLoRATransform:
 
 
 class TestPermanentMerge:
+    def test_rejects_lora_with_an_active_use(self) -> None:
+        m = _make_bf16_model(num_blocks=2, dim=16).to(torch.float32)
+        lora = _make_lora(num_blocks=2, dim=16)
+        before = m.transformer_blocks[0].attn.weight.detach().clone()
+
+        lora.activate(mode="merge")
+        try:
+            with pytest.raises(LoRARuntimeInUseError, match="active use"):
+                merge_lora(m, [(lora, 1.0)])
+        finally:
+            lora.deactivate()
+
+        torch.testing.assert_close(m.transformer_blocks[0].attn.weight, before)
+
+    def test_releases_lora_after_merge(self) -> None:
+        m = _make_bf16_model(num_blocks=2, dim=16).to(torch.float32)
+        lora = _make_lora(num_blocks=2, dim=16)
+
+        assert merge_lora(m, [(lora, 1.0)]) == 2
+        _assert_lora_available(lora)
+
     def test_quanto_target_uses_dequant_requant_strategy(self) -> None:
         quanto = pytest.importorskip("optimum.quanto")
         from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
@@ -1085,7 +1177,13 @@ class TestPermanentMerge:
         data = torch.randint(-32, 32, (rows, cols), dtype=torch.int8)
         scale = torch.rand(rows, 1, dtype=torch.bfloat16).add_(0.25)
         qt = WeightQBytesTensor.create(
-            quanto.qint8, 0, (rows, cols), (cols, 1), data, scale, None,
+            quanto.qint8,
+            0,
+            (rows, cols),
+            (cols, 1),
+            data,
+            scale,
+            None,
         )
         m = M(qt)
         original_param = m.target.weight
@@ -1094,15 +1192,13 @@ class TestPermanentMerge:
             "target.lora_A.weight": torch.randn(rank, cols),
             "target.lora_B.weight": torch.randn(rows, rank),
         }
-        lora = LoRAStore.from_state_dict(state_dict=sd)
+        lora = LoRA.from_state_dict(state_dict=sd)
         factor = lora.targets["target.weight"]
         a, b = _factor_tensors(factor)
 
         expected_dense = qt.dequantize().to(torch.float32)
         expected_dense.addmm_(b.to(torch.float32), a.to(torch.float32), alpha=0.5)
-        expected_packed = (
-            expected_dense / scale.to(torch.float32)
-        ).round().clamp(-128, 127).to(torch.int8)
+        expected_packed = (expected_dense / scale.to(torch.float32)).round().clamp(-128, 127).to(torch.int8)
 
         merged = merge_lora(m, [(lora, 0.5)])
 
@@ -1124,7 +1220,7 @@ class TestPermanentMerge:
             "head.lora_A.weight": torch.randn(4, 16),
             "head.lora_B.weight": torch.randn(16, 4),
         }
-        lora = LoRAStore.from_state_dict(state_dict=sd)
+        lora = LoRA.from_state_dict(state_dict=sd)
         factor = lora.targets["head.weight"]
         a, b = _factor_tensors(factor)
 
@@ -1132,7 +1228,9 @@ class TestPermanentMerge:
 
         expected = base.clone()
         expected.addmm_(
-            b.to(dtype=expected.dtype), a.to(dtype=expected.dtype), alpha=0.25,
+            b.to(dtype=expected.dtype),
+            a.to(dtype=expected.dtype),
+            alpha=0.25,
         )
         assert merged == 1
         torch.testing.assert_close(m.embed.weight, expected)
@@ -1150,7 +1248,7 @@ class TestPermanentMerge:
         }
 
         with pytest.raises(ValueError, match="same tied parameter backing"):
-            merge_lora(m, [(LoRAStore.from_state_dict(state_dict=sd), 1.0)])
+            merge_lora(m, [(LoRA.from_state_dict(state_dict=sd), 1.0)])
 
         torch.testing.assert_close(m.embed.weight, before)
         assert m.head.weight is m.embed.weight
@@ -1165,7 +1263,9 @@ class TestPermanentMerge:
                 self.target = nn.Linear(16, 16, bias=False)
                 self.other = nn.Linear(16, 16, bias=False)
                 wrapped = torch.Tensor._make_subclass(
-                    UnknownTensor, torch.randn(16, 16), False,
+                    UnknownTensor,
+                    torch.randn(16, 16),
+                    False,
                 )
                 self.other.weight = nn.Parameter(wrapped, requires_grad=False)
 
@@ -1175,7 +1275,7 @@ class TestPermanentMerge:
             "target.lora_A.weight": torch.randn(4, 16),
             "target.lora_B.weight": torch.randn(16, 4),
         }
-        lora = LoRAStore.from_state_dict(state_dict=sd)
+        lora = LoRA.from_state_dict(state_dict=sd)
         factor = lora.targets["target.weight"]
         a, b = _factor_tensors(factor)
 
@@ -1201,7 +1301,7 @@ class TestRoutedMode:
         self,
         model: nn.Module,
         x: torch.Tensor,
-        loras: list[tuple[LoRAStore, float]],
+        loras: list[tuple[LoRA, float]],
     ) -> torch.Tensor:
         """Manual baseline: walk the block list using F.linear so we
         bypass any forward hooks installed on the layers (otherwise
@@ -1218,23 +1318,18 @@ class TestRoutedMode:
             (_make_lora(num_blocks=3, dim=16, seed=11), 0.5),
             (_make_lora(num_blocks=3, dim=16, seed=22), 0.25),
         ]
-        base_snapshots = [
-            m.transformer_blocks[i].attn.weight.detach().clone()
-            for i in range(3)
-        ]
+        base_snapshots = [m.transformer_blocks[i].attn.weight.detach().clone() for i in range(3)]
 
         s = _make_strategy(m)
-        _set_loras(s, loras, mode="routed")
-        s.activate("cuda", stream_config=_strategy_stream_config(m))
+        _request_loras(s, loras, mode="routed")
+        _activate(s, "cuda", stream_config=_strategy_stream_config(m))
         try:
             x = torch.randn(2, 16, dtype=torch.bfloat16, device="cuda")
             actual = m(x)
             torch.cuda.synchronize()
             expected = self._expected_routed_output(m, x, loras)
             assert torch.allclose(actual, expected, rtol=0.1, atol=0.1), (
-                f"routed forward mismatch:\n"
-                f"  expected: {expected.flatten()[:4]}\n"
-                f"  actual:   {actual.flatten()[:4]}"
+                f"routed forward mismatch:\n  expected: {expected.flatten()[:4]}\n  actual:   {actual.flatten()[:4]}"
             )
         finally:
             s.deactivate()
@@ -1253,8 +1348,8 @@ class TestRoutedMode:
         # subsequent base-only forward sees the unaugmented model.
         m = _make_bf16_model(num_blocks=3, dim=16)
         s = _make_strategy(m)
-        _set_loras(s, [(_make_lora(3, 16, seed=7), 1.0)], mode="routed")
-        s.activate("cuda", stream_config=_strategy_stream_config(m))
+        _request_loras(s, [(_make_lora(3, 16, seed=7), 1.0)], mode="routed")
+        _activate(s, "cuda", stream_config=_strategy_stream_config(m))
         x = torch.randn(2, 16, dtype=torch.bfloat16, device="cuda")
         with_lora = m(x).detach().clone()
         torch.cuda.synchronize()
@@ -1262,14 +1357,13 @@ class TestRoutedMode:
 
         # Re-activate without LoRAs; output should differ from with_lora
         # (the hooks should be gone).
-        _set_loras(s, [], mode="routed")
-        s.activate("cuda", stream_config=_strategy_stream_config(m))
+        _request_loras(s, [], mode="routed")
+        _activate(s, "cuda", stream_config=_strategy_stream_config(m))
         try:
             base_only = m(x)
             torch.cuda.synchronize()
             assert not torch.allclose(with_lora, base_only, rtol=0.001, atol=0.001), (
-                "deactivate did not remove routed hooks; base-only output "
-                "still reflects LoRA contribution"
+                "deactivate did not remove routed hooks; base-only output still reflects LoRA contribution"
             )
         finally:
             s.deactivate()
@@ -1287,8 +1381,8 @@ class TestRoutedMode:
         loras = [(lora_r4, 0.6), (lora_r8, 0.3)]
 
         s = _make_strategy(m)
-        _set_loras(s, loras, mode="routed")
-        s.activate("cuda", stream_config=_strategy_stream_config(m))
+        _request_loras(s, loras, mode="routed")
+        _activate(s, "cuda", stream_config=_strategy_stream_config(m))
         try:
             x = torch.randn(2, 16, dtype=torch.bfloat16, device="cuda")
             actual = m(x)
@@ -1331,9 +1425,7 @@ class TestRoutedMode:
         class M(nn.Module):
             def __init__(self) -> None:
                 super().__init__()
-                self.transformer_blocks = nn.ModuleList(
-                    [Block(16) for _ in range(2)]
-                )
+                self.transformer_blocks = nn.ModuleList([Block(16) for _ in range(2)])
 
             def forward(self, x: torch.Tensor) -> torch.Tensor:
                 for blk in self.transformer_blocks:
@@ -1350,11 +1442,11 @@ class TestRoutedMode:
         )
         # Build a LoRA targeting attn.weight (LinearLike, not nn.Linear).
         lora = _make_lora(num_blocks=2, dim=16, seed=3)
-        _set_loras(s, [(lora, 1.0)], mode="routed")
+        _request_loras(s, [(lora, 1.0)], mode="routed")
         with pytest.raises(ValueError, match=r"Routed LoRA mode requires nn\.Linear"):
             _activate_loras_for_test(s)
         # Merge mode should still work — it doesn't care about parent type.
-        _set_loras(s, [(lora, 1.0)], mode="merge")
+        _request_loras(s, [(lora, 1.0)], mode="merge")
         _activate_loras_for_test(s)
 
     def test_routed_partial_failure_leaves_no_hooks(self) -> None:
@@ -1375,10 +1467,7 @@ class TestRoutedMode:
         class Block(nn.Module):
             def __init__(self, dim: int, normal_attn: bool) -> None:
                 super().__init__()
-                self.attn = (
-                    nn.Linear(dim, dim, bias=False) if normal_attn
-                    else LinearLike(dim)
-                )
+                self.attn = nn.Linear(dim, dim, bias=False) if normal_attn else LinearLike(dim)
                 self.ff = nn.Linear(dim, dim, bias=False)
 
             def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -1389,9 +1478,7 @@ class TestRoutedMode:
                 super().__init__()
                 # Block 0: normal Linear (passes routed validation).
                 # Block 1: LinearLike (fails routed validation).
-                self.transformer_blocks = nn.ModuleList(
-                    [Block(16, normal_attn=True), Block(16, normal_attn=False)]
-                )
+                self.transformer_blocks = nn.ModuleList([Block(16, normal_attn=True), Block(16, normal_attn=False)])
 
             def forward(self, x: torch.Tensor) -> torch.Tensor:
                 for blk in self.transformer_blocks:
@@ -1407,7 +1494,7 @@ class TestRoutedMode:
             blocks_attr=["transformer_blocks"],
         )
         lora = _make_lora(num_blocks=2, dim=16, seed=99)
-        _set_loras(s, [(lora, 1.0)], mode="routed")
+        _request_loras(s, [(lora, 1.0)], mode="routed")
         with pytest.raises(ValueError, match=r"Routed LoRA mode requires nn\.Linear"):
             _activate_loras_for_test(s)
 
@@ -1419,8 +1506,8 @@ class TestRoutedMode:
         loras = [(_make_lora(num_blocks=2, dim=16, seed=33), 0.7)]
 
         s = _make_strategy(m)
-        _set_loras(s, loras, mode="routed")
-        s.activate("cuda", stream_config=_strategy_stream_config(m))
+        _request_loras(s, loras, mode="routed")
+        _activate(s, "cuda", stream_config=_strategy_stream_config(m))
         try:
             x = torch.randn(2, 16, dtype=torch.bfloat16, device="cuda")
             actual = m(x)
@@ -1447,19 +1534,20 @@ class TestRoutedMode:
             f"{target}.lora_A.weight": torch.randn(4, 16),
             f"{target}.lora_B.weight": torch.randn(16, 4),
         }
-        lora = LoRAStore.from_state_dict(state_dict=sd)
-        _set_loras(s, [(lora, 1.0)], mode="routed")
-        s._register_routed_lora_hooks(torch.device("cpu"))
+        lora = LoRA.from_state_dict(state_dict=sd)
+        _request_loras(s, [(lora, 1.0)], mode="routed")
+        active_loras, _mode = _LORA_REQUESTS.pop(s)
+        s._register_routed_lora_hooks(active_loras, torch.device("cpu"))
         try:
             assert len(model.embed._forward_hooks) == (1 if target == "embed" else 0)
             assert len(model.head._forward_hooks) == (1 if target == "head" else 0)
         finally:
             s._clear_active_lora_hooks()
-            s._teardown_lora_bindings()
+            s._deactivate_loras()
 
         # Merge mode also matches by name; it mutates the copied backing,
         # so the normal shared-storage effect is preserved.
-        _set_loras(s, [(lora, 1.0)], mode="merge")
+        _request_loras(s, [(lora, 1.0)], mode="merge")
         _activate_loras_for_test(s)
 
     @CUDA
@@ -1481,9 +1569,7 @@ class TestRoutedMode:
             def __init__(self) -> None:
                 super().__init__()
                 self.embed = nn.Linear(16, 16, bias=False)
-                self.transformer_blocks = nn.ModuleList(
-                    [Block(16) for _ in range(2)]
-                )
+                self.transformer_blocks = nn.ModuleList([Block(16) for _ in range(2)])
                 self.head = nn.Linear(16, 16, bias=False)
 
             def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -1501,8 +1587,8 @@ class TestRoutedMode:
             m,
             blocks_attr=["transformer_blocks"],
         )
-        _set_loras(s, loras, mode="routed")
-        s.activate("cuda")
+        _request_loras(s, loras, mode="routed")
+        _activate(s, "cuda")
         try:
             x = torch.randn(2, 16, dtype=torch.bfloat16, device="cuda")
             actual = m(x)
@@ -1548,11 +1634,11 @@ class TestRoutedStreaming:
         s = _make_model_offloader(m, blocks_attr=["transformer_blocks"])
 
         def routed_forward(
-            loras: list[tuple[LoRAStore, float]],
+            loras: list[tuple[LoRA, float]],
         ) -> torch.Tensor:
             if loras:
-                _set_loras(s, loras, mode="routed")
-            s.activate(torch.device("cpu"))
+                _request_loras(s, loras, mode="routed")
+            _activate(s, torch.device("cpu"))
             try:
                 return m(x).clone()
             finally:
@@ -1563,7 +1649,10 @@ class TestRoutedStreaming:
         y2 = routed_forward([(lora2, 1.3)])
         y12 = routed_forward([(lora1, 0.7), (lora2, 1.3)])
         torch.testing.assert_close(
-            y12, y1 + y2 - y0, rtol=1e-3, atol=1e-3,
+            y12,
+            y1 + y2 - y0,
+            rtol=1e-3,
+            atol=1e-3,
         )
 
     def test_routed_nested_base_layer_path(self) -> None:
@@ -1582,9 +1671,7 @@ class TestRoutedStreaming:
         class M(nn.Module):
             def __init__(self) -> None:
                 super().__init__()
-                self.transformer_blocks = nn.ModuleList(
-                    [PEFTBlock(16) for _ in range(2)]
-                )
+                self.transformer_blocks = nn.ModuleList([PEFTBlock(16) for _ in range(2)])
 
             def forward(self, x: torch.Tensor) -> torch.Tensor:
                 for blk in self.transformer_blocks:
@@ -1594,10 +1681,7 @@ class TestRoutedStreaming:
         m = M()
         for p in m.parameters():
             p.requires_grad = False
-        base_w = [
-            m.transformer_blocks[b].attn.base_layer.weight.detach().clone()
-            for b in range(2)
-        ]
+        base_w = [m.transformer_blocks[b].attn.base_layer.weight.detach().clone() for b in range(2)]
         # Keys match the model's real ``.base_layer.`` paths exactly.
         g = torch.Generator().manual_seed(3)
         sd: dict[str, torch.Tensor] = {}
@@ -1605,22 +1689,20 @@ class TestRoutedStreaming:
             base = f"transformer_blocks.{b}.attn.base_layer"
             sd[f"{base}.lora_A.weight"] = torch.randn(4, 16, generator=g)
             sd[f"{base}.lora_B.weight"] = torch.randn(16, 4, generator=g)
-        lora = LoRAStore.from_state_dict(state_dict=sd)
+        lora = LoRA.from_state_dict(state_dict=sd)
         assert set(lora.targets) == {
             "transformer_blocks.0.attn.base_layer.weight",
             "transformer_blocks.1.attn.base_layer.weight",
         }
 
         s = _make_model_offloader(m, blocks_attr=["transformer_blocks"])
-        _set_loras(s, [(lora, 0.5)], mode="routed")
+        _request_loras(s, [(lora, 0.5)], mode="routed")
         x = torch.randn(2, 16)
-        s.activate(torch.device("cpu"))
+        _activate(s, torch.device("cpu"))
         try:
             actual = m(x).clone()
             # The hook lands on the matched ``.base_layer`` Linear.
-            assert (
-                len(m.transformer_blocks[0].attn.base_layer._forward_hooks) == 1
-            )
+            assert len(m.transformer_blocks[0].attn.base_layer._forward_hooks) == 1
         finally:
             s.deactivate()
 
@@ -1632,28 +1714,26 @@ class TestRoutedStreaming:
             h = out + 0.5 * (h @ a.T) @ bb.T
         torch.testing.assert_close(actual, h, rtol=1e-4, atol=1e-4)
 
-    def test_deactivate_tears_down_lora_bindings(self) -> None:
+    def test_deactivate_releases_active_loras(self) -> None:
         m = _make_bf16_model(num_blocks=2, dim=16)
         lora = _make_lora(num_blocks=2, dim=16, seed=4)
         s = _make_model_offloader(m, blocks_attr=["transformer_blocks"])
 
-        _set_loras(s, [(lora, 1.0)], mode="routed")
-        s.activate(torch.device("cpu"))
+        _request_loras(s, [(lora, 1.0)], mode="routed")
+        _activate(s, torch.device("cpu"))
         # One streaming engine; one stacked hook per (LoRA, target).
-        assert len(s._lora_bindings) == 1
-        assert s._lora_bindings[0].active_device == torch.device("cpu")
+        assert s._active_loras == [lora]
         assert len(s._lora_hook_handles) == 2
 
         s.deactivate()
-        assert s._lora_bindings == []
+        assert s._active_loras == []
         assert s._lora_hook_handles == []
-        assert s._loras == []
 
-        # Re-activation after re-recording works (loras clear on deactivate).
-        _set_loras(s, [(lora, 1.0)], mode="routed")
-        s.activate(torch.device("cpu"))
+        # A new activation-scoped request works after teardown.
+        _request_loras(s, [(lora, 1.0)], mode="routed")
+        _activate(s, torch.device("cpu"))
         try:
-            assert len(s._lora_bindings) == 1
+            assert len(s._active_loras) == 1
         finally:
             s.deactivate()
 
@@ -1665,7 +1745,7 @@ class TestRoutedStreaming:
         # holder modules must keep stable identity across stream load/evict
         # (the hook caches the node, not the churning .weight).
         m = _make_bf16_model(num_blocks=2, dim=16)
-        lora = LoRAStore.from_state_dict(
+        lora = LoRA.from_state_dict(
             state_dict=_make_lora_sd(num_blocks=2, dim=16, seed=7),
             blocks_attr=["transformer_blocks"],
         )
@@ -1673,24 +1753,24 @@ class TestRoutedStreaming:
         s = _make_model_offloader(m, blocks_attr=["transformer_blocks"])
         cfg = _strategy_stream_config(m, num_resident_blocks=1)
 
-        _set_loras(s, [(lora, 0.5)], mode="merge")
-        s.activate("cuda", stream_config=cfg)
+        _request_loras(s, [(lora, 0.5)], mode="merge")
+        _activate(s, "cuda", stream_config=cfg)
         try:
             merged = m(x).clone()
             torch.cuda.synchronize()
         finally:
             s.deactivate()
 
-        a_node_before = lora.module.get_submodule(
-            "transformer_blocks.0.attn.lora_A",
+        a_node_before, _ = lora.factor_holders(
+            "transformer_blocks.0.attn.weight",
         )
-        _set_loras(s, [(lora, 0.5)], mode="routed")
-        s.activate("cuda", stream_config=cfg)
+        _request_loras(s, [(lora, 0.5)], mode="routed")
+        _activate(s, "cuda", stream_config=cfg)
         try:
             routed = m(x).clone()
             torch.cuda.synchronize()
-            a_node_after = lora.module.get_submodule(
-                "transformer_blocks.0.attn.lora_A",
+            a_node_after, _ = lora.factor_holders(
+                "transformer_blocks.0.attn.weight",
             )
         finally:
             s.deactivate()
@@ -1713,20 +1793,22 @@ class TestRoutedStreaming:
             "transformer_blocks.0.absent.lora_A.weight": torch.randn(4, 16),
             "transformer_blocks.0.absent.lora_B.weight": torch.randn(16, 4),
         }
-        bad = LoRAStore.from_state_dict(
-            state_dict=sd, blocks_attr=["transformer_blocks"],
+        bad = LoRA.from_state_dict(
+            state_dict=sd,
+            blocks_attr=["transformer_blocks"],
         )
         s = _make_model_offloader(m, blocks_attr=["transformer_blocks"])
-        _set_loras(s, [(bad, 1.0)], mode="routed")
+        _request_loras(s, [(bad, 1.0)], mode="routed")
 
         with pytest.raises(ValueError, match="not managed"):
-            s.activate(torch.device("cpu"))
+            _activate(s, torch.device("cpu"))
 
         assert s.active_device is None
-        assert s._lora_bindings == []
+        _assert_lora_available(bad)
+        assert s._active_loras == []
         assert s._lora_hook_handles == []
         # Composite was deactivated -> a fresh activation succeeds and runs.
-        s.activate(torch.device("cpu"))
+        _activate(s, torch.device("cpu"))
         try:
             out = m(torch.randn(2, 16, dtype=torch.bfloat16))
             assert out.shape == (2, 16)
@@ -1737,47 +1819,49 @@ class TestRoutedStreaming:
 class TestDeactivateCleanupInvariants:
     @CUDA
     def test_cleanup_runs_even_when_streamer_deactivate_raises(
-        self, monkeypatch: pytest.MonkeyPatch,
+        self,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         m = _make_bf16_model()
         s = _make_strategy(m)
-        _set_loras(s, [(_make_lora(4, 16), 1.0)])
+        _request_loras(s, [(_make_lora(4, 16), 1.0)])
 
         def streamer_boom() -> None:
             raise RuntimeError("streamer cleanup failed")
 
         monkeypatch.setattr(streamed_components(s)[0], "deactivate", streamer_boom)
-        s.activate("cuda", stream_config=_strategy_stream_config(m))
+        _activate(s, "cuda", stream_config=_strategy_stream_config(m))
 
         with pytest.raises(RuntimeError):
             s.deactivate()
 
-    def test_deactivate_tears_down_composite_even_if_binding_raises(
-        self, monkeypatch: pytest.MonkeyPatch,
+    def test_deactivate_tears_down_composite_even_if_lora_raises(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        # A routed LoRA binding whose deactivate() raises (e.g. a factor
+        # A routed LoRA whose deactivate() raises (e.g. a factor
         # eviction CUDA error) must NOT prevent the base composite teardown —
         # otherwise the model would leak resident. CPU activation is enough to
         # exercise the lifecycle ordering.
         m = _make_bf16_model(num_blocks=2, dim=16)
         lora = _make_lora(num_blocks=2, dim=16, seed=4)
         s = _make_model_offloader(m, blocks_attr=["transformer_blocks"])
-        _set_loras(s, [(lora, 1.0)], mode="routed")
-        s.activate(torch.device("cpu"))
-        assert s._lora_bindings  # a live streaming engine to sabotage
+        _request_loras(s, [(lora, 1.0)], mode="routed")
+        _activate(s, torch.device("cpu"))
+        assert s._active_loras  # a live streaming engine to sabotage
 
         def boom() -> None:
-            raise RuntimeError("binding eviction failed")
+            raise RuntimeError("LoRA eviction failed")
 
-        monkeypatch.setattr(s._lora_bindings[0], "deactivate", boom)
+        monkeypatch.setattr(s._active_loras[0], "deactivate", boom)
 
-        with pytest.raises(RuntimeError, match="binding eviction failed"):
+        with pytest.raises(RuntimeError, match="LoRA eviction failed"):
             s.deactivate()
 
-        # Despite the binding failure, the composite was deactivated and the
+        # Despite the LoRA failure, the composite was deactivated and the
         # offloader reports inactive -> a fresh activation succeeds.
         assert s.active_device is None
-        s.activate(torch.device("cpu"))
+        _activate(s, torch.device("cpu"))
         s.deactivate()
 
 
@@ -1793,53 +1877,46 @@ class TestCacheBytes:
 
 
 # ---------------------------------------------------------------------------
-# LoRA as ResourceStore/ResourceBinding (ModelCache integration)
+# Unified LoRA resource (ResourceCache integration)
 # ---------------------------------------------------------------------------
 
 
 class TestLoRAResource:
-    def test_lora_store_is_resourcestore_and_binds_to_lifecycle_component(
-        self,
-    ) -> None:
-        store = _make_lora(num_blocks=2, dim=8, rank=2)
-        assert isinstance(store, ResourceStore)
-        assert not isinstance(store, ResourceBinding)
-        assert not isinstance(store, nn.Module)
-        # The bound LoRA is a pure activate/deactivate lifecycle component —
-        # not a cache ResourceStore/ResourceBinding. The cache holds the
-        # store; the ModelOffloader drives the binding's streaming.
-        binding = store.bind()
-        assert callable(binding.activate) and callable(binding.deactivate)
-        assert not isinstance(binding, ResourceBinding)
-        assert not isinstance(binding, ResourceStore)
+    def test_lora_is_cached_resource_with_activation_lifecycle(self) -> None:
+        lora = _make_lora(num_blocks=2, dim=8, rank=2)
+        assert isinstance(lora, ResourceStore)
+        assert not isinstance(lora, ResourceBinding)
+        assert not isinstance(lora, nn.Module)
+        assert callable(lora.activate) and callable(lora.deactivate)
 
-    def test_lora_through_model_cache(self) -> None:
+    def test_lora_through_resource_cache(self) -> None:
         sd = _make_lora_sd(num_blocks=2, dim=8, rank=2)
-        cache = ModelCache(10**9)
+        cache = ResourceCache(10**9)
         spec = LoRASpec(
             key="lora:test",
             estimated_cache_bytes=1000,
             factory=lambda: sd,
         )
-        with cache.use(spec) as lora:
-            assert isinstance(lora, LoRAStore)
+        with cache.lease(spec) as lora:
+            assert isinstance(lora, LoRA)
             assert lora.cache_bytes > 0
             assert len(lora.targets) == 2
-        with cache.use("lora:test") as lora2:
+        with cache.lease("lora:test") as lora2:
             assert lora2 is lora
 
-    def test_model_cache_use_applies_lora_specs_and_holds_lora_bindings(
+    def test_cached_model_runner_applies_loras_and_holds_leases(
         self,
     ) -> None:
         sd = _make_lora_sd(num_blocks=2, dim=8, rank=2, seed=17)
-        expected_lora = LoRAStore.from_state_dict(sd)
+        expected_lora = LoRA.from_state_dict(sd)
         factory_calls = {"lora": 0}
 
         def lora_factory() -> dict[str, torch.Tensor]:
             factory_calls["lora"] += 1
             return sd
 
-        cache = ModelCache(10**9)
+        cache = ResourceCache(10**9)
+        runner = CachedModelRunner(cache)
         lora_spec = LoRASpec(
             key="lora:style",
             estimated_cache_bytes=1000,
@@ -1848,47 +1925,162 @@ class TestLoRAResource:
         model_spec = ModelSpec(
             key="model",
             estimated_cache_bytes=10**6,
-            factory=lambda: _make_bf16_model(num_blocks=2, dim=8).to(
-                torch.float32
-            ),
+            factory=lambda: _make_bf16_model(num_blocks=2, dim=8).to(torch.float32),
         )
 
         x = torch.randn(2, 8)
-        with cache.use(
+        with runner.use(
             model_spec,
             device="cpu",
-            loras=[lora_spec],
+            lora_specs=[lora_spec],
             lora_strengths=[0.5],
             lora_mode="routed",
         ) as model:
-            assert cache.info("lora:style").active_count == 1
-            assert cache.info("model").active_count == 1
+            assert cache.info("lora:style").lease_count == 1
+            assert cache.info("model").lease_count == 1
             actual = model(x)
-            expected = _expected_routed_output(
-                model, x, [(expected_lora, 0.5)]
-            )
+            expected = _expected_routed_output(model, x, [(expected_lora, 0.5)])
             assert torch.allclose(actual, expected, rtol=1e-5, atol=1e-5)
 
-        assert cache.info("lora:style").active_count == 0
-        assert cache.info("model").active_count == 0
+        assert cache.info("lora:style").lease_count == 0
+        assert cache.info("model").lease_count == 0
         assert factory_calls["lora"] == 1
 
-        with cache.use(
-            "model",
+        with runner.use(
+            model_spec,
             device="cpu",
-            loras=["lora:style"],
+            lora_specs=[lora_spec],
             lora_mode="routed",
         ) as model:
-            assert cache.info("lora:style").active_count == 1
+            assert cache.info("lora:style").lease_count == 1
             actual = model(x)
-            expected = _expected_routed_output(
-                model, x, [(expected_lora, 1.0)]
-            )
+            expected = _expected_routed_output(model, x, [(expected_lora, 1.0)])
             assert torch.allclose(actual, expected, rtol=1e-5, atol=1e-5)
         assert factory_calls["lora"] == 1
 
-    def test_model_cache_lora_strength_length_mismatch(self) -> None:
-        cache = ModelCache(10**9)
+    def test_cached_lora_rejects_overlap_across_model_runtimes(self) -> None:
+        cache = ResourceCache(10**9)
+        runner = CachedModelRunner(cache)
+        lora_spec = LoRASpec(
+            key="lora:shared",
+            estimated_cache_bytes=1000,
+            factory=lambda: _make_lora_sd(num_blocks=2, dim=8, rank=2),
+        )
+        first_spec = ModelSpec(
+            key="model:first",
+            estimated_cache_bytes=10**6,
+            factory=lambda: _make_bf16_model(2, 8).to(torch.float32),
+        )
+        second_spec = ModelSpec(
+            key="model:second",
+            estimated_cache_bytes=10**6,
+            factory=lambda: _make_bf16_model(2, 8).to(torch.float32),
+        )
+        x = torch.randn(2, 8)
+
+        with runner.use(
+            first_spec,
+            device="cpu",
+            lora_specs=[lora_spec],
+            lora_mode="routed",
+        ) as first:
+            with pytest.raises(LoRARuntimeInUseError, match="active use"):
+                with runner.use(
+                    second_spec,
+                    device="cpu",
+                    lora_specs=[lora_spec],
+                    lora_mode="routed",
+                ):
+                    pass
+            assert cache.info("lora:shared").lease_count == 1
+            assert first(x).shape == (2, 8)
+
+        with runner.use(
+            second_spec,
+            device="cpu",
+            lora_specs=[lora_spec],
+            lora_mode="routed",
+        ) as second:
+            assert second(x).shape == (2, 8)
+
+    def test_runner_rejects_strength_mismatch_before_cache_admission(self) -> None:
+        factory_calls = {"lora": 0, "model": 0}
+
+        def lora_factory() -> dict[str, torch.Tensor]:
+            factory_calls["lora"] += 1
+            return _make_lora_sd(num_blocks=2, dim=8, rank=2)
+
+        def model_factory() -> nn.Module:
+            factory_calls["model"] += 1
+            return _make_bf16_model(num_blocks=2, dim=8)
+
+        lora_spec = LoRASpec(
+            key="lora:style",
+            estimated_cache_bytes=1000,
+            factory=lora_factory,
+        )
+        model_spec = ModelSpec(
+            key="model",
+            estimated_cache_bytes=10**6,
+            factory=model_factory,
+        )
+        cache = ResourceCache(10**9)
+        runner = CachedModelRunner(cache)
+
+        with pytest.raises(ValueError, match="same length"):
+            with runner.use(
+                model_spec,
+                device="cpu",
+                lora_specs=[lora_spec],
+                lora_strengths=[],
+            ):
+                pass
+
+        assert factory_calls == {"lora": 0, "model": 0}
+        with pytest.raises(ResourceNotRegisteredError):
+            cache.info("lora:style")
+        with pytest.raises(ResourceNotRegisteredError):
+            cache.info("model")
+
+    def test_runner_rejects_duplicate_lora_before_cache_admission(self) -> None:
+        factory_calls = {"lora": 0, "model": 0}
+
+        def lora_factory() -> dict[str, torch.Tensor]:
+            factory_calls["lora"] += 1
+            return _make_lora_sd(num_blocks=2, dim=8, rank=2)
+
+        def model_factory() -> nn.Module:
+            factory_calls["model"] += 1
+            return _make_bf16_model(num_blocks=2, dim=8)
+
+        lora_spec = LoRASpec(
+            key="lora:style",
+            estimated_cache_bytes=1000,
+            factory=lora_factory,
+        )
+        model_spec = ModelSpec(
+            key="model",
+            estimated_cache_bytes=10**6,
+            factory=model_factory,
+        )
+        cache = ResourceCache(10**9)
+        runner = CachedModelRunner(cache)
+
+        with pytest.raises(ValueError, match="same LoRA resource key"):
+            with runner.use(
+                model_spec,
+                device="cpu",
+                lora_specs=[lora_spec, lora_spec],
+                lora_mode="routed",
+            ):
+                pass
+
+        assert factory_calls == {"lora": 0, "model": 0}
+
+    def test_lora_leased_during_resource_cache_miss(self) -> None:
+        # The LoRAs acquired by a runner use are leased before the
+        # model store builds, so a model cache-miss must fail admission
+        # rather than evict a lora it is about to be applied with.
         lora_spec = LoRASpec(
             key="lora:style",
             estimated_cache_bytes=1000,
@@ -1896,49 +2088,27 @@ class TestLoRAResource:
         )
         model_spec = ModelSpec(
             key="model",
-            estimated_cache_bytes=10**6,
-            factory=lambda: _make_bf16_model(num_blocks=2, dim=8).to(
-                torch.float32
-            ),
+            estimated_cache_bytes=10_000,
+            factory=lambda: _make_bf16_model(num_blocks=2, dim=8).to(torch.float32),
         )
 
-        with pytest.raises(ValueError, match="same length"):
-            with cache.use(
+        cache = ResourceCache(10_000)
+        runner = CachedModelRunner(cache)
+        with pytest.raises(ResourceTooLargeError):
+            with runner.use(
                 model_spec,
                 device="cpu",
-                loras=[lora_spec],
-                lora_strengths=[],
+                lora_specs=[lora_spec],
                 lora_mode="routed",
             ):
                 pass
 
-    def test_model_cache_loras_require_model_offloader_binding(self) -> None:
-        cache = ModelCache(10**9)
-        lora_spec = LoRASpec(
-            key="lora:style",
-            estimated_cache_bytes=1000,
-            factory=lambda: _make_lora_sd(num_blocks=2, dim=8, rank=2),
-        )
-        non_model_spec = LoRASpec(
-            key="not-a-model",
-            estimated_cache_bytes=1000,
-            factory=lambda: _make_lora_sd(num_blocks=2, dim=8, rank=2),
-        )
-
-        with pytest.raises(TypeError, match="ModelOffloader"):
-            with cache.use(
-                non_model_spec,
-                loras=[lora_spec],
-                lora_mode="routed",
-            ):
-                pass
-
-        assert cache.info("lora:style").active_count == 0
-        assert cache.info("not-a-model").active_count == 0
+        assert cache.info("lora:style").cached
+        assert cache.info("lora:style").lease_count == 0
 
 
 # ---------------------------------------------------------------------------
-# LoRA as nn.Module + composite store (blocks_attr)
+# LoRA-owned module + composite store (blocks_attr)
 # ---------------------------------------------------------------------------
 
 
@@ -1951,8 +2121,8 @@ class TestLoRABlocksAttr:
         # bytes + cache_bytes) as the default all-pinned one, so it merges
         # identically — the transitive guarantee for the merge suite.
         sd = _make_lora_sd(num_blocks=4, dim=16, seed=7)
-        pinned = LoRAStore.from_state_dict(state_dict=sd)
-        streamed = LoRAStore.from_state_dict(state_dict=sd, blocks_attr=["transformer_blocks"])
+        pinned = LoRA.from_state_dict(state_dict=sd)
+        streamed = LoRA.from_state_dict(state_dict=sd, blocks_attr=["transformer_blocks"])
         assert set(pinned.targets) == set(streamed.targets)
         for key in pinned.targets:
             pa, pb = _factor_tensors(pinned.targets[key])
@@ -1965,7 +2135,7 @@ class TestLoRABlocksAttr:
         # The derived factor's .scaled() must view pinned host bytes, or
         # merge's non_blocking H2D silently degrades to a sync stall.
         sd = _make_lora_sd(num_blocks=2, dim=16)
-        lora = LoRAStore.from_state_dict(state_dict=sd, blocks_attr=["transformer_blocks"])
+        lora = LoRA.from_state_dict(state_dict=sd, blocks_attr=["transformer_blocks"])
         factor = next(iter(lora.targets.values()))
         scaled = factor.scaled(1.0)
         assert scaled.a.is_pinned()
@@ -1973,12 +2143,12 @@ class TestLoRABlocksAttr:
 
     def test_blocks_attr_builds_streamed_component(self) -> None:
         sd = _make_lora_sd(num_blocks=4, dim=16)
-        lora = LoRAStore.from_state_dict(state_dict=sd, blocks_attr=["transformer_blocks"])
-        streamed = lora.composite_store.streamed_stores
+        lora = LoRA.from_state_dict(state_dict=sd, blocks_attr=["transformer_blocks"])
+        streamed = lora._composite_store.streamed_stores
         assert len(streamed) == 1
         assert streamed[0].blocks_path == "transformer_blocks"
         # Default (no blocks_attr) keeps everything pinned, no streamed group.
-        assert LoRAStore.from_state_dict(state_dict=sd).composite_store.streamed_stores == ()
+        assert LoRA.from_state_dict(state_dict=sd)._composite_store.streamed_stores == ()
 
     @staticmethod
     def _sparse_sd() -> dict[str, torch.Tensor]:
@@ -1995,8 +2165,8 @@ class TestLoRABlocksAttr:
         # Path-walk construction indexes blocks truly: the gap at block 1
         # becomes an empty holder so blocks 0 and 2 keep their real indices.
         # No manual padding — it falls out of the dotted paths.
-        lora = LoRAStore.from_state_dict(state_dict=self._sparse_sd())
-        blocks = lora.module.transformer_blocks  # type: ignore[union-attr]
+        lora = LoRA.from_state_dict(state_dict=self._sparse_sd())
+        blocks = lora._module.transformer_blocks  # type: ignore[union-attr]
         assert len(blocks) == 3
         assert list(blocks[1].parameters()) == []  # empty holder at the gap
         assert set(lora.targets) == {
@@ -2013,13 +2183,13 @@ class TestLoRABlocksAttr:
             "blocks.0.1.attn.lora_A.weight": torch.randn(4, 16, generator=g),
             "blocks.0.1.attn.lora_B.weight": torch.randn(16, 4, generator=g),
         }
-        lora = LoRAStore.from_state_dict(state_dict=sd)
+        lora = LoRA.from_state_dict(state_dict=sd)
         assert set(lora.targets) == {"blocks.0.1.attn.weight"}
-        blocks = lora.module.blocks  # type: ignore[union-attr]
+        blocks = lora._module.blocks  # type: ignore[union-attr]
         assert isinstance(blocks, nn.ModuleList)
         assert isinstance(blocks[0], nn.ModuleList)
         # The path the routed apply resolves on the model is reachable.
-        assert lora.module.get_submodule("blocks.0.1.attn.lora_A") is not None
+        assert lora.factor_holders("blocks.0.1.attn.weight")[0] is not None
 
     def test_root_level_numeric_paths(self) -> None:
         # A root-level nn.Sequential / nn.ModuleList model has params like
@@ -2031,30 +2201,32 @@ class TestLoRABlocksAttr:
             "0.lora_A.weight": torch.randn(4, 16, generator=g),
             "0.lora_B.weight": torch.randn(16, 4, generator=g),
         }
-        lora = LoRAStore.from_state_dict(state_dict=sd)
+        lora = LoRA.from_state_dict(state_dict=sd)
         assert set(lora.targets) == {"0.weight"}
-        assert isinstance(lora.module, nn.ModuleList)  # type: ignore[arg-type]
+        assert isinstance(lora._module, nn.ModuleList)
 
     def test_sparse_blocks_attr_streaming_skips_empty_holders(self) -> None:
         # A sparse LoRA streams fine now (#26): the empty holder block at the
         # gap is skipped, the two adapted blocks pass the uniform-name check,
         # and their TRUE indices are recorded so the seam can co-schedule them
         # against the matching base-model blocks.
-        lora = LoRAStore.from_state_dict(
+        lora = LoRA.from_state_dict(
             state_dict=self._sparse_sd(),
             blocks_attr=["transformer_blocks"],
         )
-        (streamed,) = lora.composite_store.streamed_stores
+        (streamed,) = lora._composite_store.streamed_stores
         assert streamed.block_indices == (0, 2)
         assert len(streamed._block_stores) == 2
         # Names use TRUE indices (0, 2), so there is no bogus block-1 target
         # and no duplicate block-2 target leaking through the pinned remainder.
-        assert streamed.param_names == frozenset({
-            "transformer_blocks.0.attn.lora_A.weight",
-            "transformer_blocks.0.attn.lora_B.weight",
-            "transformer_blocks.2.attn.lora_A.weight",
-            "transformer_blocks.2.attn.lora_B.weight",
-        })
+        assert streamed.param_names == frozenset(
+            {
+                "transformer_blocks.0.attn.lora_A.weight",
+                "transformer_blocks.0.attn.lora_B.weight",
+                "transformer_blocks.2.attn.lora_A.weight",
+                "transformer_blocks.2.attn.lora_B.weight",
+            }
+        )
         assert set(lora.targets) == {
             "transformer_blocks.0.attn.weight",
             "transformer_blocks.2.attn.weight",
@@ -2064,8 +2236,8 @@ class TestLoRABlocksAttr:
         sd = _make_lora_sd(num_blocks=2, dim=16)
         sd["embed.lora_A.weight"] = torch.randn(4, 16)
         sd["embed.lora_B.weight"] = torch.randn(16, 4)
-        lora = LoRAStore.from_state_dict(state_dict=sd, blocks_attr=["transformer_blocks"])
-        assert lora.composite_store.pinned_store is not None
+        lora = LoRA.from_state_dict(state_dict=sd, blocks_attr=["transformer_blocks"])
+        assert lora._composite_store.pinned_store is not None
         assert "embed.weight" in lora.targets
         assert "transformer_blocks.0.attn.weight" in lora.targets
 
@@ -2074,23 +2246,21 @@ class TestLoRABlocksAttr:
         # End-to-end: a streamed-store-pinned LoRA merges correctly, proving
         # the derived factors keep pinned-view async H2D semantics.
         m = _make_bf16_model(num_blocks=4, dim=16)
-        captured = {
-            i: m.transformer_blocks[i].attn.weight.detach().clone()
-            for i in range(4)
-        }
+        captured = {i: m.transformer_blocks[i].attn.weight.detach().clone() for i in range(4)}
         sd = _make_lora_sd(num_blocks=4, dim=16, seed=3)
-        lora = LoRAStore.from_state_dict(state_dict=sd, blocks_attr=["transformer_blocks"])
+        lora = LoRA.from_state_dict(state_dict=sd, blocks_attr=["transformer_blocks"])
         s = _make_strategy(m)
-        _set_loras(s, [(lora, 0.5)])
-        s.activate("cuda", stream_config=_strategy_stream_config(m))
+        _request_loras(s, [(lora, 0.5)])
+        _activate(s, "cuda", stream_config=_strategy_stream_config(m))
         try:
             for i in range(4):
-                _ = m.transformer_blocks[i](
-                    torch.randn(2, 16, dtype=torch.bfloat16, device="cuda")
-                )
+                _ = m.transformer_blocks[i](torch.randn(2, 16, dtype=torch.bfloat16, device="cuda"))
                 torch.cuda.synchronize()
                 expected = _expected_merged_weight(
-                    captured[i].to("cuda"), [(lora, 0.5)], i, "attn.weight",
+                    captured[i].to("cuda"),
+                    [(lora, 0.5)],
+                    i,
+                    "attn.weight",
                 )
                 actual = m.transformer_blocks[i].attn.weight.detach()
                 assert torch.allclose(actual, expected, rtol=0.01, atol=0.01)
@@ -2099,68 +2269,127 @@ class TestLoRABlocksAttr:
 
 
 # ---------------------------------------------------------------------------
-# LoRAStore.bind -> streamable LoRA binding (foundation for routed streaming)
+# Unified LoRA activation lifecycle
 # ---------------------------------------------------------------------------
 
 
-class TestLoRAStreamingBinding:
-    """``LoRAStore.bind`` produces a real :class:`LoRA` binding whose lifecycle
-    streams the factor module — co-scheduled with a base model when
-    ``schedule_model`` is given.
-
-    No consumer reads the streamed GPU factors yet (merge and the current
-    routed path use the pinned factors via :attr:`LoRAStore.targets`); this is
-    the foundation a future routed path builds on.
-    """
-
-    def test_bind_returns_streamable_lora_binding(self) -> None:
-        store = _make_lora(num_blocks=4, dim=16)
-        binding = store.bind()
-        assert isinstance(binding, LoRA)
-        assert not isinstance(binding, LoRAStore)
+class TestLoRAActivation:
+    def test_merge_activation_holds_claim_without_binding_composite(self) -> None:
+        lora = _make_lora(num_blocks=4, dim=16)
+        lora.activate(mode="merge")
+        try:
+            assert lora._composite is None
+            with pytest.raises(LoRARuntimeInUseError, match="active use"):
+                lora.activate(mode="merge")
+        finally:
+            lora.deactivate()
+        _assert_lora_available(lora)
 
     def test_cpu_activation_round_trips(self) -> None:
-        binding = _make_lora(num_blocks=4, dim=16).bind()
-        assert binding.active_device is None
-        binding.activate(torch.device("cpu"))
-        assert binding.active_device == torch.device("cpu")
-        binding.deactivate()
-        assert binding.active_device is None
-
-    def test_rejects_double_activate(self) -> None:
-        binding = _make_lora(num_blocks=2, dim=8).bind()
-        binding.activate(torch.device("cpu"))
+        lora = _make_lora(num_blocks=4, dim=16)
+        model = _make_bf16_model(num_blocks=4, dim=16)
+        lora.activate(
+            torch.device("cpu"),
+            mode="routed",
+            schedule_model=model,
+        )
         try:
-            with pytest.raises(RuntimeError, match="already active"):
-                binding.activate(torch.device("cpu"))
+            assert lora._composite is not None
+            with pytest.raises(LoRARuntimeInUseError, match="active use"):
+                lora.activate(mode="merge")
         finally:
-            binding.deactivate()
+            lora.deactivate()
+        _assert_lora_available(lora)
+
+    @pytest.mark.parametrize("second_mode", ["merge", "routed"])
+    def test_rejects_every_overlapping_use(self, second_mode: LoraMode) -> None:
+        lora = _make_lora(num_blocks=2, dim=8)
+        model = _make_bf16_model(num_blocks=2, dim=8)
+        lora.activate(mode="merge")
+        try:
+            with pytest.raises(LoRARuntimeInUseError, match="active use"):
+                lora.activate(
+                    torch.device("cpu"),
+                    mode=second_mode,
+                    schedule_model=model,
+                )
+        finally:
+            lora.deactivate()
 
     def test_activate_rejects_unsupported_device(self) -> None:
         # Device-type validation is delegated to the offload components, which
         # support CUDA/CPU only — MPS (and anything else) is rejected there
         # (no MPS backend needed: rejection is by device.type before any move).
-        binding = _make_lora(num_blocks=2, dim=8).bind()
+        lora = _make_lora(num_blocks=2, dim=8)
         with pytest.raises(ValueError, match="supports CUDA or CPU"):
-            binding.activate(torch.device("mps"))
-        assert binding.active_device is None
+            lora.activate(
+                torch.device("mps"),
+                mode="routed",
+                schedule_model=_make_bf16_model(num_blocks=2, dim=8),
+            )
+        _assert_lora_available(lora)
 
-    def test_deactivate_clears_active_device_even_if_teardown_raises(
+    def test_deactivate_releases_claim_even_if_teardown_raises(
         self,
     ) -> None:
-        # deactivate() must not leave the binding wedged "active" if composite
-        # teardown raises — otherwise the next activate() hits the
-        # already-active guard and the binding is unusable.
-        binding = _make_lora(num_blocks=2, dim=8).bind()
-        binding.activate(torch.device("cpu"))
+        # A teardown error must not leave the resource claim wedged.
+        lora = _make_lora(num_blocks=2, dim=8)
+        lora.activate(
+            torch.device("cpu"),
+            mode="routed",
+            schedule_model=_make_bf16_model(num_blocks=2, dim=8),
+        )
 
         def boom() -> None:
             raise RuntimeError("teardown failed")
 
-        binding._composite.deactivate = boom  # type: ignore[method-assign]
+        assert lora._composite is not None
+        lora._composite.deactivate = boom  # type: ignore[method-assign]
         with pytest.raises(RuntimeError, match="teardown failed"):
-            binding.deactivate()
-        assert binding.active_device is None
+            lora.deactivate()
+        _assert_lora_available(lora)
+
+    def test_two_model_offloaders_cannot_share_active_lora(self) -> None:
+        lora = _make_lora(num_blocks=2, dim=8)
+        first = _make_model_offloader(_make_bf16_model(2, 8).to(torch.float32))
+        second = _make_model_offloader(_make_bf16_model(2, 8).to(torch.float32))
+
+        first.activate("cpu", loras=[lora], lora_mode="routed")
+        try:
+            with pytest.raises(LoRARuntimeInUseError, match="active use"):
+                second.activate("cpu", loras=[lora], lora_mode="routed")
+            assert second.active_device is None
+            assert first.value(torch.randn(2, 8)).shape == (2, 8)
+        finally:
+            first.deactivate()
+
+        second.activate("cpu", loras=[lora], lora_mode="routed")
+        second.deactivate()
+
+    def test_lora_conflict_rolls_back_preceding_lora_and_model(self) -> None:
+        available = _make_lora(num_blocks=2, dim=8, seed=1)
+        busy = _make_lora(num_blocks=2, dim=8, seed=2)
+        offloader = _make_model_offloader(
+            _make_bf16_model(2, 8).to(torch.float32),
+        )
+
+        busy.activate(mode="merge")
+        try:
+            with pytest.raises(LoRARuntimeInUseError, match="active use"):
+                offloader.activate(
+                    "cpu",
+                    loras=[available, busy],
+                    lora_mode="routed",
+                )
+            _assert_lora_available(available)
+            with pytest.raises(LoRARuntimeInUseError, match="active use"):
+                busy.activate(mode="merge")
+            assert offloader.active_device is None
+        finally:
+            busy.deactivate()
+
+        offloader.activate("cpu")
+        offloader.deactivate()
 
     @CUDA
     def test_factor_blocks_stream_co_scheduled_with_model(self) -> None:
@@ -2170,22 +2399,32 @@ class TestLoRAStreamingBinding:
         # pinned master. This is the resident streaming a future routed path
         # reads off the module.
         dim, num_blocks = 16, 4
-        store = _make_lora(num_blocks=num_blocks, dim=dim, seed=9)
+        lora = LoRA.from_state_dict(
+            _make_lora_sd(num_blocks=num_blocks, dim=dim, seed=9),
+            blocks_attr=["transformer_blocks"],
+        )
         model = _make_bf16_model(num_blocks=num_blocks, dim=dim).to("cuda")
-        factor_blocks = store.module.transformer_blocks  # type: ignore[union-attr]
-        cpu_factors = [
-            (
-                factor_blocks[i].attn.lora_A.weight.detach().clone(),
-                factor_blocks[i].attn.lora_B.weight.detach().clone(),
+        factor_holders = [
+            lora.factor_holders(
+                f"transformer_blocks.{i}.attn.weight"
             )
             for i in range(num_blocks)
         ]
+        cpu_factors = [
+            (
+                a.get_parameter("weight").detach().clone(),
+                b.get_parameter("weight").detach().clone(),
+            )
+            for a, b in factor_holders
+        ]
 
-        binding = store.bind(schedule_model=model)
-        binding.activate(
+        lora.activate(
             torch.device("cuda"),
+            mode="routed",
+            schedule_model=model,
             stream_config=StreamConfig(
-                num_resident_blocks=1, num_prefetch_blocks=1,
+                num_resident_blocks=1,
+                num_prefetch_blocks=1,
             ),
         )
         try:
@@ -2193,15 +2432,15 @@ class TestLoRAStreamingBinding:
             for i in range(num_blocks):
                 model.transformer_blocks[i](x)
                 torch.cuda.synchronize()
-                a = factor_blocks[i].attn.lora_A.weight
-                b = factor_blocks[i].attn.lora_B.weight
+                a = factor_holders[i][0].get_parameter("weight")
+                b = factor_holders[i][1].get_parameter("weight")
                 assert a.is_cuda and b.is_cuda
                 torch.testing.assert_close(a.cpu(), cpu_factors[i][0])
                 torch.testing.assert_close(b.cpu(), cpu_factors[i][1])
         finally:
-            binding.deactivate()
+            lora.deactivate()
 
         # Teardown returns every factor block to pinned CPU.
-        for i in range(num_blocks):
-            assert not factor_blocks[i].attn.lora_A.weight.is_cuda
-            assert not factor_blocks[i].attn.lora_B.weight.is_cuda
+        for a, b in factor_holders:
+            assert not a.get_parameter("weight").is_cuda
+            assert not b.get_parameter("weight").is_cuda

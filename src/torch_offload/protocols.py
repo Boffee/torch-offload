@@ -1,38 +1,39 @@
-"""Public protocols for cached resources and model bindings.
+"""Public protocols for cached stores and runtime bindings.
 
 These Protocols form the contract:
 
-- :class:`ResourceStore` -- cached backing state. A store owns the
-  budgeted cache bytes and can be reused across independent activations.
+- :class:`ResourceSpec` -- lazy cache registration. A spec identifies one
+  resource, estimates its backing bytes, builds its store, and projects a
+  leased store to the value exposed to its caller.
 
-- :class:`ResourceBinding` -- per-use active binding. A binding exposes
-  a typed :attr:`value` accessor plus activate/deactivate lifecycle.
-  :class:`~torch_offload.model_cache.ModelCache` creates one binding per
-  ``use()`` call from a cached store. ``T`` is the type yielded by
-  :meth:`~ModelCache.use`.
+- :class:`ResourceStore` -- cached backing state. A store owns the
+  budgeted cache bytes and defines whether active uses may overlap.
+
+- :class:`ResourceBinding` -- active-resource lifecycle. A binding exposes a
+  typed :attr:`value` accessor plus activate/deactivate methods. A cached
+  resource may implement this protocol directly, as :class:`ModelOffloader`
+  does. The cache does not know about this protocol.
 
 Top-level :class:`ResourceBinding` implementations in this package:
 :class:`~torch_offload.ModelOffloader` (whole-model bulk DMA or streamed
-block offload), :class:`~torch_offload.MpsWeights` (whole-model CPU->MPS
-materialization without a second CPU cache), and
-:class:`~torch_offload.LoRA` (a streamable LoRA factor binding). Its
-:class:`ResourceStore` is :class:`~torch_offload.LoRAStore` (pinned LoRA
-factor storage).
-Future resources (disk-mmap, NVMe-paged, multi-GPU shard) satisfy the
-:class:`ResourceStore` / :class:`ResourceBinding` split.
+block offload) and :class:`~torch_offload.MpsWeights` (whole-model
+CPU->MPS materialization without a second CPU cache). A
+:class:`~torch_offload.LoRA` is itself the cached adapter resource; its
+exclusive merge or routed lifecycle is driven by the
+:class:`~torch_offload.ModelOffloader` it is attached to.
 
-Composable lifecycle pieces inside a model binding include
+Composable lifecycle pieces inside a model runtime include
 :class:`~torch_offload.PinnedComponent` and
 :class:`~torch_offload.StreamedComponent`.
 
 Lifecycle
 ---------
 Backing state is set up before cache admission so store ``cache_bytes``
-is final immediately. :class:`~torch_offload.ModelCache` keeps stores
-cached and creates bindings for active ``use()`` calls. Stores that
-manage trainable parameters may reject concurrent same-key bindings.
-The binding lifecycle is then ``activate(device=...)`` (make the value
-usable, on the caller-selected device when device-aware) ->
+is final immediately. :class:`~torch_offload.ResourceCache` keeps stores
+cached and protects them with reference-counted leases. A store may itself
+implement the active lifecycle. That lifecycle is
+``activate(device=...)`` (make the value usable, on the caller-selected
+device when device-aware) ->
 ``deactivate()`` (release transient compute resources while store
 ``cache_bytes`` remains resident).
 
@@ -43,10 +44,9 @@ started, recovery of the partially constructed model/resource is
 unsupported; drop those references and rebuild from a fresh model
 instance.
 
-``activate()/deactivate()`` may be repeated as many times as you
-want. Device-aware package bindings provide ``use(device)`` for
-direct exception-safe use, while :class:`ModelCache` passes the
-acquire-time device into ``activate``.
+``activate()/deactivate()`` may be repeated as many times as you want.
+:class:`~torch_offload.CachedModelRunner` combines cache leases with an
+exception-safe model activation scope.
 
 There is no ``close()``. To release store ``cache_bytes`` (typically
 pinned host memory), drop the store reference. Python's refcount-based
@@ -66,7 +66,7 @@ T_co = TypeVar("T_co", covariant=True)
 
 @runtime_checkable
 class ResourceStore(Protocol):
-    """Cached backing state managed by :class:`ModelCache`."""
+    """Cached backing state managed by :class:`ResourceCache`."""
 
     @property
     def cache_bytes(self) -> int:
@@ -74,22 +74,52 @@ class ResourceStore(Protocol):
         ...
 
 
+class ResourceSpec(Protocol[T_co]):
+    """Structural contract for one lazily built cache entry.
+
+    ``key`` is the cache identity and must include every construction input
+    that affects the resulting resource. ``estimated_cache_bytes`` is used
+    for pre-build admission; the cache reconciles it with the built store's
+    actual :attr:`ResourceStore.cache_bytes`.
+    """
+
+    @property
+    def key(self) -> str:
+        """Caller-chosen cache identity."""
+        ...
+
+    @property
+    def estimated_cache_bytes(self) -> int:
+        """Pre-build estimate used for admission planning."""
+        ...
+
+    def build_store(self) -> ResourceStore:
+        """Build fresh reusable backing storage on a cache miss."""
+        ...
+
+    def value(self, store: ResourceStore) -> T_co:
+        """Project the leased store to the value returned to the caller."""
+        ...
+
+
 @runtime_checkable
 class ResourceBinding(Protocol[T_co]):
-    """Per-use cache binding.
+    """Active-resource lifecycle.
 
     Extends lifecycle methods with a typed :attr:`value` accessor. The
-    value must be available immediately after binding; ``activate`` makes
-    that value usable for compute.
+    value is available before activation; ``activate`` makes it usable for
+    compute.
     """
 
     @property
     def value(self) -> T_co:
-        """The bound payload yielded by :meth:`ModelCache.use`."""
+        """The bound payload made usable by :meth:`activate`."""
         ...
 
     def activate(
-        self, device: torch.device | str | None = None, **kwargs: object,
+        self,
+        device: torch.device | str | None = None,
+        **kwargs: object,
     ) -> None:
         """Make the binding ready for compute."""
         ...

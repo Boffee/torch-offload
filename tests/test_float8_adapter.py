@@ -8,10 +8,9 @@ import torch
 from torch import nn
 
 from torch_offload import (
-    LoRAStore,
+    LoRA,
     LoRATransform,
     ModelOffloader,
-    ModelOffloaderStore,
     ScaledLoRAFactor,
     StreamConfig,
     merge_lora,
@@ -20,6 +19,7 @@ from torch_offload.float8_adapter import Float8Adapter
 from torch_offload.pinned_param import PinnedParam
 from torch_offload.streamed_component import _param_target_layout
 from torch_offload.tensor_adapter_registry import tensor_id
+from tests.conftest import activated_model
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -30,12 +30,11 @@ def _make_model_offloader(
     blocks_attr: list[str] = [],
     stream_trainable_weights: bool = False,
 ) -> ModelOffloader:
-    store = ModelOffloaderStore.from_module(
+    return ModelOffloader.from_module(
         model,
         blocks_attr=blocks_attr,
         stream_trainable_weights=stream_trainable_weights,
     )
-    return store.bind(model)
 
 
 def _float8_modules():
@@ -74,9 +73,7 @@ def _make_float8(
 ) -> torch.Tensor:
     float8_tensor_cls, kwargs_cls, per_row_cls, per_tensor_cls = _float8_modules()
     granularity = per_tensor_cls() if per_tensor else per_row_cls()
-    act_quant_kwargs = (
-        kwargs_cls(granularity=granularity) if dynamic_activation else None
-    )
+    act_quant_kwargs = kwargs_cls(granularity=granularity) if dynamic_activation else None
     if weight is None:
         weight = torch.randn(rows, cols, dtype=dtype)
     return float8_tensor_cls.from_hp(
@@ -129,26 +126,16 @@ class TestFloat8Adapter:
         assert _param_target_layout(p1) == _param_target_layout(p2)
 
     def test_target_layout_tracks_granularity(self) -> None:
-        per_row = nn.Parameter(
-            _make_float8(per_tensor=False), requires_grad=False
-        )
-        per_tensor = nn.Parameter(
-            _make_float8(per_tensor=True), requires_grad=False
-        )
+        per_row = nn.Parameter(_make_float8(per_tensor=False), requires_grad=False)
+        per_tensor = nn.Parameter(_make_float8(per_tensor=True), requires_grad=False)
 
         assert _param_target_layout(per_row) != _param_target_layout(per_tensor)
 
     def test_target_layout_tracks_activation_quantization(self) -> None:
-        with_activation = nn.Parameter(
-            _make_float8(dynamic_activation=True), requires_grad=False
-        )
-        weight_only = nn.Parameter(
-            _make_float8(dynamic_activation=False), requires_grad=False
-        )
+        with_activation = nn.Parameter(_make_float8(dynamic_activation=True), requires_grad=False)
+        weight_only = nn.Parameter(_make_float8(dynamic_activation=False), requires_grad=False)
 
-        assert _param_target_layout(with_activation) != _param_target_layout(
-            weight_only
-        )
+        assert _param_target_layout(with_activation) != _param_target_layout(weight_only)
 
     def test_cpu_round_trip_restores_pinned_bytes(self) -> None:
         pinned_param = PinnedParam(
@@ -163,9 +150,7 @@ class TestFloat8Adapter:
         pinned_param.pinned_state.storage[1].zero_()
         pinned_param.copy_to_cpu(state)
 
-        assert torch.equal(
-            pinned_param.pinned_state.storage[0].view(torch.uint8), original_qdata
-        )
+        assert torch.equal(pinned_param.pinned_state.storage[0].view(torch.uint8), original_qdata)
         assert torch.equal(pinned_param.pinned_state.storage[1], original_scale)
 
     def test_no_trainable_swap_capability(self) -> None:
@@ -177,9 +162,7 @@ class TestFloat8Adapter:
             pinned_param.validate_parameter_data_swap_target()
 
     @pytest.mark.parametrize("per_tensor", [False, True])
-    def test_dequantize_requantize_preserves_representation(
-        self, per_tensor: bool
-    ) -> None:
+    def test_dequantize_requantize_preserves_representation(self, per_tensor: bool) -> None:
         f8 = _make_float8(per_tensor=per_tensor)
         dense = Float8Adapter.dequantize(f8)
         assert dense.dtype is torch.float32
@@ -192,9 +175,7 @@ class TestFloat8Adapter:
         assert again.kernel_preference == f8.kernel_preference
         assert again.mm_config == f8.mm_config
         assert again.act_quant_kwargs == f8.act_quant_kwargs
-        assert torch.equal(
-            again.qdata.view(torch.uint8), f8.qdata.view(torch.uint8)
-        )
+        assert torch.equal(again.qdata.view(torch.uint8), f8.qdata.view(torch.uint8))
         assert torch.equal(again.scale, f8.scale)
 
     def test_requantize_rejects_shape_mismatch(self) -> None:
@@ -221,9 +202,7 @@ class TestFloat8Adapter:
         # Per-tensor scaling: a fully cancelled weight gives a scalar scale
         # of 0; the repair must still yield a clean all-zero tensor.
         f8 = _make_float8(rows=16, cols=16, per_tensor=True)
-        again = Float8Adapter.requantize(
-            torch.zeros(16, 16, dtype=torch.float32), like=f8
-        )
+        again = Float8Adapter.requantize(torch.zeros(16, 16, dtype=torch.float32), like=f8)
         deq = again.dequantize().to(torch.float32)
         assert not torch.isnan(deq).any()
         assert torch.count_nonzero(deq).item() == 0
@@ -242,7 +221,8 @@ class TestFloat8Adapter:
         expected_dense = f8.dequantize().to(torch.float32)
         expected_dense.addmm_(b.to(torch.float32), a.to(torch.float32), alpha=0.5)
         expected = float8_tensor_cls.from_hp(
-            expected_dense.to(f8.dtype), granularity=per_row_cls(),
+            expected_dense.to(f8.dtype),
+            granularity=per_row_cls(),
         )
 
         transform.apply(param)
@@ -264,13 +244,11 @@ class TestFloat8Adapter:
 
         model = M()
         model.lin.weight.requires_grad = False
-        model.lin.weight = nn.Parameter(
-            _make_float8(dynamic_activation=False), requires_grad=False
-        )
+        model.lin.weight = nn.Parameter(_make_float8(dynamic_activation=False), requires_grad=False)
         # copy_into mutates the weight's storage in place, so snapshot
         # the original packed bytes rather than holding a tensor ref.
         original_qdata = model.lin.weight.data.qdata.view(torch.uint8).clone()
-        lora = LoRAStore.from_state_dict(
+        lora = LoRA.from_state_dict(
             state_dict={
                 "lin.lora_A.weight": torch.randn(4, 16),
                 "lin.lora_B.weight": torch.randn(16, 4),
@@ -280,9 +258,7 @@ class TestFloat8Adapter:
         merged = merge_lora(model, [(lora, 1.0)])
 
         assert merged == 1
-        assert not torch.equal(
-            model.lin.weight.data.qdata.view(torch.uint8), original_qdata
-        )
+        assert not torch.equal(model.lin.weight.data.qdata.view(torch.uint8), original_qdata)
 
     @CUDA
     def test_allocate_copy_make_gpu_param_preserves_wrapper(self) -> None:
@@ -323,7 +299,7 @@ class TestFloat8Adapter:
 
         try:
             x = torch.randn(128, 64, dtype=torch.bfloat16, device="cuda")
-            with strategy.use("cuda") as active:
+            with activated_model(strategy, "cuda") as active:
                 y = active(x)
                 torch.cuda.synchronize()
             assert y.shape == (128, 128)
@@ -361,7 +337,7 @@ class TestFloat8Adapter:
         rank = 4
         a = torch.randn(rank, 16)
         b = torch.randn(16, rank)
-        lora = LoRAStore.from_state_dict(
+        lora = LoRA.from_state_dict(
             state_dict={
                 "blocks.0.lora_A.weight": a,
                 "blocks.0.lora_B.weight": b,
@@ -373,26 +349,24 @@ class TestFloat8Adapter:
         # edges), making the tight tolerance RNG/CUDA-state sensitive.
         f8_cuda = f8.cuda()
         expected_dense = f8_cuda.dequantize().to(torch.float32)
-        expected_dense.addmm_(
-            b.cuda().to(torch.float32), a.cuda().to(torch.float32), alpha=0.5
-        )
+        expected_dense.addmm_(b.cuda().to(torch.float32), a.cuda().to(torch.float32), alpha=0.5)
         expected = float8_tensor_cls.from_hp(
-            expected_dense.to(f8.dtype), granularity=per_row_cls(),
+            expected_dense.to(f8.dtype),
+            granularity=per_row_cls(),
         )
 
         offloader = _make_model_offloader(
             model,
             blocks_attr=["blocks"],
         )
-        offloader.set_loras([lora], strengths=[0.5], mode="merge")
-
         try:
             x = torch.randn(8, 16, dtype=torch.bfloat16, device="cuda")
-            with offloader.use(
+            with activated_model(offloader,
                 "cuda",
-                stream_config=StreamConfig(
-                    num_resident_blocks=1, num_prefetch_blocks=0
-                ),
+                loras=[lora],
+                lora_strengths=[0.5],
+                lora_mode="merge",
+                stream_config=StreamConfig(num_resident_blocks=1, num_prefetch_blocks=0),
             ) as active:
                 merged = active.blocks[0].weight.data
                 assert isinstance(merged, float8_tensor_cls)

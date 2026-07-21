@@ -16,7 +16,7 @@ import pytest
 import torch
 from torch import nn
 
-from torch_offload import ModelOffloaderStore, StreamConfig
+from torch_offload import ModelOffloader, StreamConfig
 from torch_offload.dtensor_adapter import DTensorAdapter
 from torch_offload.pinned_param import PinnedParam
 from torch_offload.tensor_adapters import (
@@ -27,6 +27,7 @@ from torch_offload.tensor_adapters import (
     TensorCopyIntoAdapter,
 )
 from torch_offload.tensor_adapter_registry import select_adapter, tensor_id
+from tests.conftest import activated_model
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(),
@@ -213,14 +214,13 @@ class TestDTensorAdapter:
         net = Net(
             [Block(_dtensor_weight(tp_mesh)[0]), Block(_dtensor_weight(tp_mesh)[0])]
         )
-        store = ModelOffloaderStore.from_module(net, blocks_attr=["blocks"])
-        pw = store.bind(net)
+        pw = ModelOffloader.from_module(net, blocks_attr=["blocks"])
         try:
             # resting: a DTensor on a CPU mesh (local on the host)
             resting = net.blocks[0].weight.data
             assert _is_dtensor(resting)
             assert resting.device_mesh.device_type == "cpu"
-            with pw.use(
+            with activated_model(pw,
                 "cuda",
                 stream_config=StreamConfig(num_resident_blocks=2, num_prefetch_blocks=0),
             ):

@@ -8,10 +8,9 @@ import torch
 from torch import nn
 
 from torch_offload import (
-    LoRAStore,
+    LoRA,
     LoRATransform,
     ModelOffloader,
-    ModelOffloaderStore,
     ScaledLoRAFactor,
     StreamConfig,
     merge_lora,
@@ -21,6 +20,7 @@ from torch_offload.mx_adapter import MxAdapter
 from torch_offload.pinned_param import PinnedParam
 from torch_offload.streamed_component import _param_target_layout
 from torch_offload.tensor_adapter_registry import select_adapter, tensor_id
+from tests.conftest import activated_model
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -34,9 +34,7 @@ ELEM_DTYPES = [
     pytest.param(
         _FP4,
         id="mxfp4",
-        marks=pytest.mark.skipif(
-            _FP4 is None, reason="torch lacks float4_e2m1fn_x2"
-        ),
+        marks=pytest.mark.skipif(_FP4 is None, reason="torch lacks float4_e2m1fn_x2"),
     ),
 ]
 
@@ -47,12 +45,11 @@ def _make_model_offloader(
     blocks_attr: list[str] = [],
     stream_trainable_weights: bool = False,
 ) -> ModelOffloader:
-    store = ModelOffloaderStore.from_module(
+    return ModelOffloader.from_module(
         model,
         blocks_attr=blocks_attr,
         stream_trainable_weights=stream_trainable_weights,
     )
-    return store.bind(model)
 
 
 def _mx_tensor_cls():
@@ -76,11 +73,7 @@ def _quantize_mx(
     # Weight-only MX cannot run a matmul on its own; a forward needs the
     # activation-quant kwargs that the dynamic-activation MX recipe carries.
     kwargs_cls = _mx_kwargs_cls()
-    act_quant_kwargs = (
-        kwargs_cls(elem_dtype=elem_dtype, block_size=32)
-        if dynamic_activation
-        else None
-    )
+    act_quant_kwargs = kwargs_cls(elem_dtype=elem_dtype, block_size=32) if dynamic_activation else None
     return mx_cls.to_mx(
         data,
         elem_dtype,
@@ -140,9 +133,7 @@ class TestMxAdapter:
             select_adapter(f6)
 
     @pytest.mark.parametrize("elem_dtype", ELEM_DTYPES)
-    def test_pin_preserves_storage_and_metadata(
-        self, elem_dtype: torch.dtype
-    ) -> None:
+    def test_pin_preserves_storage_and_metadata(self, elem_dtype: torch.dtype) -> None:
         mx_cls = _mx_tensor_cls()
         qt = _make_mx(elem_dtype=elem_dtype)
         pinned_param = PinnedParam(nn.Parameter(qt, requires_grad=False))
@@ -160,9 +151,7 @@ class TestMxAdapter:
         assert pinned_param.compute_dtype is torch.bfloat16
 
     @pytest.mark.parametrize("elem_dtype", ELEM_DTYPES)
-    def test_transposed_storage_stride_is_preserved(
-        self, elem_dtype: torch.dtype
-    ) -> None:
+    def test_transposed_storage_stride_is_preserved(self, elem_dtype: torch.dtype) -> None:
         qt = _make_mx(elem_dtype=elem_dtype, rows=16, cols=64).t()
         pinned_param = PinnedParam(nn.Parameter(qt, requires_grad=False))
         pinned = pinned_param.make_cpu_param().data
@@ -172,9 +161,7 @@ class TestMxAdapter:
         assert pinned.scale.stride() == qt.scale.stride()
 
     @pytest.mark.parametrize("elem_dtype", ELEM_DTYPES)
-    def test_tensor_id_is_stable_and_keyed(
-        self, elem_dtype: torch.dtype
-    ) -> None:
+    def test_tensor_id_is_stable_and_keyed(self, elem_dtype: torch.dtype) -> None:
         qt = _make_mx(elem_dtype=elem_dtype)
         key = tensor_id(qt)
         assert key[0] == "torchao-mx"
@@ -183,9 +170,7 @@ class TestMxAdapter:
         assert key == tensor_id(qt)
 
     @pytest.mark.parametrize("elem_dtype", ELEM_DTYPES)
-    def test_target_layout_ignores_tensor_id(
-        self, elem_dtype: torch.dtype
-    ) -> None:
+    def test_target_layout_ignores_tensor_id(self, elem_dtype: torch.dtype) -> None:
         p1 = nn.Parameter(_make_mx(elem_dtype=elem_dtype), requires_grad=False)
         p2 = nn.Parameter(_make_mx(elem_dtype=elem_dtype), requires_grad=False)
 
@@ -194,17 +179,13 @@ class TestMxAdapter:
     def test_target_layout_distinguishes_mxfp8_and_mxfp4(self) -> None:
         if _FP4 is None:
             pytest.skip("torch lacks float4_e2m1fn_x2")
-        p8 = nn.Parameter(
-            _make_mx(elem_dtype=torch.float8_e4m3fn), requires_grad=False
-        )
+        p8 = nn.Parameter(_make_mx(elem_dtype=torch.float8_e4m3fn), requires_grad=False)
         p4 = nn.Parameter(_make_mx(elem_dtype=_FP4), requires_grad=False)
 
         assert _param_target_layout(p8) != _param_target_layout(p4)
 
     @pytest.mark.parametrize("elem_dtype", ELEM_DTYPES)
-    def test_dynamic_activation_metadata_is_keyed(
-        self, elem_dtype: torch.dtype
-    ) -> None:
+    def test_dynamic_activation_metadata_is_keyed(self, elem_dtype: torch.dtype) -> None:
         # The dynamic-activation recipe carries ``act_quant_kwargs`` (a
         # dataclass) that flows through ``metadata_key`` in tensor_id /
         # layout_signature. Exercise it on CPU so the path is covered
@@ -226,9 +207,7 @@ class TestMxAdapter:
         assert _param_target_layout(dynamic) != _param_target_layout(weight_only)
 
     @pytest.mark.parametrize("elem_dtype", ELEM_DTYPES)
-    def test_no_cpu_round_trip_or_trainable_swap_capability(
-        self, elem_dtype: torch.dtype
-    ) -> None:
+    def test_no_cpu_round_trip_or_trainable_swap_capability(self, elem_dtype: torch.dtype) -> None:
         pinned_param = PinnedParam(
             nn.Parameter(_make_mx(elem_dtype=elem_dtype), requires_grad=True),
         )
@@ -240,15 +219,11 @@ class TestMxAdapter:
             pinned_param.validate_parameter_data_swap_target()
 
     @pytest.mark.parametrize("elem_dtype", ELEM_DTYPES)
-    def test_dequantize_requantize_preserves_representation(
-        self, elem_dtype: torch.dtype
-    ) -> None:
+    def test_dequantize_requantize_preserves_representation(self, elem_dtype: torch.dtype) -> None:
         mx = _make_mx(elem_dtype=elem_dtype, rows=16, cols=64)
         dense = MxAdapter.dequantize(mx)
         assert dense.dtype is torch.float32
-        torch.testing.assert_close(
-            dense, mx.dequantize(mx.orig_dtype).to(torch.float32)
-        )
+        torch.testing.assert_close(dense, mx.dequantize(mx.orig_dtype).to(torch.float32))
 
         # MX uses deterministic FLOOR scaling onto power-of-two (E8M0)
         # block scales, so an unmodified round trip reproduces the packed
@@ -259,17 +234,11 @@ class TestMxAdapter:
         assert again.orig_dtype == mx.orig_dtype
         assert again.is_swizzled_scales == mx.is_swizzled_scales
         assert again.act_quant_kwargs == mx.act_quant_kwargs
-        assert torch.equal(
-            again.qdata.view(torch.uint8), mx.qdata.view(torch.uint8)
-        )
-        assert torch.equal(
-            again.scale.view(torch.uint8), mx.scale.view(torch.uint8)
-        )
+        assert torch.equal(again.qdata.view(torch.uint8), mx.qdata.view(torch.uint8))
+        assert torch.equal(again.scale.view(torch.uint8), mx.scale.view(torch.uint8))
 
     @pytest.mark.parametrize("elem_dtype", ELEM_DTYPES)
-    def test_requantize_preserves_scaling_mode(
-        self, elem_dtype: torch.dtype
-    ) -> None:
+    def test_requantize_preserves_scaling_mode(self, elem_dtype: torch.dtype) -> None:
         # The default MX inference recipe quantizes with RCEIL (not to_mx's
         # FLOOR default) and records the mode on act_quant_kwargs.
         # requantize must recover it so the merge re-encodes with the same
@@ -317,25 +286,17 @@ class TestMxAdapter:
         # The two modes differ on this input, and requantize reproduces the
         # RCEIL re-encode — i.e. it recovered the mode rather than using the
         # FLOOR default.
-        assert not torch.equal(
-            as_rceil.scale.view(torch.uint8), as_floor.scale.view(torch.uint8)
-        )
-        assert torch.equal(
-            again.scale.view(torch.uint8), as_rceil.scale.view(torch.uint8)
-        )
+        assert not torch.equal(as_rceil.scale.view(torch.uint8), as_floor.scale.view(torch.uint8))
+        assert torch.equal(again.scale.view(torch.uint8), as_rceil.scale.view(torch.uint8))
 
     @pytest.mark.parametrize("elem_dtype", ELEM_DTYPES)
-    def test_requantize_rejects_shape_mismatch(
-        self, elem_dtype: torch.dtype
-    ) -> None:
+    def test_requantize_rejects_shape_mismatch(self, elem_dtype: torch.dtype) -> None:
         mx = _make_mx(elem_dtype=elem_dtype, rows=16, cols=64)
         with pytest.raises(ValueError, match="Cannot requantize"):
             MxAdapter.requantize(torch.randn(64, 16), like=mx)
 
     @pytest.mark.parametrize("elem_dtype", ELEM_DTYPES)
-    def test_merge_rejects_transposed_weight(
-        self, elem_dtype: torch.dtype
-    ) -> None:
+    def test_merge_rejects_transposed_weight(self, elem_dtype: torch.dtype) -> None:
         # A transposed MX weight has non-contiguous packed qdata, which the
         # standard-layout re-encode cannot fill. The adapter preserves this
         # layout for movement but rejects it for merge with a clear error
@@ -349,9 +310,7 @@ class TestMxAdapter:
             )
 
     @pytest.mark.parametrize("elem_dtype", ELEM_DTYPES)
-    def test_lora_transform_requantizes_param_in_place(
-        self, elem_dtype: torch.dtype
-    ) -> None:
+    def test_lora_transform_requantizes_param_in_place(self, elem_dtype: torch.dtype) -> None:
         mx_cls = _mx_tensor_cls()
         rows, cols, rank = 16, 64, 2
         mx = _make_mx(elem_dtype=elem_dtype, rows=rows, cols=cols)
@@ -373,17 +332,11 @@ class TestMxAdapter:
         assert param is original_param
         assert param.data.qdata.data_ptr() == original_qdata_ptr
         assert isinstance(param.data, mx_cls)
-        assert torch.equal(
-            param.data.qdata.view(torch.uint8), expected.qdata.view(torch.uint8)
-        )
-        assert torch.equal(
-            param.data.scale.view(torch.uint8), expected.scale.view(torch.uint8)
-        )
+        assert torch.equal(param.data.qdata.view(torch.uint8), expected.qdata.view(torch.uint8))
+        assert torch.equal(param.data.scale.view(torch.uint8), expected.scale.view(torch.uint8))
 
     @pytest.mark.parametrize("elem_dtype", ELEM_DTYPES)
-    def test_merge_lora_merges_mx_weight(
-        self, elem_dtype: torch.dtype
-    ) -> None:
+    def test_merge_lora_merges_mx_weight(self, elem_dtype: torch.dtype) -> None:
         class M(nn.Module):
             def __init__(self) -> None:
                 super().__init__()
@@ -398,7 +351,7 @@ class TestMxAdapter:
         # copy_into mutates the weight's storage in place, so snapshot the
         # original packed bytes rather than holding a tensor ref.
         original_qdata = model.lin.weight.data.qdata.view(torch.uint8).clone()
-        lora = LoRAStore.from_state_dict(
+        lora = LoRA.from_state_dict(
             state_dict={
                 "lin.lora_A.weight": torch.randn(4, 64),
                 "lin.lora_B.weight": torch.randn(16, 4),
@@ -408,15 +361,11 @@ class TestMxAdapter:
         merged = merge_lora(model, [(lora, 1.0)])
 
         assert merged == 1
-        assert not torch.equal(
-            model.lin.weight.data.qdata.view(torch.uint8), original_qdata
-        )
+        assert not torch.equal(model.lin.weight.data.qdata.view(torch.uint8), original_qdata)
 
     @CUDA
     @pytest.mark.parametrize("elem_dtype", ELEM_DTYPES)
-    def test_allocate_copy_make_gpu_param_preserves_wrapper(
-        self, elem_dtype: torch.dtype
-    ) -> None:
+    def test_allocate_copy_make_gpu_param_preserves_wrapper(self, elem_dtype: torch.dtype) -> None:
         mx_cls = _mx_tensor_cls()
         pinned_param = PinnedParam(
             nn.Parameter(_make_mx(elem_dtype=elem_dtype), requires_grad=False),
@@ -447,9 +396,7 @@ class TestMxAdapter:
 
     @CUDA
     @pytest.mark.parametrize("elem_dtype", ELEM_DTYPES)
-    def test_model_offloader_cuda_forward_dynamic_mx(
-        self, elem_dtype: torch.dtype
-    ) -> None:
+    def test_model_offloader_cuda_forward_dynamic_mx(self, elem_dtype: torch.dtype) -> None:
         layer = nn.Linear(64, 128, bias=False, dtype=torch.bfloat16)
         layer.weight.requires_grad = False
         weight = layer.weight.detach().contiguous()
@@ -461,7 +408,7 @@ class TestMxAdapter:
 
         try:
             x = torch.randn(128, 64, dtype=torch.bfloat16, device="cuda")
-            with strategy.use("cuda") as active:
+            with activated_model(strategy, "cuda") as active:
                 y = active(x)
                 torch.cuda.synchronize()
             assert y.shape == (128, 128)
@@ -471,9 +418,7 @@ class TestMxAdapter:
 
     @CUDA
     @pytest.mark.parametrize("elem_dtype", ELEM_DTYPES)
-    def test_model_offloader_routed_lora_on_dynamic_mx(
-        self, elem_dtype: torch.dtype
-    ) -> None:
+    def test_model_offloader_routed_lora_on_dynamic_mx(self, elem_dtype: torch.dtype) -> None:
         class M(nn.Module):
             def __init__(self) -> None:
                 super().__init__()
@@ -494,30 +439,27 @@ class TestMxAdapter:
             block.weight.requires_grad = False
             weight = block.weight.detach().contiguous()
             block.weight = nn.Parameter(
-                _quantize_mx(
-                    weight, elem_dtype=elem_dtype, dynamic_activation=True
-                ),
+                _quantize_mx(weight, elem_dtype=elem_dtype, dynamic_activation=True),
                 requires_grad=False,
             )
         offloader = _make_model_offloader(
             model,
             blocks_attr=["blocks"],
         )
-        lora = LoRAStore.from_state_dict(
+        lora = LoRA.from_state_dict(
             state_dict={
                 "blocks.0.lora_A.weight": torch.randn(4, 128),
                 "blocks.0.lora_B.weight": torch.randn(128, 4),
             }
         )
-        offloader.set_loras([lora], strengths=[0.25], mode="routed")
-
         try:
             x = torch.randn(128, 128, dtype=torch.bfloat16, device="cuda")
-            with offloader.use(
+            with activated_model(offloader,
                 "cuda",
-                stream_config=StreamConfig(
-                    num_resident_blocks=1, num_prefetch_blocks=0
-                ),
+                loras=[lora],
+                lora_strengths=[0.25],
+                lora_mode="routed",
+                stream_config=StreamConfig(num_resident_blocks=1, num_prefetch_blocks=0),
             ) as active:
                 y = active(x)
                 torch.cuda.synchronize()
@@ -528,9 +470,7 @@ class TestMxAdapter:
 
     @CUDA
     @pytest.mark.parametrize("elem_dtype", ELEM_DTYPES)
-    def test_streamed_mx_merge_requantizes_on_activate(
-        self, elem_dtype: torch.dtype
-    ) -> None:
+    def test_streamed_mx_merge_requantizes_on_activate(self, elem_dtype: torch.dtype) -> None:
         mx_cls = _mx_tensor_cls()
 
         class M(nn.Module):
@@ -563,7 +503,7 @@ class TestMxAdapter:
         rank = 4
         a = torch.randn(rank, 64)
         b = torch.randn(64, rank)
-        lora = LoRAStore.from_state_dict(
+        lora = LoRA.from_state_dict(
             state_dict={
                 "blocks.0.lora_A.weight": a,
                 "blocks.0.lora_B.weight": b,
@@ -575,24 +515,21 @@ class TestMxAdapter:
         # weight, so move that same tensor — don't re-quantize from dense.
         mx_cuda = mx.cuda()
         expected_dense = mx_cuda.dequantize(mx.orig_dtype).to(torch.float32)
-        expected_dense.addmm_(
-            b.cuda().to(torch.float32), a.cuda().to(torch.float32), alpha=0.5
-        )
+        expected_dense.addmm_(b.cuda().to(torch.float32), a.cuda().to(torch.float32), alpha=0.5)
         expected = MxAdapter.requantize(expected_dense, like=mx_cuda)
 
         offloader = _make_model_offloader(
             model,
             blocks_attr=["blocks"],
         )
-        offloader.set_loras([lora], strengths=[0.5], mode="merge")
-
         try:
             x = torch.randn(8, 64, dtype=torch.bfloat16, device="cuda")
-            with offloader.use(
+            with activated_model(offloader,
                 "cuda",
-                stream_config=StreamConfig(
-                    num_resident_blocks=1, num_prefetch_blocks=0
-                ),
+                loras=[lora],
+                lora_strengths=[0.5],
+                lora_mode="merge",
+                stream_config=StreamConfig(num_resident_blocks=1, num_prefetch_blocks=0),
             ) as active:
                 merged = active.blocks[0].weight.data
                 assert isinstance(merged, mx_cls)

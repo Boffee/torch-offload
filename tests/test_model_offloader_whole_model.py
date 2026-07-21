@@ -10,13 +10,12 @@ from torch import nn
 
 from torch_offload import (
     ModelOffloader,
-    ModelOffloaderStore,
     PinnedComponent,
     PinnedComponentStore,
     ResourceBinding,
 )
 
-from tests.conftest import pinned_component
+from tests.conftest import activated_model, pinned_component
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -27,12 +26,11 @@ def _make_model_offloader(
     blocks_attr: list[str] = [],
     stream_trainable_weights: bool = False,
 ) -> ModelOffloader:
-    store = ModelOffloaderStore.from_module(
+    return ModelOffloader.from_module(
         model,
         blocks_attr=blocks_attr,
         stream_trainable_weights=stream_trainable_weights,
     )
-    return store.bind(model)
 
 
 def _make_simple_model() -> nn.Module:
@@ -174,7 +172,7 @@ class TestTrainableParams:
             assert m.weight.is_pinned()
 
             before = m.weight.detach().clone()
-            with pw.use("cpu"):
+            with activated_model(pw, "cpu"):
                 loss = m(torch.ones(1, 4)).sum()
                 loss.backward()
                 with pw.optimizer_step():
@@ -200,7 +198,7 @@ class TestTrainableParams:
     def test_cpu_active_optimizer_step_rejects_reentrant_entry(self) -> None:
         pw = _make_model_offloader(nn.Linear(4, 2, bias=False))
         try:
-            with pw.use("cpu"):
+            with activated_model(pw, "cpu"):
                 with pytest.raises(RuntimeError, match="reentrant"):
                     with pw.optimizer_step():
                         with pw.optimizer_step():
@@ -215,7 +213,7 @@ class TestTrainableParams:
 
         pw = _make_model_offloader(m)
         try:
-            with pw.use("cuda"):
+            with activated_model(pw, "cuda"):
                 assert m.weight is param
                 assert m.weight.is_cuda
                 assert m.weight.requires_grad
@@ -232,7 +230,7 @@ class TestTrainableParams:
 
         pw = _make_model_offloader(m)
         try:
-            with pw.use("cuda"):
+            with activated_model(pw, "cuda"):
                 loss = m(torch.ones(1, 4, device="cuda")).sum()
                 loss.backward()
                 with pw.optimizer_step():
@@ -244,7 +242,7 @@ class TestTrainableParams:
             assert m.weight.is_pinned()
             assert torch.equal(m.weight.detach(), updated)
 
-            with pw.use("cuda"):
+            with activated_model(pw, "cuda"):
                 assert torch.equal(m.weight.detach().cpu(), updated)
         finally:
             pw.deactivate()
@@ -254,7 +252,7 @@ class TestTrainableParams:
         m = nn.Linear(4, 1, bias=False)
         pw = _make_model_offloader(m)
         try:
-            with pw.use("cuda"):
+            with activated_model(pw, "cuda"):
                 with pytest.raises(RuntimeError, match="boom"):
                     with pw.optimizer_step():
                         m.weight.data.add_(1)
@@ -275,7 +273,7 @@ class TestTrainableParams:
         m = nn.Linear(4, 2, bias=False)
         pw = _make_model_offloader(m)
         try:
-            with pw.use("cuda"):
+            with activated_model(pw, "cuda"):
                 m(torch.ones(1, 4, device="cuda")).sum().backward()
                 torch.cuda.synchronize()
                 # Mid-cycle: grad lives on GPU (native AccumulateGrad).
@@ -292,7 +290,7 @@ class TestTrainableParams:
 
     @CUDA
     def test_cuda_context_free_cpu_optimizer_step(self) -> None:
-        """A plain ``optimizer.step()`` outside ``use()`` (and outside
+        """A plain ``optimizer.step()`` while deactivated (and outside
         ``optimizer_step()``) runs the optimizer on CPU over the pinned
         trainable: Adam state allocates on the host and the in-place update
         writes through to what the next forward loads. Pins the context-free
@@ -305,7 +303,7 @@ class TestTrainableParams:
         try:
             for _ in range(2):
                 x = torch.randn(4, 8, device="cuda")
-                with pw.use("cuda") as gpu_model:
+                with activated_model(pw, "cuda") as gpu_model:
                     gpu_model(x).sum().backward()
 
                 # Deactivated: trainable data + grad are host-resident.
@@ -320,7 +318,7 @@ class TestTrainableParams:
                 updated = m.weight.detach().clone()
 
                 # Write-through: the next forward loads the updated weight.
-                with pw.use("cuda"):
+                with activated_model(pw, "cuda"):
                     assert torch.equal(m.weight.detach().cpu(), updated)
 
             # The optimizer's state (Adam moments) lives on the host.
@@ -364,7 +362,7 @@ class TestLifecycle:
             # same pinned storage (the materialized CPU wrapper is built on
             # demand, not cached), so compare stable pinned-storage pointers.
             pinned_ptrs = [p.data_ptr() for p in m.parameters()]
-            with pw.use("cpu") as model:
+            with activated_model(pw, "cpu") as model:
                 assert model is m
                 assert [p.data_ptr() for p in m.parameters()] == pinned_ptrs
                 for p in m.parameters():
@@ -395,7 +393,7 @@ class TestLifecycle:
         pw = _make_model_offloader(_make_simple_model())
         try:
             for _ in range(3):
-                with pw.use("cpu"):
+                with activated_model(pw, "cpu"):
                     pass
         finally:
             pw.deactivate()
@@ -469,10 +467,9 @@ class TestConstruction:
                 self.register_buffer("table", torch.randn(8, 4))
 
         m = BufferOnly()
-        store = ModelOffloaderStore.from_module(m)
-        pw = store.bind(m)
+        pw = ModelOffloader.from_module(m)
         try:
-            assert store.cache_bytes == 8 * 4 * 4  # float32
+            assert pw.cache_bytes == 8 * 4 * 4  # float32
             assert m.table.is_pinned()
         finally:
             pw.deactivate()
@@ -572,12 +569,11 @@ class TestTiedWeightDedup:
 
     def test_cache_bytes_counts_tied_once(self) -> None:
         m, _, _ = self._make_tied_model()
-        store = ModelOffloaderStore.from_module(m)
-        pw = store.bind(m)
+        pw = ModelOffloader.from_module(m)
         try:
             # 32 * 16 * 4 (float32 default) = 2048 bytes for one pinned param.
             # If the dedup were broken this would double.
-            assert store.cache_bytes == 32 * 16 * 4
+            assert pw.cache_bytes == 32 * 16 * 4
         finally:
             pw.deactivate()
 
@@ -586,7 +582,7 @@ class TestTiedWeightDedup:
         m, embed, head = self._make_tied_model()
         pw = _make_model_offloader(m)
         try:
-            with pw.use("cuda"):
+            with activated_model(pw, "cuda"):
                 assert embed.weight.is_cuda
                 assert head.weight.is_cuda
                 assert embed.weight.data.data_ptr() == head.weight.data.data_ptr()
@@ -600,7 +596,7 @@ class TestTiedWeightDedup:
         m, a, b = self._make_distinct_param_tied_model()
         pw = _make_model_offloader(m)
         try:
-            with pw.use("cuda"):
+            with activated_model(pw, "cuda"):
                 # Registry identity comparison; the local `a` / `b` refs are
                 # the now-orphaned originals (replaced in module registries).
                 assert m._parameters["a"].is_cuda
@@ -806,7 +802,7 @@ class TestQuanto:
         m = self._make_quanto_model()
         pw = _make_model_offloader(m)
         try:
-            with pw.use("cuda"):
+            with activated_model(pw, "cuda"):
                 assert m.weight._data.is_cuda
                 assert m.weight._scale.is_cuda
             # Back to pinned after deactivate
@@ -834,7 +830,7 @@ class TestQuanto:
 
 class TestCacheBytes:
     def test_cache_bytes_positive(self) -> None:
-        store = ModelOffloaderStore.from_module(_make_simple_model())
+        store = ModelOffloader.from_module(_make_simple_model())
         assert store.cache_bytes > 0
 
     def test_cache_bytes_includes_buffers(self) -> None:
@@ -842,7 +838,7 @@ class TestCacheBytes:
         m.weight = nn.Parameter(torch.randn(4, 4), requires_grad=False)
         m.register_buffer("running", torch.randn(8))
 
-        store = ModelOffloaderStore.from_module(m)
+        store = ModelOffloader.from_module(m)
 
         expected = (4 * 4 * 4) + (8 * 4)
         assert store.cache_bytes == expected

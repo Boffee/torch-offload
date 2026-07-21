@@ -175,7 +175,7 @@ class CompositeComponentStore:
         cls,
         model: nn.Module,
         *,
-        blocks_attr: list[str] = [],  # noqa: B006  (read-only; never mutated)
+        blocks_attr: Sequence[str] = (),
         stream_trainable_weights: bool = False,
     ) -> CompositeComponentStore:
         """Decompose ``model`` into a pinned remainder + streamed block groups.

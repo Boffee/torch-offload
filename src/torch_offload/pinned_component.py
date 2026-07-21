@@ -4,7 +4,7 @@ Holds selected parameters and buffers in pinned CPU memory and
 bulk-copies them to the activation device. This is the component used
 by :class:`ModelOffloader` for both non-streamed names and whole-model
 pinning. It is a composable activate/deactivate lifecycle piece, not a
-top-level model binding.
+top-level model runtime.
 
 Cross-cutting compatibility caveats (``torch.compile`` incompatibility,
 DDP/FSDP wrap-before requirement, single-thread contract) live in the

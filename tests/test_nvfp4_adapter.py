@@ -8,10 +8,9 @@ import torch
 from torch import nn
 
 from torch_offload import (
-    LoRAStore,
+    LoRA,
     LoRATransform,
     ModelOffloader,
-    ModelOffloaderStore,
     ScaledLoRAFactor,
     StreamConfig,
     merge_lora,
@@ -20,6 +19,7 @@ from torch_offload.nvfp4_adapter import Nvfp4Adapter
 from torch_offload.pinned_param import PinnedParam
 from torch_offload.tensor_adapter_registry import tensor_id
 from torch_offload.streamed_component import _param_target_layout
+from tests.conftest import activated_model
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -30,12 +30,11 @@ def _make_model_offloader(
     blocks_attr: list[str] = [],
     stream_trainable_weights: bool = False,
 ) -> ModelOffloader:
-    store = ModelOffloaderStore.from_module(
+    return ModelOffloader.from_module(
         model,
         blocks_attr=blocks_attr,
         stream_trainable_weights=stream_trainable_weights,
     )
-    return store.bind(model)
 
 
 def _nvfp4_modules():
@@ -71,7 +70,10 @@ def _make_nvfp4(
 
 
 def _make_nvfp4_amax(
-    *, rows: int = 16, cols: int = 64, swizzled: bool = True,
+    *,
+    rows: int = 16,
+    cols: int = 64,
+    swizzled: bool = True,
 ) -> torch.Tensor:
     """NVFP4 weight whose two-level ``per_tensor_scale`` is amax-derived,
     matching the real ``quantize_`` configs — so a dequant/requant round
@@ -80,9 +82,7 @@ def _make_nvfp4_amax(
     nvfp4_tensor_cls, _ = _nvfp4_modules()
     mod = pytest.importorskip("torchao.prototype.mx_formats.nvfp4_tensor")
     weight = torch.randn(rows, cols, dtype=torch.bfloat16)
-    per_tensor_scale = mod.per_tensor_amax_to_scale(
-        weight.abs().max().to(torch.float32)
-    )
+    per_tensor_scale = mod.per_tensor_amax_to_scale(weight.abs().max().to(torch.float32))
     return nvfp4_tensor_cls.to_nvfp4(
         weight,
         per_tensor_scale=per_tensor_scale,
@@ -145,16 +145,10 @@ class TestNvfp4Adapter:
         assert _param_target_layout(p1) == _param_target_layout(p2)
 
     def test_target_layout_tracks_activation_quantization(self) -> None:
-        with_activation = nn.Parameter(
-            _make_nvfp4(dynamic_activation=True), requires_grad=False
-        )
-        weight_only = nn.Parameter(
-            _make_nvfp4(dynamic_activation=False), requires_grad=False
-        )
+        with_activation = nn.Parameter(_make_nvfp4(dynamic_activation=True), requires_grad=False)
+        weight_only = nn.Parameter(_make_nvfp4(dynamic_activation=False), requires_grad=False)
 
-        assert _param_target_layout(with_activation) != _param_target_layout(
-            weight_only
-        )
+        assert _param_target_layout(with_activation) != _param_target_layout(weight_only)
 
     def test_no_cpu_round_trip_or_trainable_swap_capability(self) -> None:
         pinned_param = PinnedParam(
@@ -168,18 +162,14 @@ class TestNvfp4Adapter:
             pinned_param.validate_parameter_data_swap_target()
 
     @pytest.mark.parametrize("swizzled", [False, True])
-    def test_dequantize_requantize_preserves_representation(
-        self, swizzled: bool
-    ) -> None:
+    def test_dequantize_requantize_preserves_representation(self, swizzled: bool) -> None:
         nvfp4_cls, _ = _nvfp4_modules()
         # Amax-derived per-tensor scale (as the real configs produce) makes
         # the round trip exact: requantize recomputes the same global scale.
         nv = _make_nvfp4_amax(rows=16, cols=64, swizzled=swizzled)
         dense = Nvfp4Adapter.dequantize(nv)
         assert dense.dtype is torch.float32
-        torch.testing.assert_close(
-            dense, nv.dequantize(nv.orig_dtype).to(torch.float32)
-        )
+        torch.testing.assert_close(dense, nv.dequantize(nv.orig_dtype).to(torch.float32))
 
         again = Nvfp4Adapter.requantize(dense, like=nv)
         assert isinstance(again, nvfp4_cls)
@@ -190,9 +180,7 @@ class TestNvfp4Adapter:
         # Re-encoding uses the torch path; the swizzled layout and packed
         # bytes match the original regardless of its use_triton_kernel flag.
         assert torch.equal(again.qdata, nv.qdata)
-        assert torch.equal(
-            again.scale.view(torch.uint8), nv.scale.view(torch.uint8)
-        )
+        assert torch.equal(again.scale.view(torch.uint8), nv.scale.view(torch.uint8))
 
     def test_requantize_rejects_shape_mismatch(self) -> None:
         nv = _make_nvfp4(rows=16, cols=64)
@@ -214,9 +202,7 @@ class TestNvfp4Adapter:
         weight = torch.randn(experts, n, k, dtype=torch.bfloat16)
         base = nvfp4_cls.to_nvfp4(
             weight,
-            per_tensor_scale=mod.per_tensor_amax_to_scale(
-                weight.abs().max().to(torch.float32)
-            ),
+            per_tensor_scale=mod.per_tensor_amax_to_scale(weight.abs().max().to(torch.float32)),
             is_swizzled_scales=False,
             use_triton_kernel=False,
         )
@@ -247,9 +233,7 @@ class TestNvfp4Adapter:
         nvfp4_cls, _ = _nvfp4_modules()
         nv = _make_nvfp4(rows=16, cols=64)
         assert nv.per_tensor_scale is not None  # two-level scaling
-        again = Nvfp4Adapter.requantize(
-            torch.zeros(16, 64, dtype=torch.float32), like=nv
-        )
+        again = Nvfp4Adapter.requantize(torch.zeros(16, 64, dtype=torch.float32), like=nv)
         assert isinstance(again, nvfp4_cls)
         assert not torch.isnan(again.scale.float()).any()
         dequant = again.dequantize(nv.orig_dtype)
@@ -294,9 +278,7 @@ class TestNvfp4Adapter:
         assert param.data.qdata.data_ptr() == original_qdata_ptr
         assert isinstance(param.data, nvfp4_cls)
         assert torch.equal(param.data.qdata, expected.qdata)
-        assert torch.equal(
-            param.data.scale.view(torch.uint8), expected.scale.view(torch.uint8)
-        )
+        assert torch.equal(param.data.scale.view(torch.uint8), expected.scale.view(torch.uint8))
 
     def test_merge_lora_merges_nvfp4_weight(self) -> None:
         class M(nn.Module):
@@ -313,7 +295,7 @@ class TestNvfp4Adapter:
         # copy_into mutates the weight's storage in place, so snapshot the
         # original packed bytes rather than holding a tensor ref.
         original_qdata = model.lin.weight.data.qdata.clone()
-        lora = LoRAStore.from_state_dict(
+        lora = LoRA.from_state_dict(
             state_dict={
                 "lin.lora_A.weight": torch.randn(4, 64),
                 "lin.lora_B.weight": torch.randn(16, 4),
@@ -364,9 +346,7 @@ class TestNvfp4Adapter:
         layer.weight = nn.Parameter(
             nvfp4_mod.NVFP4Tensor.to_nvfp4(
                 weight,
-                per_tensor_scale=nvfp4_mod.per_tensor_amax_to_scale(
-                    torch.max(torch.abs(weight))
-                ),
+                per_tensor_scale=nvfp4_mod.per_tensor_amax_to_scale(torch.max(torch.abs(weight))),
                 is_swizzled_scales=True,
                 use_triton_kernel=False,
                 act_quant_kwargs=kwargs_cls(
@@ -381,7 +361,7 @@ class TestNvfp4Adapter:
 
         try:
             x = torch.randn(128, 64, dtype=torch.bfloat16, device="cuda")
-            with strategy.use("cuda") as active:
+            with activated_model(strategy, "cuda") as active:
                 y = active(x)
                 torch.cuda.synchronize()
             assert y.shape == (128, 128)
@@ -397,9 +377,7 @@ class TestNvfp4Adapter:
         def _quantize(weight: torch.Tensor) -> torch.Tensor:
             return nvfp4_cls.to_nvfp4(
                 weight,
-                per_tensor_scale=nvfp4_mod.per_tensor_amax_to_scale(
-                    torch.max(torch.abs(weight))
-                ),
+                per_tensor_scale=nvfp4_mod.per_tensor_amax_to_scale(torch.max(torch.abs(weight))),
                 is_swizzled_scales=True,
                 use_triton_kernel=False,
                 act_quant_kwargs=kwargs_cls(
@@ -435,7 +413,7 @@ class TestNvfp4Adapter:
         rank = 4
         a = torch.randn(rank, 64)
         b = torch.randn(64, rank)
-        lora = LoRAStore.from_state_dict(
+        lora = LoRA.from_state_dict(
             state_dict={
                 "blocks.0.lora_A.weight": a,
                 "blocks.0.lora_B.weight": b,
@@ -445,24 +423,21 @@ class TestNvfp4Adapter:
         # offloader merges into a byte-identical GPU copy of the weight.
         nv_cuda = nv.cuda()
         expected_dense = nv_cuda.dequantize(nv.orig_dtype).to(torch.float32)
-        expected_dense.addmm_(
-            b.cuda().to(torch.float32), a.cuda().to(torch.float32), alpha=0.5
-        )
+        expected_dense.addmm_(b.cuda().to(torch.float32), a.cuda().to(torch.float32), alpha=0.5)
         expected = Nvfp4Adapter.requantize(expected_dense, like=nv_cuda)
 
         offloader = _make_model_offloader(
             model,
             blocks_attr=["blocks"],
         )
-        offloader.set_loras([lora], strengths=[0.5], mode="merge")
-
         try:
             x = torch.randn(8, 64, dtype=torch.bfloat16, device="cuda")
-            with offloader.use(
+            with activated_model(offloader,
                 "cuda",
-                stream_config=StreamConfig(
-                    num_resident_blocks=1, num_prefetch_blocks=0
-                ),
+                loras=[lora],
+                lora_strengths=[0.5],
+                lora_mode="merge",
+                stream_config=StreamConfig(num_resident_blocks=1, num_prefetch_blocks=0),
             ) as active:
                 merged = active.blocks[0].weight.data
                 assert isinstance(merged, nvfp4_cls)
@@ -503,9 +478,7 @@ class TestNvfp4Adapter:
             block.weight = nn.Parameter(
                 nvfp4_mod.NVFP4Tensor.to_nvfp4(
                     weight,
-                    per_tensor_scale=nvfp4_mod.per_tensor_amax_to_scale(
-                        torch.max(torch.abs(weight))
-                    ),
+                    per_tensor_scale=nvfp4_mod.per_tensor_amax_to_scale(torch.max(torch.abs(weight))),
                     is_swizzled_scales=True,
                     use_triton_kernel=False,
                     act_quant_kwargs=kwargs_cls(
@@ -520,21 +493,20 @@ class TestNvfp4Adapter:
             model,
             blocks_attr=["blocks"],
         )
-        lora = LoRAStore.from_state_dict(
+        lora = LoRA.from_state_dict(
             state_dict={
                 "blocks.0.lora_A.weight": torch.randn(4, 128),
                 "blocks.0.lora_B.weight": torch.randn(128, 4),
             }
         )
-        offloader.set_loras([lora], strengths=[0.25], mode="routed")
-
         try:
             x = torch.randn(128, 128, dtype=torch.bfloat16, device="cuda")
-            with offloader.use(
+            with activated_model(offloader,
                 "cuda",
-                stream_config=StreamConfig(
-                    num_resident_blocks=1, num_prefetch_blocks=0
-                ),
+                loras=[lora],
+                lora_strengths=[0.25],
+                lora_mode="routed",
+                stream_config=StreamConfig(num_resident_blocks=1, num_prefetch_blocks=0),
             ) as active:
                 y = active(x)
                 torch.cuda.synchronize()

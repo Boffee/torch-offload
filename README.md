@@ -1,8 +1,8 @@
 # Memory
 
 A model-agnostic GPU/CPU memory manager for PyTorch. It caches reusable
-host-side stores, creates per-use model bindings, and swaps independent
-models in and out of GPU memory under a policy-driven cache.
+model and LoRA resources, and swaps independent models in and out of
+GPU memory under a policy-driven cache.
 
 Self-contained, library-friendly: no dependencies beyond `torch` (plus
 optional `optimum.quanto`, `gguf`, and `torchao` for quantized models). Designed
@@ -12,13 +12,15 @@ to be lifted into its own package when a second consumer appears.
 
 | Module | Role |
 |---|---|
-| `model_cache.py` | `ModelCache`, `ModelSpec`, `LoRASpec` — high-level public API for cached model and LoRA resources |
-| `protocols.py` | `ResourceStore`, `ResourceBinding` plug-in contracts |
-| `model_offloader.py` | `ModelOffloaderStore`, `ModelOffloader` — lower-level store/binding for whole-model bulk pinned-CPU↔GPU or streamed block offload |
+| `resource_cache.py` | `ResourceCache`, eviction policy, cache metadata, and cache errors |
+| `resource_specs.py` | `ModelSpec`, `LoRASpec`, `ObjectSpec` — standard frozen resource specifications |
+| `cached_model_runner.py` | `CachedModelRunner` — leases cached model runtimes and LoRA dependencies |
+| `protocols.py` | `ResourceSpec`, `ResourceStore`, `ResourceBinding` plug-in contracts |
+| `model_offloader.py` | `ModelOffloader` — cached single-model runtime for whole-model bulk pinned-CPU↔GPU or streamed block offload |
 | `pinned_component.py` | `PinnedComponentStore`, `PinnedComponent` — lower-level reusable pinned backing storage plus lifecycle-only pinned component used by `ModelOffloader` |
 | `streamed_component.py` | `StreamedComponentStore`, `StreamedComponent` — lower-level streamed backing storage plus per-block-list streaming component |
-| `lora.py` | `LoRAStore`, `LoRA`, `LoRATransform` — pinned factor storage + streamable binding + merge / routed-hook application |
-| `merge.py` | `merge_lora()` — permanent in-place LoRA merge into base weights (alternative to `set_loras`) |
+| `lora.py` | `LoRA`, `LoRATransform` — cached pinned factors, exclusive activation, and merge / routed-hook application |
+| `merge.py` | `merge_lora()` — permanent in-place LoRA merge into base weights |
 | `pinned_param.py` | `PinnedParam` — per-parameter pinning primitive (handles plain tensors, quanto, GGUF, bitsandbytes, DTensor, and TorchAO scaled-FP8 / INT8 / MX (MXFP8, MXFP4) / NVFP4 / INT4 tile-packed via adapters; see [Quantized weight support](#quantized-weight-support)) |
 | `pinned_module.py` | Internal name-keyed pinned module storage plus concrete module bindings |
 | `tensor_adapters.py`, `quanto_adapter.py`, `gguf_adapter.py`, `nvfp4_adapter.py`, `mx_adapter.py`, `float8_adapter.py`, `int8_adapter.py`, `int4_tile_adapter.py`, `dtensor_adapter.py`, `gguf_dequant.py` | Tensor adapter contracts/implementations and optional optimum-quanto / gguf / torchao / DTensor support |
@@ -48,90 +50,88 @@ same host-memory budget.
 
 This library gives you:
 
-1. **Stores** that pin reusable model or LoRA state to host RAM.
-2. **Bindings** that attach a cached store to a concrete model instance
-   for one activation.
-3. **A cache** that holds multiple pinned models, evicts least-recently-
-   used inactive entries when a new model needs room, and tracks active
-   bindings so you can't accidentally evict something you're using.
-4. **A clean plug-in contract** so you can write your own store/binding
-   resource (disk-mmap, NVMe-paged, multi-GPU shard) and it fits in.
+1. **Cached resources** that pin reusable model or LoRA state to host RAM.
+2. **Activation lifecycles** that move one cached model onto a compute device.
+3. **A resource cache** that evicts least-recently-used unleased entries and
+   protects leased stores from eviction.
+4. **A model runner** that leases model and LoRA resources and owns their
+   device lifecycle.
 
 ## When to use what
 
 | Situation | Use |
 |---|---|
-| Most application code, especially multiple models or repeated calls | Register model factories with **`ModelCache`** via **`ModelSpec`** |
-| Model too big for a CUDA GPU even when active | Register **`ModelSpec(..., blocks_attr=...)`** and stream via **`cache.use(..., num_resident_blocks=...)`** |
-| LoRA adapters reused across calls | Register/apply **`LoRASpec`** through **`ModelCache.use(..., loras=[...])`** |
-| Low-level/manual lifecycle for one model | Use **`ModelOffloaderStore.from_module(model).bind(model)`** directly |
+| Most application code, especially multiple models or repeated calls | Use **`CachedModelRunner`** with a **`ResourceCache`** and **`ModelSpec`** |
+| Model too big for a CUDA GPU even when active | Use **`ModelSpec(..., blocks_attr=...)`** and pass a **`StreamConfig`** to the runner |
+| LoRA adapters reused across calls | Pass **`LoRASpec`** entries through **`CachedModelRunner.use()`** |
+| Low-level/manual lifecycle for one model | Use **`ModelOffloader.from_module(model)`** directly |
 | Component or resource development | Use the lower-level store/binding protocols and component stores directly |
 
 ## Quick start: cached model use
 
 ```python
 import torch
-from torch_offload import ModelCache, ModelSpec
+from torch_offload import CachedModelRunner, ResourceCache, ModelSpec
 
-cache = ModelCache(max_cache_bytes=24 * 1024**3)
-cache.register(ModelSpec(
+cache = ResourceCache(max_cache_bytes=24 * 1024**3)
+runner = CachedModelRunner(cache)
+model_spec = ModelSpec(
     key="main",
     estimated_cache_bytes=12 * 1024**3,
     factory=build_my_model,  # returns a fresh nn.Module
-))
+)
 device = torch.device("cuda")
 
-# First use builds the cached store. Later uses create bindings from it.
-with cache.use("main", device=device) as gpu_model:
+# First use builds and leases the runtime.
+with runner.use(model_spec, device=device) as gpu_model:
     output = gpu_model(input_tensor)
 
-with cache.use("main", device=device) as gpu_model:
+with runner.use(model_spec, device=device) as gpu_model:
     output = gpu_model(input_tensor_2)
 ```
 
-`ModelSpec` factories should build fresh modules. The cache owns store
-construction, binding, activation, deactivation, and eviction. By default
-every `use()` rebinds the cached store's canonical model instance and
-the cache rejects a second concurrent same-key binding — matching the
-trainable-model contract. To support concurrent bindings (e.g. the same
-model active on two GPUs at once), pass `skeleton_factory=` so the cache
-builds a fresh module per `use()` that the cached pinned bytes are
-re-bound into; the skeleton must match the original factory's parameter
-and buffer structure. Trainable models always reuse the canonical
-instance so optimizer parameter identity stays stable (any
-`skeleton_factory` is ignored). To release pinned host memory, evict or
-clear inactive cache entries and drop any escaped model references.
+`ModelSpec` factories should build fresh modules. The cache owns construction,
+leases, accounting, and eviction; the runner owns activation. One model cache
+entry contains one `ModelOffloader` and one model instance. Uses are sequential:
+an overlapping activation raises `ModelRuntimeInUseError`. Applications that
+need concurrent replicas must register separately constructed models under
+distinct cache keys, which intentionally duplicates their pinned host storage.
+To release pinned host memory, evict or clear inactive cache entries and drop
+any escaped model references.
 
-## Manual offloader binding
+## Manual offloader lifecycle
 
-Use the store/binding API directly when you want explicit lifecycle
-control without `ModelCache`.
+Use `ModelOffloader` directly when you want explicit lifecycle control without
+`ResourceCache`.
 
 ```python
 import torch
-from torch_offload import ModelOffloaderStore
+from torch_offload import ModelOffloader
 
 model = build_my_model()
-store = ModelOffloaderStore.from_module(model)
-offload = store.bind(model)
+offload = ModelOffloader.from_module(model)
 device = torch.device("cuda")
 
-with offload.use(device) as gpu_model:
-    output = gpu_model(input_tensor)
+offload.activate(device)
+try:
+    output = offload.value(input_tensor)
+finally:
+    offload.deactivate()
 
-del offload, store, model  # drop refs to free pinned host memory
+del offload, model  # drop refs to free pinned host memory
 ```
 
-`ModelOffloaderStore.from_module()` mutates the source model while
+`ModelOffloader.from_module()` mutates the source model while
 pinning: frozen `nn.Parameter` registry entries get repointed at
 Parameters wrapping pinned CPU storage, trainable Parameter objects keep
 their identity and point their `.data` at pinned CPU storage, and buffers
-are replaced with pinned copies. After construction, only access the
-bound model through `offload.use(device)` (or `activate(device)` /
-`deactivate()`). For CUDA training, wrap `optimizer.step()` in
+are replaced with pinned copies. After construction, only access the bound
+model while the offloader is active: call `activate(device)`, use
+`offload.value`, and guarantee a matching `deactivate()` with `try`/`finally`.
+For CUDA training, wrap `optimizer.step()` in
 `offload.optimizer_step()` so trainable GPU updates are copied back to
 the pinned CPU cache before deactivation.
-**Drop the store, binding, and model references to release pinned host
+**Drop the offloader and model references to release pinned host
 memory** — there's no `close()`; resource cleanup is reference-drop + GC.
 
 ## Manual block streaming
@@ -142,33 +142,35 @@ and a CUDA-stream-based async prefetcher.
 
 ```python
 import torch
-from torch_offload import ModelOffloaderStore, StreamConfig
+from torch_offload import ModelOffloader, StreamConfig
 
-# Store construction pins everything; cache_bytes is final immediately.
+# Construction pins and binds once; cache_bytes is final immediately.
 # blocks_attr selects what streams; the residency policy is supplied per
 # activation via StreamConfig, not at construction.
-store = ModelOffloaderStore.from_module(
+offload = ModelOffloader.from_module(
     model,
     blocks_attr=["transformer_blocks"],  # path(s) to the nn.ModuleList
 )
-offload = store.bind(model)
 device = torch.device("cuda")
 
-with offload.use(
+offload.activate(
     device,
     stream_config=StreamConfig(
         num_resident_blocks=1,   # blocks kept on GPU; rest stream in
         num_prefetch_blocks=2,   # GPU pool = resident + prefetch
     ),
-) as gpu_model:
-    output = gpu_model(input_tensor)
+)
+try:
+    output = offload.value(input_tensor)
+finally:
+    offload.deactivate()
 
-del offload, store, model  # drop refs to free pinned host memory
+del offload, model  # drop refs to free pinned host memory
 ```
 
 The residency policy lives on `StreamConfig`, supplied per activation
-(`offload.use(device, stream_config=...)` / `activate(...)`, or
-`cache.use(..., num_resident_blocks=...)`) — it governs GPU residency, a
+(`offload.activate(device, stream_config=...)` or
+`runner.use(..., stream_config=...)`) — it governs GPU residency, a
 runtime concern, and is not part of the pinned backing. `num_resident_blocks=1`
 (the default) is right for almost all workloads: eviction is LRU, so a
 sequential pass through the blocks reloads every block each iteration
@@ -182,7 +184,7 @@ bulk-pinned component that activation copies to the GPU.
 `ModelOffloader` only streams on CUDA. Activating the binding on
 `cpu` is a pass-through over the already-installed pinned CPU storage:
 no target pool, no streaming hooks, no weight copies.
-`set_loras(..., mode="merge")` is CUDA-only; use routed LoRA mode for
+`lora_mode="merge"` is CUDA-only; use routed LoRA mode for
 CPU activation. Routed LoRA installs forward hooks and streams its
 factors co-scheduled with the model, so they page onto the activation
 device with the block they belong to.
@@ -198,12 +200,11 @@ To reduce trainable-weight residency during training, opt into
 streaming in-block trainable weights:
 
 ```python
-store = ModelOffloaderStore.from_module(
+offload = ModelOffloader.from_module(
     model,
     blocks_attr=["transformer_blocks"],
     stream_trainable_weights=True,
 )
-offload = store.bind(model)
 ```
 
 During CUDA activation in this mode, only the trainable parameter
@@ -213,8 +214,8 @@ Gradients are not streamed; PyTorch owns `param.grad` normally.
 
 ### LoRA merge
 
-`ModelOffloader` supports optional per-weight LoRA merging via
-`set_loras()`. LoRA requests are applied during activation; merge mode
+`ModelOffloader` supports optional per-weight LoRA merging through activation
+arguments. Merge mode
 installs activation-scoped post-copy hooks for managed parameter
 targets. Unknown targets raise during activation. LoRA target keys must
 match the model's parameter names exactly; any remapping — stripping a
@@ -231,41 +232,44 @@ compatible logical Linear weight shape and compute dtype. `PinnedParam`
 remains a storage primitive; LoRA merge mode asks the selected adapter
 for the required update capability.
 
-`set_loras()` records the replacement request while the offload is
-inactive. Target lookup is resolved during activation; target
+The LoRA request is scoped to one `activate()` call. Target lookup
+is resolved during activation; target
 compatibility can be preflighted with `LoRATransform.validate_target()`
 or validated when the merge hook applies.
 
 ```python
 import torch
-from torch_offload import ModelOffloaderStore, LoRAStore
+from torch_offload import ModelOffloader, LoRA
 from safetensors.torch import load_file
 
-store = ModelOffloaderStore.from_module(
+offload = ModelOffloader.from_module(
     model,
     blocks_attr=["transformer_blocks"],
     # Default: stream_trainable_weights=False
 )
-offload = store.bind(model)
 device = torch.device("cuda")
 
-# Request LoRAs for the next activation (must be called while deactivated)
-lora_a = LoRAStore.from_state_dict(state_dict=load_file("lora_a.safetensors"))
-lora_b = LoRAStore.from_state_dict(state_dict=load_file("lora_b.safetensors"))
-offload.set_loras([lora_a, lora_b], strengths=[0.8, 0.5])
+# Each LoRA owns its pinned factors and is reusable across sequential uses.
+lora_a = LoRA.from_state_dict(state_dict=load_file("lora_a.safetensors"))
+lora_b = LoRA.from_state_dict(state_dict=load_file("lora_b.safetensors"))
 
-with offload.use(device) as gpu_model:
-    output = gpu_model(input_tensor)
-
-# Switch to different LoRAs or clear (base-only)
-offload.set_loras([])
+offload.activate(
+    device,
+    loras=[lora_a, lora_b],
+    lora_strengths=[0.8, 0.5],
+    lora_mode="merge",
+)
+try:
+    output = offload.value(input_tensor)
+finally:
+    offload.deactivate()
 ```
 
 Block reload from pristine pinned CPU storage automatically clears
 the previous merge — no explicit unmerge step needed.
 
-`set_loras` accepts `mode="routed"` as an alternative to the default
-`mode="merge"`. Routed mode installs a forward hook on each matched
+Pass `lora_mode="routed"` as an alternative to the default merge mode.
+Routed mode installs a forward hook on each matched
 `nn.Linear` parent — `y = base(x) + alpha * B * A * x` — instead of merging
 into the base weight. Each LoRA streams as its own engine co-scheduled
 with the model, so a factor block is GPU-resident only while its base
@@ -290,9 +294,12 @@ For a one-shot **permanent** merge — bake the LoRA into the model
 weights and discard the LoRA — use `merge_lora`:
 
 ```python
-from torch_offload import merge_lora, LoRAStore
+from torch_offload import merge_lora, LoRA
 
-merge_lora(model, [(LoRAStore.from_state_dict(state_dict=load_file("lora.safetensors")), 0.8)])
+merge_lora(
+    model,
+    [(LoRA.from_state_dict(state_dict=load_file("lora.safetensors")), 0.8)],
+)
 ```
 
 This uses an in-place `addmm_` for plain fp/bf bases and
@@ -300,8 +307,8 @@ dequantize/requantize for quantized bases that expose it (quanto,
 bitsandbytes, and TorchAO scaled-FP8 / INT8 / MX / NVFP4 — lossy but
 standard); formats without a merge path (GGUF, TorchAO INT4 tile-packed)
 need routed LoRA instead. See [Quantized weight
-support](#quantized-weight-support) for the full matrix. Unlike
-`set_loras`, this is not reversible.
+support](#quantized-weight-support) for the full matrix. Unlike an
+activation-scoped LoRA request, this is not reversible.
 
 ### Heterogeneous block lists
 
@@ -316,13 +323,12 @@ streaming settings, compose `StreamedComponentStore` instances
 directly:
 
 ```python
-store = ModelOffloaderStore.from_module(
+offload = ModelOffloader.from_module(
     model,
     blocks_attr=["transformer_blocks", "single_transformer_blocks"],
 )
-offload = store.bind(model)
 # One StreamConfig at activation is shared by all groups, e.g.:
-#   offload.use(device, stream_config=StreamConfig(num_resident_blocks=1))
+#   offload.activate(device, stream_config=StreamConfig(num_resident_blocks=1))
 ```
 
 ### Training streamed blocks
@@ -356,25 +362,28 @@ safe because no autograd graph spans across reuses.
 
 ```python
 import torch
-from torch_offload import ModelOffloaderStore
+from torch_offload import ModelOffloader
 
-store = ModelOffloaderStore.from_module(
+offload = ModelOffloader.from_module(
     model,
     blocks_attr=["transformer_blocks"],
 )
-offload = store.bind(model)
 device = torch.device("cuda")
 
 model.gradient_checkpointing_enable()  # required for training
 model.train()
 
-with offload.use(device) as gpu_model:
+offload.activate(device)
+try:
+    gpu_model = offload.value
     for batch in loader:
         loss = gpu_model(**batch).loss
         loss.backward()
         with offload.optimizer_step():
             optimizer.step()
         optimizer.zero_grad()
+finally:
+    offload.deactivate()
 ```
 
 Checkpointing every streamed training block is the caller's
@@ -391,7 +400,9 @@ materializes streamed trainable weights on GPU while a normal PyTorch
 optimizer mutates them:
 
 ```python
-with offload.use(device) as gpu_model:
+offload.activate(device)
+try:
+    gpu_model = offload.value
     for batch in loader:
         loss = gpu_model(**batch).loss
         loss.backward()
@@ -400,84 +411,80 @@ with offload.use(device) as gpu_model:
             optimizer.step()
 
         optimizer.zero_grad()
+finally:
+    offload.deactivate()
 ```
 
 This boundary is not optimizer-specific. It runs whatever
 `optimizer.step()` does, copies updated trainable data back to pinned
 CPU storage, and leaves gradients on GPU.
 
-## ModelCache details
+## Cached model details
 
-For multiple independent models swapping in and out of GPU.
+`ResourceCache` owns only reusable-resource admission, accounting, leases, and
+eviction. `CachedModelRunner` leases dependencies and owns LoRA attachment and
+device activation.
 
 ```python
-from torch_offload import ModelCache, ModelSpec
+from torch_offload import (
+    CachedModelRunner,
+    LoRASpec,
+    ResourceCache,
+    ModelSpec,
+    StreamConfig,
+)
+from safetensors.torch import load_file
 
-cache = ModelCache(max_cache_bytes=80 * 1024**3)
+cache = ResourceCache(max_cache_bytes=80 * 1024**3)
+runner = CachedModelRunner(cache)
 device = "cuda:0"
 
-# Register specs. The factory builds real weights once to create the
-# cached store. Every use() rebinds the cached canonical model; to
-# support concurrent same-key bindings, pass skeleton_factory.
-cache.register(ModelSpec(
+text_encoder = ModelSpec(
     key="text_encoder",
     estimated_cache_bytes=12 * 1024**3,
     factory=build_text_encoder,
-))
-cache.register(ModelSpec(
+)
+diffusion_model = ModelSpec(
     key="diffusion_model",
     estimated_cache_bytes=24 * 1024**3,
     factory=build_diffusion_model,
-    blocks_attr=["transformer_blocks"],
-))
-
-# First use builds the store; subsequent uses reuse it. The default
-# rebinds the cached canonical model and rejects same-key concurrent
-# use(); pass skeleton_factory= on the spec to allow concurrent bindings
-# (the cache will call it per use() to build a fresh module the cached
-# pinned bytes are re-bound into).
-with cache.use("text_encoder", device=device) as enc:
-    embeddings = enc.encode(prompt)
-
-with cache.use("diffusion_model", device=device, num_resident_blocks=1) as t:
-    latent = t(...)
-
-# When budget pressure forces eviction, the eviction policy chooses
-# from inactive cached entries. The default policy is LRU.
-# Active entries (currently inside `cache.use(...)`) are never evicted.
-# Caller code owns VRAM planning.
-```
-
-You can also auto-register at acquire time:
-
-```python
-spec = ModelSpec(key="vae", estimated_cache_bytes=500*1024**2,
-                 factory=build_vae)
-with cache.use(spec, device=device) as vae:  # registers if missing, then uses
-    decoded = vae.decode(latent)
-```
-
-LoRA adapters can be cached as resources and applied to a model use
-before activation:
-
-```python
-from torch_offload import LoRASpec
-from safetensors.torch import load_file
-
-lora = LoRASpec(
+    blocks_attr=("transformer_blocks",),
+)
+style_lora = LoRASpec(
     key="style-lora",
     estimated_cache_bytes=512 * 1024**2,
     factory=lambda: load_file("style.safetensors"),
+    blocks_attr=("transformer_blocks",),
+    dtype=torch.bfloat16,
 )
 
-with cache.use(
-    "diffusion_model",
+with runner.use(text_encoder, device=device) as enc:
+    embeddings = enc.encode(prompt)
+
+with runner.use(
+    diffusion_model,
     device=device,
-    loras=[lora],
+    lora_specs=[style_lora],
     lora_strengths=[0.8],
     lora_mode="routed",
-) as t:
-    latent = t(...)
+    stream_config=StreamConfig(num_resident_blocks=1),
+) as model:
+    latent = model(...)
+```
+
+The runner leases LoRA resources before admitting the model resource. An adapter
+selected for a use therefore cannot be evicted by that same model admission.
+All leases unwind in reverse order if construction or activation
+fails. `lora_strengths` defaults to `1.0` per LoRA; when supplied, it must
+have the same length as `lora_specs`. Like cached model runtimes, each cached
+LoRA supports one active use at a time; overlapping uses fail immediately and
+sequential reuse remains supported.
+
+For direct resource access, use a cache lease:
+
+```python
+with cache.lease(style_lora) as lora:  # auto-registers on first lease
+    targets = lora.targets
 ```
 
 > **Anti-pattern:** the factory should build a fresh model each call,
@@ -485,14 +492,14 @@ with cache.use(
 > my_kept_model` the cache is no longer the sole owner of the model.
 > Always have the factory build the model itself.
 
-`ModelCache` accepts custom `EvictionPolicy` implementations. The
-default is `LRUEvictionPolicy` for inactive host-cache eviction. The
+`ResourceCache` accepts custom `EvictionPolicy` implementations. The
+default is `LRUEvictionPolicy` for unleased host-cache eviction. The
 cache builds the eviction candidate set and byte context, then asks the
-eviction policy to choose victims; `ModelCache` still owns validation,
-accounting, binding, activation, rollback, and release. Policies are called under
+eviction policy to choose victims; `ResourceCache` still owns validation,
+accounting, admission, and release. Policies are called under
 the cache lock. `choose_victims()` must return unique keys from
 `context.candidates` and enough bytes to satisfy
-`context.bytes_to_free`; otherwise `ModelCache` raises
+`context.bytes_to_free`; otherwise `ResourceCache` raises
 `EvictionPolicyError` without evicting anything.
 
 ## Architecture
@@ -500,88 +507,91 @@ the cache lock. `choose_victims()` must return unique keys from
 ```
 registration / cache admission
 ------------------------------
-ModelSpec / LoRASpec / ResourceSpec
+            ResourceSpec protocol
+                    |
+         ModelSpec / LoRASpec / ObjectSpec
         |
         v
   +-------------+
-  | ModelCache  |  owns admission, accounting, eviction, and active bindings
+  | ResourceCache  |  owns admission, accounting, eviction, and leases
   +-------------+
         |
-        +-- builds/admit --> ModelOffloaderStore
+        +-- builds/admit --> ModelOffloader (one model, one runtime)
         |                    |
-        |                    +-- PinnedComponentStore
+        |                    +-- PinnedComponent
         |                    |       |
         |                    |       +-- PinnedParam(s)
         |                    |
-        |                    +-- StreamedComponentStore(s)
+        |                    +-- StreamedComponent(s)
         |                            |
         |                            +-- PinnedParam(s)
         |
-        +-- builds/admit --> LoRAStore (pinned factors; inert cache binding)
+        +-- builds/admit --> LoRA (pinned factors)
         |
         +-- builds/admit --> custom ResourceStore
         |
         +-- chooses inactive victims via EvictionPolicy
 
-cache.use(...)
---------------
-ModelCache
+runner.use(...)
+---------------
+CachedModelRunner
    |
-   +-- creates per-use binding from cached store
-          |
-          +-- ModelOffloader binding
-          |      |
-          |      +-- PinnedComponent
-          |      +-- StreamedComponent(s)
-          |      +-- optional LoRAStore application via set_loras before activation
-          |      |
-          |      +-- activate/deactivate --> nn.Module binding value
-          |
-          +-- custom ResourceBinding
+   +-- lease LoRASpec(s), then ModelSpec
+   +-- ModelOffloader.activate(loras=...) claims model + LoRA resources
+   +-- yield ModelOffloader.value
+   +-- ModelOffloader.deactivate() releases LoRAs + model
 ```
 
-`ResourceStore` is the cache admission contract: it reports
-`cache_bytes` for reusable backing storage. `ResourceBinding` is the
-per-use lifecycle contract: `value`, `activate(device=None, **kwargs)`,
-and `deactivate()` — `activate` accepts resource-specific activation
-policy as keyword arguments (a streamed binding's `stream_config`),
-which non-streaming resources ignore.
+`ResourceSpec` is the structural registration contract: `key`,
+`estimated_cache_bytes`, `build_store()`, and `value(store)`. The standard
+specs are independent frozen dataclasses; custom specs can implement the
+protocol without inheriting from them. `ResourceStore` is the backing-state
+contract and reports `cache_bytes`. A cache lease protects that store from
+eviction but does not create or activate a runtime.
+`ResourceBinding` is the active-resource lifecycle contract: `value`,
+`activate(device=None, **kwargs)`, and `deactivate()`.
+`ModelOffloader` is both a cached `ResourceStore` and a `ResourceBinding`;
+`LoRA` is a cached `ResourceStore` with an exclusive activation lifecycle
+driven by the `ModelOffloader` consuming it. It does not expose a separate
+binding or a model-like `value`.
 
-`ModelCache` caches stores and creates bindings for `use()` calls.
-Whether a second concurrent same-key binding is allowed is decided by
-the spec's `allow_concurrent_binding(store) -> bool` callable (default:
-always allow). `ModelSpec` plugs in stricter behavior: it rejects
-concurrent bindings unless the caller passes `skeleton_factory=`, and
-always rejects them for trainable stores. A custom resource fits by
-passing a store factory and binding function to `ResourceSpec`:
+A custom cached resource needs only one spec and one store:
 
 ```python
-from torch import nn
+from dataclasses import dataclass
 
-class MyBinding:
-    @property
-    def model(self) -> nn.Module: ...
-    @property
-    def value(self) -> nn.Module: ...
-    def activate(self, device=None, **kwargs) -> None: ...
-    def deactivate(self) -> None: ...
+from torch_offload import ResourceSpec, ResourceStore
+
 
 class MyStore:
     @property
     def cache_bytes(self) -> int: ...
-    def bind(self) -> MyBinding: ...
 
-spec = ResourceSpec(
-    key="my-resource",
-    estimated_cache_bytes=...,
-    store_factory=MyStore,
-    bind=lambda store: store.bind(),
+
+@dataclass(frozen=True)
+class MySpec:
+    key: str
+    estimated_cache_bytes: int
+
+    def build_store(self) -> MyStore:
+        return MyStore()
+
+    def value(self, store: ResourceStore) -> MyStore:
+        assert isinstance(store, MyStore)
+        return store
+
+
+spec: ResourceSpec[MyStore] = MySpec(
+    key="my-resource", estimated_cache_bytes=...,
 )
+
+with cache.lease(spec) as store:
+    ...
 ```
 
 `StreamedComponent` and `PinnedComponent` are composable
 `activate`/`deactivate` lifecycle pieces (no `value` or `model`) that live
-inside a top-level model binding rather than acting as one themselves.
+inside a top-level model runtime rather than acting as one themselves.
 
 `TensorAdapter` is the per-parameter extension point. Its base contract
 only covers inference movement: clone/pin, H2D copy, GPU wrapper rebuild,
@@ -591,23 +601,27 @@ sync, `Parameter.data` swap for trainable streaming, and — for LoRA merge
 — either dense in-place `addmm_` (plain bases) or dequantize/requantize
 plus `copy_into` (quantized wrappers).
 
-## Store and Binding Lifecycle
+## Cached resource lifecycle
 
-Stores own cache accounting. Pinning happens during store construction
-so `cache_bytes` is final at admission time; bindings are created for
-individual uses:
+Cached resources own cache accounting. Pinning happens during construction so
+`cache_bytes` is final at admission time; leases protect resources while they
+are used. `ModelOffloader` and `LoRA` each own one exclusive activation
+lifecycle:
 
 ```
-store constructed -> bind -> activate <-> deactivate -> drop binding refs
+ModelOffloader: construct -> lease -> activate <-> deactivate -> release lease
+LoRA:            construct -> lease -> activate <-> deactivate -> release lease
 ```
 
-Binding `activate(device=...)` makes the model usable for compute on the
-requested device. `ModelOffloader`, `MpsWeights`, `PinnedComponent`, and
+`ModelOffloader.activate(device=...)` makes the model usable for compute on the
+requested device. `LoRA.activate(mode=...)` claims an adapter for that model
+use; routed mode also activates its factors on the selected device.
+`ModelOffloader`, `MpsWeights`, `PinnedComponent`, and
 `StreamedComponent` require an explicit device. CUDA activation uses the
 streaming/DMA path where applicable; CPU activation is pass-through over
 pinned host-backed storage.
-`deactivate()` releases transient device resources. Store-owned pinned
-storage remains cached until the store is evicted or otherwise released.
+`deactivate()` releases transient device resources. Pinned storage remains
+cached until its resource is evicted or otherwise released.
 
 Construction optimizes peak host memory. Pinning clones managed tensors
 into pinned CPU storage. For plain `torch.Tensor` parameters, the source
@@ -619,19 +633,18 @@ CUDA-origin models. It is a clone-to-pinned plus storage swap, not true
 in-place pinning. Tensor subclasses such as quanto, GGUF, and NVFP4 do
 not use this `.data` swap when it would lose wrapper state.
 
-**There is no `close()`.** To release pinned host memory, release the
-store reference. With `ModelCache`, that means evicting or clearing the
-entry. Python's refcount-based GC frees pinned tensors immediately once
-the store and any escaped binding/model references that still point at
-store-backed tensors are gone.
+**There is no `close()`.** To release pinned host memory, first let all
+leases end, then evict or clear the cache entry. Python's refcount-based
+GC frees pinned tensors once the cache and any escaped resource, binding, or
+model references are gone.
 
 **Failure semantics.** If construction raises after pinning has started,
 the model may already be partially repointed to pinned storage. Treat the
-partially constructed store/model as unrecoverable: drop those references
-and rebuild from a fresh model instance. If binding `activate()` raises
-midway, the binding may contain partial device state; don't retry
-`activate()` on that binding. Drop the binding reference and bind again
-from the store when the store itself is still valid.
+partially constructed resource/model as unrecoverable: drop those references
+and rebuild from a fresh model instance. If `activate()` raises, the offloader
+rolls back its active components and releases its activation claim, so a later
+well-formed activation may retry the same cached resource. LoRA activation and
+permanent merge failures likewise release every acquired adapter claim.
 This is a low-level library; we don't guard against caller misuse.
 
 ## Compatibility
@@ -644,13 +657,11 @@ This is a low-level library; we don't guard against caller misuse.
   `torch.compile` makes about its trace.
 - **Wrap before DDP/FSDP**, not after. Those wrappers manage parameter
   storage themselves and conflict with the registry-replacement pattern.
-- **Coarse cache concurrency.** `ModelCache` protects cache metadata,
-  admission, binding, activation, and deactivation with an internal lock.
-  The lock is released while caller code runs inside `cache.use(...)`.
-  The cache does not make a yielded model object safe for concurrent
-  same-key execution; default `ModelSpec` bindings reject concurrent
-  same-key use unless `skeleton_factory=` is configured. Trainable model
-  specs always reject concurrent same-key bindings.
+- **One runtime per cached model.** `ResourceCache` serializes resource
+  construction and lease accounting, then releases its lock while a lease is
+  held. Each cached `ModelOffloader` owns one model and rejects overlapping
+  activation, including calls from different runners. Concurrent replicas
+  require distinct `ModelSpec` keys and therefore distinct pinned storage.
 - **Buffer mutations during CUDA activation are discarded** on
   `deactivate()`. CPU activation is pass-through over host-backed
   buffers, so CPU buffer mutations behave like ordinary module
@@ -681,7 +692,7 @@ use whole-model `ModelOffloader` if that sharing must be preserved.
 Every supported weight type can be offloaded (pinned host ↔ GPU
 movement). LoRA differs by type: a base can be **merged** into when its
 adapter exposes an in-place update path, and **routed** LoRA
-(`set_loras(mode="routed")` — a forward hook) is available for any of them
+(`lora_mode="routed"` — a forward hook) is available for any of them
 whose owning module is a logical `nn.Linear` with compatible shape and
 dtype, no merge capability required.
 
@@ -736,7 +747,7 @@ is required for correctness.
 LoRA on quanto bases: merge mode rejects quanto targets on activation
 (in-place `addmm_` on a `WeightQBytesTensor` returns
 success but silently leaves `_data` untouched). Use
-`set_loras(mode="routed")` for inference-time application, or
+`lora_mode="routed"` for inference-time application, or
 `merge_lora()` for a permanent dequant -> addmm -> requant bake-in.
 
 ## TorchAO NVFP4 support
@@ -757,7 +768,7 @@ For uv-managed installs on Linux/Windows, this repo routes `torch` and
 TorchAO NVFP4 coverage.
 
 NVFP4 weights support merged LoRA: the adapter exposes
-dequantize/requantize plus `copy_into`, so both `set_loras(mode="merge")`
+dequantize/requantize plus `copy_into`, so both activation-scoped merge mode
 and permanent `merge_lora()` re-derive the FP8 (E4M3) block scales — and,
 for two-level scaling, the global `per_tensor_scale` — from the merged
 values via `NVFP4Tensor.to_nvfp4`. Re-encoding uses the torch reference
@@ -795,7 +806,7 @@ stack. Use `uv sync --extra torchao --group dev` and then
 `pytest tests/test_mx_adapter.py -q -rs` to exercise the coverage.
 
 MX weights support merged LoRA: the adapter exposes dequantize/requantize
-plus `copy_into`, so both `set_loras(mode="merge")` and permanent
+plus `copy_into`, so both activation-scoped merge mode and permanent
 `merge_lora()` work by dequantizing to dense, applying the delta, and
 re-encoding the power-of-two (E8M0) block scales through the public
 `MXTensor.to_mx`. Both element dtypes are mergeable, but MXFP4's 4-bit
@@ -821,7 +832,7 @@ CUDA hardware.
 
 Like MX, INT8, and NVFP4, scaled-fp8 weights support merged LoRA: the
 adapter exposes dequantize/requantize plus `copy_into`, so both
-`set_loras(mode="merge")` and permanent `merge_lora()` work by
+activation-scoped merge mode and permanent `merge_lora()` work by
 dequantizing to dense, applying the delta, and re-encoding with
 recomputed scales through the public `Float8Tensor.from_hp` (lossy but
 standard practice for merges into quantized bases). The GPU
@@ -836,15 +847,17 @@ than silent corruption.
 
 | Exception | When |
 |---|---|
-| `ModelTooLargeError` | Cache miss can't fit even after evicting all inactive entries. Exposes `required`, `used`, and `limit`. |
+| `ResourceTooLargeError` | Cache miss can't fit even after evicting all inactive entries. Exposes `required`, `used`, and `limit`. |
 | `EvictionPolicyError` | Custom eviction policy returned duplicate/non-candidate victims or too few bytes |
-| `ModelInUseError` | `evict()` / `clear()` / `unregister()` called while entry is active |
-| `DuplicateModelKeyError` | `register()` called for an existing key without `replace=True` |
-| `ModelNotRegisteredError` | `use(str)` called for an unknown key |
+| `ResourceLeasedError` | A cache mutation targets a currently leased entry |
+| `ResourceCachedError` | `unregister(..., evict=False)` targets an entry with a built store |
+| `ModelRuntimeInUseError` | Any caller overlaps activation of the same cached `ModelOffloader` |
+| `LoRARuntimeInUseError` | Any caller overlaps merge or routed use of the same cached `LoRA` |
+| `DuplicateResourceKeyError` | `register()` is called for an existing key without `replace=True` |
+| `ResourceNotRegisteredError` | `lease(str)` is called for an unknown key |
 
 ## State Inspection
 
 Use `cache.used_cache_bytes` and `cache.available_cache_bytes` for
-current cache accounting. `available_cache_bytes` is signed; negative
-means a store reported growth after admission and the cache is currently
-over budget. Use `cache.info(key)` for per-key state when needed.
+current cache accounting. Use `cache.info(key)` for per-key state when
+needed.

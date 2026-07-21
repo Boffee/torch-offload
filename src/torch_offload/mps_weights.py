@@ -61,21 +61,16 @@ class MpsWeights:
         return self
 
     def activate(
-        self, device: torch.device | str | None = None, **kwargs: object,
+        self,
+        device: torch.device | str | None = None,
+        **kwargs: object,
     ) -> None:
         del kwargs  # MPS materialization takes no streaming policy
         if device is None:
-            raise ValueError(
-                "MpsWeights.activate() requires device='mps'; pass "
-                "activate('mps') or use this binding through "
-                "ModelCache.use(..., device='mps')"
-            )
+            raise ValueError("MpsWeights.activate() requires device='mps'; pass activate('mps') explicitly")
         active_device = canonical_device(device)
         if active_device.type != "mps":
-            raise ValueError(
-                "MpsWeights.activate() supports MPS; "
-                f"got {active_device}."
-            )
+            raise ValueError(f"MpsWeights.activate() supports MPS; got {active_device}.")
 
     def deactivate(self) -> None:
         return
@@ -104,10 +99,7 @@ class MpsWeights:
         device = torch.device("mps")
         for _name, parent, leaf, param in named_parameter_entries(self._model):
             if param.requires_grad:
-                raise RuntimeError(
-                    "MpsWeights is frozen-only, but a managed parameter "
-                    "became trainable."
-                )
+                raise RuntimeError("MpsWeights is frozen-only, but a managed parameter became trainable.")
             if param.device != device:
                 set_named_parameter(
                     parent,
@@ -137,18 +129,13 @@ class MpsWeights:
     @staticmethod
     def _require_cpu(tensor: torch.Tensor, name: str) -> None:
         if tensor.device.type != "cpu":
-            raise ValueError(
-                f"MpsWeights requires CPU tensors at construction; "
-                f"{name!r} is on {tensor.device}."
-            )
+            raise ValueError(f"MpsWeights requires CPU tensors at construction; {name!r} is on {tensor.device}.")
 
     @staticmethod
     def _check_mps_available() -> None:
         mps_backend = getattr(torch.backends, "mps", None)
         if mps_backend is None or not mps_backend.is_available():
-            raise RuntimeError(
-                "MpsWeights requires an available PyTorch MPS backend."
-            )
+            raise RuntimeError("MpsWeights requires an available PyTorch MPS backend.")
 
     @staticmethod
     def _synchronize_mps() -> None:

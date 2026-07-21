@@ -14,9 +14,8 @@ import torch
 from torch import nn
 
 from torch_offload import (
-    LoRAStore,
+    LoRA,
     ModelOffloader,
-    ModelOffloaderStore,
     StreamConfig,
     merge_lora,
 )
@@ -24,6 +23,7 @@ from torch_offload.int4_tile_adapter import Int4TilePackedAdapter
 from torch_offload.pinned_param import PinnedParam
 from torch_offload.streamed_component import _param_target_layout
 from torch_offload.tensor_adapter_registry import select_adapter, tensor_id
+from tests.conftest import activated_model
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(),
@@ -37,12 +37,11 @@ def _make_model_offloader(
     blocks_attr: list[str] = [],
     stream_trainable_weights: bool = False,
 ) -> ModelOffloader:
-    store = ModelOffloaderStore.from_module(
+    return ModelOffloader.from_module(
         model,
         blocks_attr=blocks_attr,
         stream_trainable_weights=stream_trainable_weights,
     )
-    return store.bind(model)
 
 
 def _int4_tile_config() -> object:
@@ -52,9 +51,7 @@ def _int4_tile_config() -> object:
         from torchao.quantization.quantize_.workflows import Int4PackingFormat
     except ImportError as exc:
         pytest.skip(f"torchao int4 API unavailable: {exc}")
-    return Int4WeightOnlyConfig(
-        int4_packing_format=Int4PackingFormat.TILE_PACKED_TO_4D
-    )
+    return Int4WeightOnlyConfig(int4_packing_format=Int4PackingFormat.TILE_PACKED_TO_4D)
 
 
 def _int4_tile_cls() -> type:
@@ -86,9 +83,7 @@ class TestInt4TilePackedAdapter:
     def test_matches_and_dispatches_int4_tile_only(self) -> None:
         qt = _make_int4_tile()
         assert Int4TilePackedAdapter.matches(qt)
-        assert not Int4TilePackedAdapter.matches(
-            torch.zeros(16, 16, dtype=torch.bfloat16)
-        )
+        assert not Int4TilePackedAdapter.matches(torch.zeros(16, 16, dtype=torch.bfloat16))
         assert isinstance(select_adapter(qt), Int4TilePackedAdapter)
 
     def test_pin_preserves_storage_and_metadata(self) -> None:
@@ -101,10 +96,7 @@ class TestInt4TilePackedAdapter:
         assert pinned.qdata.is_pinned()
         assert pinned.scale_and_zero.is_pinned()
         assert pinned.qdata.data_ptr() == pinned_param.pinned_state.storage[0].data_ptr()
-        assert (
-            pinned.scale_and_zero.data_ptr()
-            == pinned_param.pinned_state.storage[1].data_ptr()
-        )
+        assert pinned.scale_and_zero.data_ptr() == pinned_param.pinned_state.storage[1].data_ptr()
         # Logical shape is preserved even though qdata is packed to a
         # different (4-D) shape.
         assert tuple(pinned.shape) == tuple(qt.shape)
@@ -148,7 +140,7 @@ class TestInt4TilePackedAdapter:
         model = M()
         model.lin.weight.requires_grad = False
         model.lin.weight = nn.Parameter(_make_int4_tile(), requires_grad=False)
-        lora = LoRAStore.from_state_dict(
+        lora = LoRA.from_state_dict(
             state_dict={
                 "lin.lora_A.weight": torch.randn(8, 256),
                 "lin.lora_B.weight": torch.randn(256, 8),
@@ -175,9 +167,7 @@ class TestInt4TilePackedAdapter:
         assert tuple(gpu_param.data.shape) == tuple(pinned.shape)
         assert gpu_param.data.block_size == pinned.block_size
         assert torch.equal(gpu_param.data.qdata.cpu(), pinned.qdata)
-        assert torch.equal(
-            gpu_param.data.scale_and_zero.cpu(), pinned.scale_and_zero
-        )
+        assert torch.equal(gpu_param.data.scale_and_zero.cpu(), pinned.scale_and_zero)
 
     def test_model_offloader_cuda_forward(self) -> None:
         layer = nn.Linear(256, 256, bias=False, dtype=torch.bfloat16)
@@ -187,7 +177,7 @@ class TestInt4TilePackedAdapter:
 
         try:
             x = torch.randn(64, 256, dtype=torch.bfloat16, device="cuda")
-            with strategy.use("cuda") as active:
+            with activated_model(strategy, "cuda") as active:
                 y = active(x)
                 torch.cuda.synchronize()
             assert y.shape == (64, 256)
@@ -207,7 +197,7 @@ class TestInt4TilePackedAdapter:
 
         strategy = _make_model_offloader(layer)
         try:
-            with strategy.use("cuda") as active:
+            with activated_model(strategy, "cuda") as active:
                 y = active(x)
                 torch.cuda.synchronize()
             torch.testing.assert_close(y, ref)
@@ -238,21 +228,20 @@ class TestInt4TilePackedAdapter:
             model,
             blocks_attr=["blocks"],
         )
-        lora = LoRAStore.from_state_dict(
+        lora = LoRA.from_state_dict(
             state_dict={
                 "blocks.0.lora_A.weight": torch.randn(8, 256),
                 "blocks.0.lora_B.weight": torch.randn(256, 8),
             }
         )
-        offloader.set_loras([lora], strengths=[0.25], mode="routed")
-
         try:
             x = torch.randn(64, 256, dtype=torch.bfloat16, device="cuda")
-            with offloader.use(
+            with activated_model(offloader,
                 "cuda",
-                stream_config=StreamConfig(
-                    num_resident_blocks=1, num_prefetch_blocks=0
-                ),
+                loras=[lora],
+                lora_strengths=[0.25],
+                lora_mode="routed",
+                stream_config=StreamConfig(num_resident_blocks=1, num_prefetch_blocks=0),
             ) as active:
                 y = active(x)
                 torch.cuda.synchronize()

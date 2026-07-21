@@ -9,9 +9,8 @@ import torch
 from torch import nn
 
 from torch_offload import (
-    LoRAStore,
+    LoRA,
     ModelOffloader,
-    ModelOffloaderStore,
     StreamConfig,
     merge_lora,
 )
@@ -19,6 +18,7 @@ from torch_offload.bnb4bit_adapter import Bnb4bitAdapter
 from torch_offload.pinned_param import PinnedParam
 from torch_offload.streamed_component import _param_target_layout
 from torch_offload.tensor_adapter_registry import tensor_id
+from tests.conftest import activated_model
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -29,12 +29,11 @@ def _make_model_offloader(
     blocks_attr: list[str] = [],
     stream_trainable_weights: bool = False,
 ) -> ModelOffloader:
-    store = ModelOffloaderStore.from_module(
+    return ModelOffloader.from_module(
         model,
         blocks_attr=blocks_attr,
         stream_trainable_weights=stream_trainable_weights,
     )
-    return store.bind(model)
 
 
 def _make_nf4(
@@ -81,18 +80,14 @@ def _unquantized_params4bit(*, rows: int = 64, cols: int = 32) -> Any:
     from bitsandbytes.nn import Params4bit
 
     params4bit: Any = Params4bit
-    return params4bit(
-        torch.randn(rows, cols, dtype=torch.bfloat16), requires_grad=False
-    )
+    return params4bit(torch.randn(rows, cols, dtype=torch.bfloat16), requires_grad=False)
 
 
 class TestBnb4bitAdapter:
     def test_matches_nf4_only(self) -> None:
         p = _make_nf4()
         assert Bnb4bitAdapter.matches(p)
-        assert not Bnb4bitAdapter.matches(
-            torch.zeros(64, 32, dtype=torch.bfloat16)
-        )
+        assert not Bnb4bitAdapter.matches(torch.zeros(64, 32, dtype=torch.bfloat16))
 
     def test_matches_fp4(self) -> None:
         # One adapter covers the whole 4-bit family, not just NF4.
@@ -127,17 +122,12 @@ class TestBnb4bitAdapter:
         assert pinned.data.is_pinned()
         assert pinned.quant_state.absmax.is_pinned()
         assert pinned.data.data_ptr() == pinned_param.pinned_state.data.data_ptr()
-        assert (
-            pinned.quant_state.absmax.data_ptr()
-            == pinned_param.pinned_state.buffers["absmax"].data_ptr()
-        )
+        assert pinned.quant_state.absmax.data_ptr() == pinned_param.pinned_state.buffers["absmax"].data_ptr()
         assert pinned.quant_state.blocksize == p.quant_state.blocksize
         assert pinned.quant_state.quant_type == p.quant_state.quant_type
         assert tuple(pinned.quant_state.shape) == tuple(p.quant_state.shape)
         assert pinned_param.compute_dtype is torch.bfloat16
-        assert torch.equal(
-            Bnb4bitAdapter.dequantize(pinned), Bnb4bitAdapter.dequantize(p)
-        )
+        assert torch.equal(Bnb4bitAdapter.dequantize(pinned), Bnb4bitAdapter.dequantize(p))
 
     def test_tensor_id_tracks_packed_and_scales(self) -> None:
         p = _make_nf4()
@@ -174,9 +164,7 @@ class TestBnb4bitAdapter:
         real = _make_nf4(rows=64, cols=32)
         placeholder = _unquantized_params4bit(rows=64, cols=32)
         assert Bnb4bitAdapter.bind_layout_signature(real) == ((64, 32),)
-        assert Bnb4bitAdapter.bind_layout_signature(
-            placeholder
-        ) == Bnb4bitAdapter.bind_layout_signature(real)
+        assert Bnb4bitAdapter.bind_layout_signature(placeholder) == Bnb4bitAdapter.bind_layout_signature(real)
 
     def test_bind_layout_drops_store_reconstructed_fields(self) -> None:
         # Unlike the strict target layout, the bind layout keeps only the
@@ -186,9 +174,7 @@ class TestBnb4bitAdapter:
         nf4 = _make_nf4(quant_type="nf4")
         fp4 = _make_nf4(quant_type="fp4")
         assert _param_target_layout(nf4) != _param_target_layout(fp4)
-        assert Bnb4bitAdapter.bind_layout_signature(
-            nf4
-        ) == Bnb4bitAdapter.bind_layout_signature(fp4)
+        assert Bnb4bitAdapter.bind_layout_signature(nf4) == Bnb4bitAdapter.bind_layout_signature(fp4)
 
     @pytest.mark.parametrize(
         "variant",
@@ -199,9 +185,7 @@ class TestBnb4bitAdapter:
             {"quant_type": "nf4", "quant_storage": torch.bfloat16},
         ],
     )
-    def test_bind_layout_is_logical_shape_regardless_of_quant(
-        self, variant: dict[str, Any]
-    ) -> None:
+    def test_bind_layout_is_logical_shape_regardless_of_quant(self, variant: dict[str, Any]) -> None:
         # The placeholder branch reads t.shape, reliable only because an
         # unquantized Params4bit wraps the dense [out, in] weight: bnb packs
         # data solely during quantization (which is also when quant_state is
@@ -214,29 +198,6 @@ class TestBnb4bitAdapter:
         assert Bnb4bitAdapter.bind_layout_signature(real) == ((64, 32),)
         assert Bnb4bitAdapter.bind_layout_signature(placeholder) == ((64, 32),)
 
-    def test_store_binds_unquantized_skeleton(self) -> None:
-        # End to end: a store pinned from a real quantized model accepts a
-        # separately-built skeleton whose 4-bit weights are unquantized
-        # placeholders (quant_state is None) — the meta-skeleton case the
-        # native quantizer produces. Previously bind raised, because matches
-        # rejected the placeholder before the layout was ever compared.
-        bnb = pytest.importorskip("bitsandbytes")
-
-        def linear() -> Any:
-            return bnb.nn.Linear4bit(
-                32, 64, bias=False, compute_dtype=torch.bfloat16,
-                quant_type="nf4", quant_storage=torch.uint8,
-            )
-
-        real = linear().to("cpu")  # bnb 0.49+ quantizes on CPU
-        assert real.weight.quant_state is not None
-        skeleton = linear()
-        assert skeleton.weight.quant_state is None
-
-        store = ModelOffloaderStore.from_module(real)
-        binding = store.bind(skeleton)
-        assert binding is not None
-
     def test_no_cpu_round_trip_or_trainable_swap_capability(self) -> None:
         pinned_param = PinnedParam(_make_nf4())
         state = pinned_param.allocate_gpu_storage(torch.device("cpu"))
@@ -247,9 +208,7 @@ class TestBnb4bitAdapter:
             pinned_param.validate_parameter_data_swap_target()
 
     @pytest.mark.parametrize("double_quant", [False, True])
-    def test_dequantize_requantize_preserves_representation(
-        self, double_quant: bool
-    ) -> None:
+    def test_dequantize_requantize_preserves_representation(self, double_quant: bool) -> None:
         p = _make_nf4(double_quant=double_quant)
         dense = Bnb4bitAdapter.dequantize(p)
         assert dense.dtype is torch.float32
@@ -264,9 +223,7 @@ class TestBnb4bitAdapter:
         # are not asserted: whether a block's max lands on the codebook
         # extreme (so absmax is recovered bit-for-bit) is seed- and
         # kernel-dependent, so check the round-trip instead.
-        torch.testing.assert_close(
-            Bnb4bitAdapter.dequantize(again), dense, rtol=0.05, atol=0.05
-        )
+        torch.testing.assert_close(Bnb4bitAdapter.dequantize(again), dense, rtol=0.05, atol=0.05)
 
     def test_requantize_rejects_shape_mismatch(self) -> None:
         p = _make_nf4(rows=64, cols=32)
@@ -291,9 +248,7 @@ class TestBnb4bitAdapter:
         target_data_ptr = target.data.data_ptr()
         target_absmax_ptr = target.quant_state.absmax.data_ptr()
 
-        src = Bnb4bitAdapter.requantize(
-            Bnb4bitAdapter.dequantize(target) + 0.1, like=target
-        )
+        src = Bnb4bitAdapter.requantize(Bnb4bitAdapter.dequantize(target) + 0.1, like=target)
         Bnb4bitAdapter.copy_into(src, target=target)
 
         # Storage identity preserved; contents now match the source.
@@ -315,7 +270,7 @@ class TestBnb4bitAdapter:
         # copy_into mutates the weight's packed storage in place, so snapshot
         # the original bytes rather than holding a tensor reference.
         original_packed = model.lin.weight.data.data.clone()
-        lora = LoRAStore.from_state_dict(
+        lora = LoRA.from_state_dict(
             state_dict={
                 "lin.lora_A.weight": torch.randn(4, 32),
                 "lin.lora_B.weight": torch.randn(64, 4),
@@ -347,9 +302,7 @@ class TestBnb4bitAdapter:
         assert gpu_param.quant_state.blocksize == pinned.quant_state.blocksize
         assert gpu_param.quant_state.quant_type == pinned.quant_state.quant_type
         assert torch.equal(gpu_param.data.cpu(), pinned.data)
-        assert torch.equal(
-            gpu_param.quant_state.absmax.cpu(), pinned.quant_state.absmax
-        )
+        assert torch.equal(gpu_param.quant_state.absmax.cpu(), pinned.quant_state.absmax)
 
     @CUDA
     def test_double_quant_full_gpu_lifecycle_round_trip(self) -> None:
@@ -387,7 +340,7 @@ class TestBnb4bitAdapter:
 
         strategy = _make_model_offloader(layer)
         try:
-            with strategy.use("cuda") as active:
+            with activated_model(strategy, "cuda") as active:
                 y = active(x)
                 torch.cuda.synchronize()
             assert y.shape == (8, 128)
@@ -406,12 +359,20 @@ class TestBnb4bitAdapter:
                 self.blocks = nn.ModuleList(
                     [
                         bnb.nn.Linear4bit(
-                            128, 128, bias=False, compute_dtype=torch.bfloat16,
-                            quant_type="nf4", quant_storage=torch.uint8,
+                            128,
+                            128,
+                            bias=False,
+                            compute_dtype=torch.bfloat16,
+                            quant_type="nf4",
+                            quant_storage=torch.uint8,
                         ),
                         bnb.nn.Linear4bit(
-                            128, 128, bias=False, compute_dtype=torch.bfloat16,
-                            quant_type="nf4", quant_storage=torch.uint8,
+                            128,
+                            128,
+                            bias=False,
+                            compute_dtype=torch.bfloat16,
+                            quant_type="nf4",
+                            quant_storage=torch.uint8,
                         ),
                     ]
                 )
@@ -426,21 +387,20 @@ class TestBnb4bitAdapter:
             model,
             blocks_attr=["blocks"],
         )
-        lora = LoRAStore.from_state_dict(
+        lora = LoRA.from_state_dict(
             state_dict={
                 "blocks.0.lora_A.weight": torch.randn(4, 128),
                 "blocks.0.lora_B.weight": torch.randn(128, 4),
             }
         )
-        offloader.set_loras([lora], strengths=[0.25], mode="routed")
-
         try:
             x = torch.randn(128, 128, dtype=torch.bfloat16, device="cuda")
-            with offloader.use(
+            with activated_model(offloader,
                 "cuda",
-                stream_config=StreamConfig(
-                    num_resident_blocks=1, num_prefetch_blocks=0
-                ),
+                loras=[lora],
+                lora_strengths=[0.25],
+                lora_mode="routed",
+                stream_config=StreamConfig(num_resident_blocks=1, num_prefetch_blocks=0),
             ) as active:
                 y = active(x)
                 torch.cuda.synchronize()
@@ -463,8 +423,12 @@ class TestBnb4bitAdapter:
                 self.blocks = nn.ModuleList(
                     [
                         bnb.nn.Linear4bit(
-                            128, 128, bias=False, compute_dtype=torch.bfloat16,
-                            compress_statistics=True, quant_type="nf4",
+                            128,
+                            128,
+                            bias=False,
+                            compute_dtype=torch.bfloat16,
+                            compress_statistics=True,
+                            quant_type="nf4",
                             quant_storage=torch.uint8,
                         )
                         for _ in range(2)
@@ -480,29 +444,27 @@ class TestBnb4bitAdapter:
         with torch.no_grad():
             for block, scale in zip(model.blocks, (0.01, 5.0), strict=True):
                 block.weight = bnb.nn.Params4bit(
-                    torch.randn(128, 128) * scale, requires_grad=False,
-                    compress_statistics=True, quant_type="nf4",
+                    torch.randn(128, 128) * scale,
+                    requires_grad=False,
+                    compress_statistics=True,
+                    quant_type="nf4",
                     quant_storage=torch.uint8,
                 )
         model = model.to("cuda")
-        assert (
-            model.blocks[0].weight.quant_state.offset.item()
-            != model.blocks[1].weight.quant_state.offset.item()
-        )
+        assert model.blocks[0].weight.quant_state.offset.item() != model.blocks[1].weight.quant_state.offset.item()
 
         x = torch.randn(128, 128, dtype=torch.bfloat16, device="cuda")
         reference = model(x)  # 4-bit forward does not migrate state
 
         offloader = _make_model_offloader(
-            model, blocks_attr=["blocks"],
+            model,
+            blocks_attr=["blocks"],
         )
         try:
             for _ in range(3):
-                with offloader.use(
+                with activated_model(offloader,
                     "cuda",
-                    stream_config=StreamConfig(
-                        num_resident_blocks=1, num_prefetch_blocks=0
-                    ),
+                    stream_config=StreamConfig(num_resident_blocks=1, num_prefetch_blocks=0),
                 ) as active:
                     y = active(x)
                     torch.cuda.synchronize()

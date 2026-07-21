@@ -171,7 +171,7 @@ class TensorAdapter(Protocol[PinnedStateT, GpuStateT]):
     @staticmethod
     def cache_bytes(state: PinnedStateT) -> int:
         """Total bytes this state consumes in host memory. Used by
-        :class:`ModelCache` for budget accounting."""
+        :class:`ResourceCache` for budget accounting."""
         ...
 
 
