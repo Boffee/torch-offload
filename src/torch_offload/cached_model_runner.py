@@ -14,7 +14,7 @@ from typing import TypeVar, cast
 import torch
 from torch import nn
 
-from .lora import LoRA, LoraMode
+from .lora import LoRA, LoRAMode
 from .model_offloader import ModelOffloader
 from .resource_cache import ResourceCache
 from .resource_specs import LoRASpec, ModelSpec
@@ -42,7 +42,7 @@ class CachedModelRunner:
         device: torch.device | str,
         lora_specs: Sequence[LoRASpec] = (),
         lora_strengths: Sequence[float] | None = None,
-        lora_mode: LoraMode = "merge",
+        lora_mode: LoRAMode = "merge",
         stream_config: StreamConfig | None = None,
     ) -> Iterator[M]:
         """Lease dependencies and activate the cached model runtime.

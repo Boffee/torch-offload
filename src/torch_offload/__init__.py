@@ -110,6 +110,7 @@ from .gguf_adapter import GGUFWeight
 from .lora import (
     LoRA,
     LoRAFactor,
+    LoRAMode,
     LoRARuntimeInUseError,
     LoRATransform,
     ScaledLoRAFactor,
@@ -154,6 +155,7 @@ __all__ = [
     "LRUEvictionPolicy",
     "LoRA",
     "LoRAFactor",
+    "LoRAMode",
     "LoRARuntimeInUseError",
     "LoRASpec",
     "LoRATransform",

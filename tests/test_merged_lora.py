@@ -21,6 +21,7 @@ from torch_offload import (
     CachedModelRunner,
     LoRA,
     LoRAFactor,
+    LoRAMode,
     LoRARuntimeInUseError,
     LoRATransform,
     ResourceCache,
@@ -35,7 +36,6 @@ from torch_offload import (
     StreamedComponent,
     merge_lora,
 )
-from torch_offload.lora import LoraMode
 from torch_offload.pinned_module import PinnedModuleInstance
 from torch_offload.pinned_param import PinnedParam
 from torch_offload.protocols import (
@@ -185,7 +185,7 @@ def _request_loras(
     strategy: ModelOffloader,
     loras: Sequence[tuple[LoRA, float]],
     *,
-    mode: LoraMode = "merge",
+    mode: LoRAMode = "merge",
 ) -> None:
     normalized = strategy._normalize_loras(
         [lora for lora, _strength in loras],
@@ -196,7 +196,7 @@ def _request_loras(
 
 _LORA_REQUESTS: dict[
     ModelOffloader,
-    tuple[list[tuple[LoRA, float]], LoraMode],
+    tuple[list[tuple[LoRA, float]], LoRAMode],
 ] = {}
 
 
@@ -1163,6 +1163,80 @@ class TestPermanentMerge:
         assert merge_lora(m, [(lora, 1.0)]) == 2
         _assert_lora_available(lora)
 
+    def test_rejects_unknown_targets_without_mutation(self) -> None:
+        m = _make_bf16_model(num_blocks=2, dim=16).to(torch.float32)
+        before = {
+            name: param.detach().clone()
+            for name, param in m.named_parameters()
+        }
+        lora = _make_lora(
+            num_blocks=2,
+            dim=16,
+            prefix="missing.",
+        )
+
+        with pytest.raises(ValueError, match="not parameters in the model"):
+            merge_lora(m, [(lora, 1.0)])
+
+        for name, param in m.named_parameters():
+            torch.testing.assert_close(param, before[name])
+        _assert_lora_available(lora)
+
+    def test_multiple_loras_on_one_target_count_one_parameter(self) -> None:
+        class M(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.target = nn.Linear(3, 3, bias=False)
+
+        m = M()
+        m.requires_grad_(False)
+        base = m.target.weight.detach().clone()
+
+        def make_lora(seed: int) -> LoRA:
+            g = torch.Generator().manual_seed(seed)
+            return LoRA.from_state_dict(
+                {
+                    "target.lora_A.weight": torch.randn(1, 3, generator=g),
+                    "target.lora_B.weight": torch.randn(3, 1, generator=g),
+                }
+            )
+
+        first = make_lora(1)
+        second = make_lora(2)
+        expected = base.clone()
+        for lora in (first, second):
+            a, b = _factor_tensors(lora.targets["target.weight"])
+            expected.addmm_(b, a)
+
+        assert merge_lora(m, [(first, 1.0), (second, 1.0)]) == 1
+        torch.testing.assert_close(m.target.weight, expected)
+
+    def test_shape_preflight_prevents_partial_merge(self) -> None:
+        class M(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.first = nn.Linear(3, 3, bias=False)
+                self.second = nn.Linear(3, 3, bias=False)
+
+        m = M()
+        m.requires_grad_(False)
+        first_before = m.first.weight.detach().clone()
+        second_before = m.second.weight.detach().clone()
+        lora = LoRA.from_state_dict(
+            {
+                "first.lora_A.weight": torch.randn(1, 3),
+                "first.lora_B.weight": torch.randn(3, 1),
+                "second.lora_A.weight": torch.randn(1, 3),
+                "second.lora_B.weight": torch.randn(2, 1),
+            }
+        )
+
+        with pytest.raises(ValueError, match="second.weight.*shape mismatch"):
+            merge_lora(m, [(lora, 1.0)])
+
+        torch.testing.assert_close(m.first.weight, first_before)
+        torch.testing.assert_close(m.second.weight, second_before)
+
     def test_quanto_target_uses_dequant_requant_strategy(self) -> None:
         quanto = pytest.importorskip("optimum.quanto")
         from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
@@ -1212,6 +1286,49 @@ class TestPermanentMerge:
         assert tuple(merged_qt.size()) == (rows, cols)
         torch.testing.assert_close(merged_qt._data, expected_packed)
         torch.testing.assert_close(merged_qt._scale, scale)
+
+    def test_multiple_loras_requantize_shared_target_once(self) -> None:
+        quanto = pytest.importorskip("optimum.quanto")
+        from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
+
+        class M(nn.Module):
+            def __init__(self, weight: torch.Tensor) -> None:
+                super().__init__()
+                self.target = nn.Linear(2, 2, bias=False)
+                self.target.weight = nn.Parameter(weight, requires_grad=False)
+
+        data = torch.zeros((2, 2), dtype=torch.int8)
+        scale = torch.ones((2, 1), dtype=torch.float32)
+        qt = WeightQBytesTensor.create(
+            quanto.qint8,
+            0,
+            (2, 2),
+            (2, 1),
+            data,
+            scale,
+            None,
+        )
+
+        def make_lora() -> LoRA:
+            return LoRA.from_state_dict(
+                {
+                    "target.lora_A.weight": torch.ones(1, 2),
+                    "target.lora_B.weight": torch.full((2, 1), 0.6),
+                }
+            )
+
+        m = M(qt)
+        first = make_lora()
+        second = make_lora()
+
+        assert merge_lora(m, [(first, 1.0), (second, 1.0)]) == 1
+        # Both 0.6 deltas are accumulated in dense space before the one
+        # unit-scale int8 requantization: round(0.6 + 0.6) == 1. Requantizing
+        # after each contribution instead would incorrectly produce 2.
+        torch.testing.assert_close(
+            m.target.weight.data.dequantize(),
+            torch.ones(2, 2),
+        )
 
     def test_tied_alias_target_merges_shared_storage(self) -> None:
         m = _make_tied_non_block_model(dtype=torch.float32)
@@ -1308,6 +1425,43 @@ class TestRoutedMode:
         the expected calculation would also include the hook output
         and we'd be comparing the hook against itself)."""
         return _expected_routed_output(model, x, loras)
+
+    def test_routed_accepts_linear_input_by_keyword(self) -> None:
+        class M(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.target = nn.Linear(3, 3, bias=False)
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                return self.target(input=x)
+
+        m = M()
+        m.requires_grad_(False)
+        lora = LoRA.from_state_dict(
+            {
+                "target.lora_A.weight": torch.randn(1, 3),
+                "target.lora_B.weight": torch.randn(3, 1),
+            }
+        )
+        factor = lora.targets["target.weight"]
+        a, b = _factor_tensors(factor)
+        x = torch.randn(2, 3)
+        strength = 0.5
+        offloader = _make_model_offloader(m)
+
+        offloader.activate(
+            "cpu",
+            loras=[lora],
+            lora_strengths=[strength],
+            lora_mode="routed",
+        )
+        try:
+            actual = m(x)
+            expected = F.linear(x, m.target.weight)
+            expected += ((x @ a.T) * strength) @ b.T
+            torch.testing.assert_close(actual, expected)
+        finally:
+            offloader.deactivate()
 
     @CUDA
     def test_routed_forward_matches_manual_baseline(self) -> None:
@@ -2302,7 +2456,7 @@ class TestLoRAActivation:
         _assert_lora_available(lora)
 
     @pytest.mark.parametrize("second_mode", ["merge", "routed"])
-    def test_rejects_every_overlapping_use(self, second_mode: LoraMode) -> None:
+    def test_rejects_every_overlapping_use(self, second_mode: LoRAMode) -> None:
         lora = _make_lora(num_blocks=2, dim=8)
         model = _make_bf16_model(num_blocks=2, dim=8)
         lora.activate(mode="merge")

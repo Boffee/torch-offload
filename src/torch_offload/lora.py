@@ -56,13 +56,13 @@ from .tensor_adapters import (
 __all__ = [
     "LoRA",
     "LoRAFactor",
+    "LoRAMode",
     "LoRARuntimeInUseError",
     "LoRATransform",
-    "LoraMode",
     "ScaledLoRAFactor",
 ]
 
-LoraMode = Literal["merge", "routed"]
+LoRAMode = Literal["merge", "routed"]
 
 
 class LoRARuntimeInUseError(RuntimeError):
@@ -259,7 +259,7 @@ class LoRA:
         self,
         device: torch.device | str | None = None,
         *,
-        mode: LoraMode,
+        mode: LoRAMode,
         schedule_model: nn.Module | None = None,
         **kwargs: object,
     ) -> None:
@@ -478,14 +478,30 @@ def install_routed_residual_hook(
 
     def hook(
         _module: nn.Module,
-        inputs: tuple[torch.Tensor, ...],
+        inputs: tuple[Any, ...],
+        kwargs: dict[str, Any],
         output: torch.Tensor,
     ) -> torch.Tensor:
+        if inputs:
+            x = inputs[0]
+        else:
+            try:
+                x = kwargs["input"]
+            except KeyError as exc:
+                raise TypeError(
+                    "Routed LoRA expected the Linear input as either the "
+                    "first positional argument or the 'input' keyword"
+                ) from exc
+        if not isinstance(x, torch.Tensor):
+            raise TypeError(
+                "Routed LoRA requires the Linear input to be a torch.Tensor; "
+                f"got {type(x).__name__}"
+            )
         a = lora_a.get_parameter("weight").to(output.dtype)
         b = lora_b.get_parameter("weight").to(output.dtype)
-        return output + _routed_residual(inputs[0], a, b, strength)
+        return output + _routed_residual(x, a, b, strength)
 
-    return parent.register_forward_hook(hook)
+    return parent.register_forward_hook(hook, with_kwargs=True)
 
 
 # ---------------------------------------------------------------------------

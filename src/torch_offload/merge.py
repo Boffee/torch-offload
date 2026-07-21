@@ -21,7 +21,7 @@ from typing import Any
 
 from torch import nn
 
-from .lora import LoRA, LoRATransform
+from .lora import LoRA, LoRATransform, ScaledLoRAFactor
 from .tensor_adapter_registry import param_tensor_id
 
 logger = logging.getLogger(__name__)
@@ -39,7 +39,11 @@ class _MergeParamGroup:
 class _MergeOp:
     group: _MergeParamGroup
     target_key: str
-    transform: LoRATransform
+    factors: list[ScaledLoRAFactor]
+
+    @property
+    def transform(self) -> LoRATransform:
+        return LoRATransform(self.factors)
 
 
 def merge_lora(
@@ -48,9 +52,10 @@ def merge_lora(
 ) -> int:
     """Merge one or more LoRAs into model parameters in-place.
 
-    Returns the number of parameters that were modified. Every LoRA is claimed
-    exclusively for the duration of the merge; an adapter already attached to
-    another model fails immediately.
+    Returns the number of unique parameters that were modified. Every LoRA is
+    claimed exclusively for the duration of the merge; an adapter already
+    attached to another model fails immediately. All target names and merge
+    capabilities are validated before any parameter is modified.
     """
     if len({id(lora) for lora, _strength in loras}) != len(loras):
         raise ValueError(
@@ -72,41 +77,65 @@ def _merge_loras(
 ) -> int:
     params_by_target = _collect_params_by_target(model)
 
-    merge_ops: list[_MergeOp] = []
+    missing_targets = sorted({
+        target_key
+        for lora, _strength in loras
+        for target_key in lora.targets
+        if target_key not in params_by_target
+    })
+    if missing_targets:
+        sample = sorted(params_by_target)[:3]
+        raise ValueError(
+            f"LoRA targets are not parameters in the model: {missing_targets}. "
+            "LoRA target keys must match the model's parameter names exactly. "
+            f"Sample model parameter keys: {sample} ..."
+        )
+
     param_groups_by_tensor_id: dict[tuple[Any, ...], _MergeParamGroup] = {}
-    target_by_tensor_id: dict[tuple[Any, ...], str] = {}
+    merge_ops_by_tensor_id: dict[tuple[Any, ...], _MergeOp] = {}
     for lora, strength in loras:
         for target_key, factor in lora.targets.items():
-            param = params_by_target.get(target_key)
-            if param is None:
-                continue
+            param = params_by_target[target_key]
             group = _param_group_for_param(
-                param, param_groups_by_tensor_id,
+                param,
+                param_groups_by_tensor_id,
             )
-            existing_target = target_by_tensor_id.setdefault(
-                group.tensor_id, target_key,
-            )
-            if existing_target != target_key:
+            op = merge_ops_by_tensor_id.get(group.tensor_id)
+            if op is None:
+                op = _MergeOp(group, target_key, [])
+                merge_ops_by_tensor_id[group.tensor_id] = op
+            elif op.target_key != target_key:
                 raise ValueError(
-                    f"LoRA targets {existing_target!r} and {target_key!r} "
+                    f"LoRA targets {op.target_key!r} and {target_key!r} "
                     f"resolve to the same tied parameter backing. Apply "
                     f"only one name for a tied weight in a single "
                     f"merge_lora() call; otherwise the same base weight "
                     f"would receive multiple logical updates."
                 )
-            transform = LoRATransform([factor.scaled(strength)])
-            merge_ops.append(_MergeOp(group, target_key, transform))
+            op.factors.append(factor.scaled(strength))
+
+    merge_ops = list(merge_ops_by_tensor_id.values())
+
+    # Preflight every operation before applying any of them. This catches all
+    # expected name, shape, and adapter-capability errors without leaving a
+    # permanently half-merged model.
+    for op in merge_ops:
+        try:
+            op.transform.validate_target(op.group.param)
+        except ValueError as exc:
+            raise ValueError(f"Cannot merge LoRA into {op.target_key!r}: {exc}") from exc
 
     for op in merge_ops:
         try:
             op.transform.apply(op.group.param)
         except ValueError as exc:
-            raise ValueError(
-                f"Cannot merge LoRA into {op.target_key!r}: {exc}"
-            ) from exc
+            raise ValueError(f"Cannot merge LoRA into {op.target_key!r}: {exc}") from exc
 
-    logger.info("merge_lora: merged %d/%d targets", len(merge_ops),
-                sum(len(lora.targets) for lora, _ in loras))
+    logger.info(
+        "merge_lora: merged %d unique parameters from %d LoRA targets",
+        len(merge_ops),
+        sum(len(lora.targets) for lora, _ in loras),
+    )
     return len(merge_ops)
 
 

@@ -18,7 +18,7 @@ from ._devices import canonical_device
 from .composite_component import CompositeComponent, CompositeComponentStore
 from .lora import (
     LoRA,
-    LoraMode,
+    LoRAMode,
     LoRATransform,
     ScaledLoRAFactor,
     install_routed_residual_hook,
@@ -360,7 +360,7 @@ class ModelOffloader:
         *,
         loras: Sequence[LoRA] = (),
         lora_strengths: Sequence[float] | None = None,
-        lora_mode: LoraMode = "merge",
+        lora_mode: LoRAMode = "merge",
         **kwargs: object,
     ) -> None:
         """Make the owned model usable on ``device``.

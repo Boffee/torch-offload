@@ -250,8 +250,16 @@ offload = ModelOffloader.from_module(
 device = torch.device("cuda")
 
 # Each LoRA owns its pinned factors and is reusable across sequential uses.
-lora_a = LoRA.from_state_dict(state_dict=load_file("lora_a.safetensors"))
-lora_b = LoRA.from_state_dict(state_dict=load_file("lora_b.safetensors"))
+# Matching blocks_attr enables bounded factor streaming in routed mode.
+lora_blocks = ("transformer_blocks",)
+lora_a = LoRA.from_state_dict(
+    state_dict=load_file("lora_a.safetensors"),
+    blocks_attr=lora_blocks,
+)
+lora_b = LoRA.from_state_dict(
+    state_dict=load_file("lora_b.safetensors"),
+    blocks_attr=lora_blocks,
+)
 
 offload.activate(
     device,
@@ -271,10 +279,11 @@ the previous merge — no explicit unmerge step needed.
 Pass `lora_mode="routed"` as an alternative to the default merge mode.
 Routed mode installs a forward hook on each matched
 `nn.Linear` parent — `y = base(x) + alpha * B * A * x` — instead of merging
-into the base weight. Each LoRA streams as its own engine co-scheduled
-with the model, so a factor block is GPU-resident only while its base
-block runs (bounded residency, not the whole adapter at once); multiple
-LoRAs on one target stack as additive hooks. **Routed mode is
+into the base weight. A LoRA constructed with block paths matching the
+base model streams as its own engine co-scheduled with that model, so a
+factor block is GPU-resident only while its base block runs. Without
+`blocks_attr`, the whole adapter remains resident for the activation.
+Multiple LoRAs on one target stack as additive hooks. **Routed mode is
 inference-only:** the streamed factors are frozen (`requires_grad=False`)
 and no gradient flows to them. Use it when:
 
@@ -308,7 +317,10 @@ bitsandbytes, and TorchAO scaled-FP8 / INT8 / MX / NVFP4 — lossy but
 standard); formats without a merge path (GGUF, TorchAO INT4 tile-packed)
 need routed LoRA instead. See [Quantized weight
 support](#quantized-weight-support) for the full matrix. Unlike an
-activation-scoped LoRA request, this is not reversible.
+activation-scoped LoRA request, this is not reversible. Unknown targets
+raise, and all target names, factor shapes, and advertised merge
+capabilities are preflighted before mutation. Multiple LoRAs for one
+quantized parameter are accumulated in dense space and requantized once.
 
 ### Heterogeneous block lists
 
@@ -744,11 +756,11 @@ A naive `param.data.clone()` on a quanto tensor silently
 *dequantizes* it via the dispatch fallback — the explicit decomposition
 is required for correctness.
 
-LoRA on quanto bases: merge mode rejects quanto targets on activation
-(in-place `addmm_` on a `WeightQBytesTensor` returns
-success but silently leaves `_data` untouched). Use
-`lora_mode="routed"` for inference-time application, or
-`merge_lora()` for a permanent dequant -> addmm -> requant bake-in.
+LoRA on quanto bases supports both activation-scoped merge and permanent
+`merge_lora()` through dequantize -> addmm -> requantize; neither path
+attempts the ineffective native in-place `addmm_` on a
+`WeightQBytesTensor`. Use `lora_mode="routed"` when the base must remain
+untouched or adapters need to switch without reloading it.
 
 ## TorchAO NVFP4 support
 
