@@ -26,7 +26,7 @@ to be lifted into its own package when a second consumer appears.
 | `tensor_adapters.py`, `quanto_adapter.py`, `gguf_adapter.py`, `nvfp4_adapter.py`, `mx_adapter.py`, `float8_adapter.py`, `int8_adapter.py`, `int4_tile_adapter.py`, `dtensor_adapter.py`, `gguf_dequant.py` | Tensor adapter contracts/implementations and optional optimum-quanto / gguf / torchao / DTensor support |
 | `torchao_structured_adapter.py` | Internal: shared `TorchaoStructuredAdapter` base for the TorchAO subclass adapters (scaled-FP8 / INT8 / MX / NVFP4 / INT4 tile-packed) — common pin/move/identity mechanics + per-format hooks; capabilities beyond inference movement (CPU round-trip, dequant/requant LoRA merge) are opted into per subclass |
 | `dtensor_adapter.py` | Internal: movement-only `DTensorAdapter` for tensor-parallel `DTensor` weights — composes with every other adapter by delegating the local shard to the registry and replaying the `(mesh, placements)` wrapper; frozen-inference scope (see `_dtensor.py`) |
-| `tensor_adapter_registry.py` | Internal adapter dispatch and tensor-identity helpers |
+| `tensor_adapter_registry.py` | Public external-adapter registration plus adapter dispatch and tensor-identity helpers |
 | `module_names.py` | Internal name traversal and mutation helpers |
 | `_quanto.py` | Internal: optimum-quanto optional-import + layout validation; consumed by `quanto_adapter.py` and `merge.py` |
 | `_torchao_nvfp4.py` | Internal: TorchAO NVFP4 optional-import + layout validation and dequant/requant; consumed by `nvfp4_adapter.py` |
@@ -607,6 +607,29 @@ behaviors are explicit capabilities: CPU round-trip for optimizer-step
 sync, `Parameter.data` swap for trainable streaming, and — for LoRA merge
 — either dense in-place `addmm_` (plain bases) or dequantize/requantize
 plus `copy_into` (quantized wrappers).
+
+Downstream tensor subclasses can provide their adapter without adding a
+format-specific dependency to torch-offload:
+
+```python
+from torch_offload import TensorAdapter, register_adapter
+
+
+class MyTensorAdapter:
+    # Implement the stateless TensorAdapter protocol.
+    ...
+
+
+remove_adapter = register_adapter(MyTensorAdapter)
+```
+
+Register adapters during application startup, before constructing models or
+pinned resources. `DTensorAdapter` remains the outermost wrapper; registered
+adapters are then checked newest-first before the remaining built-ins. This
+lets a downstream adapter override a built-in `isinstance` match for a more
+specific subclass, and also lets DTensor delegate a custom local shard through
+the same registry. `register_adapter()` returns an idempotent removal callable
+for tests and scoped integrations.
 
 ## Cached resource lifecycle
 
