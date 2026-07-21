@@ -74,6 +74,7 @@ class PinnedParam:
     __slots__ = (
         "_bind_layout",
         "_needs_rearm",
+        "_shape",
         "_target_layout",
         "adapter",
         "pinned_state",
@@ -87,6 +88,7 @@ class PinnedParam:
         # Parameter subclass whose ``.data`` is lossy (bitsandbytes
         # Params4bit). See ``param_representation``.
         representation = param_representation(param)
+        self._shape = torch.Size(representation.shape)
         self.adapter: TensorAdapter[Any, Any] = select_adapter(representation)
         # Precompute the rearm capability once: the per-load check is a hot
         # path (every param, every block rotation), and a runtime_checkable
@@ -162,6 +164,11 @@ class PinnedParam:
         """Opaque bind-compatibility layout for this pinned backing."""
         return self._bind_layout
 
+    @property
+    def shape(self) -> torch.Size:
+        """Shape of the source parameter representation at pin time."""
+        return self._shape
+
     def make_cpu_param(self) -> nn.Parameter:
         """Build a CPU :class:`nn.Parameter` wrapper over this pinned state.
 
@@ -225,6 +232,37 @@ class PinnedParam:
             cast(
                 "PostLoadRearmTensorAdapter[Any, Any]", self.adapter
             ).rearm_after_load(param, gpu_state)
+
+    def materialize(
+        self,
+        device: torch.device,
+        *,
+        non_blocking: bool = False,
+    ) -> nn.Parameter:
+        """Build and populate a one-shot representation on ``device``.
+
+        Unlike calling ``.to(device)`` on :meth:`make_cpu_param`, this runs
+        the complete adapter lifecycle. That distinction matters for outer
+        tensor wrappers such as ``DTensor``: the local shard must move and the
+        wrapper must then be rebuilt on its original device mesh.
+
+        CPU materialization is a zero-copy wrapper over the pinned backing.
+        CUDA materialization returns a parameter wrapping fresh adapter
+        storage.
+        """
+        if device.type == "cpu":
+            return self.make_cpu_param()
+        if device.type != "cuda":
+            raise ValueError(
+                "PinnedParam materialization supports CPU and CUDA devices; "
+                f"got {device}."
+            )
+
+        state = self.allocate_gpu_storage(device)
+        param = self.make_gpu_param(state)
+        self.copy_to_gpu(state, non_blocking=non_blocking)
+        self.rearm_after_load(param, state)
+        return param
 
     @property
     def compute_dtype(self) -> torch.dtype:

@@ -45,6 +45,7 @@ class TestPinnedParam:
         assert type(cpu_param.data) is torch.Tensor
         assert cpu_param.data.is_pinned()
         assert cpu_param.data.shape == p.shape
+        assert pinned_param.shape == p.shape
         # CPU params are distinct wrappers over the same pinned host buffer,
         # not a second clone — callers replace registry entries with this and rely on
         # the storage staying alive for the pinned parameter's lifetime.

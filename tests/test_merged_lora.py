@@ -943,7 +943,7 @@ class TestLoRATransform:
         before = param.detach().clone()
         a = torch.randn(2, 8)
         b = torch.randn(4, 2)
-        transform = LoRATransform([ScaledLoRAFactor(a, b, 0.5)])
+        transform = LoRATransform([ScaledLoRAFactor.from_tensors(a, b, 0.5)])
 
         transform.validate_target(param)
 
@@ -953,7 +953,7 @@ class TestLoRATransform:
         param = nn.Parameter(torch.randn(4, 8), requires_grad=False)
         a = torch.randn(2, 8)
         b = torch.randn(3, 2)
-        transform = LoRATransform([ScaledLoRAFactor(a, b, 0.5)])
+        transform = LoRATransform([ScaledLoRAFactor.from_tensors(a, b, 0.5)])
 
         with pytest.raises(ValueError, match="B@A produces"):
             transform.validate_target(param)
@@ -963,7 +963,7 @@ class TestLoRATransform:
         before = param.detach().clone()
         a = torch.randn(2, 8)
         b = torch.randn(4, 2)
-        transform = LoRATransform([ScaledLoRAFactor(a, b, 0.5)])
+        transform = LoRATransform([ScaledLoRAFactor.from_tensors(a, b, 0.5)])
 
         transform.apply(param)
 
@@ -975,7 +975,7 @@ class TestLoRATransform:
         param = nn.Parameter(torch.zeros(4, 8, dtype=torch.int32), requires_grad=False)
         a = torch.randn(2, 8)
         b = torch.randn(4, 2)
-        transform = LoRATransform([ScaledLoRAFactor(a, b, 0.5)])
+        transform = LoRATransform([ScaledLoRAFactor.from_tensors(a, b, 0.5)])
 
         with pytest.raises(ValueError, match="dense in-place addmm requires"):
             transform.apply(param)
@@ -999,7 +999,7 @@ class TestLoRATransform:
         param = nn.Parameter(qt, requires_grad=False)
         a = torch.randn(rank, cols)
         b = torch.randn(rows, rank)
-        transform = LoRATransform([ScaledLoRAFactor(a, b, 0.5)])
+        transform = LoRATransform([ScaledLoRAFactor.from_tensors(a, b, 0.5)])
         original_param = param
         original_packed_ptr = param.data._data.data_ptr()
         expected_dense = qt.dequantize().to(torch.float32)
@@ -1807,7 +1807,7 @@ class TestRoutedStaging:
         def record_stage(
             factors: Sequence[ScaledLoRAFactor],
             x: torch.Tensor,
-        ) -> tuple[ScaledLoRAFactor, ...]:
+        ) -> tuple[lora_impl._StagedLoRAFactor, ...]:
             calls.append((len(factors), x.device))
             return original(factors, x)
 

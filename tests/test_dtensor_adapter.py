@@ -16,7 +16,7 @@ import pytest
 import torch
 from torch import nn
 
-from torch_offload import ModelOffloader, StreamConfig
+from torch_offload import LoRA, ModelOffloader, StreamConfig
 from torch_offload.dtensor_adapter import DTensorAdapter
 from torch_offload.pinned_param import PinnedParam
 from torch_offload.tensor_adapters import (
@@ -26,7 +26,11 @@ from torch_offload.tensor_adapters import (
     RegularAdapter,
     TensorCopyIntoAdapter,
 )
-from torch_offload.tensor_adapter_registry import select_adapter, tensor_id
+from torch_offload.tensor_adapter_registry import (
+    param_representation,
+    select_adapter,
+    tensor_id,
+)
 from tests.conftest import activated_model
 
 pytestmark = pytest.mark.skipif(
@@ -120,6 +124,24 @@ class TestDTensorAdapter:
         assert gpu_param.data.placements == dt.placements
         assert gpu_param.data.device_mesh == dt.device_mesh
         assert torch.equal(gpu_param.data.full_tensor(), full)
+
+    def test_one_shot_materialize_reconstructs_cuda_mesh(self, tp_mesh: Any) -> None:
+        dt, full = _dtensor_weight(tp_mesh)
+        pinned_param = PinnedParam(nn.Parameter(dt, requires_grad=False))
+        assert pinned_param.shape == dt.shape
+
+        materialized = pinned_param.materialize(
+            torch.device("cuda"),
+            non_blocking=True,
+        )
+        torch.cuda.synchronize()
+
+        tensor = param_representation(materialized)
+        assert _is_dtensor(tensor)
+        assert tensor.device_mesh == tp_mesh
+        assert tensor.device_mesh.device_type == "cuda"
+        assert tensor.to_local().is_cuda
+        assert torch.equal(tensor.full_tensor(), full)
 
     def test_gpu_param_aliases_inner_storage_for_refill(self, tp_mesh: Any) -> None:
         # The pooled streaming path reuses one wrapper across loads, refilling
@@ -232,6 +254,64 @@ class TestDTensorAdapter:
             assert net.blocks[0].weight.data.device_mesh.device_type == "cpu"
         finally:
             pw.deactivate()
+
+    def test_routed_lora_materializes_factors_on_cuda_mesh(
+        self,
+        tp_mesh: Any,
+    ) -> None:
+        from torch.distributed.tensor import Replicate, distribute_tensor
+
+        in_dim = 8
+        out_dim = 12
+        rank = 3
+        weight = torch.randn(out_dim, in_dim, device="cuda")
+        a = torch.randn(rank, in_dim, device="cuda")
+        b = torch.randn(out_dim, rank, device="cuda")
+        x = torch.randn(4, in_dim, device="cuda")
+
+        class Net(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.target = nn.Linear(in_dim, out_dim, bias=False, device="meta")
+                self.target.weight = nn.Parameter(
+                    distribute_tensor(weight, tp_mesh, [Replicate()]),
+                    requires_grad=False,
+                )
+
+            def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+                return self.target(inputs)
+
+        model = Net()
+        lora = LoRA.from_state_dict(
+            {
+                "target.lora_A.weight": distribute_tensor(
+                    a,
+                    tp_mesh,
+                    [Replicate()],
+                ),
+                "target.lora_B.weight": distribute_tensor(
+                    b,
+                    tp_mesh,
+                    [Replicate()],
+                ),
+            }
+        )
+        inputs = distribute_tensor(x, tp_mesh, [Replicate()])
+        strength = 0.4
+        expected = x @ weight.T + ((x @ a.T) * strength) @ b.T
+        offloader = ModelOffloader.from_module(model)
+
+        with activated_model(
+            offloader,
+            "cuda",
+            loras=[lora],
+            lora_strengths=[strength],
+            lora_mode="routed",
+        ):
+            actual = model(inputs)
+            assert _is_dtensor(actual)
+            assert actual.device_mesh == tp_mesh
+            torch.testing.assert_close(actual.full_tensor(), expected)
 
     def test_advertises_movement_only(self, tp_mesh: Any) -> None:
         # Frozen-inference scope: no CPU round-trip, no dequant/requant, no

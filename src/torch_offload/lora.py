@@ -72,9 +72,9 @@ class LoRAFactor:
     match against a concrete target shape is checked separately, where the
     target is known.
 
-    Both application paths consume *tensors*, so :meth:`scaled` materializes
-    a device-ready :class:`ScaledLoRAFactor` over zero-copy views of the
-    pinned host bytes.
+    :meth:`scaled` binds the extrinsic strength without discarding the pinned
+    representation, so each application path can materialize the factors
+    through their tensor adapters.
     """
 
     a: PinnedParam
@@ -86,44 +86,53 @@ class LoRAFactor:
         return self.a.cache_bytes + self.b.cache_bytes
 
     def scaled(self, strength: float) -> ScaledLoRAFactor:
-        """Materialize a device-ready compute factor bound to ``strength``.
-
-        Returns a :class:`ScaledLoRAFactor` over the pinned CPU tensors
-        (zero-copy views of this factor's pinned host bytes). Callers move it
-        to the target device / dtype at the apply site, so the pinned source
-        keeps ``non_blocking`` host-to-device copies asynchronous.
-        """
-        return ScaledLoRAFactor(
-            self.a.make_cpu_param().data,
-            self.b.make_cpu_param().data,
-            strength,
-        )
+        """Bind this pinned factor pair to ``strength``."""
+        return ScaledLoRAFactor(self.a, self.b, strength)
 
 
 @dataclass(slots=True, frozen=True)
 class ScaledLoRAFactor:
-    """A factor pair as plain tensors bound to an application ``strength``.
+    """A pinned factor pair bound to an application ``strength``.
 
-    The compute-side carrier used by :class:`LoRATransform` and routed hooks.
-    Construct it directly from device/CPU tensors, or via
-    :meth:`LoRAFactor.scaled` from a LoRA's pinned storage. The contribution
-    to the base weight is ``strength * (b @ a)``.
+    The application-side carrier used by :class:`LoRATransform` and routed
+    hooks. Keeping :class:`PinnedParam` rather than CPU tensor views preserves
+    adapter-specific reconstruction metadata such as a ``DTensor``'s original
+    device mesh. The contribution to the base weight is
+    ``strength * (b @ a)``.
+
+    Use :meth:`from_tensors` when constructing a standalone transform from
+    unpinned tensors. LoRA resources normally create this through
+    :meth:`LoRAFactor.scaled` and reuse their existing pinned backing.
     """
 
-    a: torch.Tensor
-    b: torch.Tensor
+    a: PinnedParam
+    b: PinnedParam
     strength: float
 
     def __post_init__(self) -> None:
         if (
-            self.a.ndim != 2
-            or self.b.ndim != 2
+            len(self.a.shape) != 2
+            or len(self.b.shape) != 2
             or self.a.shape[0] != self.b.shape[1]
         ):
             raise ValueError(
                 f"LoRA factor shape mismatch: A shape is {tuple(self.a.shape)}, "
                 f"B shape is {tuple(self.b.shape)}."
             )
+
+    @classmethod
+    def from_tensors(
+        cls,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        strength: float,
+    ) -> ScaledLoRAFactor:
+        """Pin an unbound tensor pair and bind it to ``strength``."""
+        return cls(
+            PinnedParam(nn.Parameter(a, requires_grad=False)),
+            PinnedParam(nn.Parameter(b, requires_grad=False)),
+            strength,
+        )
 
     @property
     def rank(self) -> int:
@@ -264,8 +273,10 @@ class LoRATransform:
     def _apply_dense(self, data: torch.Tensor) -> None:
         dev, dt = data.device, data.dtype
         for factor in self._factors:
-            a_gpu = factor.a.to(device=dev, dtype=dt, non_blocking=True)
-            b_gpu = factor.b.to(device=dev, dtype=dt, non_blocking=True)
+            a = param_representation(factor.a.make_cpu_param())
+            b = param_representation(factor.b.make_cpu_param())
+            a_gpu = a.to(device=dev, dtype=dt, non_blocking=True)
+            b_gpu = b.to(device=dev, dtype=dt, non_blocking=True)
             data.addmm_(b_gpu, a_gpu, alpha=factor.strength)
 
 
@@ -315,9 +326,18 @@ def _dequant_requant_adapter(
     )
 
 
+@dataclass(slots=True, frozen=True)
+class _StagedLoRAFactor:
+    """Adapter-materialized factor pair owned for one forward invocation."""
+
+    a: nn.Parameter
+    b: nn.Parameter
+    strength: float
+
+
 def _routed_residual(
     x: torch.Tensor,
-    factors: Sequence[ScaledLoRAFactor],
+    factors: Sequence[_StagedLoRAFactor],
     output_dtype: torch.dtype,
 ) -> torch.Tensor:
     """Routed contribution ``Σ strength_i · (x @ A_i.T) @ B_i.T``.
@@ -326,11 +346,15 @@ def _routed_residual(
     the ``M·out`` result, and keeps it extrinsic to the stored factors rather
     than baked into a buffer).
     """
+    x_compute = x.to(dtype=output_dtype)
     total: torch.Tensor | None = None
     for factor in factors:
-        a = factor.a.to(output_dtype)
-        b = factor.b.to(output_dtype)
-        part = ((x @ a.T) * factor.strength) @ b.T
+        # The PRE hook has already reconstructed the factors on their proper
+        # device representation. A dtype-only cast preserves wrappers such as
+        # DTensor and their device meshes.
+        a = param_representation(factor.a).to(dtype=output_dtype)
+        b = param_representation(factor.b).to(dtype=output_dtype)
+        part = ((x_compute @ a.T) * factor.strength) @ b.T
         total = part if total is None else total + part
     if total is None:
         raise ValueError("Routed LoRA residual requires at least one factor")
@@ -362,20 +386,12 @@ def _linear_input(
 def _stage_routed_factors(
     factors: Sequence[ScaledLoRAFactor],
     x: torch.Tensor,
-) -> tuple[ScaledLoRAFactor, ...]:
-    """Copy one target's pinned factors to the invocation's input device."""
+) -> tuple[_StagedLoRAFactor, ...]:
+    """Adapter-materialize pinned factors on the invocation's input device."""
     return tuple(
-        ScaledLoRAFactor(
-            factor.a.to(
-                device=x.device,
-                dtype=x.dtype,
-                non_blocking=True,
-            ),
-            factor.b.to(
-                device=x.device,
-                dtype=x.dtype,
-                non_blocking=True,
-            ),
+        _StagedLoRAFactor(
+            factor.a.materialize(x.device, non_blocking=True),
+            factor.b.materialize(x.device, non_blocking=True),
             factor.strength,
         )
         for factor in factors
@@ -392,7 +408,7 @@ class _RoutedLoRAHookHandle:
         parent: nn.Module,
         factors: Sequence[ScaledLoRAFactor],
     ) -> None:
-        self._staged: list[tuple[ScaledLoRAFactor, ...]] = []
+        self._staged: list[tuple[_StagedLoRAFactor, ...]] = []
 
         def pre_hook(
             _module: nn.Module,

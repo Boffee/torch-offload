@@ -261,7 +261,7 @@ class TestNvfp4Adapter:
         param = nn.Parameter(nv, requires_grad=False)
         a = torch.randn(rank, cols)
         b = torch.randn(rows, rank)
-        transform = LoRATransform([ScaledLoRAFactor(a, b, 0.5)])
+        transform = LoRATransform([ScaledLoRAFactor.from_tensors(a, b, 0.5)])
         original_param = param
         original_qdata_ptr = param.data.qdata.data_ptr()
 
