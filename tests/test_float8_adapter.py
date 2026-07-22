@@ -165,8 +165,8 @@ class TestFloat8Adapter:
     def test_dequantize_requantize_preserves_representation(self, per_tensor: bool) -> None:
         f8 = _make_float8(per_tensor=per_tensor)
         dense = Float8Adapter.dequantize(f8)
-        assert dense.dtype is torch.float32
-        torch.testing.assert_close(dense, f8.dequantize().to(torch.float32))
+        assert dense.dtype is f8.dtype
+        torch.testing.assert_close(dense, f8.dequantize())
 
         again = Float8Adapter.requantize(dense, like=f8)
         assert again.block_size == f8.block_size
@@ -218,8 +218,12 @@ class TestFloat8Adapter:
         original_param = param
         original_qdata_ptr = param.data.qdata.data_ptr()
 
-        expected_dense = f8.dequantize().to(torch.float32)
-        expected_dense.addmm_(b.to(torch.float32), a.to(torch.float32), alpha=0.5)
+        expected_dense = Float8Adapter.dequantize(f8)
+        expected_dense.addmm_(
+            b.to(expected_dense.dtype),
+            a.to(expected_dense.dtype),
+            alpha=0.5,
+        )
         expected = float8_tensor_cls.from_hp(
             expected_dense.to(f8.dtype),
             granularity=per_row_cls(),
@@ -348,8 +352,12 @@ class TestFloat8Adapter:
         # relative to the CUDA merge (CPU vs CUDA round-to-nearest at bucket
         # edges), making the tight tolerance RNG/CUDA-state sensitive.
         f8_cuda = f8.cuda()
-        expected_dense = f8_cuda.dequantize().to(torch.float32)
-        expected_dense.addmm_(b.cuda().to(torch.float32), a.cuda().to(torch.float32), alpha=0.5)
+        expected_dense = Float8Adapter.dequantize(f8_cuda)
+        expected_dense.addmm_(
+            b.cuda().to(expected_dense.dtype),
+            a.cuda().to(expected_dense.dtype),
+            alpha=0.5,
+        )
         expected = float8_tensor_cls.from_hp(
             expected_dense.to(f8.dtype),
             granularity=per_row_cls(),

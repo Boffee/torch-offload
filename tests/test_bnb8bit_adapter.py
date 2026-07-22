@@ -163,7 +163,7 @@ class TestBnb8bitAdapter:
     def test_dequantize_requantize_preserves_representation(self) -> None:
         p = _make_int8()
         dense = Bnb8bitAdapter.dequantize(p)
-        assert dense.dtype is torch.float32
+        assert dense.dtype is torch.float16
         assert tuple(dense.shape) == tuple(p.CB.shape)
 
         again = Bnb8bitAdapter.requantize(dense, like=p)

@@ -164,7 +164,7 @@ def build_params_4bit(
 
 
 def dequantize_params_4bit(t: torch.Tensor) -> torch.Tensor:
-    """Return the dense logical value of a ``Params4bit`` as fp32.
+    """Return the dense logical value in the quant state's compute dtype.
 
     Dequantizes to the logical ``quant_state.shape`` — not the packed
     ``(numel/2, 1)`` storage shape that ``Params4bit.dequantize()`` would
@@ -173,7 +173,7 @@ def dequantize_params_4bit(t: torch.Tensor) -> torch.Tensor:
     qt = require_params_4bit(t)
     quant_state = qt.quant_state
     dense = bnb_functional.dequantize_4bit(qt.data, quant_state)
-    return dense.reshape(quant_state.shape).to(torch.float32)
+    return dense.reshape(quant_state.shape)
 
 
 def requantize_params_4bit(t: torch.Tensor, *, like: torch.Tensor) -> Any:  # noqa: ANN401
@@ -292,14 +292,19 @@ def build_int8_params(
 
 
 def dequantize_int8_params(t: torch.Tensor) -> torch.Tensor:
-    """Return the dense logical value of an ``Int8Params`` as fp32.
+    """Return the dense logical value in LLM.int8's fp16 compute dtype.
 
     Row-wise affine dequant: ``CB * SCB / 127`` per output row.
     """
     qt = require_int8_params(t)
-    scale = (qt.SCB.to(torch.float32) / 127.0).view(-1, 1)
-    # int8 * fp32 promotes to fp32 directly; no explicit CB widening copy.
-    return qt.CB * scale
+    dense = qt.CB.to(torch.float16)
+    # Normalize first so SCB=65504 and CB=127 stay finite. Computing
+    # ``SCB / 127`` first can round the fp16 quotient up to 516, whose
+    # subsequent multiplication by 127 overflows even though the intended
+    # result is exactly the largest finite fp16 value.
+    dense.div_(127.0)
+    dense.mul_(qt.SCB.to(torch.float16).view(-1, 1))
+    return dense
 
 
 def requantize_int8_params(t: torch.Tensor, *, like: torch.Tensor) -> Any:  # noqa: ANN401

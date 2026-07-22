@@ -258,9 +258,9 @@ def validate_layout(t: torch.Tensor) -> None:
 
 
 def dequantize_static_float8_tensor(t: torch.Tensor) -> torch.Tensor:
-    """Return the dense logical value of a static FP8 weight as fp32."""
+    """Return the dense logical value in the wrapper's compute dtype."""
     f8 = require_static_float8_tensor(t)
-    return f8.dequantize().to(device=f8.device, dtype=torch.float32)
+    return f8.dequantize()
 
 
 def requantize_static_float8_tensor(

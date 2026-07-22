@@ -214,6 +214,10 @@ class QuantoAdapter:
         return qt.dtype
 
     @staticmethod
+    def logical_shape(t: torch.Tensor) -> tuple[int, ...]:
+        return tuple(require_qbytes_tensor(t).size())
+
+    @staticmethod
     def dequantize(t: torch.Tensor) -> torch.Tensor:
         return dequantize_qbytes_tensor(t)
 

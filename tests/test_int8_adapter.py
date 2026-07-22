@@ -169,8 +169,8 @@ class TestInt8Adapter:
         int8_cls = _int8_tensor_cls()
         qt = _make_int8(rows=32, cols=16, dynamic_activation=dynamic_activation)
         dense = Int8Adapter.dequantize(qt)
-        assert dense.dtype is torch.float32
-        torch.testing.assert_close(dense, qt.dequantize().to(torch.float32))
+        assert dense.dtype is qt.dtype
+        torch.testing.assert_close(dense, qt.dequantize())
 
         again = Int8Adapter.requantize(dense, like=qt)
         assert isinstance(again, int8_cls)
@@ -248,7 +248,11 @@ class TestInt8Adapter:
         assert like.zero_point is None
 
         dense = Int8Adapter.dequantize(like)
-        dense.addmm_(torch.randn(32, 4), torch.randn(4, 16), alpha=0.5)
+        dense.addmm_(
+            torch.randn(32, 4, dtype=dense.dtype),
+            torch.randn(4, 16, dtype=dense.dtype),
+            alpha=0.5,
+        )
         new = Int8Adapter.requantize(dense, like=like)
         assert new.zero_point is not None  # from_hp always emits one
 
@@ -270,8 +274,12 @@ class TestInt8Adapter:
         # The merge path dequantizes, applies the delta, then requantizes;
         # mirror it exactly so the comparison is deterministic (not a lossy
         # round-trip property).
-        expected_dense = qt.dequantize().to(torch.float32)
-        expected_dense.addmm_(b.to(torch.float32), a.to(torch.float32), alpha=0.5)
+        expected_dense = Int8Adapter.dequantize(qt)
+        expected_dense.addmm_(
+            b.to(expected_dense.dtype),
+            a.to(expected_dense.dtype),
+            alpha=0.5,
+        )
         expected = Int8Adapter.requantize(expected_dense, like=qt)
 
         transform.apply(param)
@@ -457,8 +465,12 @@ class TestInt8Adapter:
         # Reference on CUDA, matching the device the offloader merges on: the
         # offloader merges into a byte-identical GPU copy of the weight.
         qt_cuda = qt.cuda()
-        expected_dense = qt_cuda.dequantize().to(torch.float32)
-        expected_dense.addmm_(b.cuda().to(torch.float32), a.cuda().to(torch.float32), alpha=0.5)
+        expected_dense = Int8Adapter.dequantize(qt_cuda)
+        expected_dense.addmm_(
+            b.cuda().to(expected_dense.dtype),
+            a.cuda().to(expected_dense.dtype),
+            alpha=0.5,
+        )
         expected = Int8Adapter.requantize(expected_dense, like=qt_cuda)
 
         offloader = _make_model_offloader(

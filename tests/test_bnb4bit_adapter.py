@@ -10,7 +10,9 @@ from torch import nn
 
 from torch_offload import (
     LoRA,
+    LoRATransform,
     ModelOffloader,
+    ScaledLoRAFactor,
     StreamConfig,
     merge_lora,
 )
@@ -211,7 +213,7 @@ class TestBnb4bitAdapter:
     def test_dequantize_requantize_preserves_representation(self, double_quant: bool) -> None:
         p = _make_nf4(double_quant=double_quant)
         dense = Bnb4bitAdapter.dequantize(p)
-        assert dense.dtype is torch.float32
+        assert dense.dtype is p.quant_state.dtype
         assert tuple(dense.shape) == tuple(p.quant_state.shape)
 
         again = Bnb4bitAdapter.requantize(dense, like=p)
@@ -224,6 +226,33 @@ class TestBnb4bitAdapter:
         # extreme (so absmax is recovered bit-for-bit) is seed- and
         # kernel-dependent, so check the round-trip instead.
         torch.testing.assert_close(Bnb4bitAdapter.dequantize(again), dense, rtol=0.05, atol=0.05)
+
+    def test_logical_shape_validation_does_not_dequantize(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        rows, cols, rank = 64, 32, 4
+        param = _make_nf4(rows=rows, cols=cols)
+        transform = LoRATransform(
+            [
+                ScaledLoRAFactor.from_tensors(
+                    torch.randn(rank, cols),
+                    torch.randn(rows, rank),
+                    1.0,
+                )
+            ]
+        )
+
+        def fail_dequantize(_tensor: torch.Tensor) -> torch.Tensor:
+            raise AssertionError("validation should not dequantize")
+
+        monkeypatch.setattr(
+            Bnb4bitAdapter,
+            "dequantize",
+            staticmethod(fail_dequantize),
+        )
+
+        transform.validate_target(param)
 
     def test_requantize_rejects_shape_mismatch(self) -> None:
         p = _make_nf4(rows=64, cols=32)

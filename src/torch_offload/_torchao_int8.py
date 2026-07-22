@@ -105,9 +105,9 @@ def validate_layout(t: torch.Tensor) -> None:
 
 
 def dequantize_int8_tensor(t: torch.Tensor) -> torch.Tensor:
-    """Return the dense logical value of an Int8Tensor as fp32."""
+    """Return the dense logical value in the wrapper's compute dtype."""
     qt = require_int8_tensor(t)
-    return qt.dequantize().to(device=qt.device, dtype=torch.float32)
+    return qt.dequantize()
 
 
 def requantize_int8_tensor(

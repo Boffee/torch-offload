@@ -89,9 +89,9 @@ def validate_layout(t: torch.Tensor) -> None:
 
 
 def dequantize_float8_tensor(t: torch.Tensor) -> torch.Tensor:
-    """Return the dense logical value of a scaled-fp8 tensor as fp32."""
+    """Return the dense logical value in the wrapper's compute dtype."""
     f8 = require_float8_tensor(t)
-    return f8.dequantize().to(device=f8.device, dtype=torch.float32)
+    return f8.dequantize()
 
 
 def requantize_float8_tensor(

@@ -971,6 +971,57 @@ class TestLoRATransform:
         expected.addmm_(b, a, alpha=0.5)
         torch.testing.assert_close(param, expected)
 
+    @CUDA
+    def test_multiple_cuda_factors_use_one_packed_merge(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        param = nn.Parameter(
+            torch.randn(12, 16, device="cuda"),
+            requires_grad=False,
+        )
+        before = param.detach().clone()
+        factor_inputs = [
+            (torch.randn(2, 16), torch.randn(12, 2), 0.75),
+            (torch.randn(3, 16), torch.randn(12, 3), -0.25),
+            (torch.randn(1, 16), torch.randn(12, 1), 1.0),
+        ]
+        factors = [
+            ScaledLoRAFactor.from_tensors(a, b, strength)
+            for a, b, strength in factor_inputs
+        ]
+        transform = LoRATransform(factors)
+        packed_calls = 0
+        original = LoRATransform._apply_dense_packed
+
+        def tracked_packed_merge(
+            data: torch.Tensor,
+            factor_tensors: Sequence[
+                tuple[ScaledLoRAFactor, torch.Tensor, torch.Tensor]
+            ],
+        ) -> None:
+            nonlocal packed_calls
+            packed_calls += 1
+            original(data, factor_tensors)
+
+        monkeypatch.setattr(
+            LoRATransform,
+            "_apply_dense_packed",
+            staticmethod(tracked_packed_merge),
+        )
+
+        transform.apply(param)
+
+        expected = before.clone()
+        for a, b, strength in factor_inputs:
+            expected.addmm_(
+                b.cuda(),
+                a.cuda(),
+                alpha=strength,
+            )
+        assert packed_calls == 1
+        torch.testing.assert_close(param, expected, rtol=2e-5, atol=2e-5)
+
     def test_regular_non_addmm_dtype_raises_on_apply(self) -> None:
         param = nn.Parameter(torch.zeros(4, 8, dtype=torch.int32), requires_grad=False)
         a = torch.randn(2, 8)
@@ -1002,17 +1053,66 @@ class TestLoRATransform:
         transform = LoRATransform([ScaledLoRAFactor.from_tensors(a, b, 0.5)])
         original_param = param
         original_packed_ptr = param.data._data.data_ptr()
-        expected_dense = qt.dequantize().to(torch.float32)
+        expected_dense = qt.dequantize()
 
         transform.apply(param)
 
-        expected_dense.addmm_(b.to(torch.float32), a.to(torch.float32), alpha=0.5)
-        expected_packed = (expected_dense / scale.to(torch.float32)).round().clamp(-128, 127).to(torch.int8)
+        expected_dense.addmm_(
+            b.to(expected_dense.dtype),
+            a.to(expected_dense.dtype),
+            alpha=0.5,
+        )
+        expected_packed = (
+            (expected_dense / scale.to(expected_dense.dtype))
+            .round()
+            .clamp(-128, 127)
+            .to(torch.int8)
+        )
         assert param is original_param
         assert param.data._data.data_ptr() == original_packed_ptr
         assert isinstance(param.data, WeightQBytesTensor)
         torch.testing.assert_close(param.data._data, expected_packed)
         torch.testing.assert_close(param.data._scale, scale)
+
+    def test_quanto_validation_reads_shape_without_dequantizing(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        quanto = pytest.importorskip("optimum.quanto")
+        from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
+
+        from torch_offload.quanto_adapter import QuantoAdapter
+
+        rows, cols, rank = 4, 8, 2
+        qt = WeightQBytesTensor.create(
+            quanto.qint8,
+            0,
+            (rows, cols),
+            (cols, 1),
+            torch.randint(-32, 32, (rows, cols), dtype=torch.int8),
+            torch.rand(rows, 1, dtype=torch.bfloat16).add_(0.25),
+            None,
+        )
+        transform = LoRATransform(
+            [
+                ScaledLoRAFactor.from_tensors(
+                    torch.randn(rank, cols),
+                    torch.randn(rows, rank),
+                    0.5,
+                )
+            ]
+        )
+
+        def fail_dequantize(_tensor: torch.Tensor) -> torch.Tensor:
+            raise AssertionError("validation should not dequantize")
+
+        monkeypatch.setattr(
+            QuantoAdapter,
+            "dequantize",
+            staticmethod(fail_dequantize),
+        )
+
+        transform.validate_target(nn.Parameter(qt, requires_grad=False))
 
     @CUDA
     def test_non_block_quanto_merge_requantizes_on_activate(self) -> None:
@@ -1046,9 +1146,18 @@ class TestLoRATransform:
         # quantization bucket edges (CPU vs CUDA round-to-nearest), and the
         # comparison is exact — so the device must match to be deterministic.
         qt_cuda = qt.cuda()
-        expected_dense = qt_cuda.dequantize().to(torch.float32)
-        expected_dense.addmm_(b.cuda().to(torch.float32), a.cuda().to(torch.float32), alpha=0.5)
-        expected_packed = (expected_dense / scale.cuda().to(torch.float32)).round().clamp(-128, 127).to(torch.int8)
+        expected_dense = qt_cuda.dequantize()
+        expected_dense.addmm_(
+            b.cuda().to(expected_dense.dtype),
+            a.cuda().to(expected_dense.dtype),
+            alpha=0.5,
+        )
+        expected_packed = (
+            (expected_dense / scale.cuda().to(expected_dense.dtype))
+            .round()
+            .clamp(-128, 127)
+            .to(torch.int8)
+        )
 
         s = _make_strategy(m)
         _request_loras(s, [(lora, 0.5)], mode="merge")
@@ -1099,9 +1208,18 @@ class TestLoRATransform:
         lora = LoRA.from_state_dict(state_dict=sd)
         factor = lora.targets["transformer_blocks.0.attn.weight"]
         a, b = _factor_tensors(factor)
-        expected_dense = original_qt.dequantize().to(torch.float32)
-        expected_dense.addmm_(b.to(torch.float32), a.to(torch.float32), alpha=0.5)
-        expected_packed = (expected_dense / scales[0].to(torch.float32)).round().clamp(-128, 127).to(torch.int8)
+        expected_dense = original_qt.dequantize()
+        expected_dense.addmm_(
+            b.to(expected_dense.dtype),
+            a.to(expected_dense.dtype),
+            alpha=0.5,
+        )
+        expected_packed = (
+            (expected_dense / scales[0].to(expected_dense.dtype))
+            .round()
+            .clamp(-128, 127)
+            .to(torch.int8)
+        )
 
         s = _make_strategy(m)
         _request_loras(s, [(lora, 0.5)], mode="merge")
@@ -1253,9 +1371,18 @@ class TestPermanentMerge:
         factor = lora.targets["target.weight"]
         a, b = _factor_tensors(factor)
 
-        expected_dense = qt.dequantize().to(torch.float32)
-        expected_dense.addmm_(b.to(torch.float32), a.to(torch.float32), alpha=0.5)
-        expected_packed = (expected_dense / scale.to(torch.float32)).round().clamp(-128, 127).to(torch.int8)
+        expected_dense = qt.dequantize()
+        expected_dense.addmm_(
+            b.to(expected_dense.dtype),
+            a.to(expected_dense.dtype),
+            alpha=0.5,
+        )
+        expected_packed = (
+            (expected_dense / scale.to(expected_dense.dtype))
+            .round()
+            .clamp(-128, 127)
+            .to(torch.int8)
+        )
 
         merged = merge_lora(m, [(lora, 0.5)])
 

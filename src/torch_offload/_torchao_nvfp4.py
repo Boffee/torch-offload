@@ -96,9 +96,9 @@ def validate_layout(t: torch.Tensor) -> None:
 
 
 def dequantize_nvfp4_tensor(t: torch.Tensor) -> torch.Tensor:
-    """Return the dense logical value of an NVFP4 tensor as fp32."""
+    """Return the dense logical value in the wrapper's original dtype."""
     nv = require_nvfp4_tensor(t)
-    return nv.dequantize(nv.orig_dtype).to(device=nv.device, dtype=torch.float32)
+    return nv.dequantize(nv.orig_dtype)
 
 
 def requantize_nvfp4_tensor(

@@ -17,14 +17,13 @@ exposes the per-format parts as small hooks. Concrete adapters
 :class:`~torch_offload.nvfp4_adapter.Nvfp4Adapter`, ...) subclass it and
 implement those hooks.
 
-Capabilities beyond inference movement (CPU round-trip, dequantize/
-requantize LoRA merge) are added by the concrete subclass that supports
-them — and only that subclass — so the ``@runtime_checkable`` capability
-protocols, which test for method presence on the class, report each
-format's true capability. The base deliberately implements inference
-movement only: subclasses that add nothing (MX, NVFP4) stay
-frozen-inference, while a subclass that defines the extra methods
-(Float8) advertises exactly those capabilities.
+Capabilities beyond inference movement and metadata queries (CPU round-trip,
+dequantize/requantize LoRA merge) are added by the concrete subclass that
+supports them — and only that subclass — so the ``@runtime_checkable``
+capability protocols, which test for method presence on the class, report each
+format's true capability. The base deliberately implements no mutation
+capabilities: subclasses that add nothing stay frozen-inference, while a
+subclass that defines the extra methods advertises exactly those capabilities.
 """
 
 from __future__ import annotations
@@ -295,3 +294,8 @@ class TorchaoStructuredAdapter(ABC, Generic[MetaT]):
         # dtype off the wrapper — same single-validation path as the other
         # hooks (subclasses implement _compute_dtype on the wrapper).
         return cls._compute_dtype(cls._require(t))
+
+    @classmethod
+    def logical_shape(cls, t: torch.Tensor) -> tuple[int, ...]:
+        """Dense shape carried directly by every supported TorchAO wrapper."""
+        return tuple(cls._require(t).shape)

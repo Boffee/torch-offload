@@ -168,8 +168,8 @@ class TestNvfp4Adapter:
         # the round trip exact: requantize recomputes the same global scale.
         nv = _make_nvfp4_amax(rows=16, cols=64, swizzled=swizzled)
         dense = Nvfp4Adapter.dequantize(nv)
-        assert dense.dtype is torch.float32
-        torch.testing.assert_close(dense, nv.dequantize(nv.orig_dtype).to(torch.float32))
+        assert dense.dtype is nv.orig_dtype
+        torch.testing.assert_close(dense, nv.dequantize(nv.orig_dtype))
 
         again = Nvfp4Adapter.requantize(dense, like=nv)
         assert isinstance(again, nvfp4_cls)
@@ -266,8 +266,12 @@ class TestNvfp4Adapter:
         original_qdata_ptr = param.data.qdata.data_ptr()
 
         # Mirror the merge path exactly so the comparison is deterministic.
-        expected_dense = nv.dequantize(nv.orig_dtype).to(torch.float32)
-        expected_dense.addmm_(b.to(torch.float32), a.to(torch.float32), alpha=0.5)
+        expected_dense = Nvfp4Adapter.dequantize(nv)
+        expected_dense.addmm_(
+            b.to(expected_dense.dtype),
+            a.to(expected_dense.dtype),
+            alpha=0.5,
+        )
         expected = Nvfp4Adapter.requantize(expected_dense, like=nv)
 
         transform.apply(param)
@@ -422,8 +426,12 @@ class TestNvfp4Adapter:
         # Reference on CUDA, matching the device the offloader merges on: the
         # offloader merges into a byte-identical GPU copy of the weight.
         nv_cuda = nv.cuda()
-        expected_dense = nv_cuda.dequantize(nv.orig_dtype).to(torch.float32)
-        expected_dense.addmm_(b.cuda().to(torch.float32), a.cuda().to(torch.float32), alpha=0.5)
+        expected_dense = Nvfp4Adapter.dequantize(nv_cuda)
+        expected_dense.addmm_(
+            b.cuda().to(expected_dense.dtype),
+            a.cuda().to(expected_dense.dtype),
+            alpha=0.5,
+        )
         expected = Nvfp4Adapter.requantize(expected_dense, like=nv_cuda)
 
         offloader = _make_model_offloader(

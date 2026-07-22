@@ -46,6 +46,7 @@ from .tensor_adapter_registry import param_representation, select_adapter
 from .tensor_adapters import (
     DenseAddmmTensorAdapter,
     DequantRequantCopyIntoTensorAdapter,
+    LogicalShapeTensorAdapter,
     adapter_name,
 )
 
@@ -211,11 +212,12 @@ class LoRA:
 class LoRATransform:
     """Per-weight LoRA factors applied to one base parameter.
 
-    Holds references to LoRA-owned pinned factor matrices — no cloning
-    or pinning happens here. :meth:`apply` copies each factor pair to
-    the target parameter's device and applies the update using either
-    dense in-place ``addmm_`` or the tensor adapter's
-    dequantize/requantize plus ``copy_into`` capability. The target
+    Holds references to LoRA-owned pinned factor matrices — no cloning or
+    pinning happens here. :meth:`apply` copies factors to the target
+    parameter's device and applies the update using either dense in-place
+    ``addmm_`` or the tensor adapter's dequantize/requantize plus ``copy_into``
+    capability. Multiple ordinary CUDA factors are packed into transient
+    buffers and applied with one GEMM. The target
     :class:`~torch.nn.Parameter` object is always preserved.
     """
 
@@ -263,21 +265,99 @@ class LoRATransform:
         representation: torch.Tensor,
         adapter: DequantRequantCopyIntoTensorAdapter[Any, Any] | None,
     ) -> tuple[int, ...]:
-        # Plain / dense-addmm targets carry their logical shape directly;
-        # dequant/requant targets may wrap a different storage shape, so the
-        # logical shape comes from a dequantized view.
+        # Plain / dense-addmm targets carry their logical shape directly.
+        # Quantized adapters expose it from wrapper metadata where possible;
+        # the fallback keeps third-party adapters without that capability
+        # working, at the cost of a validation-only dequantization.
         if adapter is None:
             return tuple(representation.shape)
+        if isinstance(adapter, LogicalShapeTensorAdapter):
+            return adapter.logical_shape(representation)
         return tuple(adapter.dequantize(representation).shape)
 
     def _apply_dense(self, data: torch.Tensor) -> None:
         dev, dt = data.device, data.dtype
-        for factor in self._factors:
-            a = param_representation(factor.a.make_cpu_param())
-            b = param_representation(factor.b.make_cpu_param())
+        factor_tensors = [
+            (
+                factor,
+                param_representation(factor.a.make_cpu_param()),
+                param_representation(factor.b.make_cpu_param()),
+            )
+            for factor in self._factors
+        ]
+        if self._can_pack_factors(factor_tensors, dev):
+            self._apply_dense_packed(data, factor_tensors)
+            return
+
+        for factor, a, b in factor_tensors:
             a_gpu = a.to(device=dev, dtype=dt, non_blocking=True)
             b_gpu = b.to(device=dev, dtype=dt, non_blocking=True)
             data.addmm_(b_gpu, a_gpu, alpha=factor.strength)
+
+    @staticmethod
+    def _can_pack_factors(
+        factor_tensors: Sequence[
+            tuple[ScaledLoRAFactor, torch.Tensor, torch.Tensor]
+        ],
+        device: torch.device,
+    ) -> bool:
+        # Packing is a CUDA optimization for multiple ordinary pinned factor
+        # pairs. Outer tensor wrappers (for example DTensor) retain the
+        # adapter-aware sequential materialization path.
+        return (
+            device.type == "cuda"
+            and len(factor_tensors) > 1
+            and all(
+                type(a) is torch.Tensor
+                and type(b) is torch.Tensor
+                and a.device.type == "cpu"
+                and b.device.type == "cpu"
+                and a.is_pinned()
+                and b.is_pinned()
+                for _factor, a, b in factor_tensors
+            )
+        )
+
+    @staticmethod
+    def _apply_dense_packed(
+        data: torch.Tensor,
+        factor_tensors: Sequence[
+            tuple[ScaledLoRAFactor, torch.Tensor, torch.Tensor]
+        ],
+    ) -> None:
+        """Apply several LoRAs with one GEMM and no per-factor GPU allocations.
+
+        The temporary packed buffers contain exactly the combined factors for
+        this weight and die after the merge. CPU factors copy directly into
+        their destination slices, avoiding the extra individual device
+        tensors that a GPU-side ``torch.cat`` would require.
+        """
+        total_rank = sum(factor.rank for factor, _a, _b in factor_tensors)
+        a_packed = torch.empty(
+            (total_rank, data.shape[1]),
+            device=data.device,
+            dtype=data.dtype,
+        )
+        b_packed = torch.empty(
+            (data.shape[0], total_rank),
+            device=data.device,
+            dtype=data.dtype,
+        )
+
+        rank_offset = 0
+        for factor, a, b in factor_tensors:
+            next_offset = rank_offset + factor.rank
+            a_slice = a_packed[rank_offset:next_offset]
+            b_slice = b_packed[:, rank_offset:next_offset]
+            a_slice.copy_(a, non_blocking=True)
+            b_slice.copy_(b, non_blocking=True)
+            if factor.strength != 1.0:
+                # Scaling the contiguous A slice keeps B's strided destination
+                # copy as the only non-contiguous operation for each factor.
+                a_slice.mul_(factor.strength)
+            rank_offset = next_offset
+
+        data.addmm_(b_packed, a_packed)
 
 
 def _validate_factor_shapes(

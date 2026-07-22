@@ -158,7 +158,7 @@ class TestPinnedParamQuanto:
         assert isinstance(adapter, TensorCopyIntoAdapter)
         dense = adapter.dequantize(qt)
         assert type(dense) is torch.Tensor
-        assert dense.dtype == torch.float32
+        assert dense.dtype == qt.dtype
         assert dense.shape == qt.shape
 
         requantized = adapter.requantize(dense, like=qt)
@@ -171,7 +171,7 @@ class TestPinnedParamQuanto:
 
         updated = dense + 1
         expected_packed = (
-            updated / scale.to(torch.float32)
+            updated / scale.to(updated.dtype)
         ).round().clamp(-128, 127).to(torch.int8)
         updated_qt = adapter.requantize(updated, like=qt)
         original_scale_ptr = qt._scale.data_ptr()

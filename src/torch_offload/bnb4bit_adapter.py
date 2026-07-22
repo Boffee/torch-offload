@@ -272,6 +272,10 @@ class Bnb4bitAdapter:
         return require_params_4bit(t).quant_state.dtype
 
     @staticmethod
+    def logical_shape(t: torch.Tensor) -> tuple[int, ...]:
+        return tuple(require_params_4bit(t).quant_state.shape)
+
+    @staticmethod
     def dequantize(t: torch.Tensor) -> torch.Tensor:
         return dequantize_params_4bit(t)
 

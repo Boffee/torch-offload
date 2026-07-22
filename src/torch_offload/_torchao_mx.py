@@ -122,9 +122,9 @@ def validate_layout(t: torch.Tensor) -> None:
 
 
 def dequantize_mx_tensor(t: torch.Tensor) -> torch.Tensor:
-    """Return the dense logical value of an MX tensor as fp32."""
+    """Return the dense logical value in the wrapper's original dtype."""
     mx = require_mx_tensor(t)
-    return mx.dequantize(mx.orig_dtype).to(device=mx.device, dtype=torch.float32)
+    return mx.dequantize(mx.orig_dtype)
 
 
 def requantize_mx_tensor(

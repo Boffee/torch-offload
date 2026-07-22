@@ -98,9 +98,9 @@ def validate_layout(qt: torch.Tensor) -> None:
 
 
 def dequantize_qbytes_tensor(qt: torch.Tensor) -> torch.Tensor:
-    """Return the dense logical value of a quanto tensor as fp32."""
+    """Return the dense logical value in the wrapper's compute dtype."""
     qbytes = require_qbytes_tensor(qt)
-    return qbytes.dequantize().to(device=qbytes.device, dtype=torch.float32)
+    return qbytes.dequantize()
 
 
 def requantize_qbytes_tensor(

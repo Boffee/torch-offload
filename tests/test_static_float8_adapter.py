@@ -263,8 +263,8 @@ class TestStaticFloat8Adapter:
         f8 = _make_static_float8(act_scale_shape=(1, 1, 1))
         dense = StaticFloat8Adapter.dequantize(f8)
 
-        assert dense.dtype is torch.float32
-        torch.testing.assert_close(dense, f8.dequantize().to(torch.float32))
+        assert dense.dtype is f8.dtype
+        torch.testing.assert_close(dense, f8.dequantize())
         again = StaticFloat8Adapter.requantize(dense, like=f8)
         assert isinstance(again, prototype_cls)
         assert again.block_size == f8.block_size
@@ -297,7 +297,11 @@ class TestStaticFloat8Adapter:
     def test_copy_into_does_not_copy_activation_scale(self) -> None:
         target = _make_static_float8()
         dense = StaticFloat8Adapter.dequantize(target)
-        dense.addmm_(torch.randn(16, 4), torch.randn(4, 16), alpha=0.5)
+        dense.addmm_(
+            torch.randn(16, 4, dtype=dense.dtype),
+            torch.randn(4, 16, dtype=dense.dtype),
+            alpha=0.5,
+        )
         requantized = StaticFloat8Adapter.requantize(dense, like=target)
         src = _replace_act_scale(requantized, torch.tensor(123.0))
         original_scale = target.act_quant_scale.clone()
@@ -323,7 +327,11 @@ class TestStaticFloat8Adapter:
         original_act_scale_ptr = param.data.act_quant_scale.data_ptr()
         original_act_scale = param.data.act_quant_scale.clone()
         expected_dense = StaticFloat8Adapter.dequantize(f8)
-        expected_dense.addmm_(b.to(torch.float32), a.to(torch.float32), alpha=0.5)
+        expected_dense.addmm_(
+            b.to(expected_dense.dtype),
+            a.to(expected_dense.dtype),
+            alpha=0.5,
+        )
         expected = StaticFloat8Adapter.requantize(expected_dense, like=f8)
 
         transform.apply(param)

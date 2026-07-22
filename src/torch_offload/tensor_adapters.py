@@ -45,6 +45,7 @@ __all__ = [
     "DenseAddmmTensorAdapter",
     "DequantRequantCopyIntoTensorAdapter",
     "DequantRequantTensorAdapter",
+    "LogicalShapeTensorAdapter",
     "ParameterDataSwapTensorAdapter",
     "PostLoadRearmTensorAdapter",
     "TensorAdapter",
@@ -217,11 +218,11 @@ class DenseAddmmTensorAdapter(TensorAdapter[PinnedStateT, GpuStateT], Protocol):
 class DequantRequantTensorAdapter(TensorAdapter[PinnedStateT, GpuStateT], Protocol):
     """Optional capability for shape-preserving dequantize/requantize updates.
 
-    ``dequantize(t)`` returns a dense logical tensor for ``t``. The
-    adapter owns the compute dtype choice. ``requantize(t, like=...)``
-    converts a shape-compatible dense tensor back into the same
-    representation/layout as ``like``. Device follows the dense input
-    tensor; callers can move tensors explicitly before calling.
+    ``dequantize(t)`` returns a dense logical tensor for ``t`` in
+    ``compute_dtype(t)``. ``requantize(t, like=...)`` converts a
+    shape-compatible dense tensor back into the same representation/layout
+    as ``like``. Device follows the dense input tensor; callers can move
+    tensors explicitly before calling.
 
     Scale strategy is implementation-defined: an adapter may reuse
     ``like``'s quantization scales (quanto) or recompute them from the
@@ -231,12 +232,28 @@ class DequantRequantTensorAdapter(TensorAdapter[PinnedStateT, GpuStateT], Protoc
 
     @staticmethod
     def dequantize(t: torch.Tensor) -> torch.Tensor:
-        """Return a dense logical tensor for ``t``."""
+        """Return a dense logical tensor in ``compute_dtype(t)``."""
         ...
 
     @staticmethod
     def requantize(t: torch.Tensor, *, like: torch.Tensor) -> torch.Tensor:
         """Return ``t`` encoded in the same representation as ``like``."""
+        ...
+
+
+@runtime_checkable
+class LogicalShapeTensorAdapter(TensorAdapter[PinnedStateT, GpuStateT], Protocol):
+    """Optional capability for reading logical shape without materialization.
+
+    Packed tensor subclasses may report a physical storage shape from their
+    outer object. Adapters that can recover the logical shape from wrapper or
+    quantization metadata expose it here, allowing validation paths to avoid a
+    full dequantization solely to inspect ``dense.shape``.
+    """
+
+    @staticmethod
+    def logical_shape(t: torch.Tensor) -> tuple[int, ...]:
+        """Return the dense logical shape represented by ``t``."""
         ...
 
 
@@ -545,6 +562,10 @@ class RegularAdapter:
     @staticmethod
     def compute_dtype(t: torch.Tensor) -> torch.dtype:
         return t.dtype
+
+    @staticmethod
+    def logical_shape(t: torch.Tensor) -> tuple[int, ...]:
+        return tuple(t.shape)
 
     @staticmethod
     def validate_dense_addmm_target(t: torch.Tensor) -> None:

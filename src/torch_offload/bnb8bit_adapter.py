@@ -192,6 +192,10 @@ class Bnb8bitAdapter:
         return torch.float16
 
     @staticmethod
+    def logical_shape(t: torch.Tensor) -> tuple[int, ...]:
+        return tuple(require_int8_params(t).CB.shape)
+
+    @staticmethod
     def dequantize(t: torch.Tensor) -> torch.Tensor:
         return dequantize_int8_params(t)
 

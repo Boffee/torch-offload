@@ -222,8 +222,8 @@ class TestMxAdapter:
     def test_dequantize_requantize_preserves_representation(self, elem_dtype: torch.dtype) -> None:
         mx = _make_mx(elem_dtype=elem_dtype, rows=16, cols=64)
         dense = MxAdapter.dequantize(mx)
-        assert dense.dtype is torch.float32
-        torch.testing.assert_close(dense, mx.dequantize(mx.orig_dtype).to(torch.float32))
+        assert dense.dtype is mx.orig_dtype
+        torch.testing.assert_close(dense, mx.dequantize(mx.orig_dtype))
 
         # MX uses deterministic FLOOR scaling onto power-of-two (E8M0)
         # block scales, so an unmodified round trip reproduces the packed
@@ -321,8 +321,12 @@ class TestMxAdapter:
         original_param = param
         original_qdata_ptr = param.data.qdata.data_ptr()
 
-        expected_dense = mx.dequantize(mx.orig_dtype).to(torch.float32)
-        expected_dense.addmm_(b.to(torch.float32), a.to(torch.float32), alpha=0.5)
+        expected_dense = MxAdapter.dequantize(mx)
+        expected_dense.addmm_(
+            b.to(expected_dense.dtype),
+            a.to(expected_dense.dtype),
+            alpha=0.5,
+        )
         expected = MxAdapter.requantize(expected_dense, like=mx)
 
         transform.apply(param)
@@ -514,8 +518,12 @@ class TestMxAdapter:
         # offloader merges into a byte-identical GPU copy of the original
         # weight, so move that same tensor — don't re-quantize from dense.
         mx_cuda = mx.cuda()
-        expected_dense = mx_cuda.dequantize(mx.orig_dtype).to(torch.float32)
-        expected_dense.addmm_(b.cuda().to(torch.float32), a.cuda().to(torch.float32), alpha=0.5)
+        expected_dense = MxAdapter.dequantize(mx_cuda)
+        expected_dense.addmm_(
+            b.cuda().to(expected_dense.dtype),
+            a.cuda().to(expected_dense.dtype),
+            alpha=0.5,
+        )
         expected = MxAdapter.requantize(expected_dense, like=mx_cuda)
 
         offloader = _make_model_offloader(
