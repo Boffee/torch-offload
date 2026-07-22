@@ -42,7 +42,8 @@ per-parameter pinned storage from
 + optional quanto ``WeightQBytesTensor`` decomposition, bitsandbytes
 4-bit ``Params4bit`` (NF4/FP4) and 8-bit ``Int8Params`` (LLM.int8)
 decomposition, GGUF packed weights, TorchAO NVFP4 / MX (MXFP8,
-MXFP4) / scaled-FP8 / INT8 / INT4 (tile-packed) packed weights, and
+MXFP4) / dynamic or calibrated-static scaled-FP8 / INT8 / INT4
+(tile-packed) packed weights, and
 tensor-parallel ``DTensor`` weights wrapping any of the above).
 
 :class:`ModelOffloader` and :class:`MpsWeights` are cached resources that also

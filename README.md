@@ -21,9 +21,9 @@ to be lifted into its own package when a second consumer appears.
 | `streamed_component.py` | `StreamedComponentStore`, `StreamedComponent` — lower-level streamed backing storage plus per-block-list streaming component |
 | `lora.py` | `LoRA`, `LoRATransform` — cached pinned factors plus merge and routed application hooks |
 | `merge.py` | `merge_lora()` — permanent in-place LoRA merge into base weights |
-| `pinned_param.py` | `PinnedParam` — per-parameter pinning primitive (handles plain tensors, quanto, GGUF, bitsandbytes, DTensor, and TorchAO scaled-FP8 / INT8 / MX (MXFP8, MXFP4) / NVFP4 / INT4 tile-packed via adapters; see [Quantized weight support](#quantized-weight-support)) |
+| `pinned_param.py` | `PinnedParam` — per-parameter pinning primitive (handles plain tensors, quanto, GGUF, bitsandbytes, DTensor, and TorchAO dynamic/static scaled-FP8 / INT8 / MX (MXFP8, MXFP4) / NVFP4 / INT4 tile-packed via adapters; see [Quantized weight support](#quantized-weight-support)) |
 | `pinned_module.py` | Internal name-keyed pinned module storage plus concrete module bindings |
-| `tensor_adapters.py`, `quanto_adapter.py`, `gguf_adapter.py`, `nvfp4_adapter.py`, `mx_adapter.py`, `float8_adapter.py`, `int8_adapter.py`, `int4_tile_adapter.py`, `dtensor_adapter.py`, `gguf_dequant.py` | Tensor adapter contracts/implementations and optional optimum-quanto / gguf / torchao / DTensor support |
+| `tensor_adapters.py`, `quanto_adapter.py`, `gguf_adapter.py`, `nvfp4_adapter.py`, `mx_adapter.py`, `float8_adapter.py`, `static_float8_adapter.py`, `int8_adapter.py`, `int4_tile_adapter.py`, `dtensor_adapter.py`, `gguf_dequant.py` | Tensor adapter contracts/implementations and optional optimum-quanto / gguf / torchao / DTensor support |
 | `torchao_structured_adapter.py` | Internal: shared `TorchaoStructuredAdapter` base for the TorchAO subclass adapters (scaled-FP8 / INT8 / MX / NVFP4 / INT4 tile-packed) — common pin/move/identity mechanics + per-format hooks; capabilities beyond inference movement (CPU round-trip, dequant/requant LoRA merge) are opted into per subclass |
 | `dtensor_adapter.py` | Internal: movement-only `DTensorAdapter` for tensor-parallel `DTensor` weights — composes with every other adapter by delegating the local shard to the registry and replaying the `(mesh, placements)` wrapper; frozen-inference scope (see `_dtensor.py`) |
 | `tensor_adapter_registry.py` | Public external-adapter registration plus adapter dispatch and tensor-identity helpers |
@@ -31,7 +31,7 @@ to be lifted into its own package when a second consumer appears.
 | `_quanto.py` | Internal: optimum-quanto optional-import + layout validation; consumed by `quanto_adapter.py` and `merge.py` |
 | `_torchao_nvfp4.py` | Internal: TorchAO NVFP4 optional-import + layout validation and dequant/requant; consumed by `nvfp4_adapter.py` |
 | `_torchao_mx.py` | Internal: TorchAO MX (MXFP8 / MXFP4) optional-import + layout validation, supported-dtype gate, and dequant/requant; consumed by `mx_adapter.py` |
-| `_torchao_float8.py` | Internal: TorchAO scaled-FP8 optional-import + layout validation and dequant/requant; consumed by `float8_adapter.py` |
+| `_torchao_float8.py`, `_torchao_static_float8.py` | Internal: TorchAO dynamic/weight-only `Float8Tensor` and calibrated static `PrototypeFloat8Tensor` optional imports, layout validation, and dequant/requant; consumed by the corresponding FP8 adapters |
 | `_torchao_int8.py` | Internal: TorchAO INT8 optional-import + layout validation and dequant/requant; consumed by `int8_adapter.py` |
 | `_torchao_int4_tile.py` | Internal: TorchAO INT4 tile-packed (CUDA-native tinygemm) optional-import + layout validation; consumed by `int4_tile_adapter.py` |
 | `_dtensor.py` | Internal: PyTorch `DTensor` optional-import + mesh/placements signatures and local-shard rewrap; consumed by `dtensor_adapter.py` |
@@ -733,6 +733,7 @@ dtype, no merge capability required.
 | bitsandbytes NF4 / FP4 | ✓ | dequant / requant |
 | bitsandbytes int8 | ✓ | dequant / requant |
 | TorchAO scaled-FP8 | ✓ | dequant / requant |
+| TorchAO static-activation scaled-FP8 | ✓ | dequant / requant |
 | TorchAO INT8 | ✓ | dequant / requant |
 | TorchAO MX (MXFP8 / MXFP4) | ✓ | dequant / requant † |
 | TorchAO NVFP4 | ✓ | dequant / requant † |
@@ -758,9 +759,9 @@ Notes:
   is the intended path for tensor-parallel weights.
 - **CPU round-trip** (D2H, for context-free CPU optimizer steps) and
   **trainable `Parameter.data` swap** are separate capabilities: plain
-  tensors have both; quanto and scaled-FP8 add CPU round-trip; the other
-  quantized formats are movement + (where shown) merge only. See the
-  per-format sections below.
+  tensors have both; quanto and both scaled-FP8 representations add CPU
+  round-trip; the other quantized formats are movement + (where shown)
+  merge only. See the per-format sections below.
 
 ## Quanto support
 
@@ -869,6 +870,26 @@ standard practice for merges into quantized bases). The GPU
 representation is byte-identical to the host one, so the CPU round-trip
 capability is also available. Trainable `Parameter.data` swap is not —
 scaled-fp8 weights stay frozen.
+
+TorchAO's calibrated static-activation representation is handled separately
+by `StaticFloat8Adapter`. It targets only
+`torchao.prototype.quantization.float8_static_quant.prototype_float8_tensor.PrototypeFloat8Tensor`
+weights with per-tensor weight and activation quantization, and pins the FP8
+`qdata`, weight `scale`, and checkpoint-provided `act_quant_scale`. All three
+are included in identity, block-pool layout compatibility, cache accounting,
+H2D/D2H movement, and wrapper reconstruction; the ordinary `Float8Tensor`
+adapter remains the weight-only/dynamic path.
+
+TorchAO 0.17 normally requires the activation scale rank to equal the input
+rank. torch-offload's static adapter installs a narrow `nn.Linear` dispatch
+shim that flattens ordinary activations before static quantization and reshapes
+the result afterwards. A checkpoint scalar (or any one-element scale layout)
+therefore works unchanged for both 2-D and 3-D Linear inputs. LoRA merge
+recomputes only the weight scale and copies only the re-encoded weight bytes
+and scale into the target; the calibrated activation scale is preserved
+exactly. Routed LoRA is supported as the non-destructive alternative. Output
+activation quantization and non-per-tensor Prototype layouts are outside this
+adapter's contract and are rejected explicitly.
 
 ## Failure modes
 

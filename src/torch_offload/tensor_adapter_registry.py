@@ -25,6 +25,7 @@ from .int8_adapter import Int8Adapter
 from .mx_adapter import MxAdapter
 from .nvfp4_adapter import Nvfp4Adapter
 from .quanto_adapter import QuantoAdapter
+from .static_float8_adapter import StaticFloat8Adapter
 from .tensor_adapters import RegularAdapter, TensorAdapter
 
 # DTensorAdapter is always checked before registered and built-in adapters: a
@@ -41,6 +42,7 @@ _BUILTIN_ADAPTERS: tuple[type[TensorAdapter[Any, Any]], ...] = (
     Bnb8bitAdapter,
     Nvfp4Adapter,
     MxAdapter,
+    StaticFloat8Adapter,
     Float8Adapter,
     Int8Adapter,
     Int4TilePackedAdapter,
