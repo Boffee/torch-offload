@@ -8,11 +8,12 @@ The prototype static FP8 representation is deliberately separate from
 (``qdata``, weight ``scale``, and ``act_quant_scale``) quantized and intact
 through pinning, block streaming, cache reuse, and lossless CPU round trips.
 
-Merged LoRA updates dequantize and re-encode only the weight.  Re-encoding
-recomputes the weight scale, then ``copy_into`` fills only weight bytes and
-weight scales in the existing target; the calibrated activation scale is
-never replaced or recalibrated.  Routed LoRA uses the ordinary logical shape
-and compute dtype exposed by the shared adapter contract.
+CUDA LoRA updates use a format-specific Triton merge that recomputes only the
+weight scale and installs only weight bytes and weight scales in the existing
+target.  The calibrated activation scale is never replaced or recalibrated.
+CPU merges retain the generic dequantize/requantize adapter path. Routed LoRA
+uses the ordinary logical shape and compute dtype exposed by the shared
+adapter contract.
 """
 
 from __future__ import annotations
@@ -30,6 +31,7 @@ from ._torchao_static_float8 import (
     require_static_float8_tensor,
     validate_layout,
 )
+from ._triton_static_float8 import merge_static_float8_lora
 from .tensor_adapters import metadata_key
 from .torchao_structured_adapter import (
     TorchaoGpu,
@@ -145,6 +147,25 @@ class StaticFloat8Adapter(TorchaoStructuredAdapter[_StaticFloat8Meta]):
     @staticmethod
     def requantize(t: torch.Tensor, *, like: torch.Tensor) -> torch.Tensor:
         return requantize_static_float8_tensor(t, like=like)
+
+    @staticmethod
+    def merge_lora_(
+        target: torch.Tensor,
+        b: torch.Tensor,
+        a: torch.Tensor,
+        strength: float,
+    ) -> None:
+        """Run and install the Triton static-FP8 LoRA merge."""
+        f8 = require_static_float8_tensor(target)
+        qdata, scale = merge_static_float8_lora(
+            f8.qdata,
+            f8.scale,
+            b,
+            a,
+            strength,
+        )
+        f8.qdata.copy_(qdata)
+        f8.scale.copy_(scale)
 
     @staticmethod
     def copy_into(src: torch.Tensor, *, target: torch.Tensor) -> None:

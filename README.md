@@ -786,7 +786,7 @@ dtype, no merge capability required.
 | bitsandbytes NF4 / FP4 | ✓ | dequant / requant |
 | bitsandbytes int8 | ✓ | dequant / requant |
 | TorchAO scaled-FP8 | ✓ | dequant / requant |
-| TorchAO static-activation scaled-FP8 | ✓ | dequant / requant |
+| TorchAO static-activation scaled-FP8 | ✓ | fused Triton merge on CUDA; dequant / requant on CPU |
 | TorchAO INT8 | ✓ | dequant / requant |
 | TorchAO MX (MXFP8 / MXFP4) | ✓ | dequant / requant † |
 | TorchAO NVFP4 | ✓ | dequant / requant † |
@@ -938,11 +938,15 @@ rank. torch-offload's static adapter installs a narrow `nn.Linear` dispatch
 shim that flattens ordinary activations before static quantization and reshapes
 the result afterwards. A checkpoint scalar (or any one-element scale layout)
 therefore works unchanged for both 2-D and 3-D Linear inputs. LoRA merge
-recomputes only the weight scale and copies only the re-encoded weight bytes
-and scale into the target; the calibrated activation scale is preserved
-exactly. Routed LoRA is supported as the non-destructive alternative. Output
-activation quantization and non-per-tensor Prototype layouts are outside this
-adapter's contract and are rejected explicitly.
+uses a format-specific Triton kernel pipeline on CUDA, independently of
+`block_compile`. It fuses dequantization, the low-rank GEMM, addition, and
+tile-level maximum collection before reducing the new per-tensor weight scale
+and requantizing. CPU merges retain the generic adapter path. Both paths copy
+only the re-encoded weight bytes and scale into the target; the calibrated
+activation scale is preserved exactly. Routed LoRA is supported as the
+non-destructive alternative. Output activation quantization and non-per-tensor
+Prototype layouts are outside this adapter's contract and are rejected
+explicitly.
 
 ## Failure modes
 

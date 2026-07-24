@@ -4,8 +4,8 @@ TorchAO's prototype static FP8 workflow represents a weight with
 ``PrototypeFloat8Tensor``.  In addition to the ordinary FP8 weight bytes and
 weight scale, the wrapper owns the calibrated activation scale used by stock
 ``nn.Linear`` dispatch.  This module is the single source of truth for the
-layout that torch-offload preserves and for the dequantize/requantize path
-used by LoRA merges.
+layout that torch-offload preserves and for the generic
+dequantize/requantize adapter capability.
 
 TorchAO 0.17 requires a supplied static scale to have the same rank as the
 activation passed to ``PrototypeFloat8Tensor.from_hp``.  A checkpoint scalar

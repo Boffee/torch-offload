@@ -6,6 +6,7 @@ import pytest
 import torch
 from torch import nn
 
+from torch_offload._triton_static_float8 import merge_static_float8_lora
 from torch_offload import (
     BlockCompileConfig,
     LoRA,
@@ -51,6 +52,7 @@ def _make_static_float8(
     rows: int = 16,
     cols: int = 16,
     dtype: torch.dtype = torch.bfloat16,
+    float8_dtype: torch.dtype = torch.float8_e4m3fn,
     act_scale_shape: tuple[int, ...] = (),
     act_scale_value: float = 0.02,
     weight: torch.Tensor | None = None,
@@ -61,6 +63,7 @@ def _make_static_float8(
     mm_config = _mm_config()
     return prototype_cls.from_hp(
         weight,
+        float8_dtype=float8_dtype,
         granularity=per_tensor_cls(),
         mm_config=mm_config,
         act_quant_kwargs=kwargs_cls(
@@ -300,6 +303,79 @@ class TestStaticFloat8Adapter:
         assert torch.count_nonzero(dequantized).item() == 0
         assert torch.equal(again.act_quant_scale, f8.act_quant_scale)
 
+    @CUDA
+    @pytest.mark.parametrize(
+        ("dtype", "float8_dtype"),
+        [
+            (torch.bfloat16, torch.float8_e4m3fn),
+            (torch.bfloat16, torch.float8_e5m2),
+            (torch.float16, torch.float8_e4m3fn),
+            (torch.float16, torch.float8_e5m2),
+            (torch.float32, torch.float8_e4m3fn),
+            (torch.float32, torch.float8_e5m2),
+        ],
+    )
+    def test_triton_lora_merge_matches_eager_round_trip(
+        self,
+        dtype: torch.dtype,
+        float8_dtype: torch.dtype,
+    ) -> None:
+        rows, cols, rank = 70, 130, 7
+        f8 = _make_static_float8(
+            rows=rows,
+            cols=cols,
+            dtype=dtype,
+            float8_dtype=float8_dtype,
+        ).cuda()
+        a = torch.randn(rank, cols, device="cuda", dtype=dtype)
+        b = torch.randn(rows, rank, device="cuda", dtype=dtype)
+        strength = 0.25
+
+        dense = StaticFloat8Adapter.dequantize(f8)
+        dense.addmm_(b, a, alpha=strength)
+        expected = StaticFloat8Adapter.requantize(dense, like=f8)
+        qdata, scale = merge_static_float8_lora(
+            f8.qdata,
+            f8.scale,
+            b,
+            a,
+            strength,
+        )
+
+        torch.testing.assert_close(
+            scale,
+            expected.scale,
+            rtol=0.02,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            qdata.to(torch.float32) * scale,
+            expected.dequantize().to(torch.float32),
+            rtol=0.3 if float8_dtype is torch.float8_e5m2 else 0.13,
+            atol=0.15 if float8_dtype is torch.float8_e5m2 else 0.05,
+        )
+
+    @CUDA
+    def test_triton_lora_merge_encodes_zero_weight_safely(self) -> None:
+        f8 = _make_static_float8().cuda()
+        f8.qdata.zero_()
+        f8.scale.fill_(torch.finfo(torch.float32).eps)
+        a = torch.zeros(4, 16, device="cuda", dtype=f8.dtype)
+        b = torch.zeros(16, 4, device="cuda", dtype=f8.dtype)
+
+        qdata, scale = merge_static_float8_lora(
+            f8.qdata,
+            f8.scale,
+            b,
+            a,
+            1.0,
+        )
+
+        dequantized = qdata.to(torch.float32) * scale
+        assert torch.isfinite(dequantized).all()
+        assert torch.count_nonzero(dequantized).item() == 0
+        assert torch.count_nonzero(scale).item() == 1
+
     def test_copy_into_does_not_copy_activation_scale(self) -> None:
         target = _make_static_float8()
         dense = StaticFloat8Adapter.dequantize(target)
@@ -347,6 +423,101 @@ class TestStaticFloat8Adapter:
         assert torch.equal(param.data.qdata.view(torch.uint8), expected.qdata.view(torch.uint8))
         assert torch.equal(param.data.scale, expected.scale)
         assert torch.equal(param.data.act_quant_scale, original_act_scale)
+
+    @CUDA
+    def test_triton_lora_transform_uses_raw_storage_and_preserves_wrapper(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        rows, cols = 64, 64
+        f8 = _make_static_float8(rows=rows, cols=cols).cuda()
+        param = nn.Parameter(f8, requires_grad=False)
+        factor_inputs = [
+            (
+                torch.randn(4, cols),
+                torch.randn(rows, 4),
+                0.5,
+            ),
+            (
+                torch.randn(2, cols),
+                torch.randn(rows, 2),
+                -0.25,
+            ),
+        ]
+        factors = [
+            ScaledLoRAFactor.from_tensors(a, b, strength)
+            for a, b, strength in factor_inputs
+        ]
+        dense = StaticFloat8Adapter.dequantize(f8)
+        packed_a = torch.cat(
+            [
+                a.to(device="cuda", dtype=dense.dtype).mul_(strength)
+                for a, _b, strength in factor_inputs
+            ],
+            dim=0,
+        )
+        packed_b = torch.cat(
+            [
+                b.to(device="cuda", dtype=dense.dtype)
+                for _a, b, _strength in factor_inputs
+            ],
+            dim=1,
+        )
+        dense.addmm_(packed_b, packed_a)
+        expected = StaticFloat8Adapter.requantize(dense, like=f8)
+        qdata_ptr = f8.qdata.data_ptr()
+        scale_ptr = f8.scale.data_ptr()
+        act_scale_ptr = f8.act_quant_scale.data_ptr()
+
+        def fail_dequantize(_tensor: torch.Tensor) -> torch.Tensor:
+            raise AssertionError(
+                "Triton merge must not build the generic dense wrapper path"
+            )
+
+        monkeypatch.setattr(
+            StaticFloat8Adapter,
+            "dequantize",
+            staticmethod(fail_dequantize),
+        )
+        transform = LoRATransform(factors)
+        transform.apply(param)
+        torch.cuda.synchronize()
+
+        assert param.data.qdata.data_ptr() == qdata_ptr
+        assert param.data.scale.data_ptr() == scale_ptr
+        assert param.data.act_quant_scale.data_ptr() == act_scale_ptr
+        torch.testing.assert_close(
+            param.data.dequantize().to(torch.float32),
+            expected.dequantize().to(torch.float32),
+            # Triton's tiled BF16 GEMM may accumulate differently from addmm.
+            # Both results are then independently rounded to FP8.
+            rtol=0.13,
+            atol=0.05,
+        )
+
+    @CUDA
+    def test_triton_lora_transform_repairs_zero_weight(self) -> None:
+        f8 = _make_static_float8().cuda()
+        f8.qdata.zero_()
+        f8.scale.fill_(torch.finfo(torch.float32).eps)
+        param = nn.Parameter(f8, requires_grad=False)
+        transform = LoRATransform(
+            [
+                ScaledLoRAFactor.from_tensors(
+                    torch.zeros(4, 16),
+                    torch.zeros(16, 4),
+                    1.0,
+                )
+            ]
+        )
+
+        transform.apply(param)
+        torch.cuda.synchronize()
+
+        dequantized = param.data.dequantize().to(torch.float32)
+        assert torch.isfinite(dequantized).all()
+        assert torch.count_nonzero(dequantized).item() == 0
+        assert torch.count_nonzero(param.data.scale).item() == 1
 
     def test_merge_lora_preserves_calibrated_activation_scale(self) -> None:
         class M(nn.Module):
