@@ -335,7 +335,7 @@ class TestStaticFloat8Adapter:
         dense = StaticFloat8Adapter.dequantize(f8)
         dense.addmm_(b, a, alpha=strength)
         expected = StaticFloat8Adapter.requantize(dense, like=f8)
-        assert StaticFloat8Adapter.merge_lora_(
+        StaticFloat8Adapter.merge_lora_(
             f8,
             b,
             a,
@@ -363,7 +363,7 @@ class TestStaticFloat8Adapter:
         a = torch.zeros(4, 16, device="cuda", dtype=f8.dtype)
         b = torch.zeros(16, 4, device="cuda", dtype=f8.dtype)
 
-        assert StaticFloat8Adapter.merge_lora_(
+        StaticFloat8Adapter.merge_lora_(
             f8,
             b,
             a,
@@ -424,15 +424,33 @@ class TestStaticFloat8Adapter:
         assert torch.equal(param.data.act_quant_scale, original_act_scale)
 
     @CUDA
+    @pytest.mark.parametrize(
+        ("dtype", "float8_dtype"),
+        [
+            (torch.bfloat16, torch.float8_e4m3fn),
+            (torch.bfloat16, torch.float8_e5m2),
+            (torch.float16, torch.float8_e4m3fn),
+            (torch.float16, torch.float8_e5m2),
+            (torch.float32, torch.float8_e4m3fn),
+            (torch.float32, torch.float8_e5m2),
+        ],
+    )
     def test_lora_transform_falls_back_when_triton_is_unavailable(
         self,
         monkeypatch: pytest.MonkeyPatch,
+        dtype: torch.dtype,
+        float8_dtype: torch.dtype,
     ) -> None:
         rows, cols, rank = 16, 16, 4
-        f8 = _make_static_float8(rows=rows, cols=cols).cuda()
+        f8 = _make_static_float8(
+            rows=rows,
+            cols=cols,
+            dtype=dtype,
+            float8_dtype=float8_dtype,
+        ).cuda()
         param = nn.Parameter(f8, requires_grad=False)
-        a = torch.randn(rank, cols)
-        b = torch.randn(rows, rank)
+        a = torch.randn(rank, cols, dtype=dtype)
+        b = torch.randn(rows, rank, dtype=dtype)
         transform = LoRATransform(
             [ScaledLoRAFactor.from_tensors(a, b, 0.5)]
         )
@@ -445,7 +463,7 @@ class TestStaticFloat8Adapter:
         expected = StaticFloat8Adapter.requantize(expected_dense, like=f8)
 
         monkeypatch.setattr(
-            "torch_offload.static_float8_adapter._merge_static_float8_lora",
+            "torch_offload.static_float8_adapter._triton_merge_static_float8_lora",
             None,
         )
         transform.apply(param)

@@ -941,12 +941,13 @@ therefore works unchanged for both 2-D and 3-D Linear inputs. LoRA merge uses
 a format-specific Triton kernel pipeline on CUDA when Triton is available,
 independently of `block_compile`. It fuses dequantization, the low-rank GEMM,
 addition, and tile-level maximum collection before reducing the new per-tensor
-weight scale and requantizing. CPU merges and CUDA installations without
-Triton retain the generic adapter path. Both paths copy only the re-encoded
-weight bytes and scale into the target; the calibrated activation scale is
-preserved exactly. Routed LoRA is supported as the non-destructive alternative.
-Output activation quantization and non-per-tensor Prototype layouts are outside
-this adapter's contract and are rejected explicitly.
+weight scale and requantizing. CUDA installations without Triton use the same
+raw storage through ordinary Torch operations; CPU merges retain the generic
+adapter path. All paths copy only the re-encoded weight bytes and scale into
+the target; the calibrated activation scale is preserved exactly. Routed LoRA
+is supported as the non-destructive alternative. Output activation quantization
+and non-per-tensor Prototype layouts are outside this adapter's contract and
+are rejected explicitly.
 
 ## Failure modes
 

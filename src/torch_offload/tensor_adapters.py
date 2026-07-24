@@ -223,9 +223,8 @@ class FusedLoRAMergeTensorAdapter(
     """Optional capability for a format-specific staged LoRA merge.
 
     The caller validates and stages one combined ``B @ A`` update on the
-    target device. The adapter either applies it while preserving the target
-    tensor's object and storage identities, or declines without mutation so
-    the caller can use its generic merge path.
+    target device. The adapter applies it while preserving the target tensor's
+    object and storage identities.
     """
 
     @staticmethod
@@ -234,8 +233,8 @@ class FusedLoRAMergeTensorAdapter(
         b: torch.Tensor,
         a: torch.Tensor,
         strength: float,
-    ) -> bool:
-        """Merge into ``target``, or return false without modifying it."""
+    ) -> None:
+        """Merge the staged update into ``target`` in place."""
         ...
 
 

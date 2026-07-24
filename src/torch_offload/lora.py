@@ -304,19 +304,20 @@ class LoRATransform:
         data: torch.Tensor,
         adapter: FusedLoRAMergeTensorAdapter[Any, Any],
     ) -> bool:
-        """Try a format-specific merge after staging plain factors."""
+        """Apply a format-specific merge when factors can be staged plainly."""
         factor_tensors = self._factor_tensors()
         staged = self._stage_single_or_packed_update(data, factor_tensors)
         if staged is None:
             return False
 
         b, a, strength = staged
-        return adapter.merge_lora_(
+        adapter.merge_lora_(
             data,
             b,
             a,
             strength,
         )
+        return True
 
     def _apply_dense(self, data: torch.Tensor) -> None:
         dev, dt = data.device, data.dtype
