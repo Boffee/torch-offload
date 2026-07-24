@@ -14,6 +14,7 @@ import torch
 from torch import nn
 
 from ._devices import canonical_device
+from .block_compile import BlockCompileConfig
 from .composite_component import CompositeComponent, CompositeComponentStore
 from .lora import (
     LoRA,
@@ -49,8 +50,9 @@ class ModelOffloader:
     When ``blocks_attr`` is omitted, CUDA activation bulk-copies every
     managed parameter and buffer to CUDA. When it is set, CUDA activation
     streams the selected block groups plus component-level movement for
-    non-streamed state. CPU activation is pass-through over the pinned
-    host-backed module state.
+    non-streamed state. Supplying ``block_compile`` at construction opts those
+    streamed block forwards into Inductor during CUDA inference. CPU activation
+    is pass-through over the pinned host-backed module state and remains eager.
 
     Composes :class:`PinnedComponent` (non-streamed params and buffers)
     and one or more :class:`StreamedComponent`\\ s internally. LoRA requests
@@ -106,6 +108,8 @@ class ModelOffloader:
         and streamed offload components.
     cache_bytes:
         Stable host-cache bytes owned by the bound components.
+    block_compile:
+        Construction-scoped compile policy for streamed block groups.
     """
 
     def __init__(
@@ -114,11 +118,13 @@ class ModelOffloader:
         *,
         composite: CompositeComponent,
         cache_bytes: int,
+        block_compile: BlockCompileConfig | None = None,
     ) -> None:
         self._model = model
         self._active_device: torch.device | None = None
         self._composite = composite
         self._cache_bytes = cache_bytes
+        self._block_compile = block_compile
         self._activation_lock = threading.Lock()
         self._lora_hook_removers: list[Callable[[], None]] = []
 
@@ -129,21 +135,33 @@ class ModelOffloader:
         *,
         blocks_attr: Sequence[str] = (),
         stream_trainable_weights: bool = False,
+        block_compile: BlockCompileConfig | None = None,
     ) -> ModelOffloader:
         """Pin and bind ``model`` as one reusable cached runtime.
 
         The intermediate component store exists only during construction.
         Bound component instances retain the pinned state afterward, so the
-        model is never rebound on subsequent uses.
+        model is never rebound on subsequent uses. ``block_compile`` applies
+        one forward-only compile policy to every ``blocks_attr`` group and is
+        invalid when no block group is declared.
         """
+        if block_compile is not None and not blocks_attr:
+            raise ValueError(
+                "block_compile requires at least one blocks_attr path."
+            )
         composite_store = CompositeComponentStore.from_module(
             model,
             blocks_attr=blocks_attr,
             stream_trainable_weights=stream_trainable_weights,
         )
         cache_bytes = composite_store.cache_bytes
-        composite = composite_store.bind(model)
-        return cls(model, composite=composite, cache_bytes=cache_bytes)
+        composite = composite_store.bind(model, block_compile=block_compile)
+        return cls(
+            model,
+            composite=composite,
+            cache_bytes=cache_bytes,
+            block_compile=block_compile,
+        )
 
     # ------------------------------------------------------------------ API
 
@@ -345,7 +363,14 @@ class ModelOffloader:
                 else:
                     self._register_routed_lora_hooks(targets)
             # The composite self-cleans its components if activation fails midway.
-            self._composite.activate(active_device, **kwargs)
+            active_block_compile = (
+                None
+                if active_loras and lora_mode == "routed"
+                else self._block_compile
+            )
+            component_kwargs = dict(kwargs)
+            component_kwargs["block_compile"] = active_block_compile
+            self._composite.activate(active_device, **component_kwargs)
         except BaseException:
             try:
                 self._clear_active_lora_hooks()

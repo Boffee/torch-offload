@@ -17,8 +17,10 @@ Lower-level resource bindings:
   created by ``ModelOffloader.from_module(model)``, or per-block streaming
   when it is constructed with ``blocks_attr``
   and activation receives a :class:`StreamConfig`. Streaming mode supports optional LoRA merge,
+  opt-in forward-only block compilation for CUDA inference,
   trainable-parameter support, CUDA prefetch on a secondary stream, and
-  activation checkpointing through autograd backward. By default,
+  activation checkpointing through autograd backward when block compilation
+  is disabled. By default,
   trainable params are managed by
   :class:`PinnedComponent` and stay GPU-resident while active; set
   ``stream_trainable_weights=True`` to stream in-block trainable weights
@@ -105,7 +107,10 @@ for design notes.
 
 Compatibility
 -------------
-- **``torch.compile`` is not supported** for managed modules.
+- **``torch.compile`` support is narrow.** Only streamed block forwards
+  configured through :class:`BlockCompileConfig` are supported, and only for
+  CUDA inference. External whole-model compilation, the pinned remainder,
+  routed-LoRA activations, and compiled streamed training remain unsupported.
 - **Wrap before DDP/FSDP**, not after.
 - **Coarse cache concurrency.** :class:`ResourceCache` serializes cache
   metadata and lease operations and releases its lock while caller code
@@ -113,6 +118,7 @@ Compatibility
   backing may be shared.
 """
 
+from .block_compile import BlockCompileConfig
 from .gguf_adapter import GGUFWeight
 from .lora import (
     LoRA,
@@ -153,6 +159,7 @@ from .tensor_adapter_registry import register_adapter
 from .tensor_adapters import TensorAdapter
 
 __all__ = [
+    "BlockCompileConfig",
     "CacheError",
     "DuplicateResourceKeyError",
     "EvictionCandidate",

@@ -7,6 +7,7 @@ import torch
 from torch import nn
 
 from torch_offload import (
+    BlockCompileConfig,
     LoRA,
     LoRATransform,
     ModelOffloader,
@@ -99,8 +100,13 @@ def _make_model_offloader(
     model: nn.Module,
     *,
     blocks_attr: list[str] = [],
+    block_compile: BlockCompileConfig | None = None,
 ) -> ModelOffloader:
-    return ModelOffloader.from_module(model, blocks_attr=blocks_attr)
+    return ModelOffloader.from_module(
+        model,
+        blocks_attr=blocks_attr,
+        block_compile=block_compile,
+    )
 
 
 class TestStaticFloat8Adapter:
@@ -501,3 +507,82 @@ class TestStaticFloat8Adapter:
                 assert y.dtype is torch.bfloat16
             finally:
                 offloader.deactivate()
+
+    @CUDA
+    def test_streamed_block_compile_handles_changing_shapes(self) -> None:
+        class M(nn.Module):
+            def __init__(self, weights: list[torch.Tensor]) -> None:
+                super().__init__()
+                self.blocks = nn.ModuleList(
+                    [nn.Linear(64, 64, bias=False, dtype=torch.bfloat16) for _weight in weights]
+                )
+                for block, weight in zip(self.blocks, weights, strict=True):
+                    block.weight.requires_grad = False
+                    block.weight = nn.Parameter(
+                        _make_static_float8(
+                            rows=64,
+                            cols=64,
+                            weight=weight.clone(),
+                        ),
+                        requires_grad=False,
+                    )
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                for block in self.blocks:
+                    x = block(x)
+                return x
+
+        torch.manual_seed(0)
+        weights = [
+            torch.randn(64, 64, dtype=torch.bfloat16),
+            torch.randn(64, 64, dtype=torch.bfloat16),
+        ]
+        inputs = [
+            torch.randn(2, 8, 64, dtype=torch.bfloat16),
+            torch.randn(2, 12, 64, dtype=torch.bfloat16),
+        ]
+        stream_config = StreamConfig(
+            num_resident_blocks=1,
+            num_prefetch_blocks=0,
+        )
+
+        eager_model = M(weights)
+        eager_offloader = _make_model_offloader(
+            eager_model,
+            blocks_attr=["blocks"],
+        )
+        try:
+            with activated_model(
+                eager_offloader,
+                "cuda",
+                stream_config=stream_config,
+            ):
+                with torch.inference_mode():
+                    expected = [eager_model(x.cuda()).cpu() for x in inputs]
+        finally:
+            eager_offloader.deactivate()
+
+        compiled_model = M(weights)
+        compiled_offloader = _make_model_offloader(
+            compiled_model,
+            blocks_attr=["blocks"],
+            block_compile=BlockCompileConfig(),
+        )
+        try:
+            with activated_model(
+                compiled_offloader,
+                "cuda",
+                stream_config=stream_config,
+            ):
+                with torch.inference_mode():
+                    actual = [compiled_model(x.cuda()).cpu() for x in inputs]
+        finally:
+            compiled_offloader.deactivate()
+
+        for actual_value, expected_value in zip(actual, expected, strict=True):
+            torch.testing.assert_close(
+                actual_value,
+                expected_value,
+                rtol=0.03,
+                atol=0.03,
+            )

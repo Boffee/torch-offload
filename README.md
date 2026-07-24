@@ -16,6 +16,7 @@ to be lifted into its own package when a second consumer appears.
 | `model_cache.py` | `ModelCache` — model-aware `ResourceCache` with activation and LoRA coordination |
 | `resource_specs.py` | `ModelSpec`, `LoRASpec`, `ObjectSpec` — standard frozen resource specifications |
 | `protocols.py` | `ResourceSpec`, `ResourceStore`, `ResourceBinding` plug-in contracts |
+| `block_compile.py` | `BlockCompileConfig` — opt-in Inductor policy for streamed block forwards |
 | `model_offloader.py` | `ModelOffloader` — cached single-model runtime for whole-model bulk pinned-CPU↔GPU or streamed block offload |
 | `pinned_component.py` | `PinnedComponentStore`, `PinnedComponent` — lower-level reusable pinned backing storage plus lifecycle-only pinned component used by `ModelOffloader` |
 | `streamed_component.py` | `StreamedComponentStore`, `StreamedComponent` — lower-level streamed backing storage plus per-block-list streaming component |
@@ -188,6 +189,56 @@ no target pool, no streaming hooks, no weight copies.
 CPU activation. Routed LoRA installs target-Linear hooks: a forward-PRE
 hook copies that target's pinned factors to the input device, and a
 forward-POST hook applies the residual and releases those device copies.
+
+### Optional streamed-block compilation
+
+Repeated streamed blocks can opt into forward-only Inductor compilation at
+runtime construction:
+
+```python
+from torch_offload import BlockCompileConfig, ModelOffloader
+
+offload = ModelOffloader.from_module(
+    model,
+    blocks_attr=["transformer_blocks"],
+    block_compile=BlockCompileConfig(
+        dynamic=True,
+        fullgraph=False,
+    ),
+)
+```
+
+`block_compile=None` (the default) preserves eager behavior. One configuration
+applies to every `blocks_attr` group, and supplying a compile configuration
+without `blocks_attr` raises. The initial API fixes the backend to Inductor's
+default mode; CUDA Graph modes and backend-specific options are intentionally
+not exposed.
+
+Only each distinct block module's `forward` is compiled. Its module
+`__call__` and torch-offload's forward-pre hook stay eager, so block
+activation and prefetch finish before compiled computation begins. Compiled
+forwards are installed only for CUDA activations and the exact original
+forwards are restored on deactivate or activation rollback. CPU activation
+remains eager. The lazy compiled callables are retained by the bound runtime,
+so later eligible activations can reuse their compiled graphs.
+
+Compilation is inference-only in this initial implementation. Streamed
+training remains available without `block_compile`, but combining block
+compilation with autograd/checkpointed training is unsupported until it has
+dedicated correctness coverage.
+
+Merge-mode LoRA remains compatible. If any routed LoRA is active, every
+streamed block runs eagerly for that activation because routed child-Linear
+hooks stage parameters inside the block forward. The bypass is temporary:
+a later activation with no routed LoRA uses compiled forwards again.
+Selecting `lora_mode="routed"` without supplying a LoRA does not bypass
+compilation.
+
+Compiler and backend failures propagate normally. torch-offload never catches
+a failed compiled invocation and retries that same block eagerly: with graph
+breaks, earlier segments may already have executed, so retrying could duplicate
+mutations. Dynamo's native graph-break and recompilation-limit behavior still
+applies.
 
 By default, trainable parameters (e.g. LoRA adapters) are managed by
 the composed `PinnedComponent`: they move to GPU on CUDA activation and
@@ -679,12 +730,14 @@ This is a low-level library; we don't guard against caller misuse.
 
 ## Compatibility
 
-- **`torch.compile` is not supported** for `ModelOffloader`-managed
-  modules. Its `PinnedComponent` swaps parameter registry entries
-  (`module._parameters[leaf] = new_param`) on activate/deactivate, and
-  `StreamedComponent` registers forward-pre hooks that mutate registered
-  parameters on every block call. Both invalidate the tensor-identity assumptions
-  `torch.compile` makes about its trace.
+- **`torch.compile` support is deliberately narrow.** Use
+  `block_compile=BlockCompileConfig(...)` to compile only declared streamed
+  block forwards during CUDA inference. External whole-model
+  `torch.compile(model)`, `model.compile()`, compilation of the pinned
+  remainder, and compiled streamed training remain unsupported. Routed LoRA
+  temporarily bypasses compiled blocks. Compiler code/artifact caches and
+  compiler-owned workspace are outside `ResourceCache.cache_bytes`; model
+  eviction does not call process-global `torch.compiler.reset()`.
 - **Wrap before DDP/FSDP**, not after. Those wrappers manage parameter
   storage themselves and conflict with the registry-replacement pattern.
 - **One runtime per cached model.** `ResourceCache` serializes resource
