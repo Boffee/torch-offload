@@ -8,11 +8,12 @@ The prototype static FP8 representation is deliberately separate from
 (``qdata``, weight ``scale``, and ``act_quant_scale``) quantized and intact
 through pinning, block streaming, cache reuse, and lossless CPU round trips.
 
-Merged LoRA updates dequantize and re-encode only the weight.  Re-encoding
-recomputes the weight scale, then ``copy_into`` fills only weight bytes and
-weight scales in the existing target; the calibrated activation scale is
-never replaced or recalibrated.  Routed LoRA uses the ordinary logical shape
-and compute dtype exposed by the shared adapter contract.
+CUDA LoRA updates use a format-specific Triton merge when available, with a
+pure-Torch dequantize/GEMM/requantize fallback. Both recompute only the weight
+scale and install only weight bytes and weight scales in the existing target.
+The calibrated activation scale is never replaced or recalibrated. Routed LoRA
+uses the ordinary logical shape and compute dtype exposed by the shared adapter
+contract.
 """
 
 from __future__ import annotations
@@ -37,6 +38,66 @@ from .torchao_structured_adapter import (
     TorchaoStructuredAdapter,
     copy_storage,
 )
+
+try:
+    from ._triton_static_float8 import (
+        merge_static_float8_lora as _triton_merge_static_float8_lora,
+    )
+except ModuleNotFoundError as exc:
+    if exc.name != "triton":
+        raise
+    _triton_merge_static_float8_lora = None
+
+
+def _torch_merge_static_float8_lora(
+    qdata: torch.Tensor,
+    scale: torch.Tensor,
+    b: torch.Tensor,
+    a: torch.Tensor,
+    strength: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Merge raw static-FP8 storage with ordinary, compilable Torch ops."""
+    dense = (qdata.to(torch.float32) * scale).to(b.dtype)
+    merged = torch.addmm(dense, b, a, alpha=strength)
+
+    fp8_limit = torch.finfo(qdata.dtype).max
+    output_scale = (merged.abs().amax() / fp8_limit).to(b.dtype).to(torch.float32)
+    output_scale = torch.where(
+        output_scale == 0,
+        torch.full_like(output_scale, torch.finfo(torch.float32).eps),
+        output_scale,
+    )
+    output_qdata = (
+        (merged.to(torch.float32) / output_scale)
+        .clamp(min=-fp8_limit, max=fp8_limit)
+        .to(qdata.dtype)
+    )
+    return output_qdata, output_scale.reshape_as(scale)
+
+
+def _merge_static_float8_lora(
+    qdata: torch.Tensor,
+    scale: torch.Tensor,
+    b: torch.Tensor,
+    a: torch.Tensor,
+    strength: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Prefer Triton, falling back to the pure-Torch raw-storage merge."""
+    if _triton_merge_static_float8_lora is not None:
+        return _triton_merge_static_float8_lora(
+            qdata,
+            scale,
+            b,
+            a,
+            strength,
+        )
+    return _torch_merge_static_float8_lora(
+        qdata,
+        scale,
+        b,
+        a,
+        strength,
+    )
 
 
 @dataclass(slots=True, frozen=True)
@@ -145,6 +206,25 @@ class StaticFloat8Adapter(TorchaoStructuredAdapter[_StaticFloat8Meta]):
     @staticmethod
     def requantize(t: torch.Tensor, *, like: torch.Tensor) -> torch.Tensor:
         return requantize_static_float8_tensor(t, like=like)
+
+    @staticmethod
+    def merge_lora_(
+        target: torch.Tensor,
+        b: torch.Tensor,
+        a: torch.Tensor,
+        strength: float,
+    ) -> None:
+        """Run and install the preferred static-FP8 LoRA merge."""
+        f8 = require_static_float8_tensor(target)
+        qdata, scale = _merge_static_float8_lora(
+            f8.qdata,
+            f8.scale,
+            b,
+            a,
+            strength,
+        )
+        f8.qdata.copy_(qdata)
+        f8.scale.copy_(scale)
 
     @staticmethod
     def copy_into(src: torch.Tensor, *, target: torch.Tensor) -> None:

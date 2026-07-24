@@ -45,6 +45,7 @@ __all__ = [
     "DenseAddmmTensorAdapter",
     "DequantRequantCopyIntoTensorAdapter",
     "DequantRequantTensorAdapter",
+    "FusedLoRAMergeTensorAdapter",
     "LogicalShapeTensorAdapter",
     "ParameterDataSwapTensorAdapter",
     "PostLoadRearmTensorAdapter",
@@ -211,6 +212,29 @@ class DenseAddmmTensorAdapter(TensorAdapter[PinnedStateT, GpuStateT], Protocol):
         copied GPU tensor. Adapters that do not implement this capability
         are treated as non-mergeable by that caller.
         """
+        ...
+
+
+@runtime_checkable
+class FusedLoRAMergeTensorAdapter(
+    TensorAdapter[PinnedStateT, GpuStateT],
+    Protocol,
+):
+    """Optional capability for a format-specific staged LoRA merge.
+
+    The caller validates and stages one combined ``B @ A`` update on the
+    target device. The adapter applies it while preserving the target tensor's
+    object and storage identities.
+    """
+
+    @staticmethod
+    def merge_lora_(
+        target: torch.Tensor,
+        b: torch.Tensor,
+        a: torch.Tensor,
+        strength: float,
+    ) -> None:
+        """Merge the staged update into ``target`` in place."""
         ...
 
 

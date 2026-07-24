@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import subprocess
+import sys
 from typing import cast
 
 import pytest
@@ -11,6 +13,29 @@ from torch_offload import TensorAdapter, register_adapter
 from torch_offload.dtensor_adapter import DTensorAdapter
 from torch_offload.tensor_adapter_registry import select_adapter, tensor_id
 from torch_offload.tensor_adapters import RegularAdapter
+
+
+def test_package_import_does_not_require_triton() -> None:
+    script = (
+        "import builtins\n"
+        "real_import = builtins.__import__\n"
+        "def import_without_triton("
+        "name, globals=None, locals=None, fromlist=(), level=0):\n"
+        "    if name == 'triton' or name.startswith('triton.'):\n"
+        "        raise ModuleNotFoundError("
+        "'No module named triton', name='triton')\n"
+        "    return real_import(name, globals, locals, fromlist, level)\n"
+        "builtins.__import__ = import_without_triton\n"
+        "import torch_offload\n"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
 
 
 class _ExternalTensor(torch.Tensor):

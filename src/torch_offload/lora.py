@@ -9,8 +9,8 @@ Two application paths apply the resource's factors:
 
 - :class:`LoRATransform` (merge mode) — applied to the GPU parameter
   after DMA; integrates with block streaming. Uses dense in-place
-  ``addmm_`` when available, otherwise an adapter-provided
-  dequantize/requantize plus ``copy_into`` path.
+  ``addmm_`` when available, an adapter-provided format-specific merge when
+  available, or dequantize/requantize plus ``copy_into`` otherwise.
 - routed mode (:func:`install_routed_residual_hook`) — a forward-PRE hook
   copies the target's factors from pinned CPU storage to the input device for
   that invocation; a forward-POST hook adds
@@ -46,6 +46,7 @@ from .tensor_adapter_registry import param_representation, select_adapter
 from .tensor_adapters import (
     DenseAddmmTensorAdapter,
     DequantRequantCopyIntoTensorAdapter,
+    FusedLoRAMergeTensorAdapter,
     LogicalShapeTensorAdapter,
     adapter_name,
 )
@@ -215,10 +216,11 @@ class LoRATransform:
     Holds references to LoRA-owned pinned factor matrices — no cloning or
     pinning happens here. :meth:`apply` copies factors to the target
     parameter's device and applies the update using either dense in-place
-    ``addmm_`` or the tensor adapter's dequantize/requantize plus ``copy_into``
-    capability. Multiple ordinary CUDA factors are packed into transient
-    buffers and applied with one GEMM. The target
-    :class:`~torch.nn.Parameter` object is always preserved.
+    ``addmm_``, a format-specific fused adapter capability, or the tensor
+    adapter's dequantize/requantize plus ``copy_into`` capability. Multiple
+    ordinary CUDA factors are packed into transient buffers and applied with
+    one GEMM. The target :class:`~torch.nn.Parameter` object is always
+    preserved.
     """
 
     __slots__ = ("_factors",)
@@ -251,6 +253,16 @@ class LoRATransform:
             self._apply_dense(representation)
             return
 
+        if representation.device.type == "cuda" and isinstance(
+            adapter, FusedLoRAMergeTensorAdapter
+        ):
+            _validate_factor_shapes(self._factors, tuple(representation.shape))
+            if self._apply_fused(
+                representation,
+                adapter,
+            ):
+                return
+
         dense = adapter.dequantize(representation)
         # Validate against the dense LOGICAL shape, not the wrapper's shape:
         # Params4bit reports its packed (numel/2, 1) storage shape, so the
@@ -275,9 +287,10 @@ class LoRATransform:
             return adapter.logical_shape(representation)
         return tuple(adapter.dequantize(representation).shape)
 
-    def _apply_dense(self, data: torch.Tensor) -> None:
-        dev, dt = data.device, data.dtype
-        factor_tensors = [
+    def _factor_tensors(
+        self,
+    ) -> list[tuple[ScaledLoRAFactor, torch.Tensor, torch.Tensor]]:
+        return [
             (
                 factor,
                 param_representation(factor.a.make_cpu_param()),
@@ -285,6 +298,30 @@ class LoRATransform:
             )
             for factor in self._factors
         ]
+
+    def _apply_fused(
+        self,
+        data: torch.Tensor,
+        adapter: FusedLoRAMergeTensorAdapter[Any, Any],
+    ) -> bool:
+        """Apply a format-specific merge when factors can be staged plainly."""
+        factor_tensors = self._factor_tensors()
+        staged = self._stage_single_or_packed_update(data, factor_tensors)
+        if staged is None:
+            return False
+
+        b, a, strength = staged
+        adapter.merge_lora_(
+            data,
+            b,
+            a,
+            strength,
+        )
+        return True
+
+    def _apply_dense(self, data: torch.Tensor) -> None:
+        dev, dt = data.device, data.dtype
+        factor_tensors = self._factor_tensors()
         if self._can_pack_factors(factor_tensors, dev):
             self._apply_dense_packed(data, factor_tensors)
             return
@@ -293,6 +330,53 @@ class LoRATransform:
             a_gpu = a.to(device=dev, dtype=dt, non_blocking=True)
             b_gpu = b.to(device=dev, dtype=dt, non_blocking=True)
             data.addmm_(b_gpu, a_gpu, alpha=factor.strength)
+
+    @classmethod
+    def _stage_single_or_packed_update(
+        cls,
+        data: torch.Tensor,
+        factor_tensors: Sequence[
+            tuple[ScaledLoRAFactor, torch.Tensor, torch.Tensor]
+        ],
+    ) -> tuple[torch.Tensor, torch.Tensor, float] | None:
+        if len(factor_tensors) == 1 and cls._are_plain_pinned_factors(
+            factor_tensors
+        ):
+            factor, a, b = factor_tensors[0]
+            return (
+                b.to(
+                    device=data.device,
+                    dtype=data.dtype,
+                    non_blocking=True,
+                ),
+                a.to(
+                    device=data.device,
+                    dtype=data.dtype,
+                    non_blocking=True,
+                ),
+                factor.strength,
+            )
+
+        if cls._can_pack_factors(factor_tensors, data.device):
+            a, b = cls._pack_factors(data, factor_tensors)
+            return b, a, 1.0
+        return None
+
+    @staticmethod
+    def _are_plain_pinned_factors(
+        factor_tensors: Sequence[
+            tuple[ScaledLoRAFactor, torch.Tensor, torch.Tensor]
+        ],
+    ) -> bool:
+        return all(
+            type(a) is torch.Tensor
+            and type(b) is torch.Tensor
+            and a.device.type == "cpu"
+            and b.device.type == "cpu"
+            and a.is_pinned()
+            and b.is_pinned()
+            for _factor, a, b in factor_tensors
+        )
 
     @staticmethod
     def _can_pack_factors(
@@ -307,25 +391,17 @@ class LoRATransform:
         return (
             device.type == "cuda"
             and len(factor_tensors) > 1
-            and all(
-                type(a) is torch.Tensor
-                and type(b) is torch.Tensor
-                and a.device.type == "cpu"
-                and b.device.type == "cpu"
-                and a.is_pinned()
-                and b.is_pinned()
-                for _factor, a, b in factor_tensors
-            )
+            and LoRATransform._are_plain_pinned_factors(factor_tensors)
         )
 
     @staticmethod
-    def _apply_dense_packed(
+    def _pack_factors(
         data: torch.Tensor,
         factor_tensors: Sequence[
             tuple[ScaledLoRAFactor, torch.Tensor, torch.Tensor]
         ],
-    ) -> None:
-        """Apply several LoRAs with one GEMM and no per-factor GPU allocations.
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Stage several LoRAs for one GEMM with no per-factor GPU tensors.
 
         The temporary packed buffers contain exactly the combined factors for
         this weight and die after the merge. CPU factors copy directly into
@@ -357,6 +433,20 @@ class LoRATransform:
                 a_slice.mul_(factor.strength)
             rank_offset = next_offset
 
+        return a_packed, b_packed
+
+    @staticmethod
+    def _apply_dense_packed(
+        data: torch.Tensor,
+        factor_tensors: Sequence[
+            tuple[ScaledLoRAFactor, torch.Tensor, torch.Tensor]
+        ],
+    ) -> None:
+        """Apply several staged LoRAs with one GEMM."""
+        a_packed, b_packed = LoRATransform._pack_factors(
+            data,
+            factor_tensors,
+        )
         data.addmm_(b_packed, a_packed)
 
 

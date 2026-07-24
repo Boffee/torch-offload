@@ -786,7 +786,7 @@ dtype, no merge capability required.
 | bitsandbytes NF4 / FP4 | ✓ | dequant / requant |
 | bitsandbytes int8 | ✓ | dequant / requant |
 | TorchAO scaled-FP8 | ✓ | dequant / requant |
-| TorchAO static-activation scaled-FP8 | ✓ | dequant / requant |
+| TorchAO static-activation scaled-FP8 | ✓ | fused Triton merge on CUDA; dequant / requant fallback |
 | TorchAO INT8 | ✓ | dequant / requant |
 | TorchAO MX (MXFP8 / MXFP4) | ✓ | dequant / requant † |
 | TorchAO NVFP4 | ✓ | dequant / requant † |
@@ -937,12 +937,17 @@ TorchAO 0.17 normally requires the activation scale rank to equal the input
 rank. torch-offload's static adapter installs a narrow `nn.Linear` dispatch
 shim that flattens ordinary activations before static quantization and reshapes
 the result afterwards. A checkpoint scalar (or any one-element scale layout)
-therefore works unchanged for both 2-D and 3-D Linear inputs. LoRA merge
-recomputes only the weight scale and copies only the re-encoded weight bytes
-and scale into the target; the calibrated activation scale is preserved
-exactly. Routed LoRA is supported as the non-destructive alternative. Output
-activation quantization and non-per-tensor Prototype layouts are outside this
-adapter's contract and are rejected explicitly.
+therefore works unchanged for both 2-D and 3-D Linear inputs. LoRA merge uses
+a format-specific Triton kernel pipeline on CUDA when Triton is available,
+independently of `block_compile`. It fuses dequantization, the low-rank GEMM,
+addition, and tile-level maximum collection before reducing the new per-tensor
+weight scale and requantizing. CUDA installations without Triton use the same
+raw storage through ordinary Torch operations; CPU merges retain the generic
+adapter path. All paths copy only the re-encoded weight bytes and scale into
+the target; the calibrated activation scale is preserved exactly. Routed LoRA
+is supported as the non-destructive alternative. Output activation quantization
+and non-per-tensor Prototype layouts are outside this adapter's contract and
+are rejected explicitly.
 
 ## Failure modes
 
