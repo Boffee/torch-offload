@@ -60,6 +60,7 @@ import torch
 from torch import nn
 
 from ._devices import canonical_device
+from .block_compile import BlockCompileConfig, _BlockCompileState
 from .module_names import group_names, walk_attr_path
 from .pinned_module import (
     PinnedModuleInstance,
@@ -671,6 +672,8 @@ class StreamedComponentStore:
     def bind(
         self,
         model: nn.Module,
+        *,
+        block_compile: BlockCompileConfig | None = None,
     ) -> StreamedComponent:
         """Bind this store's per-block backing bytes to ``model``.
 
@@ -710,6 +713,7 @@ class StreamedComponentStore:
             instances,
             name=self.blocks_path,
             block_indices=self.block_indices,
+            block_compile=block_compile,
         )
 
 
@@ -742,7 +746,10 @@ class StreamedComponent:
     pins (so ``cache_bytes`` is final at construction time, ready
     for :class:`~torch_offload.resource_cache.ResourceCache` admission), and
     ``activate`` brings to CUDA or marks CPU active, ``deactivate`` returns state to
-    pinned CPU and removes hooks. The residency/prefetch policy
+    pinned CPU, removes hooks, and restores eager forwards. Optional
+    ``block_compile`` policy belongs to this bound runtime and installs lazy
+    compiled forwards only for eligible CUDA inference activations. The
+    residency/prefetch policy
     (``num_resident_blocks``, ``num_prefetch_blocks``, ``cyclic``) is supplied
     per activation via :class:`~torch_offload.stream_config.StreamConfig` passed
     to :meth:`activate` — a runtime concern, not part of the pinned backing.
@@ -780,6 +787,10 @@ class StreamedComponent:
         (so a sparse group addresses ``"blocks.2.weight"`` not the compact
         ``"blocks.1.weight"``). The streaming engine still uses the compact
         ``0..k-1`` position internally. Defaults to ``0..k-1`` (contiguous).
+    block_compile:
+        Optional forward-only compile policy. One lazy callable is retained per
+        distinct block module object, installed during eligible CUDA
+        activations, and removed on deactivate. CPU activation stays eager.
     """
 
     def __init__(
@@ -788,6 +799,7 @@ class StreamedComponent:
         *,
         name: str | None = None,
         block_indices: Sequence[int] | None = None,
+        block_compile: BlockCompileConfig | None = None,
     ) -> None:
         self._block_instances = list(block_instances)
         if block_indices is None:
@@ -800,6 +812,10 @@ class StreamedComponent:
                 f"{len(self._block_instances)} blocks."
             )
         self._blocks = [instance.module for instance in self._block_instances]
+        self._block_compile = _BlockCompileState.create(
+            self._blocks,
+            block_compile,
+        )
         # Per-block layout signature: blocks with equal signatures share
         # pooled GPU targets, so a block list may mix quant formats.
         self._block_signatures = [
@@ -853,6 +869,11 @@ class StreamedComponent:
     def blocks(self) -> tuple[nn.Module, ...]:
         """The bound modules whose forward drives streaming, in order."""
         return tuple(self._blocks)
+
+    @property
+    def block_compile(self) -> BlockCompileConfig | None:
+        """This bound streamer's optional block compilation policy."""
+        return self._block_compile.config
 
     @property
     def streamed_param_names_by_block(self) -> list[list[str]]:
@@ -963,7 +984,8 @@ class StreamedComponent:
         """Activate the block list on ``device``.
 
         CUDA activation uses the streaming path: GPU target pool, CUDA
-        stream/events, prefetch executor, and forward hooks. CPU
+        stream/events, prefetch executor, forward hooks, and optional compiled
+        block forwards. CPU
         activation is pass-through over the pinned host-backed state.
         The composite's :meth:`activate` returns the model — this
         method returns ``None`` because the streamer doesn't own one.
@@ -996,15 +1018,25 @@ class StreamedComponent:
                 "StreamedComponent.activate() supports CUDA or CPU; "
                 f"got {active_device}."
             )
+        active_block_compile = cast(
+            BlockCompileConfig | None,
+            kwargs.get("block_compile", self._block_compile.config),
+        )
         self._activate_cuda_resolved(
-            active_device, _stream_config_from_kwargs(kwargs),
+            active_device,
+            _stream_config_from_kwargs(kwargs),
+            block_compile=active_block_compile,
         )
 
     def _activate_cpu_resolved(self) -> None:
         self._active_device = torch.device("cpu")
 
     def _activate_cuda_resolved(
-        self, active_device: torch.device, stream_config: StreamConfig,
+        self,
+        active_device: torch.device,
+        stream_config: StreamConfig,
+        *,
+        block_compile: BlockCompileConfig | None,
     ) -> None:
         num_blocks = len(self._block_instances)
         num_resident = min(stream_config.num_resident_blocks, num_blocks)
@@ -1026,8 +1058,11 @@ class StreamedComponent:
             self._tracker.mark_on_gpu(block_idx)
 
         self._register_hooks(
-            num_resident, stream_config.num_prefetch_blocks, stream_config.cyclic,
+            num_resident,
+            stream_config.num_prefetch_blocks,
+            stream_config.cyclic,
         )
+        self._block_compile.install(block_compile)
         self.reset_peak()
 
         logger.info(
@@ -1044,6 +1079,7 @@ class StreamedComponent:
         binding reference after deactivate to release pinned
         memory."""
         if self._active_device == torch.device("cpu"):
+            self._block_compile.restore()
             self._active_device = None
             return
         prefetch_exc = self._teardown_active_resources()
@@ -1441,6 +1477,7 @@ class StreamedComponent:
         """Idempotent cleanup of all active resources. Returns the
         first prefetch exception encountered (or None) so the caller
         can surface it after cleanup completes."""
+        self._block_compile.restore()
         for h in self._hooks:
             h.remove()
         self._hooks.clear()

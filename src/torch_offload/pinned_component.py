@@ -6,7 +6,7 @@ by :class:`ModelOffloader` for both non-streamed names and whole-model
 pinning. It is a composable activate/deactivate lifecycle piece, not a
 top-level model runtime.
 
-Cross-cutting compatibility caveats (``torch.compile`` incompatibility,
+Cross-cutting compatibility caveats (the narrow ``torch.compile`` scope,
 DDP/FSDP wrap-before requirement, single-thread contract) live in the
 :mod:`~torch_offload` package docstring.
 

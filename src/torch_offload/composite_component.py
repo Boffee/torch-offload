@@ -26,6 +26,7 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 
+from .block_compile import BlockCompileConfig
 from .module_names import buffer_names, parameter_names
 from .pinned_component import PinnedComponent, PinnedComponentStore
 from .pinned_module import PostCopyHook
@@ -227,12 +228,25 @@ class CompositeComponentStore:
         pinned = bool(self.pinned_store and self.pinned_store.has_trainables)
         return pinned or any(s.has_trainables for s in self.streamed_stores)
 
-    def bind(self, model: nn.Module) -> CompositeComponent:
-        """Bind the pinned and streamed stores to ``model``."""
+    def bind(
+        self,
+        model: nn.Module,
+        *,
+        block_compile: BlockCompileConfig | None = None,
+    ) -> CompositeComponent:
+        """Bind the pinned and streamed stores to ``model``.
+
+        Compile policy belongs to the bound runtime rather than this pinned
+        store: it creates no pinned bytes and does not affect
+        :attr:`cache_bytes`.
+        """
         pinned = self.pinned_store.bind(model) if self.pinned_store else None
         return CompositeComponent(
             pinned=pinned,
-            streamed=[s.bind(model) for s in self.streamed_stores],
+            streamed=[
+                s.bind(model, block_compile=block_compile)
+                for s in self.streamed_stores
+            ],
         )
 
 

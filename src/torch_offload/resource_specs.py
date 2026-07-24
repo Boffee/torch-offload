@@ -14,6 +14,7 @@ from typing import Generic, TypeVar, cast
 import torch
 from torch import nn
 
+from .block_compile import BlockCompileConfig
 from .lora import LoRA
 from .model_offloader import ModelOffloader
 from .protocols import ResourceStore
@@ -28,7 +29,8 @@ class ModelSpec(Generic[M]):
 
     ``factory`` runs once to construct the cached :class:`ModelOffloader`.
     Every lease reuses that same model runtime sequentially; overlapping uses
-    are rejected by the offloader.
+    are rejected by the offloader. ``block_compile`` is an opt-in construction
+    policy for every streamed group named by ``blocks_attr``.
     """
 
     key: str
@@ -36,6 +38,7 @@ class ModelSpec(Generic[M]):
     factory: Callable[[], M]
     blocks_attr: tuple[str, ...] = ()
     stream_trainable_weights: bool = False
+    block_compile: BlockCompileConfig | None = None
 
     def build_store(self) -> ModelOffloader:
         """Build, pin, and bind the cached model runtime."""
@@ -43,6 +46,7 @@ class ModelSpec(Generic[M]):
             self.factory(),
             blocks_attr=self.blocks_attr,
             stream_trainable_weights=self.stream_trainable_weights,
+            block_compile=self.block_compile,
         )
 
     def value(self, store: ResourceStore) -> ModelOffloader:
