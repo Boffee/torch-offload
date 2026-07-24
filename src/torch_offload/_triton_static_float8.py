@@ -179,13 +179,6 @@ def merge_static_float8_lora(
     compute_dtype = _compute_dtype_id(b.dtype)
     if qdata.ndim != 2 or b.ndim != 2 or a.ndim != 2:
         raise ValueError("Triton static-FP8 merge expects rank-two tensors.")
-    if not (
-        qdata.is_contiguous()
-        and scale.is_contiguous()
-        and b.is_contiguous()
-        and a.is_contiguous()
-    ):
-        raise ValueError("Triton static-FP8 merge expects contiguous tensors.")
     if (
         qdata.device != scale.device
         or qdata.device != b.device
@@ -205,6 +198,10 @@ def merge_static_float8_lora(
         )
     if b.shape != (rows, rank) or a.shape[1] != cols:
         raise ValueError("LoRA factors do not match the FP8 weight shape.")
+
+    qdata = qdata.contiguous()
+    b = b.contiguous()
+    a = a.contiguous()
 
     block_m = 64
     block_n = 128

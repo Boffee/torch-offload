@@ -6,7 +6,6 @@ import pytest
 import torch
 from torch import nn
 
-from torch_offload._triton_static_float8 import merge_static_float8_lora
 from torch_offload import (
     BlockCompileConfig,
     LoRA,
@@ -327,29 +326,30 @@ class TestStaticFloat8Adapter:
             dtype=dtype,
             float8_dtype=float8_dtype,
         ).cuda()
-        a = torch.randn(rank, cols, device="cuda", dtype=dtype)
-        b = torch.randn(rows, rank, device="cuda", dtype=dtype)
+        a = torch.randn(cols, rank, device="cuda", dtype=dtype).t()
+        b = torch.randn(rank, rows, device="cuda", dtype=dtype).t()
         strength = 0.25
 
+        assert not a.is_contiguous()
+        assert not b.is_contiguous()
         dense = StaticFloat8Adapter.dequantize(f8)
         dense.addmm_(b, a, alpha=strength)
         expected = StaticFloat8Adapter.requantize(dense, like=f8)
-        qdata, scale = merge_static_float8_lora(
-            f8.qdata,
-            f8.scale,
+        assert StaticFloat8Adapter.merge_lora_(
+            f8,
             b,
             a,
             strength,
         )
 
         torch.testing.assert_close(
-            scale,
+            f8.scale,
             expected.scale,
             rtol=0.02,
             atol=0,
         )
         torch.testing.assert_close(
-            qdata.to(torch.float32) * scale,
+            f8.qdata.to(torch.float32) * f8.scale,
             expected.dequantize().to(torch.float32),
             rtol=0.3 if float8_dtype is torch.float8_e5m2 else 0.13,
             atol=0.15 if float8_dtype is torch.float8_e5m2 else 0.05,
@@ -363,18 +363,17 @@ class TestStaticFloat8Adapter:
         a = torch.zeros(4, 16, device="cuda", dtype=f8.dtype)
         b = torch.zeros(16, 4, device="cuda", dtype=f8.dtype)
 
-        qdata, scale = merge_static_float8_lora(
-            f8.qdata,
-            f8.scale,
+        assert StaticFloat8Adapter.merge_lora_(
+            f8,
             b,
             a,
             1.0,
         )
 
-        dequantized = qdata.to(torch.float32) * scale
+        dequantized = f8.qdata.to(torch.float32) * f8.scale
         assert torch.isfinite(dequantized).all()
         assert torch.count_nonzero(dequantized).item() == 0
-        assert torch.count_nonzero(scale).item() == 1
+        assert torch.count_nonzero(f8.scale).item() == 1
 
     def test_copy_into_does_not_copy_activation_scale(self) -> None:
         target = _make_static_float8()
@@ -425,12 +424,46 @@ class TestStaticFloat8Adapter:
         assert torch.equal(param.data.act_quant_scale, original_act_scale)
 
     @CUDA
+    def test_lora_transform_falls_back_when_triton_is_unavailable(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        rows, cols, rank = 16, 16, 4
+        f8 = _make_static_float8(rows=rows, cols=cols).cuda()
+        param = nn.Parameter(f8, requires_grad=False)
+        a = torch.randn(rank, cols)
+        b = torch.randn(rows, rank)
+        transform = LoRATransform(
+            [ScaledLoRAFactor.from_tensors(a, b, 0.5)]
+        )
+        expected_dense = StaticFloat8Adapter.dequantize(f8)
+        expected_dense.addmm_(
+            b.to(device="cuda", dtype=expected_dense.dtype),
+            a.to(device="cuda", dtype=expected_dense.dtype),
+            alpha=0.5,
+        )
+        expected = StaticFloat8Adapter.requantize(expected_dense, like=f8)
+
+        monkeypatch.setattr(
+            "torch_offload.static_float8_adapter._merge_static_float8_lora",
+            None,
+        )
+        transform.apply(param)
+
+        assert torch.equal(
+            param.data.qdata.view(torch.uint8),
+            expected.qdata.view(torch.uint8),
+        )
+        assert torch.equal(param.data.scale, expected.scale)
+
+    @CUDA
     def test_triton_lora_transform_uses_raw_storage_and_preserves_wrapper(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         rows, cols = 64, 64
-        f8 = _make_static_float8(rows=rows, cols=cols).cuda()
+        weight = torch.randn(cols, rows, dtype=torch.bfloat16).t()
+        f8 = _make_static_float8(weight=weight).cuda()
         param = nn.Parameter(f8, requires_grad=False)
         factor_inputs = [
             (
@@ -466,8 +499,11 @@ class TestStaticFloat8Adapter:
         dense.addmm_(packed_b, packed_a)
         expected = StaticFloat8Adapter.requantize(dense, like=f8)
         qdata_ptr = f8.qdata.data_ptr()
+        qdata_stride = f8.qdata.stride()
         scale_ptr = f8.scale.data_ptr()
         act_scale_ptr = f8.act_quant_scale.data_ptr()
+
+        assert not f8.qdata.is_contiguous()
 
         def fail_dequantize(_tensor: torch.Tensor) -> torch.Tensor:
             raise AssertionError(
@@ -484,6 +520,7 @@ class TestStaticFloat8Adapter:
         torch.cuda.synchronize()
 
         assert param.data.qdata.data_ptr() == qdata_ptr
+        assert param.data.qdata.stride() == qdata_stride
         assert param.data.scale.data_ptr() == scale_ptr
         assert param.data.act_quant_scale.data_ptr() == act_scale_ptr
         torch.testing.assert_close(

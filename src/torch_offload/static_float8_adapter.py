@@ -10,10 +10,10 @@ through pinning, block streaming, cache reuse, and lossless CPU round trips.
 
 CUDA LoRA updates use a format-specific Triton merge that recomputes only the
 weight scale and installs only weight bytes and weight scales in the existing
-target.  The calibrated activation scale is never replaced or recalibrated.
-CPU merges retain the generic dequantize/requantize adapter path. Routed LoRA
-uses the ordinary logical shape and compute dtype exposed by the shared
-adapter contract.
+target. If Triton is unavailable, CUDA merges fall back to the generic
+dequantize/requantize adapter path also used on CPU. The calibrated activation
+scale is never replaced or recalibrated. Routed LoRA uses the ordinary logical
+shape and compute dtype exposed by the shared adapter contract.
 """
 
 from __future__ import annotations
@@ -31,7 +31,6 @@ from ._torchao_static_float8 import (
     require_static_float8_tensor,
     validate_layout,
 )
-from ._triton_static_float8 import merge_static_float8_lora
 from .tensor_adapters import metadata_key
 from .torchao_structured_adapter import (
     TorchaoGpu,
@@ -39,6 +38,15 @@ from .torchao_structured_adapter import (
     TorchaoStructuredAdapter,
     copy_storage,
 )
+
+try:
+    from ._triton_static_float8 import (
+        merge_static_float8_lora as _merge_static_float8_lora,
+    )
+except ModuleNotFoundError as exc:
+    if exc.name != "triton":
+        raise
+    _merge_static_float8_lora = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -154,10 +162,12 @@ class StaticFloat8Adapter(TorchaoStructuredAdapter[_StaticFloat8Meta]):
         b: torch.Tensor,
         a: torch.Tensor,
         strength: float,
-    ) -> None:
-        """Run and install the Triton static-FP8 LoRA merge."""
+    ) -> bool:
+        """Run the Triton merge when its optional dependency is available."""
+        if _merge_static_float8_lora is None:
+            return False
         f8 = require_static_float8_tensor(target)
-        qdata, scale = merge_static_float8_lora(
+        qdata, scale = _merge_static_float8_lora(
             f8.qdata,
             f8.scale,
             b,
@@ -166,6 +176,7 @@ class StaticFloat8Adapter(TorchaoStructuredAdapter[_StaticFloat8Meta]):
         )
         f8.qdata.copy_(qdata)
         f8.scale.copy_(scale)
+        return True
 
     @staticmethod
     def copy_into(src: torch.Tensor, *, target: torch.Tensor) -> None:
